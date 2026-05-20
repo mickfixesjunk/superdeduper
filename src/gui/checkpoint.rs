@@ -114,6 +114,101 @@ pub fn save(path: &Path, cp: &Checkpoint) -> Result<()> {
     Ok(())
 }
 
+/// Tiny non-destructive read used by the launch-time Resume/Start
+/// Fresh modal. Returns enough to render the prompt (timestamp,
+/// roots, dup count) without committing to threading the whole
+/// state through the engine. `Ok(None)` = no file present.
+/// `Err(_)` = file exists but is corrupt; caller is expected to
+/// rename it via [`mark_corrupt`].
+#[derive(Debug, Clone)]
+pub struct CheckpointSummary {
+    pub created_at_unix: u64,
+    pub roots: Vec<RootEntry>,
+    pub duplicate_count: usize,
+    pub has_saved_inventory: bool,
+}
+
+pub fn summary(path: &Path) -> Result<Option<CheckpointSummary>> {
+    match load(path)? {
+        Some(cp) => Ok(Some(CheckpointSummary {
+            created_at_unix: cp.created_at_unix,
+            roots: cp.roots,
+            duplicate_count: cp.previous_duplicates.len(),
+            has_saved_inventory: cp.saved_inventory.is_some(),
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Rename the existing checkpoint to a timestamped `.bak` sibling so
+/// the user can recover from a Start-Fresh later. Filename pattern:
+/// `<stem>-<ISO-timestamp>.json.bak`. Idempotent — if the source
+/// file doesn't exist, returns `Ok(None)`.
+pub fn archive(path: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = iso_timestamp_now();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("checkpoint");
+    let archived = parent.join(format!("{stem}-{stamp}.json.bak"));
+    std::fs::rename(path, &archived)?;
+    Ok(Some(archived))
+}
+
+/// Rename a corrupt checkpoint so the user can inspect it later.
+/// Pattern: `<stem>-<ISO-timestamp>.json.corrupt`. Distinct
+/// extension from `.bak` so a corrupt file isn't confused with a
+/// safely-archived one the user might want to restore.
+pub fn mark_corrupt(path: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = iso_timestamp_now();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("checkpoint");
+    let archived = parent.join(format!("{stem}-{stamp}.json.corrupt"));
+    std::fs::rename(path, &archived)?;
+    Ok(Some(archived))
+}
+
+fn iso_timestamp_now() -> String {
+    // Filename-safe ISO-8601 in UTC: 2026-05-20T13-45-22Z.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = unix_to_ymdhms(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}Z")
+}
+
+fn unix_to_ymdhms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    // Same civil-from-days dance as diagnostics::unix_to_ymdhms; we
+    // duplicate it here to keep checkpoint.rs free of cross-module
+    // ordering dependencies.
+    let days = (secs / 86_400) as i64;
+    let h = ((secs % 86_400) / 3600) as u32;
+    let m = ((secs % 3600) / 60) as u32;
+    let s = (secs % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    (year, mo, day, h, m, s)
+}
+
 pub fn delete(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),

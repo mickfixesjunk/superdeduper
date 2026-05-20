@@ -29,9 +29,10 @@ use crate::gui::events::EngineEvent;
 use crate::gui::state::{RootEntry, ScanSettings, UiState};
 use crate::gui::widgets::groups_table::GroupAction;
 use crate::gui::widgets::roots_panel::RootsAction;
+use crate::gui::widgets::resume_modal::ResumeChoice;
 use crate::gui::widgets::{
-    drive_scope, funnel, groups_table, header, log_panel, overall_bar, roots_panel,
-    settings_modal, treemap,
+    drive_scope, funnel, groups_table, header, log_panel, overall_bar, resume_modal,
+    roots_panel, settings_modal, treemap,
 };
 use crate::gui::{demo, live, theme};
 
@@ -78,6 +79,11 @@ pub struct SuperdupeApp {
     /// detected `has_seek_penalty` value. Lives outside `persisted`
     /// because drive ids change between scans.
     drive_render_overrides: hashbrown::HashMap<u32, bool>,
+    /// Launch-time Resume/Start-Fresh modal state. `Some` ⇒ a usable
+    /// scan-checkpoint was found on disk and we're waiting for the
+    /// user to pick. While this is `Some`, the rest of the UI stays
+    /// behind the modal so Start Fresh can safely wipe state.
+    pending_resume: Option<crate::gui::checkpoint::CheckpointSummary>,
 }
 
 impl SuperdupeApp {
@@ -88,17 +94,31 @@ impl SuperdupeApp {
             .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdupe.app.v1"))
             .unwrap_or_default();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
-        let can_resume = check_resumable(&persisted);
-        // If a prior scan's results match the currently-configured
-        // roots+settings AND the folder fingerprint still matches
-        // what we saw, restore the duplicate list straight into the
-        // UI so the user can act on it without re-scanning.
-        let saved_results = crate::gui::results_store::load_matching(
-            &persisted.roots,
-            &persisted.settings,
-        )
-        .ok()
-        .flatten();
+
+        // Probe the scan-checkpoint file BEFORE any state restore so
+        // we can show the launch-time Resume / Start Fresh modal.
+        // The summary is cheap; the full restore only happens if the
+        // user picks Resume.
+        let pending_resume = match crate::gui::checkpoint::default_checkpoint_path() {
+            Ok(path) => match crate::gui::checkpoint::summary(&path) {
+                Ok(summary) => summary,
+                Err(e) => {
+                    // Corrupt or unparseable checkpoint: rename it
+                    // with a .corrupt suffix so the user can inspect
+                    // and we don't trip over it again. Proceed as if
+                    // there was no checkpoint.
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "checkpoint unparseable; renaming with .corrupt suffix"
+                    );
+                    let _ = crate::gui::checkpoint::mark_corrupt(&path);
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
         let mut app = Self {
             state: UiState::default(),
             rx,
@@ -109,41 +129,154 @@ impl SuperdupeApp {
             persisted,
             groups_state: groups_table::GroupsTableState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
-            can_resume,
+            can_resume: false,
             selected_drive: None,
             drive_render_overrides: hashbrown::HashMap::new(),
+            pending_resume,
         };
+
+        // The previous auto-restore behaviour (load results_state.json
+        // + replay duplicates) only kicks in when there's no
+        // checkpoint asking for an explicit decision. Otherwise the
+        // modal handles the choice and the restore happens inside
+        // `accept_resume`.
+        if app.pending_resume.is_none() {
+            app.auto_restore_results_state();
+        }
+        if start_in_demo {
+            app.start_demo();
+        }
+        app
+    }
+
+    /// Apply the existing "load results_state.json if folders match"
+    /// flow. Extracted so both the no-checkpoint launch path AND the
+    /// post-modal Start Fresh path can reuse it (the latter just
+    /// doesn't get here because Start Fresh wipes results_state out
+    /// of view).
+    fn auto_restore_results_state(&mut self) {
+        let saved_results = crate::gui::results_store::load_matching(
+            &self.persisted.roots,
+            &self.persisted.settings,
+        )
+        .ok()
+        .flatten();
+        let can_resume = check_resumable(&self.persisted);
+        self.can_resume = can_resume;
         if can_resume {
-            app.state.push_log(
+            self.state.push_log(
                 crate::gui::events::LogLevel::Info,
                 "A paused scan was found on disk. Click Resume to continue.".into(),
             );
         }
-        // Restore prior scan results, if they're still valid.
         if let Some(saved) = saved_results {
             let dup_count = saved.duplicates.len();
             for g in saved.duplicates {
                 let savings = g.size.saturating_mul(g.files.len().saturating_sub(1) as u64);
-                app.state.totals.duplicates =
-                    app.state.totals.duplicates.saturating_add(1);
-                app.state.totals.reclaimable_bytes =
-                    app.state.totals.reclaimable_bytes.saturating_add(savings);
-                app.state.duplicates.push(g);
+                self.state.totals.duplicates =
+                    self.state.totals.duplicates.saturating_add(1);
+                self.state.totals.reclaimable_bytes =
+                    self.state.totals.reclaimable_bytes.saturating_add(savings);
+                self.state.duplicates.push(g);
             }
-            app.state.push_log(
+            self.state.push_log(
                 crate::gui::events::LogLevel::Info,
                 format!(
                     "Restored {} duplicate group(s) from a prior scan — folders haven't changed. Safe-rename / Unsuperdupe pick up where you left off.",
                     dup_count
                 ),
             );
-            // Land the user on Groups so the restored content is visible.
-            app.persisted.results_tab = ResultsTab::Groups;
+            self.persisted.results_tab = ResultsTab::Groups;
         }
-        if start_in_demo {
-            app.start_demo();
+    }
+
+    /// User clicked Resume on the launch-time modal. Hydrate state
+    /// from the on-disk checkpoint so the funnel/groups/log all show
+    /// what the prior session ended with; the engine isn't auto-
+    /// started — the user clicks the "Resume scan" button in the
+    /// roots panel when they're ready to actually continue.
+    fn accept_resume(&mut self) {
+        let path = match crate::gui::checkpoint::default_checkpoint_path() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cp = match crate::gui::checkpoint::load(&path) {
+            Ok(Some(c)) => c,
+            _ => return,
+        };
+        // Adopt the checkpoint's roots + settings so the Roots panel
+        // matches the paused state.
+        self.persisted.roots = cp.roots.clone();
+        self.persisted.settings = cp.settings.clone();
+        // Replay every confirmed duplicate so the Groups + Treemap
+        // come back populated.
+        let dup_count = cp.previous_duplicates.len();
+        for g in &cp.previous_duplicates {
+            let savings = g.size.saturating_mul(g.files.len().saturating_sub(1) as u64);
+            self.state.totals.duplicates =
+                self.state.totals.duplicates.saturating_add(1);
+            self.state.totals.reclaimable_bytes =
+                self.state.totals.reclaimable_bytes.saturating_add(savings);
+            self.state.duplicates.push(g.clone());
         }
-        app
+        self.state.push_log(
+            crate::gui::events::LogLevel::Info,
+            format!(
+                "Resumed previous scan: {} duplicate group(s) restored{}",
+                dup_count,
+                if cp.saved_inventory.is_some() {
+                    "; saved inventory present (next scan skips Stage 1)"
+                } else {
+                    ""
+                },
+            ),
+        );
+        self.persisted.results_tab = ResultsTab::Groups;
+        self.can_resume = true;
+        // Pull the regular results_store path back in too — if its
+        // fingerprint also matches it's a freebie.
+        self.auto_restore_results_state();
+    }
+
+    /// User clicked Start Fresh. Rename the checkpoint to a
+    /// timestamped `.bak` (never delete!), wipe in-memory state, and
+    /// leave the rusqlite hash cache untouched so the next scan
+    /// silently benefits from prior work.
+    fn accept_start_fresh(&mut self) {
+        match crate::gui::checkpoint::default_checkpoint_path() {
+            Ok(path) => match crate::gui::checkpoint::archive(&path) {
+                Ok(Some(archived)) => {
+                    self.state.push_log(
+                        crate::gui::events::LogLevel::Info,
+                        format!(
+                            "Previous checkpoint archived to {} — recover with a manual rename.",
+                            archived.display()
+                        ),
+                    );
+                }
+                Ok(None) => {} // File vanished between summary() and now.
+                Err(e) => {
+                    self.state.push_log(
+                        crate::gui::events::LogLevel::Warn,
+                        format!("Couldn't archive previous checkpoint: {e}"),
+                    );
+                }
+            },
+            Err(_) => {}
+        }
+        // Wipe everything the user would consider "current results".
+        // Settings + drive_render_overrides + persisted.results_tab
+        // are intentionally kept — they're user preferences, not
+        // results.
+        self.state = UiState::default();
+        self.persisted.roots = Vec::new();
+        self.groups_state = groups_table::GroupsTableState::default();
+        self.selected_drive = None;
+        self.can_resume = false;
+        self.state.push_log(
+            crate::gui::events::LogLevel::Info,
+            "Started fresh. Hash cache preserved — overlapping files will hit the cache on the next scan.".into(),
+        );
     }
 
     pub fn sender(&self) -> Sender<EngineEvent> {
@@ -535,6 +668,25 @@ impl eframe::App for SuperdupeApp {
         self.drain_events();
         if self.is_scanning {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
+        // Launch-time Resume / Start Fresh modal. While
+        // `pending_resume` is Some we paint a dimmed background and
+        // ONLY the modal. The rest of the UI is skipped entirely so
+        // there's no way to interact with stale state before the user
+        // has chosen — that's the contract Start Fresh relies on.
+        if let Some(summary) = self.pending_resume.clone() {
+            CentralPanel::default()
+                .frame(Frame::default().fill(theme::BG).inner_margin(0.0))
+                .show(ctx, |_ui| { /* empty backdrop */ });
+            if let Some(choice) = resume_modal::show(ctx, &summary) {
+                self.pending_resume = None;
+                match choice {
+                    ResumeChoice::Resume => self.accept_resume(),
+                    ResumeChoice::StartFresh => self.accept_start_fresh(),
+                }
+            }
+            return;
         }
 
         // Settings modal first; it doesn't claim screen real estate.
