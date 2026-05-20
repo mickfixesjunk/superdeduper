@@ -1,0 +1,128 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+# Required for Sigstore-backed artifact attestations. These OIDC scopes
+# let the runner mint a short-lived signing key that proves the binary
+# came from THIS workflow at THIS commit. Anyone can later verify the
+# attestation against the public Sigstore log — no shared secrets, no
+# trust in a private key.
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: superdupe-x86_64-windows
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: superdupe-aarch64-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (locked, release)
+        shell: pwsh
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} --bin superdupe
+          cargo build --release --locked --target ${{ matrix.target }} --features gui --bin superdupe-gui
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $stage = "stage/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/superdupe.exe $stage/
+          Copy-Item target/${{ matrix.target }}/release/superdupe-gui.exe $stage/
+          Copy-Item LICENSE $stage/
+          Copy-Item README.md $stage/
+
+      - name: Authenticode sign (if cert available)
+        # Skipped automatically when secrets aren't configured (forks,
+        # PR builds). Maintainer set CODE_SIGN_PFX_BASE64 + PFX_PASSWORD
+        # in repo secrets to enable. Use signtool's /tr timestamping so
+        # signatures remain valid after the cert expires.
+        if: ${{ env.CODE_SIGN_PFX_BASE64 != '' }}
+        shell: pwsh
+        env:
+          CODE_SIGN_PFX_BASE64: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.PFX_PASSWORD }}
+        run: |
+          $pfx = "$env:RUNNER_TEMP\codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CODE_SIGN_PFX_BASE64))
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                       Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1).FullName
+          $stage = "stage/${{ matrix.artifact }}"
+          & $signtool sign /fd SHA256 /f $pfx /p $env:PFX_PASSWORD `
+            /tr "http://timestamp.digicert.com" /td SHA256 `
+            "$stage\superdupe.exe" "$stage\superdupe-gui.exe"
+          & $signtool verify /pa "$stage\superdupe.exe"
+          & $signtool verify /pa "$stage\superdupe-gui.exe"
+          Remove-Item $pfx
+
+      - name: Compute SHA-256 checksums
+        shell: pwsh
+        run: |
+          $stage = "stage/${{ matrix.artifact }}"
+          Get-ChildItem $stage -File | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Out-File -Encoding ascii "$stage/SHA256SUMS"
+          Get-Content "$stage/SHA256SUMS"
+
+      - name: Zip artifact
+        shell: pwsh
+        run: |
+          $stage = "stage/${{ matrix.artifact }}"
+          Compress-Archive -Path "$stage/*" -DestinationPath "${{ matrix.artifact }}.zip"
+          (Get-FileHash -Algorithm SHA256 "${{ matrix.artifact }}.zip").Hash.ToLower() + "  ${{ matrix.artifact }}.zip" `
+            | Out-File -Encoding ascii "${{ matrix.artifact }}.zip.sha256"
+
+      # Sigstore-backed attestation. Proves these specific bytes came
+      # from this commit on this workflow run, signed by GitHub's OIDC
+      # identity. Verifiable with `gh attestation verify` — no shared
+      # secret required and no risk of key compromise.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
