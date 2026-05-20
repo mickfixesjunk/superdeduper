@@ -82,6 +82,39 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
 
             ui.add_space(8.0);
             ui.heading("Engine");
+            ui.horizontal(|ui| {
+                ui.label("Content hash:");
+                let mut algo = settings.hash_algo;
+                egui::ComboBox::from_id_source("hash-algo")
+                    .selected_text(match algo {
+                        crate::pipeline::hash::HashAlgo::Blake3 => "BLAKE3 (32-byte, cryptographic)",
+                        crate::pipeline::hash::HashAlgo::Ddh128 => "DDH-128 (16-byte, in development)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut algo,
+                            crate::pipeline::hash::HashAlgo::Blake3,
+                            "BLAKE3 (32-byte, cryptographic)",
+                        );
+                        ui.selectable_value(
+                            &mut algo,
+                            crate::pipeline::hash::HashAlgo::Ddh128,
+                            "DDH-128 (16-byte, in development — currently an xxhash3-128 stub)",
+                        );
+                    });
+                if algo != settings.hash_algo {
+                    settings.hash_algo = algo;
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "DDH-128 outputs are 16 bytes vs BLAKE3's 32. The cache stores \
+                     the algo per row so switching doesn't pull stale hashes.",
+                )
+                .color(theme::TEXT_LO)
+                .small(),
+            );
+            ui.add_space(4.0);
             ui.checkbox(&mut settings.use_format_aware, "Tier 0 format-aware fingerprints");
             ui.checkbox(&mut settings.use_cache, "Persistent cache (USN delta + last hashes)");
             ui.checkbox(&mut settings.paranoid, "Paranoid byte-by-byte confirm before reporting");

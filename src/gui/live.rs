@@ -978,6 +978,7 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         output: None,
         follow_links: settings.follow_links,
         allow_system_paths: settings.allow_system_paths,
+        hash_algo: settings.hash_algo,
     })
 }
 

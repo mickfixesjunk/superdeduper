@@ -12,11 +12,15 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
+use crate::pipeline::hash::HashAlgo;
 use crate::{Error, Result};
 
-/// The bundled cache schema. Bumping this string invalidates the cache
-/// (we drop and recreate the tables on mismatch).
-const SCHEMA_VERSION: &str = "1";
+/// The bundled cache schema. v2 adds the `hash_algo` column so the
+/// same volume+file_ref can have separate rows for Blake3 and Ddh128
+/// outputs (their hashes are different bytes for the same file).
+/// Bumping this string causes init_schema to drop and recreate the
+/// tables; any cached data from older versions is discarded.
+const SCHEMA_VERSION: &str = "2";
 
 #[derive(Debug, Clone)]
 pub struct CacheKey {
@@ -26,14 +30,18 @@ pub struct CacheKey {
     /// 100ns FILETIME ticks.
     pub mtime: i64,
     pub usn: i64,
+    /// Which content-hash algorithm produced the cached BLAKE/DDH
+    /// bytes. Stored in the primary key so an algo switch never
+    /// pulls a stale row.
+    pub hash_algo: HashAlgo,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct CachedHashes {
-    pub tier0_fingerprint: Option<[u8; 32]>,
-    pub tier1_hash: Option<[u8; 32]>,
-    pub tier2_hash: Option<[u8; 32]>,
-    pub tier3_hash: Option<[u8; 32]>,
+    pub tier0_fingerprint: Option<Vec<u8>>,
+    pub tier1_hash: Option<Vec<u8>>,
+    pub tier2_hash: Option<Vec<u8>>,
+    pub tier3_hash: Option<Vec<u8>>,
 }
 
 impl CachedHashes {
@@ -119,6 +127,7 @@ impl Cache {
             CREATE TABLE IF NOT EXISTS files (
                 volume_guid       TEXT NOT NULL,
                 file_ref          INTEGER NOT NULL,
+                hash_algo         TEXT NOT NULL,
                 size              INTEGER NOT NULL,
                 mtime             INTEGER NOT NULL,
                 usn               INTEGER NOT NULL,
@@ -127,7 +136,7 @@ impl Cache {
                 tier2_hash        BLOB,
                 tier3_hash        BLOB,
                 last_seen         INTEGER NOT NULL,
-                PRIMARY KEY (volume_guid, file_ref)
+                PRIMARY KEY (volume_guid, file_ref, hash_algo)
             );
             CREATE INDEX IF NOT EXISTS idx_size ON files(size);
             CREATE INDEX IF NOT EXISTS idx_tier3 ON files(tier3_hash) WHERE tier3_hash IS NOT NULL;",
@@ -159,8 +168,8 @@ impl Cache {
             .conn
             .query_row(
                 "SELECT size, mtime, usn, tier0_fingerprint, tier1_hash, tier2_hash, tier3_hash
-                 FROM files WHERE volume_guid = ?1 AND file_ref = ?2",
-                params![key.volume_guid, key.file_ref],
+                 FROM files WHERE volume_guid = ?1 AND file_ref = ?2 AND hash_algo = ?3",
+                params![key.volume_guid, key.file_ref, key.hash_algo.tag()],
                 |r| {
                     Ok((
                         r.get(0)?,
@@ -184,10 +193,10 @@ impl Cache {
         }
 
         Ok(Some(CachedHashes {
-            tier0_fingerprint: opt_hash(t0),
-            tier1_hash: opt_hash(t1),
-            tier2_hash: opt_hash(t2),
-            tier3_hash: opt_hash(t3),
+            tier0_fingerprint: t0,
+            tier1_hash: t1,
+            tier2_hash: t2,
+            tier3_hash: t3,
         }))
     }
 
@@ -195,10 +204,10 @@ impl Cache {
         let now = now_unix();
         self.conn.execute(
             "INSERT INTO files (
-                volume_guid, file_ref, size, mtime, usn,
+                volume_guid, file_ref, hash_algo, size, mtime, usn,
                 tier0_fingerprint, tier1_hash, tier2_hash, tier3_hash, last_seen
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(volume_guid, file_ref) DO UPDATE SET
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(volume_guid, file_ref, hash_algo) DO UPDATE SET
                 size = excluded.size,
                 mtime = excluded.mtime,
                 usn = excluded.usn,
@@ -210,6 +219,7 @@ impl Cache {
             params![
                 key.volume_guid,
                 key.file_ref,
+                key.hash_algo.tag(),
                 key.size as i64,
                 key.mtime,
                 key.usn,
@@ -272,10 +282,6 @@ impl Cache {
     }
 }
 
-fn opt_hash(b: Option<Vec<u8>>) -> Option<[u8; 32]> {
-    b.and_then(|v| v.try_into().ok())
-}
-
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -328,6 +334,7 @@ mod tests {
             size,
             mtime,
             usn,
+            hash_algo: HashAlgo::Blake3,
         }
     }
 
@@ -336,11 +343,11 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
 
         let got = cache.lookup(&k).unwrap().expect("row should exist");
-        assert_eq!(got.tier3_hash, Some([0xABu8; 32]));
+        assert_eq!(got.tier3_hash, Some(vec![0xABu8; 32]));
         std::fs::remove_file(&p).ok();
     }
 
@@ -349,7 +356,7 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
 
         let modified = key(42, 2048, 100_000, 7);
@@ -362,7 +369,7 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
         let modified = key(42, 1024, 100_001, 7);
         assert!(cache.lookup(&modified).unwrap().is_none());
@@ -374,7 +381,7 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
         let modified = key(42, 1024, 100_000, 8);
         assert!(cache.lookup(&modified).unwrap().is_none());

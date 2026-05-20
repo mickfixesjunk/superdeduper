@@ -26,6 +26,10 @@ pub struct ScanConfig {
     pub output: Option<PathBuf>,
     pub follow_links: bool,
     pub allow_system_paths: bool,
+    /// Which content-hash algorithm to use for Tier 1/2/3 + format
+    /// fingerprints. BLAKE3 is the default; DDH-128 is the
+    /// in-development alternative (currently an xxhash3-128 stub).
+    pub hash_algo: crate::pipeline::hash::HashAlgo,
 }
 
 impl ScanConfig {
@@ -60,6 +64,7 @@ impl ScanConfig {
             output: args.output.clone(),
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
+            hash_algo: crate::pipeline::hash::HashAlgo::Blake3,
         })
     }
 }
