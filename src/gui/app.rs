@@ -72,6 +72,12 @@ pub struct SuperdupeApp {
     /// duplicate groups whose files live on that drive (plus any
     /// reference paths) are shown in Groups / Treemap.
     selected_drive: Option<u32>,
+    /// Per-drive manual override of the auto-detected HDD/SSD render.
+    /// `Some(true)` = force SSD render (scatter via hashed LCN);
+    /// `Some(false)` = force HDD render (diagonal). `None` = use the
+    /// detected `has_seek_penalty` value. Lives outside `persisted`
+    /// because drive ids change between scans.
+    drive_render_overrides: hashbrown::HashMap<u32, bool>,
 }
 
 impl SuperdupeApp {
@@ -95,6 +101,7 @@ impl SuperdupeApp {
             cancel: Arc::new(AtomicBool::new(false)),
             can_resume,
             selected_drive: None,
+            drive_render_overrides: hashbrown::HashMap::new(),
         };
         if can_resume {
             app.state.push_log(
@@ -351,8 +358,12 @@ impl eframe::App for SuperdupeApp {
                         egui::ScrollArea::vertical()
                             .id_source("drive-scope")
                             .show(ui, |ui| {
-                                drive_clicked =
-                                    drive_scope::show(ui, &self.state, self.selected_drive);
+                                drive_clicked = drive_scope::show(
+                                    ui,
+                                    &self.state,
+                                    self.selected_drive,
+                                    &mut self.drive_render_overrides,
+                                );
                             });
                     },
                 );
