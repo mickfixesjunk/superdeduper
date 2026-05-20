@@ -37,6 +37,9 @@ impl Stage {
     ];
 
     pub fn label(self) -> &'static str {
+        // Algo-agnostic label. Use [`label_with_algo`] when you want
+        // the Tier 3 line to say "full BLAKE3" / "full DDH-128"
+        // instead of just "full hash".
         match self {
             Stage::Inventory => "Inventory",
             Stage::SizeGroup => "Size group",
@@ -44,8 +47,26 @@ impl Stage {
             Stage::Tier0Format => "Tier 0 · format",
             Stage::Tier1Head => "Tier 1 · 4 KiB head",
             Stage::Tier2HeadMidTail => "Tier 2 · head+mid+tail",
-            Stage::Tier3Full => "Tier 3 · full BLAKE3",
+            Stage::Tier3Full => "Tier 3 · full hash",
             Stage::Confirmed => "Confirmed",
+        }
+    }
+
+    /// Same as [`label`] but the Tier 3 row carries the currently-
+    /// selected content-hash algorithm name. Used by the funnel and
+    /// overall progress bar so flipping the algo dropdown updates the
+    /// UI label too.
+    pub fn label_with_algo(
+        self,
+        algo: crate::pipeline::hash::HashAlgo,
+    ) -> String {
+        use crate::pipeline::hash::HashAlgo;
+        match self {
+            Stage::Tier3Full => match algo {
+                HashAlgo::Blake3 => "Tier 3 · full BLAKE3".to_string(),
+                HashAlgo::Ddh128 => "Tier 3 · full DDH-128".to_string(),
+            },
+            other => other.label().to_string(),
         }
     }
 }

@@ -593,7 +593,7 @@ impl eframe::App for SuperdupeApp {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(6.0);
-                funnel::show(ui, &self.state);
+                funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
             });
 
         CentralPanel::default()
