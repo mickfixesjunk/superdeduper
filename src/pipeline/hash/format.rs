@@ -4,9 +4,9 @@
 //! a small, structurally-significant region rather than hashing the
 //! whole body. Two files that share the same Tier 0 fingerprint are
 //! >99.99% certain to be byte-identical, so a fingerprint collision
-//! immediately advances them to Tier 3 (full BLAKE3) for the final
-//! signoff. Mismatched fingerprints reject the pair without any
-//! further reads.
+//! > immediately advances them to Tier 3 (full BLAKE3) for the final
+//! > signoff. Mismatched fingerprints reject the pair without any
+//! > further reads.
 //!
 //! This module is intentionally cautious: any parsing failure simply
 //! returns `None` and the file falls back to the byte-sampling tiers.

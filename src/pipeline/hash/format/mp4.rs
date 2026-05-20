@@ -225,7 +225,7 @@ mod tests {
         file.extend(atom(b"ftyp", b"isom\x00\x00\x02\x00mp41mp42isom"));
         file.extend(moov);
         // throw in some unused mdat to look realistic
-        let mdat = atom(b"mdat", &vec![0u8; 32]);
+        let mdat = atom(b"mdat", &[0u8; 32]);
         file.extend(mdat);
         file
     }

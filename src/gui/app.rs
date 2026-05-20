@@ -36,17 +36,14 @@ use crate::gui::widgets::{
 use crate::gui::{demo, live, theme};
 
 #[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 enum ResultsTab {
+    #[default]
     Treemap,
     Groups,
     Log,
 }
 
-impl Default for ResultsTab {
-    fn default() -> Self {
-        ResultsTab::Treemap
-    }
-}
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PersistedAppState {

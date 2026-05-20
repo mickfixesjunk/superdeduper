@@ -67,7 +67,7 @@ pub fn show(
                 let path_str = root.path.to_string_lossy();
                 let color = if root.is_reference { theme::WARN } else { theme::TEXT_HI };
                 ui.add(egui::Label::new(
-                    RichText::new(format!("{}", truncate(&path_str, 40)))
+                    RichText::new(truncate(&path_str, 40).to_string())
                         .color(color)
                         .monospace()
                         .small(),

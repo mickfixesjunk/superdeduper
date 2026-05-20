@@ -193,7 +193,7 @@ fn canonical(groups: &[pipeline::DuplicateGroup]) -> BTreeSet<BTreeSet<PathBuf>>
         .collect()
 }
 
-/// Sanity proptest: planting only unique files yields zero groups.
+// Sanity proptest: planting only unique files yields zero groups.
 proptest! {
     #![proptest_config(PropConfig { cases: 16, .. PropConfig::default() })]
 
@@ -206,7 +206,7 @@ proptest! {
         for i in 0..n {
             let mut body = vec![0u8; size as usize];
             for (j, b) in body.iter_mut().enumerate() {
-                *b = ((i as u32 * 0x1000193 ^ j as u32) & 0xFF) as u8;
+                *b = (((i as u32 * 0x1000193) ^ j as u32) & 0xFF) as u8;
             }
             fs::write(dir.path().join(format!("f{i}.bin")), &body).unwrap();
         }
