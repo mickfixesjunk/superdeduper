@@ -27,6 +27,15 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let cfg = ScanConfig::from_args(&args).context("invalid scan configuration")?;
 
     let scan_started = std::time::Instant::now();
+    // Tell the user which content-hash core is actually linked. For
+    // BLAKE3 this is just the compile-time crate version; for
+    // DDH-128 it's whatever the upstream lib reports via
+    // `impl_name()` — "ddh128-stub-xxh3" vs "ddh128-aesni-v2" tells
+    // you definitively whether the AES-NI core is live.
+    let hash_impl: &str = match cfg.hash_algo {
+        crate::pipeline::hash::HashAlgo::Blake3 => "blake3 (Rust crate)",
+        crate::pipeline::hash::HashAlgo::Ddh128 => ddh128::impl_name(),
+    };
     tracing::info!(
         roots = ?cfg.roots,
         threads = cfg.threads,
@@ -34,8 +43,12 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         format_aware = cfg.use_format_aware,
         cache = cfg.use_cache,
         hash_algo = cfg.hash_algo.tag(),
+        hash_impl,
         "starting scan",
     );
+    // Also surface it in the stderr timing block (which lands at WARN
+    // level by default) so users running with --quiet still see it.
+    eprintln!("hash impl: {hash_impl}");
 
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.threads)
@@ -115,6 +128,19 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         hash_ms,
         humansize::format_size(counters.bytes_read.load(Ordering::Relaxed), humansize::BINARY),
     );
+    // CPU-summed time = wall-clock time spent in the per-file
+    // open+read+hash closure, summed across all rayon workers. For
+    // tiers that read small per-file payloads (Tier 0, Tier 1), most
+    // of this is the open() syscall, NTFS metadata fetch and OS
+    // cache lookup — not the hash compute. So the "MB/s/thread" is
+    // an *effective* throughput including I/O overhead, which is
+    // what users actually feel; bulk-only hash throughput is what
+    // Tier 3 approaches once the per-file overhead is amortised.
+    let _ = writeln!(
+        stderr,
+        "  (per-tier CPU-summed includes file open + read + hash; \
+         compare effective MB/s side-by-side across algos)"
+    );
     for (i, tier_name) in ["Tier 0 fmt ", "Tier 1 head", "Tier 2 hmt ", "Tier 3 full"]
         .iter()
         .enumerate()
@@ -126,17 +152,28 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
             continue;
         }
         let cpu_ms = micros / 1000;
+        // bytes per microsecond happens to read as MB/s.
         let mbps = if micros == 0 {
             0.0
         } else {
-            (bytes as f64) / (micros as f64) // bytes per microsecond = MB/s
+            bytes as f64 / micros as f64
+        };
+        // files per second across the summed-CPU window — for
+        // small-payload tiers this is the more honest metric: it
+        // tells you how fast each worker is churning through file
+        // open+read cycles.
+        let files_per_s = if micros == 0 {
+            0.0
+        } else {
+            count as f64 / (micros as f64 / 1_000_000.0)
         };
         let _ = writeln!(
             stderr,
-            "  {tier_name}: {count:>6} files · {} hashed · {:>6} ms CPU-summed · {:>6.0} MB/s/thread",
+            "  {tier_name}: {count:>6} files · {:>10} hashed · {:>7} ms CPU-summed · {:>8.2} MB/s/thread · {:>7.0} files/s/thread",
             humansize::format_size(bytes, humansize::BINARY),
             cpu_ms,
             mbps,
+            files_per_s,
         );
     }
     let _ = writeln!(

@@ -79,17 +79,23 @@ fn run(
     // Diagnostics report file — fresh per scan. Failure to open it
     // doesn't kill the scan; we just lose self-debug telemetry.
     let diag = DiagnosticsLog::open();
+    let hash_impl: &str = match settings.hash_algo {
+        crate::pipeline::hash::HashAlgo::Blake3 => "blake3 (Rust crate)",
+        crate::pipeline::hash::HashAlgo::Ddh128 => ddh128::impl_name(),
+    };
     if let Some(d) = &diag {
         d.log(
             "SCAN-START",
             format_args!(
-                "roots={} min_size={} format_aware={} use_cache={} paranoid={} threads={:?}",
+                "roots={} min_size={} format_aware={} use_cache={} paranoid={} threads={:?} \
+                 hash_algo={} hash_impl={hash_impl}",
                 roots.len(),
                 settings.min_size_bytes,
                 settings.use_format_aware,
                 settings.use_cache,
                 settings.paranoid,
                 settings.threads,
+                settings.hash_algo.tag(),
             ),
         );
         for r in &roots {
@@ -107,6 +113,13 @@ fn run(
             message: format!("Diagnostics report opened in ./diagnostics/"),
         });
     }
+    // Surface the linked hash implementation so users running with
+    // DDH-128 can tell at a glance whether they're on the stub or
+    // the eventual AES-NI core.
+    let _ = tx.send(EngineEvent::Log {
+        level: LogLevel::Info,
+        message: format!("Hash impl: {hash_impl}"),
+    });
     let cfg = build_config(&roots, &settings)?;
     let reference_set: hashbrown::HashSet<PathBuf> = roots
         .iter()
