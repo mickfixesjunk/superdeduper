@@ -55,8 +55,13 @@ pub struct DiagnosticsLog {
 }
 
 struct DiagnosticsInner {
-    file: BufWriter<File>,
+    /// `None` after [`finalize`] has closed the file. log() and
+    /// log_hash_failure() become silent no-ops at that point.
+    file: Option<BufWriter<File>>,
     failure_samples_emitted: u64,
+    /// Absolute on-disk path of the report so [`finalize`] can rename
+    /// it to include the run duration once the scan finishes.
+    current_path: PathBuf,
 }
 
 impl DiagnosticsLog {
@@ -100,21 +105,31 @@ impl DiagnosticsLog {
         let _ = bw.flush();
         Some(Arc::new(Self {
             inner: Mutex::new(DiagnosticsInner {
-                file: bw,
+                file: Some(bw),
                 failure_samples_emitted: 0,
+                current_path: path,
             }),
             started_at: Instant::now(),
         }))
     }
 
+    /// End-to-end wallclock since [`open`]. Used by [`finalize`] to
+    /// stamp the report's final filename + body footer.
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
     /// Write a structured entry. `tag` is uppercase-kebab, fields
     /// are key=value pairs (caller supplies an already-built suffix
-    /// to keep allocation churn low).
+    /// to keep allocation churn low). Silent no-op once
+    /// [`finalize`] has closed the file.
     pub fn log(&self, tag: &str, fields: impl std::fmt::Display) {
         let elapsed = self.started_at.elapsed().as_millis();
         let mut g = self.inner.lock();
-        let _ = writeln!(g.file, "{elapsed:>8}ms [{tag}] {fields}");
-        let _ = g.file.flush();
+        if let Some(file) = g.file.as_mut() {
+            let _ = writeln!(file, "{elapsed:>8}ms [{tag}] {fields}");
+            let _ = file.flush();
+        }
     }
 
     /// Record a hash failure — log the first `SAMPLE_LIMIT` in full
@@ -125,23 +140,64 @@ impl DiagnosticsLog {
         const SAMPLE_LIMIT: u64 = 50;
         let mut g = self.inner.lock();
         let n = g.failure_samples_emitted;
-        if n < SAMPLE_LIMIT {
-            let elapsed = self.started_at.elapsed().as_millis();
-            let _ = writeln!(
-                g.file,
-                "{elapsed:>8}ms [HASH-FAIL] path={:?} error={error:?}",
-                path.display().to_string()
-            );
-            let _ = g.file.flush();
-        } else if n == SAMPLE_LIMIT {
-            let elapsed = self.started_at.elapsed().as_millis();
-            let _ = writeln!(
-                g.file,
-                "{elapsed:>8}ms [HASH-FAIL-SUPPRESSED] further per-file entries hidden (see [STATE] failed=… counter)"
-            );
-            let _ = g.file.flush();
+        let elapsed = self.started_at.elapsed().as_millis();
+        if let Some(file) = g.file.as_mut() {
+            if n < SAMPLE_LIMIT {
+                let _ = writeln!(
+                    file,
+                    "{elapsed:>8}ms [HASH-FAIL] path={:?} error={error:?}",
+                    path.display().to_string()
+                );
+                let _ = file.flush();
+            } else if n == SAMPLE_LIMIT {
+                let _ = writeln!(
+                    file,
+                    "{elapsed:>8}ms [HASH-FAIL-SUPPRESSED] further per-file entries hidden (see [STATE] failed=… counter)"
+                );
+                let _ = file.flush();
+            }
         }
         g.failure_samples_emitted = n + 1;
+    }
+
+    /// Close the file, write a final `[WALLCLOCK]` line, and rename
+    /// the report from `report-<uuid>.txt` to
+    /// `report-<uuid>-<HHh-MMm-SSs>.txt` so the duration shows up in
+    /// the filename. Idempotent — subsequent calls do nothing.
+    pub fn finalize(&self, summary: impl std::fmt::Display) {
+        let elapsed = self.started_at.elapsed();
+        let dur = format_duration_hms(elapsed);
+        // Write the final body line BEFORE we close the file.
+        self.log(
+            "WALLCLOCK",
+            format_args!(
+                "elapsed_secs={:.3} elapsed={dur} · {summary}",
+                elapsed.as_secs_f64()
+            ),
+        );
+        let mut g = self.inner.lock();
+        // Close the file by dropping it so Windows lets us rename.
+        if let Some(mut bw) = g.file.take() {
+            let _ = bw.flush();
+            drop(bw);
+        }
+        let old = g.current_path.clone();
+        let stem = old
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("report");
+        let parent = old.parent().unwrap_or(std::path::Path::new("."));
+        let new_path = parent.join(format!("{stem}-{dur}.txt"));
+        if let Err(e) = std::fs::rename(&old, &new_path) {
+            tracing::warn!(
+                error = %e,
+                from = %old.display(),
+                to = %new_path.display(),
+                "diagnostics: rename failed"
+            );
+        } else {
+            g.current_path = new_path;
+        }
     }
 }
 
@@ -193,6 +249,17 @@ pub fn spawn_state_sampler(
 /// Best-effort UUID built from `(unix_nanos, pid, thread_rng-ish)`.
 /// Not RFC-4122 compliant; just unique enough to dedupe report file
 /// names within a session.
+/// Render a duration as `HHh-MMm-SSs`. Filename-safe (no colons) and
+/// monotonic across orders of magnitude — sort lex and you sort by
+/// scan length.
+fn format_duration_hms(d: Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    format!("{h:02}h-{m:02}m-{s:02}s")
+}
+
 fn quick_uuid() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

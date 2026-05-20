@@ -551,16 +551,19 @@ fn run(
             }
             sampler_stop.store(true, Ordering::Relaxed);
             if let Some(d) = &diag {
+                let n = files_hashed.load(Ordering::Relaxed);
+                let f = hash_failures.load(Ordering::Relaxed);
                 d.log(
                     "SCAN-PAUSED",
                     format_args!(
-                        "n_hashed={} hash_failures={} dups={} reclaimable={}",
-                        files_hashed.load(Ordering::Relaxed),
-                        hash_failures.load(Ordering::Relaxed),
-                        total_dups,
-                        reclaimable,
+                        "n_hashed={n} hash_failures={f} dups={total_dups} reclaimable={reclaimable}"
                     ),
                 );
+                d.finalize(format_args!(
+                    "paused at chunk {}/{} · {total_dups} dup group(s)",
+                    i + 1,
+                    total_chunks
+                ));
             }
             emit_paused(&tx);
             return Ok(());
@@ -801,6 +804,11 @@ fn run(
                  bytes_read={total_bytes_read}"
             ),
         );
+        // Close the report and rename it to include the run duration
+        // (report-<uuid>-<HHh-MMm-SSs>.txt).
+        d.finalize(format_args!(
+            "completed · {total_dups} dup group(s) · {reclaimable} bytes reclaimable"
+        ));
     }
     Ok(())
 }

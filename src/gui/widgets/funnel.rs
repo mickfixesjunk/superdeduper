@@ -15,7 +15,11 @@ use crate::gui::theme;
 const BAR_HEIGHT: f32 = 8.0;
 const ROW_GAP: f32 = 10.0;
 
-pub fn show(ui: &mut Ui, state: &UiState) {
+pub fn show(
+    ui: &mut Ui,
+    state: &UiState,
+    hash_algo: crate::pipeline::hash::HashAlgo,
+) {
     ui.label(RichText::new("Pipeline").color(theme::TEXT_LO).strong())
         .on_hover_text(
             "Five-stage funnel showing how many files survive each \
@@ -41,11 +45,14 @@ pub fn show(ui: &mut Ui, state: &UiState) {
             .last_update
             .map(|t| 1.0 - (now.saturating_duration_since(t).as_secs_f32() / 0.8).clamp(0.0, 1.0))
             .unwrap_or(0.0);
+        // Tier 3 row carries the active algo name so flipping the
+        // dropdown updates the label live.
+        let stage_label = stage.label_with_algo(hash_algo);
 
         // Label row.
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(stage.label())
+                RichText::new(&stage_label)
                     .color(theme::TEXT_HI)
                     .strong()
                     .size(12.0),
@@ -65,7 +72,6 @@ pub fn show(ui: &mut Ui, state: &UiState) {
             vec2(ui.available_width(), BAR_HEIGHT),
             Sense::hover(),
         );
-        let stage_label = stage.label();
         let count = counter.total;
         resp.on_hover_text(format!("{stage_label}: {count} file(s)"));
         let painter = ui.painter_at(rect);
