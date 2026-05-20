@@ -23,4 +23,7 @@ pub mod output;
 pub mod pipeline;
 pub mod winapi_wrappers;
 
+#[cfg(feature = "gui")]
+pub mod gui;
+
 pub use error::{Error, Result};
