@@ -1,7 +1,10 @@
 use std::io::{self, BufWriter, Write};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use parking_lot::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use superdupe::cache::Cache;
@@ -48,8 +51,27 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let laid_out = pipeline::layout::resolve(size_groups).context("layout resolution failed")?;
     tracing::info!(groups = laid_out.len(), "stage 3: layout resolution complete");
 
-    let duplicates = pipeline::hash::run(laid_out, &cfg).context("hashing failed")?;
-    tracing::info!(groups = duplicates.len(), "stage 4: hashing complete");
+    let cache = if cfg.use_cache {
+        match superdupe::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
+            Ok(c) => Some(Arc::new(Mutex::new(c))),
+            Err(e) => {
+                tracing::warn!(error = %e, "cache disabled (couldn't open)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (duplicates, counters) =
+        pipeline::hash::run_with_counters(laid_out, &cfg, cache).context("hashing failed")?;
+    tracing::info!(
+        groups = duplicates.len(),
+        cache_hits = counters.cache_hits.load(Ordering::Relaxed),
+        cache_writes = counters.cache_writes.load(Ordering::Relaxed),
+        bytes_read = counters.bytes_read.load(Ordering::Relaxed),
+        "stage 4: hashing complete"
+    );
 
     let duplicates = if cfg.paranoid {
         pipeline::confirm::paranoid_verify(duplicates).context("paranoid verification failed")?
