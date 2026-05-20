@@ -37,7 +37,10 @@ use crate::pipeline::layout::{LaidOutFile, LaidOutGroup};
 use crate::pipeline::DuplicateGroup;
 use crate::Result;
 
+pub mod algo;
 pub mod format;
+
+pub use algo::{ContentHasher, HashAlgo};
 
 /// Tier 1 sample size — first 4 KiB of the file.
 const TIER1_BYTES: u64 = 4 * 1024;
@@ -180,9 +183,10 @@ fn run_group(
             return Ok(Vec::new());
         }
         let files: Vec<PathBuf> = group.files.into_iter().map(|f| f.entry.path).collect();
+        let empty_hash = algo::hash_oneshot(cfg.hash_algo, &[]);
         return Ok(vec![DuplicateGroup {
             size: 0,
-            content_hash: blake3::hash(&[]).to_hex().to_string(),
+            content_hash: hex(&empty_hash),
             files,
             link_equivalent: false,
         }]);
@@ -190,13 +194,14 @@ fn run_group(
 
     let mut survivors = group.files;
 
+    let algo = cfg.hash_algo;
     if cfg.use_format_aware {
         survivors = split_by_optional(&survivors, |f| {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return None;
             }
-            tiered_optional(f, Tier::Zero, cache, counters, on_file, || {
-                format::fingerprint(&f.entry.path, size)
+            tiered_optional(f, Tier::Zero, algo, cache, counters, on_file, || {
+                format::fingerprint(&f.entry.path, size, algo)
             })
         })?;
         if survivors.len() < 2 {
@@ -208,7 +213,7 @@ fn run_group(
         return Ok(Vec::new());
     }
     survivors = split_by(&survivors, |f| {
-        tiered(f, Tier::One, cache, counters, on_file, || tier1_hash(f, size))
+        tiered(f, Tier::One, algo, cache, counters, on_file, || tier1_hash(f, size, algo))
     })?;
     if survivors.len() < 2 {
         return Ok(Vec::new());
@@ -219,7 +224,7 @@ fn run_group(
             return Ok(Vec::new());
         }
         survivors = split_by(&survivors, |f| {
-            tiered(f, Tier::Two, cache, counters, on_file, || tier2_hash(f, size))
+            tiered(f, Tier::Two, algo, cache, counters, on_file, || tier2_hash(f, size, algo))
         })?;
         if survivors.len() < 2 {
             return Ok(Vec::new());
@@ -230,8 +235,8 @@ fn run_group(
         return Ok(Vec::new());
     }
     let groups = into_subgroups(&survivors, |f| {
-        tiered(f, Tier::Three, cache, counters, on_file, || {
-            tier3_hash_cancellable(f, size, cancel)
+        tiered(f, Tier::Three, algo, cache, counters, on_file, || {
+            tier3_hash_cancellable(f, size, algo, cancel)
         })
     })?;
     let mut out = Vec::new();
@@ -256,22 +261,22 @@ fn run_group(
 /// files as a flat Vec — sub-grouping is implicit since survivors of
 /// every Tier-N round are by definition still candidates for the same
 /// equivalence class. The next tier then splits them again.
-/// Like [`split_by`] but the hash function returns `Option<[u8; 32]>`.
+/// Like [`split_by`] but the hash function returns `Option<Vec<u8>>`.
 /// Files that produce `None` are kept in the survivor pool unchanged
 /// (they fall through to subsequent tiers). Files that produce a
 /// fingerprint must collide with at least one other fingerprinted
 /// file to survive.
 fn split_by_optional<F>(flat: &[LaidOutFile], hasher: F) -> Result<Vec<LaidOutFile>>
 where
-    F: Fn(&LaidOutFile) -> Option<[u8; 32]> + Send + Sync,
+    F: Fn(&LaidOutFile) -> Option<Vec<u8>> + Send + Sync,
 {
-    let pairs: Vec<(LaidOutFile, Option<[u8; 32]>)> = flat
+    let pairs: Vec<(LaidOutFile, Option<Vec<u8>>)> = flat
         .par_iter()
         .map(|f| (f.clone(), hasher(f)))
         .collect();
 
     let mut without_fp: Vec<LaidOutFile> = Vec::new();
-    let mut by_hash: HashMap<[u8; 32], Vec<LaidOutFile>> = HashMap::new();
+    let mut by_hash: HashMap<Vec<u8>, Vec<LaidOutFile>> = HashMap::new();
     for (f, fp) in pairs {
         match fp {
             Some(h) => by_hash.entry(h).or_default().push(f),
@@ -289,9 +294,9 @@ where
 
 fn split_by<F>(flat: &[LaidOutFile], hasher: F) -> Result<Vec<LaidOutFile>>
 where
-    F: Fn(&LaidOutFile) -> std::io::Result<[u8; 32]> + Send + Sync,
+    F: Fn(&LaidOutFile) -> std::io::Result<Vec<u8>> + Send + Sync,
 {
-    let pairs: Vec<(LaidOutFile, [u8; 32])> = flat
+    let pairs: Vec<(LaidOutFile, Vec<u8>)> = flat
         .par_iter()
         .filter_map(|f| match hasher(f) {
             Ok(h) => Some((f.clone(), h)),
@@ -302,7 +307,7 @@ where
         })
         .collect();
 
-    let mut by_hash: HashMap<[u8; 32], Vec<LaidOutFile>> = HashMap::new();
+    let mut by_hash: HashMap<Vec<u8>, Vec<LaidOutFile>> = HashMap::new();
     for (f, h) in pairs {
         by_hash.entry(h).or_default().push(f);
     }
@@ -322,11 +327,11 @@ where
 fn into_subgroups<F>(
     flat: &[LaidOutFile],
     hasher: F,
-) -> Result<HashMap<[u8; 32], Vec<LaidOutFile>>>
+) -> Result<HashMap<Vec<u8>, Vec<LaidOutFile>>>
 where
-    F: Fn(&LaidOutFile) -> std::io::Result<[u8; 32]> + Send + Sync,
+    F: Fn(&LaidOutFile) -> std::io::Result<Vec<u8>> + Send + Sync,
 {
-    let pairs: Vec<(LaidOutFile, [u8; 32])> = flat
+    let pairs: Vec<(LaidOutFile, Vec<u8>)> = flat
         .par_iter()
         .filter_map(|f| match hasher(f) {
             Ok(h) => Some((f.clone(), h)),
@@ -336,7 +341,7 @@ where
             }
         })
         .collect();
-    let mut out: HashMap<[u8; 32], Vec<LaidOutFile>> = HashMap::new();
+    let mut out: HashMap<Vec<u8>, Vec<LaidOutFile>> = HashMap::new();
     for (f, h) in pairs {
         out.entry(h).or_default().push(f);
     }
@@ -349,16 +354,17 @@ where
 fn tiered<F>(
     f: &LaidOutFile,
     tier: Tier,
+    algo: HashAlgo,
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
     on_file: Option<&FileProgress>,
     compute: F,
-) -> std::io::Result<[u8; 32]>
+) -> std::io::Result<Vec<u8>>
 where
-    F: FnOnce() -> std::io::Result<[u8; 32]>,
+    F: FnOnce() -> std::io::Result<Vec<u8>>,
 {
     if let Some(c) = cache {
-        if let Some(key) = cache_key(f) {
+        if let Some(key) = cache_key(f, algo) {
             if let Ok(Some(cached)) = c.lock().lookup(&key) {
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -378,9 +384,9 @@ where
                 cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
             }
             if let Some(c) = cache {
-                if let Some(key) = cache_key(f) {
+                if let Some(key) = cache_key(f, algo) {
                     let mut hashes = CachedHashes::default();
-                    put_hash(&mut hashes, tier, h);
+                    put_hash(&mut hashes, tier, h.clone());
                     if c.lock().store(&key, &hashes).is_ok() {
                         counters.cache_writes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -404,16 +410,17 @@ where
 fn tiered_optional<F>(
     f: &LaidOutFile,
     tier: Tier,
+    algo: HashAlgo,
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
     on_file: Option<&FileProgress>,
     compute: F,
-) -> Option<[u8; 32]>
+) -> Option<Vec<u8>>
 where
-    F: FnOnce() -> Option<[u8; 32]>,
+    F: FnOnce() -> Option<Vec<u8>>,
 {
     if let Some(c) = cache {
-        if let Some(key) = cache_key(f) {
+        if let Some(key) = cache_key(f, algo) {
             if let Ok(Some(cached)) = c.lock().lookup(&key) {
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -433,9 +440,9 @@ where
                 cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
             }
             if let Some(c) = cache {
-                if let Some(key) = cache_key(f) {
+                if let Some(key) = cache_key(f, algo) {
                     let mut hashes = CachedHashes::default();
-                    put_hash(&mut hashes, tier, h);
+                    put_hash(&mut hashes, tier, h.clone());
                     if c.lock().store(&key, &hashes).is_ok() {
                         counters.cache_writes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -462,7 +469,7 @@ fn tier_index(tier: Tier) -> u8 {
     }
 }
 
-fn cache_key(f: &LaidOutFile) -> Option<CacheKey> {
+fn cache_key(f: &LaidOutFile, algo: HashAlgo) -> Option<CacheKey> {
     let guid = f.entry.volume_guid.clone()?;
     Some(CacheKey {
         volume_guid: guid,
@@ -470,19 +477,20 @@ fn cache_key(f: &LaidOutFile) -> Option<CacheKey> {
         size: f.entry.size,
         mtime: f.entry.mtime,
         usn: f.entry.usn,
+        hash_algo: algo,
     })
 }
 
-fn pick_hash(c: &CachedHashes, tier: Tier) -> Option<[u8; 32]> {
+fn pick_hash(c: &CachedHashes, tier: Tier) -> Option<Vec<u8>> {
     match tier {
-        Tier::Zero => c.tier0_fingerprint,
-        Tier::One => c.tier1_hash,
-        Tier::Two => c.tier2_hash,
-        Tier::Three => c.tier3_hash,
+        Tier::Zero => c.tier0_fingerprint.clone(),
+        Tier::One => c.tier1_hash.clone(),
+        Tier::Two => c.tier2_hash.clone(),
+        Tier::Three => c.tier3_hash.clone(),
     }
 }
 
-fn put_hash(c: &mut CachedHashes, tier: Tier, h: [u8; 32]) {
+fn put_hash(c: &mut CachedHashes, tier: Tier, h: Vec<u8>) {
     match tier {
         Tier::Zero => c.tier0_fingerprint = Some(h),
         Tier::One => c.tier1_hash = Some(h),
@@ -500,15 +508,15 @@ fn tier_byte_estimate(tier: Tier, size: u64) -> u64 {
     }
 }
 
-fn tier1_hash(f: &LaidOutFile, size: u64) -> std::io::Result<[u8; 32]> {
+fn tier1_hash(f: &LaidOutFile, size: u64, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
     let to_read = size.min(TIER1_BYTES) as usize;
     let mut buf = vec![0u8; to_read];
     let mut file = File::open(&f.entry.path)?;
     read_exact_or_eof(&mut file, &mut buf)?;
-    Ok(*blake3::hash(&buf).as_bytes())
+    Ok(algo::hash_oneshot(algo, &buf))
 }
 
-fn tier2_hash(f: &LaidOutFile, size: u64) -> std::io::Result<[u8; 32]> {
+fn tier2_hash(f: &LaidOutFile, size: u64, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
     let region = TIER2_REGION as usize;
     let mut head = vec![0u8; region];
     let mut mid = vec![0u8; region];
@@ -525,11 +533,11 @@ fn tier2_hash(f: &LaidOutFile, size: u64) -> std::io::Result<[u8; 32]> {
     file.seek(SeekFrom::Start(tail_off))?;
     read_exact_or_eof(&mut file, &mut tail)?;
 
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = ContentHasher::new(algo);
     hasher.update(&head);
     hasher.update(&mid);
     hasher.update(&tail);
-    Ok(*hasher.finalize().as_bytes())
+    Ok(hasher.finalize())
 }
 
 /// Tier 3 full-content hash. Polls an optional cancel flag every
@@ -538,11 +546,12 @@ fn tier2_hash(f: &LaidOutFile, size: u64) -> std::io::Result<[u8; 32]> {
 fn tier3_hash_cancellable(
     f: &LaidOutFile,
     _size: u64,
+    algo: HashAlgo,
     cancel: Option<&Arc<AtomicBool>>,
-) -> std::io::Result<[u8; 32]> {
+) -> std::io::Result<Vec<u8>> {
     let file = File::open(&f.entry.path)?;
     let mut reader = BufReader::with_capacity(TIER3_BUF, file);
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = ContentHasher::new(algo);
     let mut buf = vec![0u8; TIER3_BUF];
     loop {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -557,7 +566,7 @@ fn tier3_hash_cancellable(
         }
         hasher.update(&buf[..n]);
     }
-    Ok(*hasher.finalize().as_bytes())
+    Ok(hasher.finalize())
 }
 
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -642,6 +651,7 @@ mod tests {
             output: None,
             follow_links: false,
             allow_system_paths: false,
+            hash_algo: HashAlgo::Blake3,
         }
     }
 

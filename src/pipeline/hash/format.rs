@@ -56,9 +56,14 @@ impl Format {
     }
 }
 
-/// Compute the Tier 0 fingerprint for `path`. Returns `None` if the
-/// path's extension is unsupported or parsing failed.
-pub fn fingerprint(path: &Path, size: u64) -> Option<[u8; 32]> {
+/// Compute the Tier 0 fingerprint for `path` using the supplied
+/// content-hash algorithm. Returns `None` if the path's extension is
+/// unsupported or parsing failed.
+pub fn fingerprint(
+    path: &Path,
+    size: u64,
+    algo: super::HashAlgo,
+) -> Option<Vec<u8>> {
     let fmt = Format::from_path(path)?;
     let mut file = File::open(path).ok()?;
     let raw = match fmt {
@@ -70,10 +75,10 @@ pub fn fingerprint(path: &Path, size: u64) -> Option<[u8; 32]> {
         Format::Mkv => mkv::fingerprint(&mut file, size).ok()?,
         Format::Pdf => pdf::fingerprint(&mut file, size).ok()?,
     };
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = super::ContentHasher::new(algo);
     hasher.update(&[fmt as u8]);
     hasher.update(&raw);
-    Some(*hasher.finalize().as_bytes())
+    Some(hasher.finalize())
 }
 
 // Format-parser helpers. Some are unused in the v0.1 parser set but
