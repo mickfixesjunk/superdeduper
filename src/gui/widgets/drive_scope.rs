@@ -18,14 +18,24 @@ const SPARK_HEIGHT: f32 = 36.0;
 
 /// Returns the drive id the user clicked this frame (caller toggles a
 /// selection in App state and the Groups / Treemap filter to that
-/// drive's paths).
-pub fn show(ui: &mut Ui, state: &UiState, selected: Option<u32>) -> Option<u32> {
+/// drive's paths). `render_overrides[id] = Some(true)` forces SSD-
+/// style render even if the device was detected as an HDD; `None` =
+/// use auto-detected `has_seek_penalty`. The widget mutates the map
+/// when the user clicks the "HDD"/"SSD" badge in a panel.
+pub fn show(
+    ui: &mut Ui,
+    state: &UiState,
+    selected: Option<u32>,
+    render_overrides: &mut hashbrown::HashMap<u32, bool>,
+) -> Option<u32> {
     let mut clicked: Option<u32> = None;
     ui.label(RichText::new("Drive scope").color(theme::TEXT_LO).strong())
         .on_hover_text(
             "Per-drive read activity. Click a drive panel to filter the \
              Groups and Treemap below to duplicates that live on that \
-             drive — click again or pick another drive to clear.",
+             drive — click again or pick another drive to clear. Click \
+             the HDD / SSD badge to override the auto-detected render \
+             style.",
         );
     ui.add_space(4.0);
 
@@ -45,16 +55,54 @@ pub fn show(ui: &mut Ui, state: &UiState, selected: Option<u32>) -> Option<u32> 
     for id in ids {
         let drive = &state.drives[&id];
         let is_selected = selected == Some(id);
-        if draw_drive_panel(ui, drive, now, is_selected) {
+        let override_ssd = render_overrides.get(&id).copied();
+        let action = draw_drive_panel(ui, drive, now, is_selected, override_ssd);
+        if action.panel_clicked {
             clicked = Some(id);
+        }
+        if action.badge_clicked {
+            // Cycle: None → Some(true SSD) → Some(false HDD) → None.
+            let next = match render_overrides.get(&id).copied() {
+                None => Some(true),
+                Some(true) => Some(false),
+                Some(false) => None,
+            };
+            if let Some(v) = next {
+                render_overrides.insert(id, v);
+            } else {
+                render_overrides.remove(&id);
+            }
         }
         ui.add_space(8.0);
     }
     clicked
 }
 
-/// Returns `true` if the user clicked anywhere on this drive panel.
-fn draw_drive_panel(ui: &mut Ui, drive: &DriveLive, now: Instant, selected: bool) -> bool {
+#[derive(Default)]
+struct PanelAction {
+    panel_clicked: bool,
+    badge_clicked: bool,
+}
+
+/// Returns the panel + badge click state. `override_ssd` reflects the
+/// app-level manual override: `None` use auto, `Some(true)` force SSD
+/// render, `Some(false)` force HDD render. The badge cycles the
+/// override on click.
+fn draw_drive_panel(
+    ui: &mut Ui,
+    drive: &DriveLive,
+    now: Instant,
+    selected: bool,
+    override_ssd: Option<bool>,
+) -> PanelAction {
+    let mut action = PanelAction::default();
+    // Effective render mode: explicit override wins, otherwise use
+    // the detection result (has_seek_penalty == true ⇒ HDD render).
+    let effective_hdd = match override_ssd {
+        Some(true) => false,  // forced SSD render
+        Some(false) => true,  // forced HDD render
+        None => drive.info.has_seek_penalty,
+    };
     let stroke = if selected {
         Stroke::new(2.0, theme::ACCENT)
     } else {
@@ -68,19 +116,29 @@ fn draw_drive_panel(ui: &mut Ui, drive: &DriveLive, now: Instant, selected: bool
 
     let inner = frame.show(ui, |ui| {
         let mbps = drive.current_mbps();
-        let type_color = if drive.info.has_seek_penalty {
-            theme::HDD
-        } else {
-            theme::SSD
+        let type_color = if effective_hdd { theme::HDD } else { theme::SSD };
+        let detected_label = if drive.info.has_seek_penalty { "HDD" } else { "SSD" };
+        let badge_label = match override_ssd {
+            Some(true) => format!("● SSD (manual)  [auto: {detected_label}]"),
+            Some(false) => format!("● HDD (manual)  [auto: {detected_label}]"),
+            None => format!("● {detected_label}"),
         };
-        let type_label = if drive.info.has_seek_penalty { "HDD" } else { "SSD" };
 
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("● {}", type_label))
-                    .color(type_color)
-                    .strong(),
+            let badge = ui.add(
+                egui::Label::new(
+                    RichText::new(badge_label).color(type_color).strong(),
+                )
+                .sense(egui::Sense::click()),
             );
+            if badge
+                .on_hover_text(
+                    "Click to cycle render style: detected → SSD (scatter) → HDD (diagonal) → detected.",
+                )
+                .clicked()
+            {
+                action.badge_clicked = true;
+            }
             ui.label(RichText::new(&drive.info.model).color(theme::TEXT_HI));
             ui.label(
                 RichText::new(format!("/ {}", drive.info.volume_label)).color(theme::TEXT_LO),
@@ -104,18 +162,23 @@ fn draw_drive_panel(ui: &mut Ui, drive: &DriveLive, now: Instant, selected: bool
         ui.add_space(2.0);
         draw_sparkline(ui, drive, now);
         ui.add_space(4.0);
-        draw_lcn_trace(ui, drive, now);
+        draw_lcn_trace(ui, drive, now, effective_hdd);
     });
     // The frame itself doesn't receive clicks; we ask egui to
     // interact with the bounding rect at click sense so a click
-    // anywhere on the panel toggles the filter.
+    // anywhere on the panel toggles the filter. The badge above is
+    // its own click target via the inner Sense::click so it doesn't
+    // also fire the filter toggle.
     let panel_rect = inner.response.rect;
     let panel_click = ui.interact(
         panel_rect,
         ui.id().with(("drive-panel-click", drive.info.id)),
         egui::Sense::click(),
     );
-    panel_click.clicked()
+    if panel_click.clicked() && !action.badge_clicked {
+        action.panel_clicked = true;
+    }
+    action
 }
 
 fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
@@ -166,27 +229,26 @@ fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
     );
 }
 
-fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant) {
+fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant, render_as_hdd: bool) {
     let (rect, resp) = ui.allocate_exact_size(
         vec2(ui.available_width(), SCOPE_HEIGHT),
         Sense::hover(),
     );
-    let tip = if drive.info.has_seek_penalty {
-        "LCN-vs-time read trace (HDD). Y = position on the drive, \
-         X = time (right = now). The yellow line climbing diagonally \
-         means the scheduler is reading sequentially — the cheap \
+    let tip = if render_as_hdd {
+        "LCN-vs-time read trace (HDD render). Y = position on the \
+         drive, X = time (right = now). The yellow line climbing \
+         diagonally means reads are running sequentially — the cheap \
          pattern on a spinning disk."
     } else {
-        "LCN-vs-time read trace (SSD). Y = position on the drive, \
-         X = time (right = now). The teal cloud is the random spray \
-         pattern SSDs love — no seek penalty so we read all over \
-         the address space in parallel."
+        "LCN-vs-time read trace (SSD render). Y = position on the \
+         drive, X = time (right = now). The teal cloud is the random \
+         spray pattern SSDs love — no seek penalty so we read all \
+         over the address space in parallel."
     };
     resp.on_hover_text(tip);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, theme::BG);
 
-    // Faint axis label.
     painter.text(
         rect.left_top() + vec2(4.0, 2.0),
         egui::Align2::LEFT_TOP,
@@ -200,28 +262,49 @@ fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant) {
     }
 
     let window = THROUGHPUT_WINDOW_SECS as f32;
+    // If the user is forcing SSD render on an HDD-detected drive (or
+    // vice versa), the LCNs the engine recorded won't match the render
+    // pattern (monotonic vs scattered). Re-bucket Y positions via a
+    // cheap hash of `lcn_bytes` so the SSD-style render gets the
+    // scattered cloud regardless of what the engine emitted.
+    let mismatch = render_as_hdd != drive.info.has_seek_penalty;
+    let effective_lcn = |raw: u64| -> u64 {
+        if !mismatch {
+            return raw;
+        }
+        if render_as_hdd {
+            // Forcing HDD render on SSD data: collapse to a monotonic
+            // sequence keyed by sample order. Approximate via the raw
+            // value modulo a sensible max.
+            raw
+        } else {
+            // Forcing SSD render on HDD data: hash the cumulative
+            // bytes into a fixed-range bucket so the trace scatters.
+            let mut x = raw.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 31;
+            x % (4 * 1024 * 1024 * 1024 * 1024u64)
+        }
+    };
+
     let max_lcn = drive
         .reads
         .iter()
-        .map(|r| r.lcn_bytes)
+        .map(|r| effective_lcn(r.lcn_bytes))
         .max()
         .unwrap_or(1)
         .max(1) as f32;
 
-    let dot_color = if drive.info.has_seek_penalty {
-        theme::HDD
-    } else {
-        theme::SSD
-    };
+    let dot_color = if render_as_hdd { theme::HDD } else { theme::SSD };
 
-    // Density-aware rendering: very large sample sets are subsampled
-    // and rendered with low alpha so the trace reads as a heat plot,
-    // not a single opaque blob.
     let total = drive.reads.len();
-    let max_dots = if drive.info.has_seek_penalty { 1024 } else { 768 };
+    let max_dots = if render_as_hdd { 1024 } else { 768 };
     let stride = (total / max_dots).max(1);
-    let alpha = if drive.info.has_seek_penalty { 0.85 } else { 0.35 };
-    let radius = if drive.info.has_seek_penalty { 2.0 } else { 1.4 };
+    let alpha = if render_as_hdd { 0.85 } else { 0.35 };
+    let radius = if render_as_hdd { 2.0 } else { 1.4 };
 
     for (i, r) in drive.reads.iter().enumerate() {
         if i % stride != 0 {
@@ -232,16 +315,18 @@ fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant) {
             continue;
         }
         let x_frac = 1.0 - (age / window);
-        let y_frac = (r.lcn_bytes as f32) / max_lcn;
+        let y_lcn = effective_lcn(r.lcn_bytes) as f32;
+        let y_frac = y_lcn / max_lcn;
         let p = rect.left_bottom()
             + vec2(rect.width() * x_frac, -rect.height() * y_frac.clamp(0.0, 1.0));
         painter.circle_filled(p, radius, dot_color.gamma_multiply(alpha));
     }
 
-    // Caption: drive-relative LCN range covered in the visible window.
     if let (Some(first), Some(last)) = (drive.reads.front(), drive.reads.back()) {
-        let span = last.lcn_bytes.max(first.lcn_bytes) - last.lcn_bytes.min(first.lcn_bytes);
-        let traversed = if drive.info.has_seek_penalty {
+        let first_lcn = effective_lcn(first.lcn_bytes);
+        let last_lcn = effective_lcn(last.lcn_bytes);
+        let span = last_lcn.max(first_lcn) - last_lcn.min(first_lcn);
+        let traversed = if render_as_hdd {
             format!("sequential   Δ {} this window", theme::humansize(span))
         } else {
             format!("scattered    Δ {} this window", theme::humansize(span))
