@@ -529,6 +529,112 @@ pub fn recycle(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replace `target` with a ReFS block-clone of `keeper` using
+/// `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. Atomic-ish via the same
+/// rename-aside / restore-on-failure dance as the hardlink action.
+pub fn replace_with_reflink(target: &Path, keeper: &Path) -> Result<()> {
+    use std::fs;
+    let tmp_dest = target.with_extension("superdupe.reflink.tmp");
+    let tmp_orig = target.with_extension("superdupe.tmp");
+    if tmp_dest.exists() {
+        fs::remove_file(&tmp_dest)?;
+    }
+    if tmp_orig.exists() {
+        fs::remove_file(&tmp_orig)?;
+    }
+    let size = fs::metadata(keeper)?.len();
+
+    // Stash the original aside so we can roll back on failure.
+    fs::rename(target, &tmp_orig)?;
+
+    let result = (|| -> Result<()> {
+        block_clone(&tmp_dest, keeper, size)?;
+        fs::rename(&tmp_dest, target)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            fs::remove_file(&tmp_orig).ok();
+            Ok(())
+        }
+        Err(e) => {
+            fs::rename(&tmp_orig, target).ok();
+            fs::remove_file(&tmp_dest).ok();
+            Err(e)
+        }
+    }
+}
+
+/// Create `dest` as a block-clone of `source` for the given size.
+/// Issues `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in cluster-aligned chunks.
+fn block_clone(dest: &Path, source: &Path, size: u64) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::System::Ioctl::{
+        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+    };
+
+    // Cluster size is volume-dependent; ReFS standard is 4 KiB, may be
+    // 64 KiB. Use the larger value so requests are guaranteed-aligned.
+    const CHUNK: u64 = 64 * 1024;
+
+    let source_file = OpenOptions::new()
+        .read(true)
+        .share_mode(/* FILE_SHARE_READ */ 1 | /* FILE_SHARE_WRITE */ 2)
+        .open(source)?;
+    let dest_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(1 | 2)
+        .open(dest)?;
+    dest_file.set_len(size)?;
+
+    let source_handle = HANDLE(source_file.as_raw_handle());
+    let dest_handle = HANDLE(dest_file.as_raw_handle());
+
+    let mut offset = 0u64;
+    while offset < size {
+        let chunk = CHUNK.min(size - offset);
+        // Round up to cluster boundary (FSCTL requires it).
+        let aligned_chunk = (chunk + 4095) & !4095;
+        let chunk_to_clone = if offset + aligned_chunk > size {
+            size - offset
+        } else {
+            aligned_chunk
+        };
+        let mut request = DUPLICATE_EXTENTS_DATA {
+            FileHandle: source_handle,
+            SourceFileOffset: offset as i64,
+            TargetFileOffset: offset as i64,
+            ByteCount: chunk_to_clone as i64,
+        };
+        let mut returned = 0u32;
+        // SAFETY: `request` is POD and outlives the call; the source
+        // handle is held alive by `source_file`; dest handle by
+        // `dest_file`. Buffer sizes are correctly computed via
+        // size_of_val on a stack value.
+        unsafe {
+            DeviceIoControl(
+                dest_handle,
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                Some(&request as *const _ as *const std::ffi::c_void),
+                std::mem::size_of_val(&request) as u32,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+            .map_err(|e| Error::Other(format!("FSCTL_DUPLICATE_EXTENTS_TO_FILE: {e}")))?;
+        }
+        let _ = &mut request;
+        offset += chunk_to_clone;
+    }
+    Ok(())
+}
+
 /// Atomically replace `target` with a hardlink to `keeper`.
 pub fn replace_with_hardlink(target: &Path, keeper: &Path) -> Result<()> {
     use std::fs;

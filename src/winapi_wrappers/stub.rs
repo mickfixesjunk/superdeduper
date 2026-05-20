@@ -46,3 +46,7 @@ pub fn recycle(_p: &Path) -> Result<()> {
 pub fn replace_with_hardlink(_t: &Path, _k: &Path) -> Result<()> {
     Err(Error::Unsupported("Windows-only CreateHardLinkW"))
 }
+
+pub fn replace_with_reflink(_t: &Path, _k: &Path) -> Result<()> {
+    Err(Error::Unsupported("Windows-only FSCTL_DUPLICATE_EXTENTS_TO_FILE"))
+}
