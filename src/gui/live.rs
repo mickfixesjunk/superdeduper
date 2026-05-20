@@ -139,7 +139,62 @@ fn run(
         emit_paused(&tx);
         return Ok(());
     }
-    let inv_result = inventory::enumerate(&cfg);
+    let inv_tx = tx.clone();
+    let mut files_seen: u64 = 0;
+    let mut dirs_entered: u64 = 0;
+    let mut dirs_denied: u64 = 0;
+    let mut entries_skipped: u64 = 0;
+    let mut skipped_below_min: u64 = 0;
+    let mut last_emit = Instant::now();
+    let inv_result = inventory::walk::enumerate_with_progress(&cfg, |evt| {
+        use crate::inventory::walk::WalkEvent;
+        match evt {
+            WalkEvent::Entered { path, depth } => {
+                dirs_entered += 1;
+                // Don't spam the status with every directory; show one
+                // current path every ~250ms so the user sees activity.
+                if last_emit.elapsed() > std::time::Duration::from_millis(250) {
+                    last_emit = Instant::now();
+                    let display = path.display().to_string();
+                    let _ = inv_tx.send(EngineEvent::Status(format!(
+                        "Walking: {} ({} dirs, {} files so far)",
+                        truncate_tail(&display, 60),
+                        dirs_entered,
+                        files_seen,
+                    )));
+                    let _ = inv_tx.send(EngineEvent::StageTick {
+                        stage: Stage::Inventory,
+                        delta: 0,
+                        total: files_seen,
+                    });
+                }
+                let _ = depth; // reserved for a future visualisation
+            }
+            WalkEvent::FileFound { size: _, .. } => {
+                files_seen += 1;
+                if files_seen.is_multiple_of(200) {
+                    let _ = inv_tx.send(EngineEvent::StageTick {
+                        stage: Stage::Inventory,
+                        delta: 200,
+                        total: files_seen,
+                    });
+                }
+            }
+            WalkEvent::DirError { path, message } => {
+                dirs_denied += 1;
+                let _ = inv_tx.send(EngineEvent::Log {
+                    level: LogLevel::Warn,
+                    message: format!("dir {}: {}", path.display(), message),
+                });
+            }
+            WalkEvent::EntrySkipped { reason, .. } => {
+                entries_skipped += 1;
+                if reason == "below min-size" {
+                    skipped_below_min += 1;
+                }
+            }
+        }
+    });
     let files = match inv_result {
         Ok(v) => v,
         Err(e) => {
@@ -153,18 +208,39 @@ fn run(
     let total_files = files.len() as u64;
     let _ = tx.send(EngineEvent::StageTick {
         stage: Stage::Inventory,
-        delta: total_files,
+        delta: 0,
         total: total_files,
     });
+    // Always emit a summary line so the user sees a definitive
+    // "what happened during inventory" — regardless of whether we
+    // found anything.
+    let _ = tx.send(EngineEvent::Log {
+        level: if total_files == 0 { LogLevel::Warn } else { LogLevel::Info },
+        message: format!(
+            "inventory done · {} files · {} dirs walked · {} dirs denied · {} entries skipped ({} below min-size)",
+            total_files, dirs_entered, dirs_denied, entries_skipped, skipped_below_min,
+        ),
+    });
     if total_files == 0 {
+        let mut hint = "Inventory returned 0 files.".to_string();
+        if dirs_denied > 0 {
+            hint.push_str(&format!(
+                " {} director(ies) were permission-denied — try running superdupe-gui as administrator.",
+                dirs_denied
+            ));
+        }
+        if skipped_below_min > 0 {
+            hint.push_str(&format!(
+                " {} file(s) were below the min-size filter ({} bytes) — drop it via ⚙ Settings.",
+                skipped_below_min, cfg.min_size,
+            ));
+        }
+        if dirs_denied == 0 && skipped_below_min == 0 && dirs_entered <= 1 {
+            hint.push_str(" The root appears empty or the volume isn't accessible.");
+        }
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Warn,
-            message: "Inventory returned 0 files. Either the roots are empty, all files are below the min-size filter, or permission was denied on the directories.".into(),
-        });
-    } else {
-        let _ = tx.send(EngineEvent::Log {
-            level: LogLevel::Info,
-            message: format!("inventory complete: {} file(s)", total_files),
+            message: hint,
         });
     }
 
@@ -216,14 +292,13 @@ fn run(
         None
     };
 
-    // Chunk the hashing so per-chunk events flow to the UI as work
-    // progresses. Each chunk is internally rayon-parallelised by
-    // `pipeline::hash::run_with_counters`, so we keep CPU saturated
-    // while still emitting smooth progress.
-    let chunks = chunk_groups(laid, 8);
+    // Smaller chunks → more frequent updates between chunks. We also
+    // wire a per-file progress callback into the hasher so the UI
+    // animates *within* a chunk, not just between them.
+    let chunks = chunk_groups(laid, 32, 50);
     let total_chunks = chunks.len();
     let _ = tx.send(EngineEvent::Status(format!(
-        "Stage 4 — hashing {} candidate group(s)…",
+        "Stage 4 — hashing {} chunk(s)…",
         total_chunks
     )));
 
@@ -232,6 +307,8 @@ fn run(
     let mut reclaimable: u64 = 0;
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
+    let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let already_reported: hashbrown::HashSet<String> = checkpoint_state
         .completed_hashes
@@ -252,22 +329,43 @@ fn run(
             emit_paused(&tx);
             return Ok(());
         }
-        let (dups, counters) =
-            pipeline::hash::run_with_counters(chunk, &cfg, cache.clone())?;
+        let progress_tx = tx.clone();
+        let progress_files = Arc::clone(&files_hashed);
+        let progress_bytes = Arc::clone(&bytes_hashed);
+        let progress_drive = (i as u32) % roots.len().max(1) as u32;
+        let on_file: pipeline::hash::FileProgress = Arc::new(move |_tier, bytes| {
+            let n = progress_files.fetch_add(1, Ordering::Relaxed) + 1;
+            let total_bytes =
+                progress_bytes.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+            // Drive scope: one ReadSample every 5 files. Cumulative
+            // bytes go on the LCN axis so the trace climbs.
+            if n.is_multiple_of(5) {
+                let _ = progress_tx.send(EngineEvent::Read(ReadSample {
+                    drive: progress_drive,
+                    lcn_bytes: total_bytes,
+                    bytes,
+                    latency_us: 1,
+                    at: Instant::now(),
+                }));
+            }
+            // Funnel + survival ratio: a Tier 3 tick every 25 files.
+            if n.is_multiple_of(25) {
+                let _ = progress_tx.send(EngineEvent::StageTick {
+                    stage: Stage::Tier3Full,
+                    delta: 25,
+                    total: n,
+                });
+            }
+        });
+
+        let (dups, counters) = pipeline::hash::run_with_progress(
+            chunk,
+            &cfg,
+            cache.clone(),
+            on_file,
+        )?;
         let chunk_bytes = counters.bytes_read.load(Ordering::Relaxed);
         total_bytes_read = total_bytes_read.saturating_add(chunk_bytes);
-
-        // Cheap synthetic ReadSample so the live drive scope animates
-        // during real scans, not just demos. Each chunk produces one
-        // sample carrying the bytes-read total; the LCN is the
-        // cumulative total so the scope shows a rising trace.
-        let _ = tx.send(EngineEvent::Read(ReadSample {
-            drive: (i as u32) % roots.len().max(1) as u32,
-            lcn_bytes: total_bytes_read,
-            bytes: chunk_bytes,
-            latency_us: 1,
-            at: Instant::now(),
-        }));
 
         for g in dups {
             if already_reported.contains(&g.content_hash) {
@@ -339,6 +437,15 @@ fn run(
     Ok(())
 }
 
+fn truncate_tail(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        return s.to_string();
+    }
+    let tail: String = chars[chars.len() - (n - 1)..].iter().collect();
+    format!("…{tail}")
+}
+
 fn emit_paused(tx: &Sender<EngineEvent>) {
     let _ = tx.send(EngineEvent::ScanPaused {
         at: Instant::now(),
@@ -379,15 +486,21 @@ fn reference_belongs(path: &PathBuf, reference_set: &hashbrown::HashSet<PathBuf>
     false
 }
 
+/// Pick chunk sizes so we get *both* enough chunks (for cross-chunk
+/// updates) and reasonably small chunks (for cancellation
+/// responsiveness). Target ≥ `min_chunks` chunks where possible, but
+/// never put more than `max_chunk_size` groups in a single chunk.
 fn chunk_groups(
     laid: Vec<pipeline::layout::LaidOutGroup>,
-    target_chunks: usize,
+    min_chunks: usize,
+    max_chunk_size: usize,
 ) -> Vec<Vec<pipeline::layout::LaidOutGroup>> {
     if laid.is_empty() {
         return Vec::new();
     }
-    let chunk_size = (laid.len() / target_chunks.max(1)).max(1);
-    let mut chunks = Vec::with_capacity(target_chunks);
+    let raw = (laid.len() / min_chunks.max(1)).max(1);
+    let chunk_size = raw.min(max_chunk_size.max(1));
+    let mut chunks = Vec::with_capacity(laid.len() / chunk_size + 1);
     let mut current: Vec<pipeline::layout::LaidOutGroup> = Vec::with_capacity(chunk_size);
     for g in laid {
         if current.len() >= chunk_size {

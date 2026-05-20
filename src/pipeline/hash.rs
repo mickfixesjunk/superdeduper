@@ -58,6 +58,12 @@ pub struct HashCounters {
     pub bytes_read: AtomicU64,
 }
 
+/// Callback invoked after each hash compute (non-cached). Receives
+/// the tier that ran and the byte count it processed. Used by the
+/// GUI to drive per-file progress events from inside the rayon
+/// parallel hashers.
+pub type FileProgress = Arc<dyn Fn(u8, u64) + Send + Sync>;
+
 /// Top-level entry point. Takes size-grouped, layout-annotated files
 /// and returns confirmed duplicate groups by full content hash.
 pub fn run(groups: Vec<LaidOutGroup>, cfg: &ScanConfig) -> Result<Vec<DuplicateGroup>> {
@@ -74,17 +80,39 @@ pub fn run_with_counters(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    run_with_counters_inner(groups, cfg, cache, None)
+}
+
+/// Same as [`run_with_counters`] but with a per-file progress
+/// callback that fires after each fresh (non-cache-hit) hash compute.
+/// The callback receives `(tier, bytes_processed)` and may be invoked
+/// from multiple rayon worker threads — keep it cheap and thread-safe.
+pub fn run_with_progress(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+    on_file: FileProgress,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    run_with_counters_inner(groups, cfg, cache, Some(on_file))
+}
+
+fn run_with_counters_inner(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+    on_file: Option<FileProgress>,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
     let counters = Arc::new(HashCounters::default());
+    let on_file_ref = on_file.as_ref();
     let mut confirmed: Vec<DuplicateGroup> = groups
         .into_par_iter()
-        .map(|g| run_group(g, cfg, cache.as_ref(), &counters))
+        .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
         .collect();
 
     confirmed.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.files.cmp(&b.files)));
-    // Unwrap is safe — we hold the only strong reference at this point.
     let counters = Arc::try_unwrap(counters).unwrap_or_else(|arc| HashCounters {
         cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
         cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
@@ -107,6 +135,7 @@ fn run_group(
     cfg: &ScanConfig,
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
+    on_file: Option<&FileProgress>,
 ) -> Result<Vec<DuplicateGroup>> {
     let size = group.size;
 
@@ -126,14 +155,9 @@ fn run_group(
 
     let mut survivors = group.files;
 
-    // Tier 0: optional format-aware fingerprint. When enabled, we
-    // compute a fingerprint per file and split the group by it. Files
-    // that share a fingerprint stay together; the ones without one
-    // (unsupported extension or parse failure) skip Tier 0 and stay in
-    // the group untouched.
     if cfg.use_format_aware {
         survivors = split_by_optional(&survivors, |f| {
-            tiered_optional(f, Tier::Zero, cache, counters, || {
+            tiered_optional(f, Tier::Zero, cache, counters, on_file, || {
                 format::fingerprint(&f.entry.path, size)
             })
         })?;
@@ -142,27 +166,24 @@ fn run_group(
         }
     }
 
-    // Tier 1: 4 KiB head sample.
     survivors = split_by(&survivors, |f| {
-        tiered(f, Tier::One, cache, counters, || tier1_hash(f, size))
+        tiered(f, Tier::One, cache, counters, on_file, || tier1_hash(f, size))
     })?;
     if survivors.len() < 2 {
         return Ok(Vec::new());
     }
 
-    // Tier 2: head+mid+tail, skipped for small files.
     if size >= TIER2_MIN_FILE {
         survivors = split_by(&survivors, |f| {
-            tiered(f, Tier::Two, cache, counters, || tier2_hash(f, size))
+            tiered(f, Tier::Two, cache, counters, on_file, || tier2_hash(f, size))
         })?;
         if survivors.len() < 2 {
             return Ok(Vec::new());
         }
     }
 
-    // Tier 3: full BLAKE3.
     let groups = into_subgroups(&survivors, |f| {
-        tiered(f, Tier::Three, cache, counters, || tier3_hash(f, size))
+        tiered(f, Tier::Three, cache, counters, on_file, || tier3_hash(f, size))
     })?;
     let mut out = Vec::new();
     for (hash, files) in groups {
@@ -281,6 +302,7 @@ fn tiered<F>(
     tier: Tier,
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
+    on_file: Option<&FileProgress>,
     compute: F,
 ) -> std::io::Result<[u8; 32]>
 where
@@ -291,15 +313,20 @@ where
             if let Ok(Some(cached)) = c.lock().lookup(&key) {
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    if let Some(cb) = on_file {
+                        cb(tier_index(tier), 0);
+                    }
                     return Ok(h);
                 }
             }
         }
     }
     let h = compute()?;
-    counters
-        .bytes_read
-        .fetch_add(tier_byte_estimate(tier, f.entry.size), Ordering::Relaxed);
+    let bytes = tier_byte_estimate(tier, f.entry.size);
+    counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+    if let Some(cb) = on_file {
+        cb(tier_index(tier), bytes);
+    }
     if let Some(c) = cache {
         if let Some(key) = cache_key(f) {
             let mut hashes = CachedHashes::default();
@@ -312,13 +339,12 @@ where
     Ok(h)
 }
 
-/// Like [`tiered`] but the compute step returns `Option<[u8; 32]>` for
-/// callers (Tier 0) that may simply lack a fingerprint.
 fn tiered_optional<F>(
     f: &LaidOutFile,
     tier: Tier,
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
+    on_file: Option<&FileProgress>,
     compute: F,
 ) -> Option<[u8; 32]>
 where
@@ -329,12 +355,20 @@ where
             if let Ok(Some(cached)) = c.lock().lookup(&key) {
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    if let Some(cb) = on_file {
+                        cb(tier_index(tier), 0);
+                    }
                     return Some(h);
                 }
             }
         }
     }
     let h = compute()?;
+    let bytes = tier_byte_estimate(tier, f.entry.size);
+    counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+    if let Some(cb) = on_file {
+        cb(tier_index(tier), bytes);
+    }
     if let Some(c) = cache {
         if let Some(key) = cache_key(f) {
             let mut hashes = CachedHashes::default();
@@ -345,6 +379,15 @@ where
         }
     }
     Some(h)
+}
+
+fn tier_index(tier: Tier) -> u8 {
+    match tier {
+        Tier::Zero => 0,
+        Tier::One => 1,
+        Tier::Two => 2,
+        Tier::Three => 3,
+    }
 }
 
 fn cache_key(f: &LaidOutFile) -> Option<CacheKey> {
