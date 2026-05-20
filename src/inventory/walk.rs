@@ -28,10 +28,17 @@ fn walk(dir: &Path, cfg: &ScanConfig, out: &mut Vec<FileEntry>) -> Result<()> {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::debug!(path = %dir.display(), "permission denied; skipping");
+            tracing::warn!(path = %dir.display(), "permission denied; skipping");
             return Ok(());
         }
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Race with deletion mid-scan; not worth raising.
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "open dir failed; skipping");
+            return Ok(());
+        }
     };
 
     for entry in read {

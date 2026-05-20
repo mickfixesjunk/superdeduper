@@ -1,18 +1,24 @@
 //! The `eframe::App` that lays out and drives the GUI.
 //!
-//! Layout:
+//! Layout (v0.1.3):
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
-//! │  header (Scan button, Demo button, status, totals)               │
+//! │  header (logo, ⚙ settings, status, totals)                       │
 //! ├──────────────┬───────────────────────────────────────────────────┤
-//! │              │  drive scope (per-physical-drive)                 │
-//! │  pipeline    │                                                   │
-//! │  funnel      ├───────────────────────────────────────────────────┤
-//! │              │  results — Treemap | Groups table                 │
+//! │              │  drive scope                                      │
+//! │  Roots       │                                                   │
+//! │              │                                                   │
+//! │  ──────      │                                                   │
+//! │              ├───────────────────────────────────────────────────┤
+//! │  Pipeline    │  Treemap | Groups | Log                           │
+//! │              │                                                   │
 //! └──────────────┴───────────────────────────────────────────────────┘
 //! ```
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -20,36 +26,55 @@ use egui::{CentralPanel, Frame, SidePanel, TopBottomPanel};
 
 use crate::cli::DedupeAction;
 use crate::gui::events::EngineEvent;
-use crate::gui::state::UiState;
+use crate::gui::state::{RootEntry, ScanSettings, UiState};
 use crate::gui::widgets::groups_table::GroupAction;
-use crate::gui::widgets::header::HeaderAction;
-use crate::gui::widgets::{drive_scope, funnel, groups_table, header, treemap};
+use crate::gui::widgets::roots_panel::RootsAction;
+use crate::gui::widgets::{
+    drive_scope, funnel, groups_table, header, log_panel, roots_panel, settings_modal, treemap,
+};
 use crate::gui::{demo, live, theme};
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ResultsTab {
     Treemap,
     Groups,
+    Log,
+}
+
+impl Default for ResultsTab {
+    fn default() -> Self {
+        ResultsTab::Treemap
+    }
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedAppState {
+    roots: Vec<RootEntry>,
+    settings: ScanSettings,
+    results_tab: ResultsTab,
 }
 
 pub struct SuperdupeApp {
     state: UiState,
     rx: Receiver<EngineEvent>,
     tx: Sender<EngineEvent>,
-    /// True if a demo or live engine thread is currently producing
-    /// events. Set when the user clicks Scan/Demo (or when launched
-    /// with `--live`), cleared on `ScanFinished`.
     is_scanning: bool,
-    /// Most recent scan was the synthetic demo. Used for the "DEMO"
-    /// header badge.
     demo_mode: bool,
-    results_tab: ResultsTab,
+    settings_open: bool,
+    persisted: PersistedAppState,
     groups_state: groups_table::GroupsTableState,
+    /// Cancel-token; the engine checks it cooperatively to honour
+    /// Pause / Cancel from the UI.
+    cancel: Arc<AtomicBool>,
 }
 
 impl SuperdupeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, start_in_demo: bool) -> Self {
         theme::install(&cc.egui_ctx);
+        let persisted: PersistedAppState = cc
+            .storage
+            .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdupe.app.v1"))
+            .unwrap_or_default();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
         let mut app = Self {
             state: UiState::default(),
@@ -57,8 +82,10 @@ impl SuperdupeApp {
             tx,
             is_scanning: false,
             demo_mode: false,
-            results_tab: ResultsTab::Treemap,
+            settings_open: false,
+            persisted,
             groups_state: groups_table::GroupsTableState::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         if start_in_demo {
             app.start_demo();
@@ -70,16 +97,26 @@ impl SuperdupeApp {
         self.tx.clone()
     }
 
-    /// Mark the app as scanning (so the user can't kick off another)
-    /// and let the engine know to reset state via `ScanStarted` (the
-    /// demo / live thread sends it before doing any work).
-    pub fn start_live(&mut self, paths: Vec<std::path::PathBuf>) {
-        if self.is_scanning || paths.is_empty() {
+    pub fn add_root(&mut self, path: PathBuf, is_reference: bool) {
+        if self.persisted.roots.iter().any(|r| r.path == path) {
+            return;
+        }
+        self.persisted.roots.push(RootEntry { path, is_reference });
+    }
+
+    pub fn start_live(&mut self) {
+        if self.is_scanning || self.persisted.roots.is_empty() {
             return;
         }
         self.is_scanning = true;
         self.demo_mode = false;
-        live::spawn(self.tx.clone(), paths);
+        self.cancel.store(false, Ordering::Relaxed);
+        live::spawn_with_settings(
+            self.tx.clone(),
+            self.persisted.roots.clone(),
+            self.persisted.settings.clone(),
+            self.cancel.clone(),
+        );
     }
 
     pub fn start_demo(&mut self) {
@@ -91,6 +128,10 @@ impl SuperdupeApp {
         demo::spawn(self.tx.clone());
     }
 
+    fn request_pause(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
     fn drain_events(&mut self) {
         for _ in 0..512 {
             match self.rx.try_recv() {
@@ -99,11 +140,11 @@ impl SuperdupeApp {
                         EngineEvent::ScanStarted { .. } => self.is_scanning = true,
                         EngineEvent::ScanFinished { .. } => {
                             self.is_scanning = false;
-                            // Surface the candidates as soon as the
-                            // scan completes — that's the entire
-                            // point of running the tool.
-                            self.results_tab = ResultsTab::Groups;
+                            self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
+                        }
+                        EngineEvent::ScanPaused { .. } => {
+                            self.is_scanning = false;
                         }
                         _ => {}
                     }
@@ -115,6 +156,43 @@ impl SuperdupeApp {
         let now = Instant::now();
         for drive in self.state.drives.values_mut() {
             drive.roll_throughput(now);
+        }
+    }
+
+    fn dispatch_root_action(&mut self, action: RootsAction) {
+        match action {
+            RootsAction::PickFolder => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("Pick a folder to scan")
+                    .pick_folder()
+                {
+                    self.add_root(p, false);
+                }
+            }
+            RootsAction::PickReferenceFolder => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("Pick a reference folder (never deleted from)")
+                    .pick_folder()
+                {
+                    self.add_root(p, true);
+                }
+            }
+            RootsAction::Remove(i) => {
+                if i < self.persisted.roots.len() {
+                    self.persisted.roots.remove(i);
+                }
+            }
+            RootsAction::ToggleReference(i) => {
+                if let Some(r) = self.persisted.roots.get_mut(i) {
+                    r.is_reference = !r.is_reference;
+                }
+            }
+            RootsAction::StartScan => self.start_live(),
+            RootsAction::Pause => self.request_pause(),
+            RootsAction::Cancel => {
+                self.request_pause();
+                self.persisted.results_tab = ResultsTab::Log;
+            }
         }
     }
 
@@ -130,14 +208,11 @@ impl SuperdupeApp {
         }
     }
 
-    /// Run a destructive dedupe action on a background thread so the UI
-    /// stays responsive. Status updates are pushed back over the same
-    /// event channel that drives the rest of the UI.
     fn run_action_threaded(
         &self,
         action: DedupeAction,
-        keeper: std::path::PathBuf,
-        dupes: Vec<std::path::PathBuf>,
+        keeper: PathBuf,
+        dupes: Vec<PathBuf>,
     ) {
         let tx = self.tx.clone();
         std::thread::Builder::new()
@@ -154,9 +229,7 @@ impl SuperdupeApp {
                 for d in &dupes {
                     let r = match action {
                         DedupeAction::Recycle => crate::dedupe::action_recycle(d),
-                        DedupeAction::Hardlink => {
-                            crate::dedupe::action_hardlink(d, &keeper)
-                        }
+                        DedupeAction::Hardlink => crate::dedupe::action_hardlink(d, &keeper),
                         DedupeAction::Remove => crate::dedupe::action_remove(d),
                         DedupeAction::Reflink => crate::dedupe::action_reflink(d, &keeper),
                     };
@@ -164,7 +237,10 @@ impl SuperdupeApp {
                         Ok(()) => done += 1,
                         Err(e) => {
                             failed += 1;
-                            tracing::error!(path = %d.display(), error = %e, "action failed");
+                            let _ = tx.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Error,
+                                message: format!("{}: {e}", d.display()),
+                            });
                         }
                     }
                 }
@@ -177,18 +253,6 @@ impl SuperdupeApp {
     }
 }
 
-#[cfg(windows)]
-fn reveal_in_explorer(path: &std::path::Path) {
-    let _ = std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .spawn();
-}
-
-#[cfg(not(windows))]
-fn reveal_in_explorer(_path: &std::path::Path) {
-    // No-op on non-Windows; the GUI's production target is Windows.
-}
-
 impl eframe::App for SuperdupeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
@@ -196,37 +260,61 @@ impl eframe::App for SuperdupeApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
-        let mut header_action = HeaderAction::None;
+        // Settings modal first; it doesn't claim screen real estate.
+        if self.settings_open {
+            let mut open = self.settings_open;
+            if settings_modal::show(ctx, &mut open, &mut self.persisted.settings) {
+                self.settings_open = false;
+            } else {
+                self.settings_open = open;
+            }
+        }
+
+        let mut want_settings = false;
+        let mut want_demo = false;
         TopBottomPanel::top("header")
             .frame(Frame::default().fill(theme::BG).inner_margin(8.0))
             .show(ctx, |ui| {
-                header_action = header::show(ui, &self.state, self.demo_mode, self.is_scanning);
-            });
-        match header_action {
-            HeaderAction::PickAndScan => {
-                if let Some(folder) = rfd::FileDialog::new()
-                    .set_title("Pick a folder to scan for duplicates")
-                    .pick_folder()
-                {
-                    self.start_live(vec![folder]);
+                let action = header::show(ui, &self.state, self.demo_mode, self.is_scanning);
+                match action {
+                    header::HeaderAction::OpenSettings => want_settings = true,
+                    header::HeaderAction::StartDemo => want_demo = true,
+                    _ => {}
                 }
-            }
-            HeaderAction::StartDemo => self.start_demo(),
-            HeaderAction::None => {}
+            });
+        if want_settings {
+            self.settings_open = true;
+        }
+        if want_demo {
+            self.start_demo();
         }
 
-        SidePanel::left("pipeline")
+        SidePanel::left("sidebar")
             .resizable(true)
-            .default_width(280.0)
-            .min_width(220.0)
+            .default_width(300.0)
+            .min_width(240.0)
             .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
-            .show(ctx, |ui| funnel::show(ui, &self.state));
+            .show(ctx, |ui| {
+                let roots_action = roots_panel::show(
+                    ui,
+                    &self.persisted.roots,
+                    self.is_scanning,
+                    false, // resume tracking lands in pass 2
+                );
+                if let Some(a) = roots_action {
+                    self.dispatch_root_action(a);
+                }
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+                funnel::show(ui, &self.state);
+            });
 
         CentralPanel::default()
             .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
             .show(ctx, |ui| {
                 let avail = ui.available_height();
-                let scope_h = (avail * 0.55).clamp(440.0, 620.0);
+                let scope_h = (avail * 0.50).clamp(380.0, 580.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), scope_h),
                     egui::Layout::top_down(egui::Align::Min),
@@ -243,27 +331,43 @@ impl eframe::App for SuperdupeApp {
 
                 ui.horizontal(|ui| {
                     let mut pick = |label, value| {
-                        let selected = self.results_tab == value;
+                        let selected = self.persisted.results_tab == value;
                         if ui.selectable_label(selected, label).clicked() {
-                            self.results_tab = value;
+                            self.persisted.results_tab = value;
                         }
                     };
                     pick("Treemap", ResultsTab::Treemap);
                     pick("Groups", ResultsTab::Groups);
+                    pick("Log", ResultsTab::Log);
                 });
                 ui.add_space(2.0);
 
                 let mut group_action: Option<GroupAction> = None;
-                match self.results_tab {
+                match self.persisted.results_tab {
                     ResultsTab::Treemap => treemap::show(ui, &self.state),
                     ResultsTab::Groups => {
                         group_action =
                             groups_table::show(ui, &self.state, &mut self.groups_state);
                     }
+                    ResultsTab::Log => log_panel::show(ui, &self.state),
                 }
                 if let Some(a) = group_action {
                     self.dispatch_group_action(a);
                 }
             });
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "superdupe.app.v1", &self.persisted);
+    }
 }
+
+#[cfg(windows)]
+fn reveal_in_explorer(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+}
+
+#[cfg(not(windows))]
+fn reveal_in_explorer(_path: &std::path::Path) {}

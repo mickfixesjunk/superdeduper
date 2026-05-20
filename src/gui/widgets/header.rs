@@ -1,22 +1,14 @@
-//! Top status bar — title, action buttons, status line, big stat tiles.
-//!
-//! The action area exposes the only two ways the user can change what
-//! the engine is doing: pick a folder and start a real scan, or kick
-//! off the synthetic demo. A scan-in-progress flag disables the
-//! buttons so we don't queue two engines onto the same channel.
+//! Top status bar — title, settings button, status line, big stat tiles.
 
 use egui::{vec2, Align, Layout, RichText, Ui};
 
 use crate::gui::state::UiState;
 use crate::gui::theme;
 
-/// Actions the user can trigger from the header. Bubbled back up to
-/// [`SuperdupeApp::update`] which is the only place engine threads
-/// get spawned.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HeaderAction {
     None,
-    PickAndScan,
+    OpenSettings,
     StartDemo,
 }
 
@@ -41,19 +33,17 @@ pub fn show(
         }
         ui.add_space(8.0);
 
-        // Action buttons.
-        let scan_label = if is_scanning { "Scanning…" } else { "📂  Scan a folder" };
-        let scan_btn = egui::Button::new(
-            RichText::new(scan_label).color(theme::PANEL_DEEP).strong(),
+        let settings_btn = egui::Button::new(
+            RichText::new("⚙  Settings").color(theme::TEXT_HI),
         )
-        .fill(theme::ACCENT)
-        .min_size(vec2(160.0, 28.0));
+        .fill(theme::PANEL_DEEP)
+        .min_size(vec2(110.0, 28.0));
         if ui
-            .add_enabled(!is_scanning, scan_btn)
-            .on_hover_text("Pick a folder and run a real scan.")
+            .add(settings_btn)
+            .on_hover_text("Engine options (size filters, glob patterns, format-aware, threads).")
             .clicked()
         {
-            action = HeaderAction::PickAndScan;
+            action = HeaderAction::OpenSettings;
         }
 
         let demo_btn = egui::Button::new(
@@ -63,14 +53,19 @@ pub fn show(
         .min_size(vec2(80.0, 28.0));
         if ui
             .add_enabled(!is_scanning, demo_btn)
-            .on_hover_text("Replay the synthetic demo with two simulated drives.")
+            .on_hover_text("Replay the synthetic engine demo.")
             .clicked()
         {
             action = HeaderAction::StartDemo;
         }
 
         ui.separator();
-        ui.label(RichText::new(&state.status).color(theme::TEXT_HI));
+        let status = if state.status.is_empty() {
+            "Idle — add folders in the sidebar, then click Start scan."
+        } else {
+            state.status.as_str()
+        };
+        ui.label(RichText::new(status).color(theme::TEXT_HI));
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             big_stat(ui, "Reclaimable", &theme::humansize(state.totals.reclaimable_bytes), theme::HOT);
