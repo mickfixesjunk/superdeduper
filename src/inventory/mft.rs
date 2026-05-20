@@ -29,9 +29,18 @@ pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
     use crate::winapi_wrappers::volume_for_path;
 
     // Group roots by volume.
+    //
+    // `std::fs::canonicalize` on Windows returns a verbatim path
+    // (`\\?\F:\Github`), but the path we reconstruct from MFT
+    // records starts with `F:\…` — no verbatim prefix. Comparing
+    // those with `starts_with` returns false for every file, which
+    // before this fix meant a scan of `F:\Github` from an
+    // MFT-capable shell finished in seconds with 0 files. Strip the
+    // verbatim prefix here so the two path shapes line up.
     let mut roots_by_volume: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for root in &cfg.roots {
         let abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let abs = strip_verbatim_prefix(&abs);
         let vol = volume_for_path(&abs)?;
         roots_by_volume.entry(vol).or_default().push(abs);
     }
@@ -156,6 +165,45 @@ fn reconstruct_path(
     }
     cache.insert(file_ref, path.clone());
     Some(path)
+}
+
+/// Strip Windows' `\\?\` verbatim prefix from a canonicalised path
+/// so it compares cleanly against the `Drive:\…` style paths that
+/// MFT enumeration produces. No-op on non-Windows shapes.
+#[cfg(windows)]
+fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut comps = p.components();
+    if let Some(Component::Prefix(prefix)) = comps.next() {
+        match prefix.kind() {
+            Prefix::VerbatimDisk(letter) => {
+                // `\\?\C:\foo` → `C:\foo`.
+                let mut out = PathBuf::from(format!("{}:\\", letter as char));
+                for c in comps {
+                    if matches!(c, Component::RootDir) {
+                        continue;
+                    }
+                    out.push(c.as_os_str());
+                }
+                return out;
+            }
+            Prefix::VerbatimUNC(_, _) | Prefix::Verbatim(_) => {
+                // Less common shapes — at least drop the `\\?\`.
+                let s = p.to_string_lossy();
+                if let Some(rest) = s.strip_prefix(r"\\?\") {
+                    return PathBuf::from(rest);
+                }
+            }
+            _ => {}
+        }
+    }
+    p.to_path_buf()
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    p.to_path_buf()
 }
 
 #[allow(dead_code)]
