@@ -24,7 +24,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hashbrown::HashMap;
@@ -58,11 +58,13 @@ pub struct HashCounters {
     pub bytes_read: AtomicU64,
 }
 
-/// Callback invoked after each hash compute (non-cached). Receives
-/// the tier that ran and the byte count it processed. Used by the
-/// GUI to drive per-file progress events from inside the rayon
-/// parallel hashers.
-pub type FileProgress = Arc<dyn Fn(u8, u64) + Send + Sync>;
+/// Callback invoked after each hash compute (cached OR fresh).
+/// Receives the file's path, the tier that ran, and the byte count
+/// it processed (0 for cache hits). Used by the GUI to drive
+/// per-file progress events from inside the rayon parallel hashers
+/// — the path lets the UI compute a stable scattered LCN per file
+/// so SSDs show a spray pattern instead of a monotonic line.
+pub type FileProgress = Arc<dyn Fn(&std::path::Path, u8, u64) + Send + Sync>;
 
 /// Top-level entry point. Takes size-grouped, layout-annotated files
 /// and returns confirmed duplicate groups by full content hash.
@@ -80,7 +82,7 @@ pub fn run_with_counters(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, None)
+    run_with_counters_inner(groups, cfg, cache, None, None)
 }
 
 /// Same as [`run_with_counters`] but with a per-file progress
@@ -93,7 +95,22 @@ pub fn run_with_progress(
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: FileProgress,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, Some(on_file))
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), None)
+}
+
+/// Like [`run_with_progress`] but also takes a cancellation flag. The
+/// engine polls this between groups and inside the streaming Tier 3
+/// read loop, so cancelling a scan on a 10 GB file no longer waits
+/// for the read to complete — at worst, we finish the current 1 MiB
+/// buffer and return.
+pub fn run_cancellable(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+    on_file: FileProgress,
+    cancel: Arc<AtomicBool>,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), Some(cancel))
 }
 
 fn run_with_counters_inner(
@@ -101,12 +118,14 @@ fn run_with_counters_inner(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: Option<FileProgress>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
     let counters = Arc::new(HashCounters::default());
     let on_file_ref = on_file.as_ref();
+    let cancel_ref = cancel.as_ref();
     let mut confirmed: Vec<DuplicateGroup> = groups
         .into_par_iter()
-        .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref))
+        .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref, cancel_ref))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -136,8 +155,12 @@ fn run_group(
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
     on_file: Option<&FileProgress>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<DuplicateGroup>> {
     let size = group.size;
+    if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+        return Ok(Vec::new());
+    }
 
     // Zero-byte short circuit.
     if size == 0 {
@@ -157,6 +180,9 @@ fn run_group(
 
     if cfg.use_format_aware {
         survivors = split_by_optional(&survivors, |f| {
+            if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+                return None;
+            }
             tiered_optional(f, Tier::Zero, cache, counters, on_file, || {
                 format::fingerprint(&f.entry.path, size)
             })
@@ -166,6 +192,9 @@ fn run_group(
         }
     }
 
+    if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+        return Ok(Vec::new());
+    }
     survivors = split_by(&survivors, |f| {
         tiered(f, Tier::One, cache, counters, on_file, || tier1_hash(f, size))
     })?;
@@ -174,6 +203,9 @@ fn run_group(
     }
 
     if size >= TIER2_MIN_FILE {
+        if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+            return Ok(Vec::new());
+        }
         survivors = split_by(&survivors, |f| {
             tiered(f, Tier::Two, cache, counters, on_file, || tier2_hash(f, size))
         })?;
@@ -182,8 +214,13 @@ fn run_group(
         }
     }
 
+    if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+        return Ok(Vec::new());
+    }
     let groups = into_subgroups(&survivors, |f| {
-        tiered(f, Tier::Three, cache, counters, on_file, || tier3_hash(f, size))
+        tiered(f, Tier::Three, cache, counters, on_file, || {
+            tier3_hash_cancellable(f, size, cancel)
+        })
     })?;
     let mut out = Vec::new();
     for (hash, files) in groups {
@@ -314,7 +351,7 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(tier_index(tier), 0);
+                        cb(&f.entry.path, tier_index(tier), 0);
                     }
                     return Ok(h);
                 }
@@ -325,7 +362,7 @@ where
     let bytes = tier_byte_estimate(tier, f.entry.size);
     counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
     if let Some(cb) = on_file {
-        cb(tier_index(tier), bytes);
+        cb(&f.entry.path, tier_index(tier), bytes);
     }
     if let Some(c) = cache {
         if let Some(key) = cache_key(f) {
@@ -356,7 +393,7 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(tier_index(tier), 0);
+                        cb(&f.entry.path, tier_index(tier), 0);
                     }
                     return Some(h);
                 }
@@ -367,7 +404,7 @@ where
     let bytes = tier_byte_estimate(tier, f.entry.size);
     counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
     if let Some(cb) = on_file {
-        cb(tier_index(tier), bytes);
+        cb(&f.entry.path, tier_index(tier), bytes);
     }
     if let Some(c) = cache {
         if let Some(key) = cache_key(f) {
@@ -460,12 +497,25 @@ fn tier2_hash(f: &LaidOutFile, size: u64) -> std::io::Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn tier3_hash(f: &LaidOutFile, _size: u64) -> std::io::Result<[u8; 32]> {
+/// Tier 3 full-content hash. Polls an optional cancel flag every
+/// buffer so a multi-GB file becomes interruptible — at worst we
+/// finish the current 1 MiB read and bail.
+fn tier3_hash_cancellable(
+    f: &LaidOutFile,
+    _size: u64,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<[u8; 32]> {
     let file = File::open(&f.entry.path)?;
     let mut reader = BufReader::with_capacity(TIER3_BUF, file);
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; TIER3_BUF];
     loop {
+        if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ));
+        }
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;

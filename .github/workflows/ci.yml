@@ -47,3 +47,31 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked --features gui --bin superdupe-gui
       - run: cargo build --release --locked --bin superdupe
+      # Upload the built EXEs as a workflow artifact on every push to
+      # main so we can iterate without cutting a tagged release. The
+      # bundle lives under the run's Artifacts section for 14 days.
+      - name: Stage artifacts
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $stage = "ci-build"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/superdupe.exe $stage/
+          Copy-Item target/release/superdupe-gui.exe $stage/
+          Copy-Item LICENSE $stage/
+          Copy-Item README.md $stage/
+          $files = @(Get-ChildItem $stage -File | Where-Object { $_.Name -ne 'SHA256SUMS' })
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $f.FullName).Hash.ToLower()
+            "$hash  $($f.Name)"
+          }
+          $lines | Set-Content -Encoding ascii -Path "$stage/SHA256SUMS"
+          Get-Content "$stage/SHA256SUMS"
+      - name: Upload Windows build
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: superdupe-windows-${{ github.sha }}
+          path: ci-build/**
+          if-no-files-found: error
+          retention-days: 14

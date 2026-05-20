@@ -124,5 +124,40 @@ pub enum EngineEvent {
     /// User requested a pause; the engine has flushed checkpoint state
     /// and is now idle. Re-issuing a scan with the same roots resumes.
     ScanPaused { at: Instant, checkpoint_id: String },
+    /// Overall scan progress — drives the top-of-window progress bar.
+    /// `done` and `total` count whatever unit the current stage uses
+    /// (files for inventory, candidate files for hashing). If
+    /// `total == 0` the bar renders indeterminate (sweeping).
+    OverallProgress {
+        stage: OverallStage,
+        done: u64,
+        total: u64,
+        eta_secs: Option<f32>,
+    },
+}
+
+/// Coarse "what's the engine doing right now" tag. Drives the
+/// overall progress bar's label and tint.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OverallStage {
+    Idle,
+    Inventory,
+    SizeGroup,
+    Layout,
+    Hashing,
+    Finishing,
+}
+
+impl OverallStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            OverallStage::Idle => "Idle",
+            OverallStage::Inventory => "Inventory",
+            OverallStage::SizeGroup => "Size grouping",
+            OverallStage::Layout => "Layout",
+            OverallStage::Hashing => "Hashing",
+            OverallStage::Finishing => "Finishing",
+        }
+    }
 }
 

@@ -9,7 +9,8 @@ use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::gui::events::{
-    DriveId, DriveInfo, DuplicateGroupSummary, EngineEvent, LogLevel, ReadSample, Stage,
+    DriveId, DriveInfo, DuplicateGroupSummary, EngineEvent, LogLevel, OverallStage, ReadSample,
+    Stage,
 };
 
 /// Ring buffer of read samples for the live scope, capped to keep
@@ -79,6 +80,40 @@ pub struct UiState {
     pub duplicates: Vec<DuplicateGroupSummary>,
     pub totals: Totals,
     pub logs: VecDeque<LogEntry>,
+    pub overall: OverallProgress,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct OverallProgress {
+    pub stage: OverallStage,
+    pub done: u64,
+    pub total: u64,
+    pub eta_secs: Option<f32>,
+}
+
+impl Default for OverallProgress {
+    fn default() -> Self {
+        Self {
+            stage: OverallStage::Idle,
+            done: 0,
+            total: 0,
+            eta_secs: None,
+        }
+    }
+}
+
+impl OverallProgress {
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.done as f64 / self.total as f64).clamp(0.0, 1.0) as f32
+        }
+    }
+
+    pub fn is_determinate(&self) -> bool {
+        self.total > 0
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -223,14 +258,29 @@ impl UiState {
                     reclaimable_bytes,
                 };
                 self.status = "Done.".into();
+                self.overall = OverallProgress {
+                    stage: OverallStage::Idle,
+                    done: total_files,
+                    total: total_files.max(1),
+                    eta_secs: Some(0.0),
+                };
             }
             EngineEvent::ScanPaused { at, checkpoint_id } => {
                 self.scan_finished_at = Some(at);
                 self.status = format!("Paused — resume by clicking Scan ({} saved)", checkpoint_id);
+                self.overall.eta_secs = None;
             }
             EngineEvent::Status(s) => self.status = s,
             EngineEvent::Log { level, message } => {
                 self.push_log(level, message);
+            }
+            EngineEvent::OverallProgress { stage, done, total, eta_secs } => {
+                self.overall = OverallProgress {
+                    stage,
+                    done,
+                    total,
+                    eta_secs,
+                };
             }
         }
     }
