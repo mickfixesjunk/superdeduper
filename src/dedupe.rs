@@ -237,14 +237,32 @@ fn validate_file(path: &Path, expected_size: u64) -> Result<()> {
 
 fn perform_action(action: DedupeAction, path: &Path, keeper: &Path) -> Result<()> {
     match action {
-        DedupeAction::Remove => {
-            fs::remove_file(path)?;
-            Ok(())
-        }
-        DedupeAction::Recycle => recycle(path),
-        DedupeAction::Hardlink => replace_with_hardlink(path, keeper),
-        DedupeAction::Reflink => replace_with_reflink(path, keeper),
+        DedupeAction::Remove => action_remove(path),
+        DedupeAction::Recycle => action_recycle(path),
+        DedupeAction::Hardlink => action_hardlink(path, keeper),
+        DedupeAction::Reflink => action_reflink(path, keeper),
     }
+}
+
+/// Single-file destructive actions, exposed so callers (the GUI) can
+/// run them directly without round-tripping through a results file.
+/// Each goes through the same Win32 / portable backend the planner
+/// uses, so the safety guarantees are identical.
+pub fn action_remove(path: &Path) -> Result<()> {
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+pub fn action_recycle(path: &Path) -> Result<()> {
+    recycle(path)
+}
+
+pub fn action_hardlink(target: &Path, keeper: &Path) -> Result<()> {
+    replace_with_hardlink(target, keeper)
+}
+
+pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
+    replace_with_reflink(target, keeper)
 }
 
 #[cfg(windows)]
