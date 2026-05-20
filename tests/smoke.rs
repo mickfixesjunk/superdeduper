@@ -66,7 +66,7 @@ fn finds_planted_duplicates() {
 
     let groups = pipeline::grouping::group_by_size(inv);
     let laid = pipeline::layout::resolve(groups).unwrap();
-    let dups = pipeline::hash::run(laid).unwrap();
+    let dups = pipeline::hash::run(laid, &cfg).unwrap();
 
     assert_eq!(dups.len(), 1, "expected exactly one duplicate group");
     let g = &dups[0];

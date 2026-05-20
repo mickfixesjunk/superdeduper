@@ -51,7 +51,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let laid_out = pipeline::layout::resolve(size_groups).context("layout resolution failed")?;
     tracing::info!(groups = laid_out.len(), "stage 3: layout resolution complete");
 
-    let duplicates = pipeline::hash::run(laid_out).context("hashing failed")?;
+    let duplicates = pipeline::hash::run(laid_out, &cfg).context("hashing failed")?;
     tracing::info!(groups = duplicates.len(), "stage 4: hashing complete");
 
     let duplicates = if cfg.paranoid {
