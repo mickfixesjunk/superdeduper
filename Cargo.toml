@@ -70,6 +70,10 @@ features = [
     "Win32_UI_Shell",
 ]
 
+[dev-dependencies]
+proptest = "1.5"
+tempfile = "3.10"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

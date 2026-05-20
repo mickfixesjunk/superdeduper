@@ -18,7 +18,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub mod jpeg;
+pub mod mkv;
 pub mod mp3;
+pub mod mp4;
+pub mod pdf;
 pub mod png;
 pub mod zip;
 
@@ -30,6 +33,9 @@ pub enum Format {
     Jpeg,
     Png,
     Mp3,
+    Mp4,
+    Mkv,
+    Pdf,
 }
 
 impl Format {
@@ -42,6 +48,9 @@ impl Format {
             "jpg" | "jpeg" | "jpe" | "jfif" => Format::Jpeg,
             "png" => Format::Png,
             "mp3" => Format::Mp3,
+            "mp4" | "m4v" | "m4a" | "mov" => Format::Mp4,
+            "mkv" | "webm" => Format::Mkv,
+            "pdf" => Format::Pdf,
             _ => return None,
         })
     }
@@ -57,6 +66,9 @@ pub fn fingerprint(path: &Path, size: u64) -> Option<[u8; 32]> {
         Format::Jpeg => jpeg::fingerprint(&mut file, size).ok()?,
         Format::Png => png::fingerprint(&mut file, size).ok()?,
         Format::Mp3 => mp3::fingerprint(&mut file, size).ok()?,
+        Format::Mp4 => mp4::fingerprint(&mut file, size).ok()?,
+        Format::Mkv => mkv::fingerprint(&mut file, size).ok()?,
+        Format::Pdf => pdf::fingerprint(&mut file, size).ok()?,
     };
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[fmt as u8]);
