@@ -58,13 +58,25 @@ pub struct HashCounters {
     pub bytes_read: AtomicU64,
 }
 
-/// Callback invoked after each hash compute (cached OR fresh).
-/// Receives the file's path, the tier that ran, and the byte count
-/// it processed (0 for cache hits). Used by the GUI to drive
-/// per-file progress events from inside the rayon parallel hashers
-/// — the path lets the UI compute a stable scattered LCN per file
-/// so SSDs show a spray pattern instead of a monotonic line.
-pub type FileProgress = Arc<dyn Fn(&std::path::Path, u8, u64) + Send + Sync>;
+/// Outcome reported by the per-file [`FileProgress`] callback.
+/// `Failed` lets the UI see files that couldn't even be opened
+/// (cloud-only OneDrive placeholders, exclusively-locked files,
+/// broken reparse points). Without this, those files were silently
+/// dropped and the progress bar froze on its denominator.
+#[derive(Debug, Clone)]
+pub enum ProgressOutcome {
+    Hashed { bytes: u64 },
+    Cached,
+    Failed { error: String },
+}
+
+/// Callback invoked once per file per attempted tier — success,
+/// cache hit, OR failure. Used by the GUI to drive per-file progress
+/// events from inside the rayon parallel hashers; the path lets the
+/// UI compute a stable scattered LCN per file so SSDs show a spray
+/// pattern instead of a monotonic line, and the `outcome` lets it
+/// surface unreadable files in the Log tab.
+pub type FileProgress = Arc<dyn Fn(&std::path::Path, u8, ProgressOutcome) + Send + Sync>;
 
 /// Top-level entry point. Takes size-grouped, layout-annotated files
 /// and returns confirmed duplicate groups by full content hash.
@@ -351,29 +363,42 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(&f.entry.path, tier_index(tier), 0);
+                        cb(&f.entry.path, tier_index(tier), ProgressOutcome::Cached);
                     }
                     return Ok(h);
                 }
             }
         }
     }
-    let h = compute()?;
-    let bytes = tier_byte_estimate(tier, f.entry.size);
-    counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
-    if let Some(cb) = on_file {
-        cb(&f.entry.path, tier_index(tier), bytes);
-    }
-    if let Some(c) = cache {
-        if let Some(key) = cache_key(f) {
-            let mut hashes = CachedHashes::default();
-            put_hash(&mut hashes, tier, h);
-            if c.lock().store(&key, &hashes).is_ok() {
-                counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+    match compute() {
+        Ok(h) => {
+            let bytes = tier_byte_estimate(tier, f.entry.size);
+            counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+            if let Some(cb) = on_file {
+                cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
             }
+            if let Some(c) = cache {
+                if let Some(key) = cache_key(f) {
+                    let mut hashes = CachedHashes::default();
+                    put_hash(&mut hashes, tier, h);
+                    if c.lock().store(&key, &hashes).is_ok() {
+                        counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            Ok(h)
+        }
+        Err(e) => {
+            if let Some(cb) = on_file {
+                cb(
+                    &f.entry.path,
+                    tier_index(tier),
+                    ProgressOutcome::Failed { error: e.to_string() },
+                );
+            }
+            Err(e)
         }
     }
-    Ok(h)
 }
 
 fn tiered_optional<F>(
@@ -393,29 +418,39 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(&f.entry.path, tier_index(tier), 0);
+                        cb(&f.entry.path, tier_index(tier), ProgressOutcome::Cached);
                     }
                     return Some(h);
                 }
             }
         }
     }
-    let h = compute()?;
-    let bytes = tier_byte_estimate(tier, f.entry.size);
-    counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
-    if let Some(cb) = on_file {
-        cb(&f.entry.path, tier_index(tier), bytes);
-    }
-    if let Some(c) = cache {
-        if let Some(key) = cache_key(f) {
-            let mut hashes = CachedHashes::default();
-            put_hash(&mut hashes, tier, h);
-            if c.lock().store(&key, &hashes).is_ok() {
-                counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+    match compute() {
+        Some(h) => {
+            let bytes = tier_byte_estimate(tier, f.entry.size);
+            counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+            if let Some(cb) = on_file {
+                cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
             }
+            if let Some(c) = cache {
+                if let Some(key) = cache_key(f) {
+                    let mut hashes = CachedHashes::default();
+                    put_hash(&mut hashes, tier, h);
+                    if c.lock().store(&key, &hashes).is_ok() {
+                        counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            Some(h)
+        }
+        None => {
+            // Tier-0 fingerprint parser declined; this isn't an
+            // "error" per se (file just didn't match a known format).
+            // Don't surface it as a Failure — the file simply skips
+            // Tier 0 and continues to Tier 1.
+            None
         }
     }
-    Some(h)
 }
 
 fn tier_index(tier: Tier) -> u8 {

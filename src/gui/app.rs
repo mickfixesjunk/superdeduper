@@ -68,6 +68,10 @@ pub struct SuperdupeApp {
     /// is sitting on disk and the current roots+settings match it.
     /// Drives the "Resume" label on the primary scan button.
     can_resume: bool,
+    /// Drive scope filter: when the user clicks a drive panel, only
+    /// duplicate groups whose files live on that drive (plus any
+    /// reference paths) are shown in Groups / Treemap.
+    selected_drive: Option<u32>,
 }
 
 impl SuperdupeApp {
@@ -90,6 +94,7 @@ impl SuperdupeApp {
             groups_state: groups_table::GroupsTableState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             can_resume,
+            selected_drive: None,
         };
         if can_resume {
             app.state.push_log(
@@ -338,15 +343,26 @@ impl eframe::App for SuperdupeApp {
             .show(ctx, |ui| {
                 let avail = ui.available_height();
                 let scope_h = (avail * 0.50).clamp(380.0, 580.0);
+                let mut drive_clicked: Option<u32> = None;
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), scope_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         egui::ScrollArea::vertical()
                             .id_source("drive-scope")
-                            .show(ui, |ui| drive_scope::show(ui, &self.state));
+                            .show(ui, |ui| {
+                                drive_clicked =
+                                    drive_scope::show(ui, &self.state, self.selected_drive);
+                            });
                     },
                 );
+                if let Some(id) = drive_clicked {
+                    self.selected_drive = if self.selected_drive == Some(id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -362,15 +378,56 @@ impl eframe::App for SuperdupeApp {
                     pick("Treemap", ResultsTab::Treemap);
                     pick("Groups", ResultsTab::Groups);
                     pick("Log", ResultsTab::Log);
+                    // Filter chip — visible whenever a drive is selected.
+                    if let Some(id) = self.selected_drive {
+                        let label = self
+                            .state
+                            .drives
+                            .get(&id)
+                            .map(|d| {
+                                format!(
+                                    "  ✕ filtered to: {}",
+                                    d.info.volume_label
+                                )
+                            })
+                            .unwrap_or_else(|| "  ✕ clear filter".into());
+                        if ui
+                            .selectable_label(true, label)
+                            .on_hover_text("Click to clear the drive filter.")
+                            .clicked()
+                        {
+                            self.selected_drive = None;
+                        }
+                    }
                 });
                 ui.add_space(2.0);
 
+                let reference_roots: Vec<PathBuf> = self
+                    .persisted
+                    .roots
+                    .iter()
+                    .filter(|r| r.is_reference)
+                    .map(|r| r.path.clone())
+                    .collect();
+                let drive_root = self.selected_drive.and_then(|id| {
+                    self.persisted.roots.get(id as usize).map(|r| r.path.clone())
+                });
                 let mut group_action: Option<GroupAction> = None;
                 match self.persisted.results_tab {
-                    ResultsTab::Treemap => treemap::show(ui, &self.state),
+                    ResultsTab::Treemap => treemap::show_filtered(
+                        ui,
+                        &self.state,
+                        drive_root.as_deref(),
+                        &reference_roots,
+                    ),
                     ResultsTab::Groups => {
-                        group_action =
-                            groups_table::show(ui, &self.state, &mut self.groups_state);
+                        group_action = groups_table::show_filtered(
+                            ui,
+                            &self.state,
+                            &mut self.groups_state,
+                            drive_root.as_deref(),
+                            &reference_roots,
+                        );
                     }
                     ResultsTab::Log => log_panel::show(ui, &self.state),
                 }

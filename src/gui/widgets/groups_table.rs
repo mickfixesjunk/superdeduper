@@ -40,16 +40,35 @@ pub struct GroupsTableState {
     acted: hashbrown::HashSet<usize>,
 }
 
-/// Render the table. Returns the action the user clicked this frame,
-/// if any — caller dispatches it to the engine.
+/// Render the unfiltered table. Kept for callers that don't need a
+/// drive filter (the App always uses `show_filtered`).
 pub fn show(
     ui: &mut Ui,
     state: &UiState,
     table_state: &mut GroupsTableState,
 ) -> Option<GroupAction> {
+    show_filtered(ui, state, table_state, None, &[])
+}
+
+/// Render the table, filtering groups so only those with at least one
+/// member under `drive_root` (or any of `reference_roots`) are shown.
+/// Reference paths are exempt — they always show through any filter,
+/// matching the user's expectation that source-of-truth folders are
+/// always visible.
+pub fn show_filtered(
+    ui: &mut Ui,
+    state: &UiState,
+    table_state: &mut GroupsTableState,
+    drive_root: Option<&std::path::Path>,
+    reference_roots: &[std::path::PathBuf],
+) -> Option<GroupAction> {
     let mut clicked: Option<GroupAction> = None;
 
-    ui.label(RichText::new("Duplicate groups").color(theme::TEXT_LO).strong());
+    ui.label(
+        RichText::new("Duplicate groups")
+            .color(theme::TEXT_LO)
+            .strong(),
+    );
     ui.add_space(4.0);
 
     if state.duplicates.is_empty() {
@@ -73,13 +92,29 @@ pub fn show(
         return clicked;
     }
 
-    let mut sorted: Vec<(usize, &DuplicateGroupSummary)> =
-        state.duplicates.iter().enumerate().collect();
+    // Apply the drive filter: keep a group if any member lives under
+    // drive_root OR under any reference root. (Empty filter ⇒ keep
+    // every group, original behaviour.)
+    let mut sorted: Vec<(usize, &DuplicateGroupSummary)> = state
+        .duplicates
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| group_passes_filter(g, drive_root, reference_roots))
+        .collect();
     sorted.sort_by(|a, b| {
         let sa = a.1.size.saturating_mul(a.1.files.len().saturating_sub(1) as u64);
         let sb = b.1.size.saturating_mul(b.1.files.len().saturating_sub(1) as u64);
         sb.cmp(&sa)
     });
+
+    if sorted.is_empty() {
+        ui.label(
+            RichText::new("No duplicates on this drive.")
+                .color(theme::TEXT_LO)
+                .italics(),
+        );
+        return clicked;
+    }
 
     ScrollArea::vertical().id_source("groups-table").show(ui, |ui| {
         TableBuilder::new(ui)
@@ -247,4 +282,16 @@ pub fn show(
 
 fn format_path(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+fn group_passes_filter(
+    g: &DuplicateGroupSummary,
+    drive_root: Option<&Path>,
+    reference_roots: &[std::path::PathBuf],
+) -> bool {
+    // No filter ⇒ everything passes.
+    let Some(root) = drive_root else { return true };
+    g.files.iter().any(|p| {
+        p.starts_with(root) || reference_roots.iter().any(|r| p.starts_with(r))
+    })
 }

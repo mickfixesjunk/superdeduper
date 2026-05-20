@@ -5,3 +5,8 @@ Cargo.lock.bak
 .vscode/
 .idea/
 *.swp
+
+# Locally cross-compiled test build dropped next to the repo for
+# the maintainer's iteration loop. Not part of any release.
+/superdupe-gui.exe
+/diagnostics/
