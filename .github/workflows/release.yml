@@ -91,11 +91,16 @@ jobs:
       - name: Compute SHA-256 checksums
         shell: pwsh
         run: |
+          # Materialise the file list eagerly so the pipeline doesn't
+          # try to hash SHA256SUMS itself while Out-File still holds
+          # the write handle.
           $stage = "stage/${{ matrix.artifact }}"
-          Get-ChildItem $stage -File | ForEach-Object {
-            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower()
-            "$hash  $($_.Name)"
-          } | Out-File -Encoding ascii "$stage/SHA256SUMS"
+          $files = @(Get-ChildItem $stage -File | Where-Object { $_.Name -ne 'SHA256SUMS' })
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $f.FullName).Hash.ToLower()
+            "$hash  $($f.Name)"
+          }
+          $lines | Set-Content -Encoding ascii -Path "$stage/SHA256SUMS"
           Get-Content "$stage/SHA256SUMS"
 
       - name: Zip artifact
