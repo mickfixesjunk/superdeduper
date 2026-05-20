@@ -13,6 +13,7 @@
 pub mod app;
 pub mod demo;
 pub mod events;
+pub mod live;
 pub mod state;
 pub mod theme;
 pub mod widgets;

@@ -24,10 +24,14 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use hashbrown::HashMap;
+use parking_lot::Mutex;
 use rayon::prelude::*;
 
+use crate::cache::{Cache, CacheKey, CachedHashes};
 use crate::config::ScanConfig;
 use crate::pipeline::layout::{LaidOutFile, LaidOutGroup};
 use crate::pipeline::DuplicateGroup;
@@ -44,22 +48,66 @@ const TIER2_MIN_FILE: u64 = 256 * 1024;
 /// Read buffer for Tier 3 streaming.
 const TIER3_BUF: usize = 1 << 20;
 
+/// Per-scan instrumentation. The engine atomically updates these
+/// counters so callers (CLI summary, GUI scope) can read them without
+/// locking. Returned alongside the duplicates from [`run`].
+#[derive(Default, Debug)]
+pub struct HashCounters {
+    pub cache_hits: AtomicU64,
+    pub cache_writes: AtomicU64,
+    pub bytes_read: AtomicU64,
+}
+
 /// Top-level entry point. Takes size-grouped, layout-annotated files
 /// and returns confirmed duplicate groups by full content hash.
 pub fn run(groups: Vec<LaidOutGroup>, cfg: &ScanConfig) -> Result<Vec<DuplicateGroup>> {
+    let (dups, _) = run_with_counters(groups, cfg, None)?;
+    Ok(dups)
+}
+
+/// Hash with optional cache integration and instrumentation. The cache
+/// is consulted before each tier and written after each successful
+/// hash; this is what makes the "warm rescan is near-instant" promise
+/// real.
+pub fn run_with_counters(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    let counters = Arc::new(HashCounters::default());
     let mut confirmed: Vec<DuplicateGroup> = groups
         .into_par_iter()
-        .map(|g| run_group(g, cfg))
+        .map(|g| run_group(g, cfg, cache.as_ref(), &counters))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
         .collect();
 
     confirmed.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.files.cmp(&b.files)));
-    Ok(confirmed)
+    // Unwrap is safe — we hold the only strong reference at this point.
+    let counters = Arc::try_unwrap(counters).unwrap_or_else(|arc| HashCounters {
+        cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
+        cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
+        bytes_read: AtomicU64::new(arc.bytes_read.load(Ordering::Relaxed)),
+    });
+    Ok((confirmed, counters))
 }
 
-fn run_group(group: LaidOutGroup, cfg: &ScanConfig) -> Result<Vec<DuplicateGroup>> {
+/// Which tier a cached hash slot maps to.
+#[derive(Copy, Clone, Debug)]
+enum Tier {
+    Zero,
+    One,
+    Two,
+    Three,
+}
+
+fn run_group(
+    group: LaidOutGroup,
+    cfg: &ScanConfig,
+    cache: Option<&Arc<Mutex<Cache>>>,
+    counters: &Arc<HashCounters>,
+) -> Result<Vec<DuplicateGroup>> {
     let size = group.size;
 
     // Zero-byte short circuit.
@@ -84,28 +132,38 @@ fn run_group(group: LaidOutGroup, cfg: &ScanConfig) -> Result<Vec<DuplicateGroup
     // (unsupported extension or parse failure) skip Tier 0 and stay in
     // the group untouched.
     if cfg.use_format_aware {
-        survivors = split_by_optional(&survivors, |f| format::fingerprint(&f.entry.path, size))?;
+        survivors = split_by_optional(&survivors, |f| {
+            tiered_optional(f, Tier::Zero, cache, counters, || {
+                format::fingerprint(&f.entry.path, size)
+            })
+        })?;
         if survivors.len() < 2 {
             return Ok(Vec::new());
         }
     }
 
     // Tier 1: 4 KiB head sample.
-    survivors = split_by(&survivors, |f| tier1_hash(f, size))?;
+    survivors = split_by(&survivors, |f| {
+        tiered(f, Tier::One, cache, counters, || tier1_hash(f, size))
+    })?;
     if survivors.len() < 2 {
         return Ok(Vec::new());
     }
 
     // Tier 2: head+mid+tail, skipped for small files.
     if size >= TIER2_MIN_FILE {
-        survivors = split_by(&survivors, |f| tier2_hash(f, size))?;
+        survivors = split_by(&survivors, |f| {
+            tiered(f, Tier::Two, cache, counters, || tier2_hash(f, size))
+        })?;
         if survivors.len() < 2 {
             return Ok(Vec::new());
         }
     }
 
     // Tier 3: full BLAKE3.
-    let groups = into_subgroups(&survivors, |f| tier3_hash(f, size))?;
+    let groups = into_subgroups(&survivors, |f| {
+        tiered(f, Tier::Three, cache, counters, || tier3_hash(f, size))
+    })?;
     let mut out = Vec::new();
     for (hash, files) in groups {
         if files.len() < 2 {
@@ -213,6 +271,118 @@ where
         out.entry(h).or_default().push(f);
     }
     Ok(out)
+}
+
+/// Wrap a hash computation in a cache lookup-or-store. Returns the
+/// cached hash if `(volume_guid, file_ref, size, mtime, usn)` matches;
+/// otherwise calls `compute`, stores the result, and returns it.
+fn tiered<F>(
+    f: &LaidOutFile,
+    tier: Tier,
+    cache: Option<&Arc<Mutex<Cache>>>,
+    counters: &Arc<HashCounters>,
+    compute: F,
+) -> std::io::Result<[u8; 32]>
+where
+    F: FnOnce() -> std::io::Result<[u8; 32]>,
+{
+    if let Some(c) = cache {
+        if let Some(key) = cache_key(f) {
+            if let Ok(Some(cached)) = c.lock().lookup(&key) {
+                if let Some(h) = pick_hash(&cached, tier) {
+                    counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(h);
+                }
+            }
+        }
+    }
+    let h = compute()?;
+    counters
+        .bytes_read
+        .fetch_add(tier_byte_estimate(tier, f.entry.size), Ordering::Relaxed);
+    if let Some(c) = cache {
+        if let Some(key) = cache_key(f) {
+            let mut hashes = CachedHashes::default();
+            put_hash(&mut hashes, tier, h);
+            if c.lock().store(&key, &hashes).is_ok() {
+                counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    Ok(h)
+}
+
+/// Like [`tiered`] but the compute step returns `Option<[u8; 32]>` for
+/// callers (Tier 0) that may simply lack a fingerprint.
+fn tiered_optional<F>(
+    f: &LaidOutFile,
+    tier: Tier,
+    cache: Option<&Arc<Mutex<Cache>>>,
+    counters: &Arc<HashCounters>,
+    compute: F,
+) -> Option<[u8; 32]>
+where
+    F: FnOnce() -> Option<[u8; 32]>,
+{
+    if let Some(c) = cache {
+        if let Some(key) = cache_key(f) {
+            if let Ok(Some(cached)) = c.lock().lookup(&key) {
+                if let Some(h) = pick_hash(&cached, tier) {
+                    counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(h);
+                }
+            }
+        }
+    }
+    let h = compute()?;
+    if let Some(c) = cache {
+        if let Some(key) = cache_key(f) {
+            let mut hashes = CachedHashes::default();
+            put_hash(&mut hashes, tier, h);
+            if c.lock().store(&key, &hashes).is_ok() {
+                counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    Some(h)
+}
+
+fn cache_key(f: &LaidOutFile) -> Option<CacheKey> {
+    let guid = f.entry.volume_guid.clone()?;
+    Some(CacheKey {
+        volume_guid: guid,
+        file_ref: f.entry.file_ref as i64,
+        size: f.entry.size,
+        mtime: f.entry.mtime,
+        usn: f.entry.usn,
+    })
+}
+
+fn pick_hash(c: &CachedHashes, tier: Tier) -> Option<[u8; 32]> {
+    match tier {
+        Tier::Zero => c.tier0_fingerprint,
+        Tier::One => c.tier1_hash,
+        Tier::Two => c.tier2_hash,
+        Tier::Three => c.tier3_hash,
+    }
+}
+
+fn put_hash(c: &mut CachedHashes, tier: Tier, h: [u8; 32]) {
+    match tier {
+        Tier::Zero => c.tier0_fingerprint = Some(h),
+        Tier::One => c.tier1_hash = Some(h),
+        Tier::Two => c.tier2_hash = Some(h),
+        Tier::Three => c.tier3_hash = Some(h),
+    }
+}
+
+fn tier_byte_estimate(tier: Tier, size: u64) -> u64 {
+    match tier {
+        Tier::Zero => 64 * 1024, // typical structural region
+        Tier::One => size.min(TIER1_BYTES),
+        Tier::Two => 3 * TIER2_REGION,
+        Tier::Three => size,
+    }
 }
 
 fn tier1_hash(f: &LaidOutFile, size: u64) -> std::io::Result<[u8; 32]> {
