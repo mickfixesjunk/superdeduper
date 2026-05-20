@@ -21,6 +21,8 @@
 //! pipeline that submits sector-aligned, LCN-sorted, direct-I/O
 //! requests. The tier logic above is independent of how bytes arrive.
 
+use std::time::Instant;
+
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -54,11 +56,26 @@ const TIER3_BUF: usize = 1 << 20;
 /// Per-scan instrumentation. The engine atomically updates these
 /// counters so callers (CLI summary, GUI scope) can read them without
 /// locking. Returned alongside the duplicates from [`run`].
+///
+/// Per-tier timing is **summed CPU time across all rayon workers**,
+/// not wallclock, so it scales linearly with parallelism and is
+/// directly comparable across hash algorithms. Use it to answer
+/// "which tier did all my CPU time go into?" — typical pattern is
+/// `tier3_micros` dominating because Tier 3 reads the whole file.
 #[derive(Default, Debug)]
 pub struct HashCounters {
     pub cache_hits: AtomicU64,
     pub cache_writes: AtomicU64,
     pub bytes_read: AtomicU64,
+    /// Microseconds spent computing a fresh hash at each tier
+    /// (cache hits and failures excluded — only successful
+    /// computes count). Index 0..=3 → Tier 0 / 1 / 2 / 3.
+    pub tier_micros: [AtomicU64; 4],
+    /// Bytes hashed (input size, not output size) at each tier.
+    /// Lets the CLI / diagnostics print MB/s per tier.
+    pub tier_bytes: [AtomicU64; 4],
+    /// Number of files whose compute step succeeded at each tier.
+    pub tier_count: [AtomicU64; 4],
 }
 
 /// Outcome reported by the per-file [`FileProgress`] callback.
@@ -147,10 +164,23 @@ fn run_with_counters_inner(
         .collect();
 
     confirmed.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.files.cmp(&b.files)));
-    let counters = Arc::try_unwrap(counters).unwrap_or_else(|arc| HashCounters {
-        cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
-        cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
-        bytes_read: AtomicU64::new(arc.bytes_read.load(Ordering::Relaxed)),
+    let counters = Arc::try_unwrap(counters).unwrap_or_else(|arc| {
+        let snap_arr = |slot: &[AtomicU64; 4]| {
+            [
+                AtomicU64::new(slot[0].load(Ordering::Relaxed)),
+                AtomicU64::new(slot[1].load(Ordering::Relaxed)),
+                AtomicU64::new(slot[2].load(Ordering::Relaxed)),
+                AtomicU64::new(slot[3].load(Ordering::Relaxed)),
+            ]
+        };
+        HashCounters {
+            cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
+            cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
+            bytes_read: AtomicU64::new(arc.bytes_read.load(Ordering::Relaxed)),
+            tier_micros: snap_arr(&arc.tier_micros),
+            tier_bytes: snap_arr(&arc.tier_bytes),
+            tier_count: snap_arr(&arc.tier_count),
+        }
     });
     Ok((confirmed, counters))
 }
@@ -376,10 +406,16 @@ where
             }
         }
     }
+    let started = Instant::now();
     match compute() {
         Ok(h) => {
+            let elapsed_us = started.elapsed().as_micros() as u64;
             let bytes = tier_byte_estimate(tier, f.entry.size);
             counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+            let idx = tier_index(tier) as usize;
+            counters.tier_micros[idx].fetch_add(elapsed_us, Ordering::Relaxed);
+            counters.tier_bytes[idx].fetch_add(bytes, Ordering::Relaxed);
+            counters.tier_count[idx].fetch_add(1, Ordering::Relaxed);
             if let Some(cb) = on_file {
                 cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
             }
@@ -432,10 +468,16 @@ where
             }
         }
     }
+    let started = Instant::now();
     match compute() {
         Some(h) => {
+            let elapsed_us = started.elapsed().as_micros() as u64;
             let bytes = tier_byte_estimate(tier, f.entry.size);
             counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+            let idx = tier_index(tier) as usize;
+            counters.tier_micros[idx].fetch_add(elapsed_us, Ordering::Relaxed);
+            counters.tier_bytes[idx].fetch_add(bytes, Ordering::Relaxed);
+            counters.tier_count[idx].fetch_add(1, Ordering::Relaxed);
             if let Some(cb) = on_file {
                 cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
             }

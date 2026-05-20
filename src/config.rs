@@ -64,7 +64,7 @@ impl ScanConfig {
             output: args.output.clone(),
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
-            hash_algo: crate::pipeline::hash::HashAlgo::Blake3,
+            hash_algo: args.hash_algo.into(),
         })
     }
 }
