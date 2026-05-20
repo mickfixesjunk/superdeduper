@@ -77,6 +77,14 @@ pub struct DuplicateGroupSummary {
     pub files: Vec<PathBuf>,
 }
 
+/// Severity tag for [`EngineEvent::Log`] entries.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
 /// Every event flows through this enum.
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
@@ -106,4 +114,13 @@ pub enum EngineEvent {
     },
     /// Human-readable status line to surface in the header.
     Status(String),
+    /// Adds a row to the GUI log panel. Used for things like "scan
+    /// finished with 0 results because 4,182 directories were
+    /// permission-denied" — the kind of context that turns a silent
+    /// failure into an actionable signal.
+    Log { level: LogLevel, message: String },
+    /// User requested a pause; the engine has flushed checkpoint state
+    /// and is now idle. Re-issuing a scan with the same roots resumes.
+    ScanPaused { at: Instant, checkpoint_id: String },
 }
+

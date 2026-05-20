@@ -1,12 +1,8 @@
 //! `superdupe-gui` — desktop window for the engine.
 //!
-//! Modes:
-//!
-//! * `superdupe-gui` (no args) — demo mode. A synthetic engine streams
-//!   realistic events so the GUI is usable on any host without a real
-//!   scan target. Great for screenshots and design iteration.
-//! * `superdupe-gui --live <PATH>…` — wires the real engine to the
-//!   same event channel. Identical UI, real data.
+//! By default launches into an idle "pick a folder to scan" state.
+//! Pass `--demo` to replay the synthetic engine for screenshots; pass
+//! `--live <PATH>…` to start a real scan immediately on those paths.
 
 use std::path::PathBuf;
 
@@ -17,13 +13,14 @@ use superdupe::gui::SuperdupeApp;
 #[derive(Debug, Parser)]
 #[command(name = "superdupe-gui", version, about = "superdupe desktop GUI")]
 struct Args {
-    /// Run a real scan against these paths instead of the demo.
-    #[arg(long, conflicts_with = "demo")]
-    live: bool,
-    /// Force demo mode even with paths. Default when no --live flag.
+    /// Run a real scan against these paths instead of waiting for the
+    /// user to click "Scan".
     #[arg(long)]
+    live: bool,
+    /// Replay the synthetic demo engine. Useful for screenshots.
+    #[arg(long, conflicts_with = "live")]
     demo: bool,
-    /// Paths to scan when --live is set.
+    /// Paths to scan when --live is set, or to seed the roots panel.
     #[arg(value_name = "PATHS")]
     paths: Vec<PathBuf>,
 }
@@ -40,20 +37,30 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    let live_paths = if args.live { Some(args.paths) } else { None };
-    let demo_mode = live_paths.is_none() || args.demo;
+    let live_paths = if args.live && !args.paths.is_empty() {
+        Some(args.paths.clone())
+    } else {
+        None
+    };
+    let seed_roots = if !args.live { args.paths.clone() } else { Vec::new() };
+    let start_demo = args.demo;
 
     eframe::run_native(
         "superdupe",
         native_options,
         Box::new(move |cc| {
-            let app = SuperdupeApp::new(cc, demo_mode);
+            let mut app = SuperdupeApp::new(cc, start_demo);
+            for p in &seed_roots {
+                app.add_root(p.clone(), false);
+            }
             if let Some(paths) = live_paths.clone() {
-                if !paths.is_empty() {
-                    superdupe::gui::live::spawn(app.sender(), paths);
+                for p in &paths {
+                    app.add_root(p.clone(), false);
                 }
+                app.start_live();
             }
             Ok(Box::new(app))
         }),
     )
 }
+

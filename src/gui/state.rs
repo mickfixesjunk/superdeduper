@@ -6,14 +6,66 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hashbrown::HashMap;
+use serde::{Deserialize, Serialize};
 
-use crate::gui::events::{DriveId, DriveInfo, DuplicateGroupSummary, EngineEvent, ReadSample, Stage};
+use crate::gui::events::{
+    DriveId, DriveInfo, DuplicateGroupSummary, EngineEvent, LogLevel, ReadSample, Stage,
+};
 
 /// Ring buffer of read samples for the live scope, capped to keep
 /// rendering fast even on multi-hour scans.
 const SCOPE_BUFFER: usize = 4096;
 /// Throughput sparkline window (seconds shown on the X axis).
 pub const THROUGHPUT_WINDOW_SECS: f64 = 30.0;
+
+/// One row in the Roots panel. `is_reference` files are never offered
+/// for destructive action; they're always treated as keepers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootEntry {
+    pub path: PathBuf,
+    pub is_reference: bool,
+}
+
+/// Persisted user preferences. Loaded via egui's persistence on
+/// startup; survives app restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanSettings {
+    pub min_size_bytes: u64,
+    pub max_size_bytes: Option<u64>,
+    pub include_glob: String,
+    pub exclude_glob: String,
+    pub use_format_aware: bool,
+    pub use_cache: bool,
+    pub paranoid: bool,
+    pub follow_links: bool,
+    pub threads: Option<usize>,
+    pub allow_system_paths: bool,
+}
+
+impl Default for ScanSettings {
+    fn default() -> Self {
+        Self {
+            min_size_bytes: 4 * 1024,
+            max_size_bytes: None,
+            include_glob: String::new(),
+            exclude_glob: String::new(),
+            use_format_aware: true,
+            use_cache: true,
+            paranoid: false,
+            follow_links: false,
+            threads: None,
+            allow_system_paths: false,
+        }
+    }
+}
+
+/// One row in the Log panel. Surfaced from `EngineEvent::Log`.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub at: Instant,
+    pub level: LogLevel,
+    pub message: String,
+}
 
 #[derive(Default)]
 pub struct UiState {
@@ -26,6 +78,7 @@ pub struct UiState {
     pub drives: HashMap<DriveId, DriveLive>,
     pub duplicates: Vec<DuplicateGroupSummary>,
     pub totals: Totals,
+    pub logs: VecDeque<LogEntry>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -171,8 +224,26 @@ impl UiState {
                 };
                 self.status = "Done.".into();
             }
+            EngineEvent::ScanPaused { at, checkpoint_id } => {
+                self.scan_finished_at = Some(at);
+                self.status = format!("Paused — resume by clicking Scan ({} saved)", checkpoint_id);
+            }
             EngineEvent::Status(s) => self.status = s,
+            EngineEvent::Log { level, message } => {
+                self.push_log(level, message);
+            }
         }
+    }
+
+    pub fn push_log(&mut self, level: LogLevel, message: String) {
+        if self.logs.len() >= 1024 {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(LogEntry {
+            at: Instant::now(),
+            level,
+            message,
+        });
     }
 
     pub fn scan_elapsed(&self) -> Option<Duration> {
