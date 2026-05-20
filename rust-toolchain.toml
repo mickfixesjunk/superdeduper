@@ -1,0 +1,8 @@
+# Pinning the toolchain makes builds reproducible: anyone who checks
+# this commit out and runs `cargo build --release --locked` gets the
+# exact same bytes the release workflow does. Bumping requires a
+# deliberate commit so reviewers can think about the upgrade.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -30,13 +30,44 @@ auto-tuned queue depth (HDD ≈ 32, SSD ≈ 256), and a SQLite cache keyed by
 `(volume_guid, file_ref, size, mtime, usn)` makes warm rescans
 near-instant via the USN journal.
 
-## Building
+## Installing a release
+
+Releases are at
+[github.com/mickfixesjunk/superdupe/releases](https://github.com/mickfixesjunk/superdupe/releases).
+Each release ships a per-architecture zip with `superdupe.exe`,
+`superdupe-gui.exe`, the LICENSE, and a `SHA256SUMS` manifest. All
+artifacts are reproducibly built in public CI and signed twice —
+once via [GitHub Sigstore attestations][gh-attest] (always) and once
+via Authenticode (when a code-signing cert is configured).
+
+**Always verify a download before running it.** Step-by-step
+instructions live in [SECURITY.md](SECURITY.md); the short version is:
 
 ```pwsh
-cargo build --release
+gh attestation verify superdupe-x86_64-windows.zip --repo mickfixesjunk/superdupe
 ```
 
-The release binary is a single `target\release\superdupe.exe`.
+If you see anything other than `verification succeeded`, do not run
+the binary — it didn't come from this repo's `release.yml`.
+
+[gh-attest]: https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds
+
+## Building from source
+
+```pwsh
+cargo build --release --locked
+```
+
+The release binary is a single `target\release\superdupe.exe`. The
+optional GUI:
+
+```pwsh
+cargo build --release --locked --features gui --bin superdupe-gui
+```
+
+`rust-toolchain.toml` pins the toolchain; `--locked` enforces the
+checked-in `Cargo.lock`. Together they make local builds bit-for-bit
+match the release workflow.
 
 ## Usage
 
