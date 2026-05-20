@@ -319,8 +319,8 @@ mod tests {
         let d = tmp();
         let a = d.join("a.bin");
         let b = d.join("b.bin");
-        fs::write(&a, &vec![0xAAu8; 1024]).unwrap();
-        fs::write(&b, &vec![0xBBu8; 1024]).unwrap();
+        fs::write(&a, vec![0xAAu8; 1024]).unwrap();
+        fs::write(&b, vec![0xBBu8; 1024]).unwrap();
         let s = buffered::BufferedScheduler::new();
         s.submit(ReadRequest {
             start_lcn_bytes: 1_000_000_000,

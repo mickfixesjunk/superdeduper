@@ -53,7 +53,7 @@ pub fn show(ui: &mut Ui, state: &UiState) {
             })
         })
         .collect();
-    tiles.sort_by(|a, b| b.savings.cmp(&a.savings));
+    tiles.sort_by_key(|t| std::cmp::Reverse(t.savings));
     if tiles.len() > 256 {
         tiles.truncate(256);
     }
@@ -78,7 +78,7 @@ pub fn show(ui: &mut Ui, state: &UiState) {
     if let Some(pos) = response.hover_pos() {
         if let Some(placement) = placed.iter().find(|p| p.rect.contains(pos)) {
             response.clone().on_hover_ui_at_pointer(|ui| {
-                tooltip(ui, &placement.tile);
+                tooltip(ui, placement.tile);
             });
         }
     }

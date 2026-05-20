@@ -33,11 +33,7 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, _size: u64) -> std::io::Result<Vec
 
     let mut datetime_original: Option<Vec<u8>> = None;
 
-    loop {
-        let marker = match read_u16_be(r) {
-            Ok(m) => m,
-            Err(_) => break,
-        };
+    while let Ok(marker) = read_u16_be(r) {
         if marker == SOS || marker == EOI {
             break;
         }
@@ -66,8 +62,8 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, _size: u64) -> std::io::Result<Vec
             }
         }
         // SOFn: 0xFFC0..=0xFFCF except 0xFFC4 (DHT) and 0xFFCC (DAC).
-        if (0xFFC0..=0xFFCF).contains(&marker) && marker != 0xFFC4 && marker != 0xFFCC {
-            if payload_len >= 5 {
+        if (0xFFC0..=0xFFCF).contains(&marker) && marker != 0xFFC4 && marker != 0xFFCC
+            && payload_len >= 5 {
                 let precision = payload[0];
                 let height = u16::from_be_bytes([payload[1], payload[2]]);
                 let width = u16::from_be_bytes([payload[3], payload[4]]);
@@ -76,7 +72,6 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, _size: u64) -> std::io::Result<Vec
                 hasher.update(&height.to_be_bytes());
                 hasher.update(&width.to_be_bytes());
             }
-        }
     }
 
     if let Some(dt) = datetime_original {

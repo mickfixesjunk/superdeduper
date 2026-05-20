@@ -144,7 +144,18 @@ impl Cache {
     /// the cached `(size, mtime, usn)` differ from the supplied key —
     /// i.e. the file has changed since we last hashed it.
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<CachedHashes>> {
-        let row: Option<(i64, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = self
+        // Row layout from the SELECT below. Aliased so the function
+        // signature isn't a 100-column horror.
+        type Row = (
+            i64,             // size
+            i64,             // mtime
+            i64,             // usn
+            Option<Vec<u8>>, // tier0_fingerprint
+            Option<Vec<u8>>, // tier1_hash
+            Option<Vec<u8>>, // tier2_hash
+            Option<Vec<u8>>, // tier3_hash
+        );
+        let row: Option<Row> = self
             .conn
             .query_row(
                 "SELECT size, mtime, usn, tier0_fingerprint, tier1_hash, tier2_hash, tier3_hash
@@ -325,8 +336,7 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let mut hashes = CachedHashes::default();
-        hashes.tier3_hash = Some([0xABu8; 32]);
+        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
 
         let got = cache.lookup(&k).unwrap().expect("row should exist");
@@ -339,8 +349,7 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let mut hashes = CachedHashes::default();
-        hashes.tier3_hash = Some([0xABu8; 32]);
+        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
 
         let modified = key(42, 2048, 100_000, 7);
@@ -353,8 +362,7 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let mut hashes = CachedHashes::default();
-        hashes.tier3_hash = Some([0xABu8; 32]);
+        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
         let modified = key(42, 1024, 100_001, 7);
         assert!(cache.lookup(&modified).unwrap().is_none());
@@ -366,8 +374,7 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let mut hashes = CachedHashes::default();
-        hashes.tier3_hash = Some([0xABu8; 32]);
+        let hashes = CachedHashes { tier3_hash: Some([0xABu8; 32]), ..CachedHashes::default() };
         cache.store(&k, &hashes).unwrap();
         let modified = key(42, 1024, 100_000, 8);
         assert!(cache.lookup(&modified).unwrap().is_none());

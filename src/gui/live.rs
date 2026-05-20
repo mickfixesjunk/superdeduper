@@ -615,7 +615,7 @@ fn filter_reference_only(
     files
 }
 
-fn reference_belongs(path: &PathBuf, reference_set: &hashbrown::HashSet<PathBuf>) -> bool {
+fn reference_belongs(path: &std::path::Path, reference_set: &hashbrown::HashSet<PathBuf>) -> bool {
     for r in reference_set {
         if path.starts_with(r) {
             return true;

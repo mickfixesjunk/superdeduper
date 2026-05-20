@@ -158,7 +158,7 @@ fn run_group(
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<DuplicateGroup>> {
     let size = group.size;
-    if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Ok(Vec::new());
     }
 
@@ -180,7 +180,7 @@ fn run_group(
 
     if cfg.use_format_aware {
         survivors = split_by_optional(&survivors, |f| {
-            if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return None;
             }
             tiered_optional(f, Tier::Zero, cache, counters, on_file, || {
@@ -192,7 +192,7 @@ fn run_group(
         }
     }
 
-    if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Ok(Vec::new());
     }
     survivors = split_by(&survivors, |f| {
@@ -203,7 +203,7 @@ fn run_group(
     }
 
     if size >= TIER2_MIN_FILE {
-        if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Ok(Vec::new());
         }
         survivors = split_by(&survivors, |f| {
@@ -214,7 +214,7 @@ fn run_group(
         }
     }
 
-    if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Ok(Vec::new());
     }
     let groups = into_subgroups(&survivors, |f| {
@@ -510,7 +510,7 @@ fn tier3_hash_cancellable(
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; TIER3_BUF];
     loop {
-        if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "cancelled",

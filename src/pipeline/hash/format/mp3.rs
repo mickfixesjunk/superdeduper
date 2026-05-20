@@ -82,12 +82,8 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, size: u64) -> std::io::Result<Vec<
 }
 
 fn find_sync(buf: &[u8]) -> Option<usize> {
-    for i in 0..buf.len().saturating_sub(1) {
-        if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
-            return Some(i);
-        }
-    }
-    None
+    (0..buf.len().saturating_sub(1))
+        .find(|&i| buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0)
 }
 
 fn walk_frames<R: Read + Seek>(

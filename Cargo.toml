@@ -2,7 +2,7 @@
 name = "superdupe"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.87"
 description = "superdupe — the fastest duplicate file finder for Windows / NTFS."
 license = "MIT"
 repository = "https://github.com/mdreeling/superdupe"

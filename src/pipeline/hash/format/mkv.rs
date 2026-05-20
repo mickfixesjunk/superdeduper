@@ -116,7 +116,7 @@ fn walk_info<R: Read + Seek>(
 }
 
 fn position<S: Seek>(s: &mut S) -> std::io::Result<u64> {
-    s.seek(SeekFrom::Current(0))
+    s.stream_position()
 }
 
 /// Read an EBML element header: variable-length element ID followed by
