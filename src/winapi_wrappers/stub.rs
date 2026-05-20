@@ -38,3 +38,11 @@ pub fn query_storage_device(_volume: &str) -> Result<StorageDeviceInfo> {
 pub fn get_retrieval_pointers(_path: &Path) -> Result<Vec<ExtentRun>> {
     Err(Error::Unsupported("Windows-only FSCTL_GET_RETRIEVAL_POINTERS"))
 }
+
+pub fn recycle(_p: &Path) -> Result<()> {
+    Err(Error::Unsupported("Windows-only Recycle Bin"))
+}
+
+pub fn replace_with_hardlink(_t: &Path, _k: &Path) -> Result<()> {
+    Err(Error::Unsupported("Windows-only CreateHardLinkW"))
+}

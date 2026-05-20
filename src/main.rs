@@ -4,9 +4,10 @@ use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use superdupe::cli::{Cli, Command, ScanArgs};
+use superdupe::cache::Cache;
+use superdupe::cli::{CacheCommand, Cli, Command, DedupeArgs, ScanArgs};
 use superdupe::config::ScanConfig;
-use superdupe::{inventory, output, pipeline};
+use superdupe::{dedupe, inventory, output, pipeline};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -14,12 +15,8 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Scan(args) => run_scan(args),
-        Command::Dedupe(_) => {
-            anyhow::bail!("`dedupe` is not yet implemented in this build");
-        }
-        Command::Cache(_) => {
-            anyhow::bail!("`cache` is not yet implemented in this build");
-        }
+        Command::Dedupe(args) => run_dedupe(args),
+        Command::Cache(cmd) => run_cache(cmd),
     }
 }
 
@@ -30,11 +27,11 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         roots = ?cfg.roots,
         threads = cfg.threads,
         min_size = cfg.min_size,
+        format_aware = cfg.use_format_aware,
+        cache = cfg.use_cache,
         "starting scan",
     );
 
-    // Apply the requested rayon thread pool size globally. Failure here is
-    // not fatal — rayon falls back to its default and we log once.
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.threads)
         .build_global()
@@ -69,6 +66,55 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     output::write(writer.as_mut(), cfg.format, &duplicates)?;
     writer.flush()?;
 
+    Ok(())
+}
+
+fn run_dedupe(args: DedupeArgs) -> anyhow::Result<()> {
+    let outcome = dedupe::run(&args).context("dedupe failed")?;
+    let mut stderr = io::stderr().lock();
+    writeln!(
+        stderr,
+        "Planned: {} · executed: {} · skipped (reference): {} · skipped (system): {} · skipped (changed): {} · failed: {}",
+        outcome.planned,
+        outcome.executed,
+        outcome.skipped_reference,
+        outcome.skipped_system,
+        outcome.skipped_invalidated,
+        outcome.failed,
+    )?;
+    writeln!(
+        stderr,
+        "Reclaimed (planned): {}",
+        humansize::format_size(outcome.bytes_reclaimed, humansize::BINARY),
+    )?;
+    if outcome.failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_cache(cmd: CacheCommand) -> anyhow::Result<()> {
+    let path = superdupe::cache::default_cache_path()?;
+    let cache = Cache::open(&path).context("opening cache database")?;
+    match cmd {
+        CacheCommand::Info => {
+            let stats = cache.stats(&path).context("reading cache stats")?;
+            println!("path:           {}", stats.path.display());
+            println!("rows:           {}", stats.rows);
+            println!(
+                "size on disk:   {}",
+                humansize::format_size(stats.bytes_on_disk, humansize::BINARY)
+            );
+        }
+        CacheCommand::Clear => {
+            cache.clear()?;
+            tracing::info!(path = %path.display(), "cache cleared");
+        }
+        CacheCommand::Vacuum => {
+            cache.vacuum()?;
+            tracing::info!(path = %path.display(), "cache compacted");
+        }
+    }
     Ok(())
 }
 
