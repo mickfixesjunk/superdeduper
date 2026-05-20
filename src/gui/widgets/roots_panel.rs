@@ -23,6 +23,10 @@ pub enum RootsAction {
     StartScan,
     Pause,
     Cancel,
+    /// Walk every root (reference included) and strip the
+    /// `.superdupe` suffix from any file that has it — the safe-mode
+    /// undo. Doesn't require a prior scan.
+    Unsuperdupe,
 }
 
 pub fn show(
@@ -120,6 +124,7 @@ pub fn show(
     ui.add_space(6.0);
 
     let can_scan = !roots.is_empty() && !is_scanning;
+    let can_unsuperdupe = !roots.is_empty() && !is_scanning;
     ui.horizontal(|ui| {
         let primary_label = if is_scanning {
             "⏸  Pause"
@@ -142,6 +147,25 @@ pub fn show(
             } else {
                 RootsAction::StartScan
             });
+        }
+
+        // Unsuperdupe sits beside Start scan — no scan required, just
+        // walks the roots and strips `.superdupe` extensions back.
+        let unsuperdupe = egui::Button::new(
+            RichText::new("↩  Unsuperdupe").color(theme::TEXT_HI),
+        )
+        .fill(theme::PANEL_DEEP)
+        .min_size(vec2(140.0, 28.0));
+        if ui
+            .add_enabled(can_unsuperdupe, unsuperdupe)
+            .on_hover_text(
+                "Walk every root and rename any *.superdupe file back \
+                 to its original. Reverses safe-mode rename. No scan \
+                 required.",
+            )
+            .clicked()
+        {
+            action = Some(RootsAction::Unsuperdupe);
         }
 
         if is_scanning {

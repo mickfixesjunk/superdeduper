@@ -89,6 +89,16 @@ impl SuperdupeApp {
             .unwrap_or_default();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
         let can_resume = check_resumable(&persisted);
+        // If a prior scan's results match the currently-configured
+        // roots+settings AND the folder fingerprint still matches
+        // what we saw, restore the duplicate list straight into the
+        // UI so the user can act on it without re-scanning.
+        let saved_results = crate::gui::results_store::load_matching(
+            &persisted.roots,
+            &persisted.settings,
+        )
+        .ok()
+        .flatten();
         let mut app = Self {
             state: UiState::default(),
             rx,
@@ -108,6 +118,27 @@ impl SuperdupeApp {
                 crate::gui::events::LogLevel::Info,
                 "A paused scan was found on disk. Click Resume to continue.".into(),
             );
+        }
+        // Restore prior scan results, if they're still valid.
+        if let Some(saved) = saved_results {
+            let dup_count = saved.duplicates.len();
+            for g in saved.duplicates {
+                let savings = g.size.saturating_mul(g.files.len().saturating_sub(1) as u64);
+                app.state.totals.duplicates =
+                    app.state.totals.duplicates.saturating_add(1);
+                app.state.totals.reclaimable_bytes =
+                    app.state.totals.reclaimable_bytes.saturating_add(savings);
+                app.state.duplicates.push(g);
+            }
+            app.state.push_log(
+                crate::gui::events::LogLevel::Info,
+                format!(
+                    "Restored {} duplicate group(s) from a prior scan — folders haven't changed. Safe-rename / Unsuperdupe pick up where you left off.",
+                    dup_count
+                ),
+            );
+            // Land the user on Groups so the restored content is visible.
+            app.persisted.results_tab = ResultsTab::Groups;
         }
         if start_in_demo {
             app.start_demo();
@@ -159,6 +190,7 @@ impl SuperdupeApp {
     }
 
     fn drain_events(&mut self) {
+        let mut scan_just_finished = false;
         for _ in 0..512 {
             match self.rx.try_recv() {
                 Ok(ev) => {
@@ -168,6 +200,7 @@ impl SuperdupeApp {
                             self.is_scanning = false;
                             self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
+                            scan_just_finished = true;
                         }
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;
@@ -178,6 +211,12 @@ impl SuperdupeApp {
                 }
                 Err(_) => break,
             }
+        }
+        if scan_just_finished {
+            // Persist results + per-root fingerprint in the background
+            // so safe-rename / Unsuperdupe pick up where we left off
+            // after a restart.
+            self.persist_results_after_scan();
         }
         let now = Instant::now();
         for drive in self.state.drives.values_mut() {
@@ -219,6 +258,7 @@ impl SuperdupeApp {
                 self.request_pause();
                 self.persisted.results_tab = ResultsTab::Log;
             }
+            RootsAction::Unsuperdupe => self.run_unsuperdupe_threaded(),
         }
     }
 
@@ -231,7 +271,205 @@ impl SuperdupeApp {
                 self.run_action_threaded(DedupeAction::Hardlink, keeper, dupes);
             }
             GroupAction::Reveal(path) => reveal_in_explorer(&path),
+            GroupAction::SafeRenameOthers { keeper, dupes } => {
+                self.run_action_threaded(DedupeAction::SafeRename, keeper, dupes);
+            }
+            GroupAction::SafeRenameAllVisible => {
+                self.run_safe_rename_all_threaded();
+            }
         }
+    }
+
+    /// Iterate every duplicate group currently in `self.state` and
+    /// safe-rename every non-keeper that isn't a reference path. Runs
+    /// on a worker thread so the UI keeps responding.
+    fn run_safe_rename_all_threaded(&self) {
+        let tx = self.tx.clone();
+        let reference_roots: Vec<PathBuf> = self
+            .persisted
+            .roots
+            .iter()
+            .filter(|r| r.is_reference)
+            .map(|r| r.path.clone())
+            .collect();
+        let groups: Vec<(PathBuf, Vec<PathBuf>)> = self
+            .state
+            .duplicates
+            .iter()
+            .filter_map(|g| {
+                if g.files.len() < 2 {
+                    return None;
+                }
+                let keeper = g.files[0].clone();
+                // Drop any file under a reference root: those are
+                // keepers by definition and must never be renamed.
+                let dupes: Vec<PathBuf> = g.files[1..]
+                    .iter()
+                    .filter(|p| !reference_roots.iter().any(|r| p.starts_with(r)))
+                    .cloned()
+                    .collect();
+                if dupes.is_empty() {
+                    None
+                } else {
+                    Some((keeper, dupes))
+                }
+            })
+            .collect();
+        let total: u64 = groups.iter().map(|(_, d)| d.len() as u64).sum();
+        std::thread::Builder::new()
+            .name("superdupe-safe-rename-all".into())
+            .spawn(move || {
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Safe-renaming {} file(s) across {} group(s)…",
+                    total,
+                    groups.len()
+                )));
+                let mut done = 0u64;
+                let mut failed = 0u64;
+                let mut skipped = 0u64;
+                let mut renamed_paths: Vec<PathBuf> = Vec::new();
+                for (_keeper, dupes) in &groups {
+                    for d in dupes {
+                        match crate::dedupe::action_safe_rename(d) {
+                            Ok(()) => {
+                                done += 1;
+                                renamed_paths.push(d.clone());
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg.contains("already exists") {
+                                    skipped += 1;
+                                } else {
+                                    failed += 1;
+                                    let _ = tx.send(EngineEvent::Log {
+                                        level: crate::gui::events::LogLevel::Warn,
+                                        message: format!(
+                                            "safe-rename failed · {} · {e}",
+                                            d.display()
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Persist the renamed set so a restart picks up where
+                // we left off without re-scanning.
+                if !renamed_paths.is_empty() {
+                    if let Ok(Some(mut state)) = crate::gui::results_store::load() {
+                        state.renamed_paths.extend(renamed_paths);
+                        if let Err(e) = crate::gui::results_store::save(&state) {
+                            tracing::warn!(
+                                error = %e,
+                                "safe-rename-all: results-state save failed"
+                            );
+                        }
+                    }
+                }
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Safe-rename complete · {} renamed, {} skipped, {} failed.",
+                    done, skipped, failed
+                )));
+                let _ = tx.send(EngineEvent::Log {
+                    level: crate::gui::events::LogLevel::Info,
+                    message: format!(
+                        "safe-rename · renamed={done} skipped={skipped} failed={failed}"
+                    ),
+                });
+            })
+            .expect("spawn safe-rename-all thread");
+    }
+
+    /// Snapshot the current duplicate list + roots + settings and
+    /// compute a per-root fingerprint, then write the whole bundle to
+    /// `%LOCALAPPDATA%\superdupe\results-state.json` on a background
+    /// thread. Used right after a scan finishes so the next launch
+    /// can restore the duplicate list without re-scanning, provided
+    /// the folders haven't drifted.
+    fn persist_results_after_scan(&self) {
+        let duplicates = self.state.duplicates.clone();
+        let roots = self.persisted.roots.clone();
+        let settings = self.persisted.settings.clone();
+        std::thread::Builder::new()
+            .name("superdupe-results-save".into())
+            .spawn(move || {
+                let fingerprints = roots
+                    .iter()
+                    .map(|r| crate::gui::results_store::fingerprint_root(&r.path))
+                    .collect();
+                let state = crate::gui::results_store::ResultsState::new(
+                    roots,
+                    settings,
+                    duplicates,
+                    fingerprints,
+                );
+                if let Err(e) = crate::gui::results_store::save(&state) {
+                    tracing::warn!(error = %e, "results-state save failed");
+                }
+            })
+            .expect("spawn results-save thread");
+    }
+
+    /// Walk every root (incl. reference) and rename any
+    /// `*.superdupe` file back to its original. No prior scan needed.
+    fn run_unsuperdupe_threaded(&self) {
+        let tx = self.tx.clone();
+        let roots: Vec<PathBuf> = self
+            .persisted
+            .roots
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        std::thread::Builder::new()
+            .name("superdupe-unsuperdupe".into())
+            .spawn(move || {
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Unsuperduping {} root(s)…",
+                    roots.len()
+                )));
+                let mut total_renamed = 0u64;
+                let mut total_skipped = 0u64;
+                let mut total_errors = 0u64;
+                for r in &roots {
+                    match crate::dedupe::unsuperdupe_root(r) {
+                        Ok((renamed, skipped, errors)) => {
+                            total_renamed += renamed;
+                            total_skipped += skipped;
+                            total_errors += errors;
+                            let _ = tx.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Info,
+                                message: format!(
+                                    "unsuperdupe · {} · renamed={renamed} skipped={skipped} errors={errors}",
+                                    r.display()
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Error,
+                                message: format!(
+                                    "unsuperdupe failed · {} · {e}",
+                                    r.display()
+                                ),
+                            });
+                            total_errors += 1;
+                        }
+                    }
+                }
+                // Renamed_paths in the saved state no longer reflects
+                // reality — every `.superdupe` file just got restored.
+                // Clear the renamed list (but keep the duplicates so
+                // the user can act on them again if they want).
+                if let Ok(Some(mut state)) = crate::gui::results_store::load() {
+                    state.renamed_paths.clear();
+                    let _ = crate::gui::results_store::save(&state);
+                }
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Unsuperdupe complete · {} renamed, {} skipped, {} errors.",
+                    total_renamed, total_skipped, total_errors,
+                )));
+            })
+            .expect("spawn unsuperdupe thread");
     }
 
     fn run_action_threaded(
@@ -246,6 +484,7 @@ impl SuperdupeApp {
             .spawn(move || {
                 let mut done = 0u64;
                 let mut failed = 0u64;
+                let mut renamed_paths: Vec<PathBuf> = Vec::new();
                 let _ = tx.send(EngineEvent::Status(format!(
                     "{:?}: {} file(s) → keeper {}",
                     action,
@@ -258,9 +497,15 @@ impl SuperdupeApp {
                         DedupeAction::Hardlink => crate::dedupe::action_hardlink(d, &keeper),
                         DedupeAction::Remove => crate::dedupe::action_remove(d),
                         DedupeAction::Reflink => crate::dedupe::action_reflink(d, &keeper),
+                        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(d),
                     };
                     match r {
-                        Ok(()) => done += 1,
+                        Ok(()) => {
+                            done += 1;
+                            if matches!(action, DedupeAction::SafeRename) {
+                                renamed_paths.push(d.clone());
+                            }
+                        }
                         Err(e) => {
                             failed += 1;
                             let _ = tx.send(EngineEvent::Log {
@@ -268,6 +513,12 @@ impl SuperdupeApp {
                                 message: format!("{}: {e}", d.display()),
                             });
                         }
+                    }
+                }
+                if !renamed_paths.is_empty() {
+                    if let Ok(Some(mut state)) = crate::gui::results_store::load() {
+                        state.renamed_paths.extend(renamed_paths);
+                        let _ = crate::gui::results_store::save(&state);
                     }
                 }
                 let _ = tx.send(EngineEvent::Status(format!(

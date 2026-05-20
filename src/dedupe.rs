@@ -241,8 +241,14 @@ fn perform_action(action: DedupeAction, path: &Path, keeper: &Path) -> Result<()
         DedupeAction::Recycle => action_recycle(path),
         DedupeAction::Hardlink => action_hardlink(path, keeper),
         DedupeAction::Reflink => action_reflink(path, keeper),
+        DedupeAction::SafeRename => action_safe_rename(path),
     }
 }
+
+/// File extension we append in safe-rename mode. Chosen to be
+/// distinctive enough that an undo walker won't accidentally touch
+/// user files (e.g. `.bak` or `.tmp` would be too generic).
+pub const SAFE_RENAME_SUFFIX: &str = ".superdupe";
 
 /// Single-file destructive actions, exposed so callers (the GUI) can
 /// run them directly without round-tripping through a results file.
@@ -263,6 +269,98 @@ pub fn action_hardlink(target: &Path, keeper: &Path) -> Result<()> {
 
 pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
     replace_with_reflink(target, keeper)
+}
+
+/// Safe-mode rename: append `.superdupe` to the target. Idempotent —
+/// files already ending in the suffix are a no-op. Reversible via
+/// `unsuperdupe_root`. Never deletes anything.
+pub fn action_safe_rename(target: &Path) -> Result<()> {
+    let name = target
+        .file_name()
+        .ok_or_else(|| Error::other(format!("{} has no file name", target.display())))?;
+    let name_str = name.to_string_lossy();
+    if name_str.ends_with(SAFE_RENAME_SUFFIX) {
+        // Already safe-renamed; nothing to do.
+        return Ok(());
+    }
+    let new_name = format!("{name_str}{SAFE_RENAME_SUFFIX}");
+    let dest = target.with_file_name(new_name);
+    if dest.exists() {
+        return Err(Error::other(format!(
+            "safe-rename: {} already exists",
+            dest.display()
+        )));
+    }
+    fs::rename(target, &dest)?;
+    Ok(())
+}
+
+/// Walk `root` and rename every file ending in `.superdupe` back to
+/// its original. Used by the GUI's Unsuperdupe button to reverse a
+/// safe-rename batch on demand — no scan required first.
+///
+/// Returns `(renamed, skipped, errors)` so callers can surface a
+/// summary line. Errors are logged via `tracing::warn!` and don't
+/// halt the walk; a single permission-denied subdirectory shouldn't
+/// abort the whole undo.
+pub fn unsuperdupe_root(root: &Path) -> Result<(u64, u64, u64)> {
+    let mut renamed = 0u64;
+    let mut skipped = 0u64;
+    let mut errors = 0u64;
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "unsuperdupe: dir open failed");
+                errors += 1;
+                continue;
+            }
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                skipped += 1;
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                skipped += 1;
+                continue;
+            };
+            if !name.ends_with(SAFE_RENAME_SUFFIX) {
+                continue;
+            }
+            let restored_name = &name[..name.len() - SAFE_RENAME_SUFFIX.len()];
+            let dest = path.with_file_name(restored_name);
+            if dest.exists() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "unsuperdupe: restore target already exists; skipping"
+                );
+                skipped += 1;
+                continue;
+            }
+            match fs::rename(&path, &dest) {
+                Ok(()) => renamed += 1,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "unsuperdupe: rename failed");
+                    errors += 1;
+                }
+            }
+        }
+    }
+    Ok((renamed, skipped, errors))
 }
 
 #[cfg(windows)]

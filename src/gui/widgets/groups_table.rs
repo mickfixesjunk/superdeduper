@@ -29,6 +29,11 @@ pub enum GroupAction {
     HardlinkOthers { keeper: PathBuf, dupes: Vec<PathBuf> },
     /// Open the keeper's containing folder in Explorer.
     Reveal(PathBuf),
+    /// Safe-mode: append `.superdupe` to every non-keeper. Reversible
+    /// via Unsuperdupe; nothing is deleted.
+    SafeRenameOthers { keeper: PathBuf, dupes: Vec<PathBuf> },
+    /// Safe-rename across EVERY visible duplicate group at once.
+    SafeRenameAllVisible,
 }
 
 #[derive(Default)]
@@ -116,6 +121,42 @@ pub fn show_filtered(
         return clicked;
     }
 
+    // Bulk safe-rename header row — one button to safe-rename every
+    // non-keeper across every visible group. Reversible via the
+    // Unsuperdupe button in the Roots panel; never deletes anything.
+    let visible_dupe_count: usize = sorted
+        .iter()
+        .map(|(_, g)| g.files.len().saturating_sub(1))
+        .sum();
+    ui.horizontal(|ui| {
+        let label = if visible_dupe_count > 0 {
+            format!("🛡  Safe-rename ALL ({} files)", visible_dupe_count)
+        } else {
+            "🛡  Safe-rename ALL".to_string()
+        };
+        let btn = egui::Button::new(RichText::new(label).color(theme::PANEL_DEEP).strong())
+            .fill(theme::ACCENT_DIM)
+            .min_size(egui::vec2(220.0, 24.0));
+        if ui
+            .add_enabled(visible_dupe_count > 0, btn)
+            .on_hover_text(
+                "Append .superdupe to every non-keeper across every visible group. \
+                 Reversible: click Unsuperdupe in the Roots panel to restore. \
+                 Reference paths are never touched.",
+            )
+            .clicked()
+        {
+            clicked = Some(GroupAction::SafeRenameAllVisible);
+        }
+        ui.label(
+            RichText::new("safe-mode (no files deleted)")
+                .color(theme::TEXT_LO)
+                .small()
+                .italics(),
+        );
+    });
+    ui.add_space(4.0);
+
     ScrollArea::vertical().id_source("groups-table").show(ui, |ui| {
         TableBuilder::new(ui)
             .striped(true)
@@ -176,6 +217,23 @@ pub fn show_filtered(
                                 );
                             } else if let Some(k) = &keeper {
                                 ui.horizontal(|ui| {
+                                    if ui
+                                        .small_button(
+                                            RichText::new("🛡 Safe-rename")
+                                                .color(theme::ACCENT),
+                                        )
+                                        .on_hover_text(
+                                            "Append .superdupe to every dupe. Reversible \
+                                             via Unsuperdupe; nothing deleted.",
+                                        )
+                                        .clicked()
+                                    {
+                                        clicked = Some(GroupAction::SafeRenameOthers {
+                                            keeper: k.clone(),
+                                            dupes: dupes.clone(),
+                                        });
+                                        table_state.acted.insert(*orig_idx);
+                                    }
                                     if ui
                                         .small_button(
                                             RichText::new("♻ Recycle").color(theme::WARN),

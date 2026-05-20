@@ -165,6 +165,9 @@ pub enum DedupeAction {
     Hardlink,
     /// Replace the file with a reflink / block-clone (ReFS only).
     Reflink,
+    /// Safe-mode: append `.superdupe` to the filename. Reversible by
+    /// running `unsuperdupe` against the root (no deletion happens).
+    SafeRename,
 }
 
 /// Parse a human-friendly size string like `"4K"`, `"512M"`, `"2G"`.
