@@ -33,7 +33,8 @@ use parking_lot::Mutex;
 
 /// Snapshot of the engine's internal counters at a moment in time.
 /// The snapshot thread reads this every 10 s and writes a one-line
-/// summary to the report.
+/// summary to the report. Per-tier counters live alongside the
+/// top-line totals so the report shows the funnel narrowing.
 #[derive(Default)]
 pub struct EngineCounters {
     pub stage: AtomicU64, // OverallStage as u64 for cheap read
@@ -43,6 +44,9 @@ pub struct EngineCounters {
     pub candidates: AtomicU64,
     pub confirmed_dups: AtomicU64,
     pub reclaimable_bytes: AtomicU64,
+    /// Per-tier attempt counts (success+cache+failure). Index 0..=3
+    /// correspond to Tier 0 / Tier 1 / Tier 2 / Tier 3.
+    pub tier_counts: [Arc<AtomicU64>; 4],
 }
 
 pub struct DiagnosticsLog {
@@ -170,10 +174,16 @@ pub fn spawn_state_sampler(
             let dups = counters.confirmed_dups.load(Ordering::Relaxed);
             let recl = counters.reclaimable_bytes.load(Ordering::Relaxed);
             let stage = counters.stage.load(Ordering::Relaxed);
+            let t0 = counters.tier_counts[0].load(Ordering::Relaxed);
+            let t1 = counters.tier_counts[1].load(Ordering::Relaxed);
+            let t2 = counters.tier_counts[2].load(Ordering::Relaxed);
+            let t3 = counters.tier_counts[3].load(Ordering::Relaxed);
             log.log(
                 "STATE",
                 format_args!(
-                    "stage={stage} n={n} candidates={cand} failed={f} dups={dups} bytes_hashed={b} reclaimable={recl}",
+                    "stage={stage} n={n} candidates={cand} failed={f} dups={dups} \
+                     t0={t0} t1={t1} t2={t2} t3={t3} \
+                     bytes_hashed={b} reclaimable={recl}",
                 ),
             );
         })

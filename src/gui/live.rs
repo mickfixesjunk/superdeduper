@@ -431,6 +431,15 @@ fn run(
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let hash_failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Per-tier attempt counters (one slot for Tier 0..3). Shared
+    // ownership across rayon worker threads via Arc; updated
+    // lock-free by the per-file callback.
+    let tier_counts: [Arc<std::sync::atomic::AtomicU64>; 4] = [
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    ];
 
     // Counters the diagnostics sampler reads every 10 seconds. They
     // share Arc<AtomicU64> ownership with the rayon callback so reads
@@ -439,6 +448,12 @@ fn run(
         files_hashed: Arc::clone(&files_hashed),
         bytes_hashed: Arc::clone(&bytes_hashed),
         hash_failures: Arc::clone(&hash_failures),
+        tier_counts: [
+            Arc::clone(&tier_counts[0]),
+            Arc::clone(&tier_counts[1]),
+            Arc::clone(&tier_counts[2]),
+            Arc::clone(&tier_counts[3]),
+        ],
         ..EngineCounters::default()
     });
     diag_counters
@@ -507,14 +522,26 @@ fn run(
         let total_to_hash_inner = total_to_hash;
         let hashing_started_inner = hashing_started;
         let progress_diag = diag.clone();
+        let progress_tier_counts = [
+            Arc::clone(&tier_counts[0]),
+            Arc::clone(&tier_counts[1]),
+            Arc::clone(&tier_counts[2]),
+            Arc::clone(&tier_counts[3]),
+        ];
         let on_file: pipeline::hash::FileProgress =
             Arc::new(move |path, tier, outcome| {
-                // Only Tier 1 fires for every candidate file exactly
-                // once. Counting every tier invocation would let `n`
-                // overshoot `total` (file goes through T0+T1+T2+T3).
-                // Tier 0/2/3 still call the callback so we log
-                // failures and emit ReadSample dots — they just don't
-                // move the headline progress counter.
+                // Bump the per-tier attempt counter (success+cache+fail).
+                // The funnel reads these so each tier shows its own
+                // narrowing count instead of all rolling into Tier 3.
+                let tier_idx = (tier as usize).min(3);
+                let n_tier = progress_tier_counts[tier_idx]
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+
+                // Headline progress only counts Tier 1 (which fires
+                // for every candidate file exactly once). Counting
+                // every tier invocation would let `n` overshoot
+                // `total` (a single file goes through T0+T1+T2+T3).
                 let counts_for_progress = tier == 1;
                 let n = if counts_for_progress {
                     progress_files.fetch_add(1, Ordering::Relaxed) + 1
@@ -569,12 +596,25 @@ fn run(
                         at: Instant::now(),
                     }));
                 }
-                if n.is_multiple_of(100) {
+                // Per-tier funnel tick — uses the tier-local counter
+                // and the matching Stage enum so the funnel rows
+                // narrow as you'd expect: T0 ≥ T1 ≥ T2 ≥ T3.
+                if n_tier.is_multiple_of(100) {
+                    let stage = match tier {
+                        0 => Stage::Tier0Format,
+                        1 => Stage::Tier1Head,
+                        2 => Stage::Tier2HeadMidTail,
+                        _ => Stage::Tier3Full,
+                    };
                     let _ = progress_tx.try_send(EngineEvent::StageTick {
-                        stage: Stage::Tier3Full,
+                        stage,
                         delta: 100,
-                        total: n,
+                        total: n_tier,
                     });
+                }
+
+                // Headline OverallProgress + ETA: only Tier 1 advances.
+                if counts_for_progress && n.is_multiple_of(100) {
                     let elapsed = hashing_started_inner.elapsed().as_secs_f32();
                     let frac = if total_to_hash_inner > 0 {
                         (n as f32 / total_to_hash_inner as f32).clamp(0.0, 1.0)
