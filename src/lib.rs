@@ -15,8 +15,10 @@
 //! The [`winapi_wrappers`] module hides every `unsafe` FFI call behind a safe
 //! Rust API. No `unsafe` code is permitted elsewhere in the crate.
 
+pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod dedupe;
 pub mod error;
 pub mod inventory;
 pub mod output;

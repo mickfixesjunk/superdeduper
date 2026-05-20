@@ -11,7 +11,7 @@
 //! truly are copies. Re-encoded or re-saved JPEGs differ in metadata
 //! and rightly fingerprint differently.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 
 use super::{read_u16_be, read_u32_be, seek_to};
 
