@@ -78,37 +78,79 @@ fn enumerate_volume(volume: &str, roots: &[PathBuf], cfg: &ScanConfig) -> Result
         }
     }
 
-    let volume_root = PathBuf::from(volume.trim_end_matches('\\'));
+    // `volume` is the `\\?\Volume{…}\` GUID form — correct for opening
+    // the raw device, *wrong* for building file paths users can match
+    // against roots like `F:\Github`. Derive the drive-letter prefix
+    // from any of the roots (they all share this volume so any root
+    // works). Fall back to the trimmed GUID only if no root carries a
+    // disk prefix (defensive: the roots have already been
+    // canonicalised + verbatim-stripped before we got here).
+    let volume_root = roots
+        .iter()
+        .find_map(|r| {
+            use std::path::{Component, Prefix};
+            let mut comps = r.components();
+            if let Some(Component::Prefix(p)) = comps.next() {
+                if let Prefix::Disk(letter) = p.kind() {
+                    return Some(PathBuf::from(format!("{}:", letter as char)));
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| PathBuf::from(volume.trim_end_matches('\\')));
     let mut path_cache: HashMap<u64, PathBuf> = HashMap::new();
     let mut out = Vec::new();
+    // Filter-pass counters — emitted as a single tracing event at the
+    // end so "MFT found 250k records, 0 made it past root match" is a
+    // one-line diagnosis instead of mysterious silence. This is what
+    // would have caught the verbatim-prefix and GUID-vs-drive-letter
+    // bugs immediately.
+    let total_records = by_ref.len();
+    let mut filtered_dir = 0usize;
+    let mut filtered_no_path = 0usize;
+    let mut filtered_root = 0usize;
+    let mut filtered_metadata = 0usize;
+    let mut filtered_size = 0usize;
+    let mut filtered_glob = 0usize;
     for (_ref, record) in &by_ref {
         // Skip directories — only files become FileEntry rows.
         let is_dir = (record.attributes & 0x10) != 0; // FILE_ATTRIBUTE_DIRECTORY
         if is_dir {
+            filtered_dir += 1;
             continue;
         }
         let full = match reconstruct_path(record.file_ref, &by_ref, &mut path_cache, &volume_root) {
             Some(p) => p,
-            None => continue,
+            None => {
+                filtered_no_path += 1;
+                continue;
+            }
         };
         if !under_any_root(&full, roots) {
+            filtered_root += 1;
             continue;
         }
         // FSCTL_ENUM_USN_DATA doesn't include file size. We fetch it via
         // GetFileAttributesEx for files that survived the path filter.
         let size = match std::fs::metadata(&full) {
             Ok(m) => m.len(),
-            Err(_) => continue,
+            Err(_) => {
+                filtered_metadata += 1;
+                continue;
+            }
         };
         if size < cfg.min_size {
+            filtered_size += 1;
             continue;
         }
         if let Some(max) = cfg.max_size {
             if size > max {
+                filtered_size += 1;
                 continue;
             }
         }
         if !path_passes_globs(&full, cfg) {
+            filtered_glob += 1;
             continue;
         }
         out.push(FileEntry {
@@ -121,6 +163,44 @@ fn enumerate_volume(volume: &str, roots: &[PathBuf], cfg: &ScanConfig) -> Result
             attributes: record.attributes,
             volume_guid: Some(volume.to_string()),
         });
+    }
+
+    // Empty-result diagnostic: if we found MFT records but nothing
+    // survived the filter, that's almost certainly a bug (wrong
+    // volume_root prefix, mis-canonicalised root, etc.). Promote to
+    // WARN so the default log level shows it without `-v`.
+    let anomaly = total_records > 0 && out.is_empty();
+    if anomaly {
+        tracing::warn!(
+            volume = %volume,
+            roots = ?roots,
+            volume_root = %volume_root.display(),
+            total_mft_records = total_records,
+            accepted = out.len(),
+            filtered_dir,
+            filtered_no_path,
+            filtered_root,
+            filtered_metadata,
+            filtered_size,
+            filtered_glob,
+            "MFT enumeration produced records but none survived filtering — \
+             check root path vs MFT path prefix (likely a Drive: vs \\\\?\\Volume{{…}} mismatch)",
+        );
+    } else {
+        tracing::info!(
+            volume = %volume,
+            roots = ?roots,
+            volume_root = %volume_root.display(),
+            total_mft_records = total_records,
+            accepted = out.len(),
+            filtered_dir,
+            filtered_no_path,
+            filtered_root,
+            filtered_metadata,
+            filtered_size,
+            filtered_glob,
+            "mft inventory filter pass",
+        );
     }
 
     Ok(out)
