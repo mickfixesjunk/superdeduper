@@ -25,6 +25,22 @@ use crate::gui::events::DuplicateGroupSummary;
 use crate::gui::state::{RootEntry, ScanSettings};
 use crate::{Error, Result};
 
+/// Lightweight file entry persisted in the checkpoint so resume can
+/// skip the inventory walk. Carries just enough to feed Stage 2
+/// (size grouping) — paths, size, mtime, and the Windows-only
+/// volume_guid / file_ref / usn fields that drive cache invalidation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedFileEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime: i64,
+    pub file_ref: u64,
+    pub parent_ref: u64,
+    pub usn: i64,
+    pub attributes: u32,
+    pub volume_guid: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub schema: String,
@@ -38,6 +54,11 @@ pub struct Checkpoint {
     /// Snapshot of duplicates the GUI already had so it can be
     /// restored on resume.
     pub previous_duplicates: Vec<DuplicateGroupSummary>,
+    /// Full file list from the inventory walk, persisted so resume
+    /// can skip Stage 1 entirely. `None` ⇒ inventory hadn't finished
+    /// when the pause fired, and a fresh walk is required.
+    #[serde(default)]
+    pub saved_inventory: Option<Vec<SavedFileEntry>>,
 }
 
 impl Checkpoint {
@@ -49,6 +70,7 @@ impl Checkpoint {
             settings,
             completed_hashes: Vec::new(),
             previous_duplicates: Vec::new(),
+            saved_inventory: None,
         }
     }
 

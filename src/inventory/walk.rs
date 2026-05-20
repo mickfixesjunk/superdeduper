@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::ScanConfig;
 use crate::inventory::FileEntry;
@@ -35,12 +36,32 @@ pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
     enumerate_with_progress(cfg, |_| {})
 }
 
-pub fn enumerate_with_progress<F>(cfg: &ScanConfig, mut callback: F) -> Result<Vec<FileEntry>>
+pub fn enumerate_with_progress<F>(cfg: &ScanConfig, callback: F) -> Result<Vec<FileEntry>>
+where
+    F: FnMut(WalkEvent<'_>),
+{
+    enumerate_cancellable(cfg, None, callback)
+}
+
+/// Like [`enumerate_with_progress`] but polls an optional cancel
+/// flag before every directory recursion and before every entry. If
+/// the flag flips to `true`, the walk stops and returns whatever it
+/// has collected so far — caller is expected to honour the cancel
+/// signal too (e.g. by emitting Paused and discarding the partial
+/// list).
+pub fn enumerate_cancellable<F>(
+    cfg: &ScanConfig,
+    cancel: Option<&AtomicBool>,
+    mut callback: F,
+) -> Result<Vec<FileEntry>>
 where
     F: FnMut(WalkEvent<'_>),
 {
     let mut out = Vec::new();
     for root in &cfg.roots {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            break;
+        }
         if !root.exists() {
             callback(WalkEvent::DirError {
                 path: root,
@@ -48,7 +69,7 @@ where
             });
             return Err(crate::Error::PathNotFound(root.clone()));
         }
-        walk(root, cfg, &mut out, &mut callback, 0)?;
+        walk(root, cfg, &mut out, &mut callback, 0, cancel)?;
     }
     Ok(out)
 }
@@ -59,10 +80,14 @@ fn walk<F>(
     out: &mut Vec<FileEntry>,
     callback: &mut F,
     depth: u32,
+    cancel: Option<&AtomicBool>,
 ) -> Result<()>
 where
     F: FnMut(WalkEvent<'_>),
 {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Ok(());
+    }
     callback(WalkEvent::Entered { path: dir, depth });
 
     let read = match fs::read_dir(dir) {
@@ -89,6 +114,9 @@ where
     };
 
     for entry in read {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -123,7 +151,7 @@ where
         }
 
         if metadata.is_dir() {
-            walk(&path, cfg, out, callback, depth + 1)?;
+            walk(&path, cfg, out, callback, depth + 1, cancel)?;
             continue;
         }
         if !metadata.is_file() {

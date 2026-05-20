@@ -123,6 +123,10 @@ fn run(
         .as_ref()
         .and_then(|p| checkpoint::load(p).ok().flatten())
         .filter(|cp| cp.roots == roots && cp.settings == settings);
+    // Inventory state carried over from a prior pause: lets us skip
+    // Stage 1 entirely and jump straight to size-grouping. Empty
+    // (None) ⇒ no saved inventory; do a fresh walk.
+    let mut resumed_inventory: Option<Vec<crate::inventory::FileEntry>> = None;
     if let Some(prior) = prior {
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
@@ -134,6 +138,37 @@ fn run(
         for g in &prior.previous_duplicates {
             checkpoint_state.record(g);
             let _ = tx.send(EngineEvent::DuplicateFound(g.clone()));
+        }
+        // If the prior pause happened after inventory completed, the
+        // walker output is on disk — promote it back into a runtime
+        // FileEntry list so size-grouping can pick up right away.
+        if let Some(saved) = prior.saved_inventory.clone() {
+            let mapped: Vec<crate::inventory::FileEntry> = saved
+                .into_iter()
+                .map(|s| crate::inventory::FileEntry {
+                    path: s.path,
+                    size: s.size,
+                    mtime: s.mtime,
+                    file_ref: s.file_ref,
+                    parent_ref: s.parent_ref,
+                    usn: s.usn,
+                    attributes: s.attributes,
+                    volume_guid: s.volume_guid,
+                })
+                .collect();
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Resume · skipping Stage 1: reusing {} file(s) from saved inventory",
+                    mapped.len()
+                ),
+            });
+            resumed_inventory = Some(mapped);
+            // Also propagate into the new checkpoint we're about to
+            // build so a subsequent pause doesn't lose the list.
+            checkpoint_state.saved_inventory = Some(saved_files_from_runtime(
+                resumed_inventory.as_deref().unwrap_or(&[]),
+            ));
         }
     }
 
@@ -216,7 +251,7 @@ fn run(
     let mut entries_skipped: u64 = 0;
     let mut skipped_below_min: u64 = 0;
     let mut last_emit = Instant::now();
-    let inv_result = inventory::walk::enumerate_with_progress(&cfg, |evt| {
+    let inv_result = inventory::walk::enumerate_cancellable(&cfg, Some(&*cancel), |evt| {
         use crate::inventory::walk::WalkEvent;
         // Walker is single-threaded so we don't worry about producer
         // races, but try_send keeps a slow UI from back-pressuring the
@@ -278,7 +313,7 @@ fn run(
             }
         }
     });
-    let files = match inv_result {
+    let mut files = match inv_result {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(EngineEvent::Log {
@@ -288,6 +323,26 @@ fn run(
             return Err(e);
         }
     };
+    // Resume fast-path: if the prior pause persisted a complete file
+    // list, override the (possibly partial, possibly cancelled) walk
+    // output with the saved one. Sized after the walk so we still
+    // see the walk's progress events but discard its results when we
+    // have something better.
+    if let Some(saved) = resumed_inventory.take() {
+        files = saved;
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Resume · using {} file(s) from saved inventory; skipping walk result",
+                files.len()
+            ),
+        });
+    }
+    // Persist the inventory NOW so a subsequent pause during hashing
+    // doesn't have to re-walk on the next resume. Cheap: just clones
+    // path + size + mtime; serialisation happens inside the next
+    // checkpoint::save call below in the hashing loop.
+    checkpoint_state.saved_inventory = Some(saved_files_from_runtime(&files));
     let total_files = files.len() as u64;
     let _ = tx.send(EngineEvent::StageTick {
         stage: Stage::Inventory,
@@ -924,4 +979,26 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         follow_links: settings.follow_links,
         allow_system_paths: settings.allow_system_paths,
     })
+}
+
+/// Compress a runtime inventory into the lightweight `SavedFileEntry`
+/// form the checkpoint persists. One allocation per file; the on-disk
+/// size for 50 000 files is ~5 MiB of JSON, well within "save in a
+/// few hundred ms" territory.
+fn saved_files_from_runtime(
+    files: &[crate::inventory::FileEntry],
+) -> Vec<crate::gui::checkpoint::SavedFileEntry> {
+    files
+        .iter()
+        .map(|f| crate::gui::checkpoint::SavedFileEntry {
+            path: f.path.clone(),
+            size: f.size,
+            mtime: f.mtime,
+            file_ref: f.file_ref,
+            parent_ref: f.parent_ref,
+            usn: f.usn,
+            attributes: f.attributes,
+            volume_guid: f.volume_guid.clone(),
+        })
+        .collect()
 }
