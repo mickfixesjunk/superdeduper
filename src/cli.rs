@@ -102,6 +102,26 @@ pub struct ScanArgs {
     /// Permit scanning system-critical paths (Windows, Program Files, ...).
     #[arg(long)]
     pub allow_system_paths: bool,
+
+    /// Content-hash algorithm. blake3 (default, 32-byte) or ddh128
+    /// (16-byte, currently an xxhash3-128 stub).
+    #[arg(long, value_enum, default_value_t = HashAlgoArg::Blake3)]
+    pub hash_algo: HashAlgoArg,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum HashAlgoArg {
+    Blake3,
+    Ddh128,
+}
+
+impl From<HashAlgoArg> for crate::pipeline::hash::HashAlgo {
+    fn from(v: HashAlgoArg) -> Self {
+        match v {
+            HashAlgoArg::Blake3 => crate::pipeline::hash::HashAlgo::Blake3,
+            HashAlgoArg::Ddh128 => crate::pipeline::hash::HashAlgo::Ddh128,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

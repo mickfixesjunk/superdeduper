@@ -10,3 +10,4 @@ Cargo.lock.bak
 # the maintainer's iteration loop. Not part of any release.
 /superdupe-gui.exe
 /diagnostics/
+/superdupe.exe

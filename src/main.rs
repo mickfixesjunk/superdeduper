@@ -26,12 +26,14 @@ fn main() -> anyhow::Result<()> {
 fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let cfg = ScanConfig::from_args(&args).context("invalid scan configuration")?;
 
+    let scan_started = std::time::Instant::now();
     tracing::info!(
         roots = ?cfg.roots,
         threads = cfg.threads,
         min_size = cfg.min_size,
         format_aware = cfg.use_format_aware,
         cache = cfg.use_cache,
+        hash_algo = cfg.hash_algo.tag(),
         "starting scan",
     );
 
@@ -42,14 +44,32 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         tracing::debug!(error = %e, "rayon global pool already initialized; keeping existing");
     }
 
+    let t_inventory = std::time::Instant::now();
     let inventory = inventory::enumerate(&cfg).context("inventory failed")?;
-    tracing::info!(count = inventory.len(), "stage 1: inventory complete");
+    let inventory_ms = t_inventory.elapsed().as_millis();
+    tracing::info!(
+        count = inventory.len(),
+        elapsed_ms = inventory_ms as u64,
+        "stage 1: inventory complete"
+    );
 
+    let t_group = std::time::Instant::now();
     let size_groups = pipeline::grouping::group_by_size(inventory);
-    tracing::info!(groups = size_groups.len(), "stage 2: size grouping complete");
+    let group_ms = t_group.elapsed().as_millis();
+    tracing::info!(
+        groups = size_groups.len(),
+        elapsed_ms = group_ms as u64,
+        "stage 2: size grouping complete"
+    );
 
+    let t_layout = std::time::Instant::now();
     let laid_out = pipeline::layout::resolve(size_groups).context("layout resolution failed")?;
-    tracing::info!(groups = laid_out.len(), "stage 3: layout resolution complete");
+    let layout_ms = t_layout.elapsed().as_millis();
+    tracing::info!(
+        groups = laid_out.len(),
+        elapsed_ms = layout_ms as u64,
+        "stage 3: layout resolution complete"
+    );
 
     let cache = if cfg.use_cache {
         match superdupe::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
@@ -63,14 +83,66 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         None
     };
 
+    let t_hash = std::time::Instant::now();
     let (duplicates, counters) =
         pipeline::hash::run_with_counters(laid_out, &cfg, cache).context("hashing failed")?;
+    let hash_ms = t_hash.elapsed().as_millis();
     tracing::info!(
         groups = duplicates.len(),
         cache_hits = counters.cache_hits.load(Ordering::Relaxed),
         cache_writes = counters.cache_writes.load(Ordering::Relaxed),
         bytes_read = counters.bytes_read.load(Ordering::Relaxed),
+        elapsed_ms = hash_ms as u64,
         "stage 4: hashing complete"
+    );
+    // Per-tier breakdown — shows whether the time gap between two
+    // hash algorithms is in Tier 1 (per-file FFI overhead) or Tier 3
+    // (bulk throughput).
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "\n--- timing ({}) ---\n\
+         stage 1 inventory:    {:>6} ms ({} files)\n\
+         stage 2 grouping:     {:>6} ms\n\
+         stage 3 layout:       {:>6} ms\n\
+         stage 4 hashing:      {:>6} ms (wallclock) — bytes_read={}",
+        cfg.hash_algo.tag(),
+        inventory_ms,
+        counters.cache_hits.load(Ordering::Relaxed)
+            + counters.tier_count[1].load(Ordering::Relaxed),
+        group_ms,
+        layout_ms,
+        hash_ms,
+        humansize::format_size(counters.bytes_read.load(Ordering::Relaxed), humansize::BINARY),
+    );
+    for (i, tier_name) in ["Tier 0 fmt ", "Tier 1 head", "Tier 2 hmt ", "Tier 3 full"]
+        .iter()
+        .enumerate()
+    {
+        let micros = counters.tier_micros[i].load(Ordering::Relaxed);
+        let count = counters.tier_count[i].load(Ordering::Relaxed);
+        let bytes = counters.tier_bytes[i].load(Ordering::Relaxed);
+        if count == 0 && micros == 0 {
+            continue;
+        }
+        let cpu_ms = micros / 1000;
+        let mbps = if micros == 0 {
+            0.0
+        } else {
+            (bytes as f64) / (micros as f64) // bytes per microsecond = MB/s
+        };
+        let _ = writeln!(
+            stderr,
+            "  {tier_name}: {count:>6} files · {} hashed · {:>6} ms CPU-summed · {:>6.0} MB/s/thread",
+            humansize::format_size(bytes, humansize::BINARY),
+            cpu_ms,
+            mbps,
+        );
+    }
+    let _ = writeln!(
+        stderr,
+        "total wallclock:      {:>6} ms",
+        scan_started.elapsed().as_millis()
     );
 
     let duplicates = if cfg.paranoid {

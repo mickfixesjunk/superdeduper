@@ -486,6 +486,13 @@ fn run(
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let hash_failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Per-tier accumulators rolled up across all chunks. Each
+    // HashCounters returned from run_cancellable is chunk-local; we
+    // sum them here so the post-scan diagnostics line carries the
+    // whole-scan picture.
+    let mut tier_micros_total: [u64; 4] = [0; 4];
+    let mut tier_bytes_total: [u64; 4] = [0; 4];
+    let mut tier_count_total: [u64; 4] = [0; 4];
     // Per-tier attempt counters (one slot for Tier 0..3). Shared
     // ownership across rayon worker threads via Arc; updated
     // lock-free by the per-file callback.
@@ -702,6 +709,14 @@ fn run(
         )?;
         let chunk_bytes = counters.bytes_read.load(Ordering::Relaxed);
         total_bytes_read = total_bytes_read.saturating_add(chunk_bytes);
+        for i in 0..4 {
+            tier_micros_total[i] = tier_micros_total[i]
+                .saturating_add(counters.tier_micros[i].load(Ordering::Relaxed));
+            tier_bytes_total[i] = tier_bytes_total[i]
+                .saturating_add(counters.tier_bytes[i].load(Ordering::Relaxed));
+            tier_count_total[i] = tier_count_total[i]
+                .saturating_add(counters.tier_count[i].load(Ordering::Relaxed));
+        }
 
         for g in dups {
             if already_reported.contains(&g.content_hash) {
@@ -801,13 +816,38 @@ fn run(
                 "files_inventory={total_files} candidates={total_to_hash} \
                  n_hashed={n_final} hash_failures={f_final} \
                  confirmed_dups={total_dups} reclaimable={reclaimable} \
-                 bytes_read={total_bytes_read}"
+                 bytes_read={total_bytes_read} hash_algo={}",
+                cfg.hash_algo.tag()
             ),
         );
-        // Close the report and rename it to include the run duration
-        // (report-<uuid>-<HHh-MMm-SSs>.txt).
+        // Per-tier wallclock breakdown — the single most useful line
+        // when diagnosing "algo X is slower than algo Y". CPU-summed
+        // microseconds + bytes hashed at each tier so MB/s/thread is
+        // a one-line derivation.
+        for (i, name) in ["t0_fmt", "t1_head", "t2_hmt", "t3_full"].iter().enumerate() {
+            if tier_count_total[i] == 0 && tier_micros_total[i] == 0 {
+                continue;
+            }
+            let micros = tier_micros_total[i];
+            let bytes = tier_bytes_total[i];
+            let count = tier_count_total[i];
+            // Bytes per microsecond happens to read as MB/s.
+            let mbps = if micros == 0 {
+                0.0
+            } else {
+                bytes as f64 / micros as f64
+            };
+            d.log(
+                "TIER-TIMING",
+                format_args!(
+                    "tier={name} algo={} files={count} bytes={bytes} cpu_us={micros} thru_mb_per_s={mbps:.0}",
+                    cfg.hash_algo.tag()
+                ),
+            );
+        }
         d.finalize(format_args!(
-            "completed · {total_dups} dup group(s) · {reclaimable} bytes reclaimable"
+            "completed · {total_dups} dup group(s) · {reclaimable} bytes reclaimable · algo={}",
+            cfg.hash_algo.tag()
         ));
     }
     Ok(())
