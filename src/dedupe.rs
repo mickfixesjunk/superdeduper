@@ -285,9 +285,16 @@ fn replace_with_hardlink(target: &Path, keeper: &Path) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn replace_with_reflink(target: &Path, keeper: &Path) -> Result<()> {
+    crate::winapi_wrappers::replace_with_reflink(target, keeper)
+}
+
+#[cfg(not(windows))]
 fn replace_with_reflink(_target: &Path, _keeper: &Path) -> Result<()> {
-    // ReFS block-clone via FSCTL_DUPLICATE_EXTENTS_TO_FILE — TBD.
-    Err(Error::Unsupported("reflink action not yet implemented"))
+    Err(Error::Unsupported(
+        "reflink (FSCTL_DUPLICATE_EXTENTS_TO_FILE) is Windows-only",
+    ))
 }
 
 /// Convert a slice of user-supplied paths into a canonical lookup set.
