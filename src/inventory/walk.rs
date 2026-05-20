@@ -13,29 +13,76 @@ use crate::config::ScanConfig;
 use crate::inventory::FileEntry;
 use crate::Result;
 
+/// Streaming progress emitted by [`enumerate_with_progress`]. Consumers
+/// translate these into [`EngineEvent`]s for the GUI; the CLI uses a
+/// no-op consumer.
+pub enum WalkEvent<'a> {
+    /// About to enumerate this directory.
+    Entered { path: &'a Path, depth: u32 },
+    /// One eligible file picked up. Filter rules have already passed.
+    FileFound { path: &'a Path, size: u64 },
+    /// `read_dir` or `metadata` failed on this path. Most common
+    /// cause on Windows is permission denied (e.g. `C:\Program Files`
+    /// without elevation, or `\System Volume Information` on external
+    /// drives).
+    DirError { path: &'a Path, message: String },
+    /// One read_dir entry was skipped because its `metadata()` errored
+    /// or it was an unsupported type (junction not followed, etc.).
+    EntrySkipped { path: &'a Path, reason: &'static str },
+}
+
 pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
+    enumerate_with_progress(cfg, |_| {})
+}
+
+pub fn enumerate_with_progress<F>(cfg: &ScanConfig, mut callback: F) -> Result<Vec<FileEntry>>
+where
+    F: FnMut(WalkEvent<'_>),
+{
     let mut out = Vec::new();
     for root in &cfg.roots {
         if !root.exists() {
+            callback(WalkEvent::DirError {
+                path: root,
+                message: "path not found".into(),
+            });
             return Err(crate::Error::PathNotFound(root.clone()));
         }
-        walk(root, cfg, &mut out)?;
+        walk(root, cfg, &mut out, &mut callback, 0)?;
     }
     Ok(out)
 }
 
-fn walk(dir: &Path, cfg: &ScanConfig, out: &mut Vec<FileEntry>) -> Result<()> {
+fn walk<F>(
+    dir: &Path,
+    cfg: &ScanConfig,
+    out: &mut Vec<FileEntry>,
+    callback: &mut F,
+    depth: u32,
+) -> Result<()>
+where
+    F: FnMut(WalkEvent<'_>),
+{
+    callback(WalkEvent::Entered { path: dir, depth });
+
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            callback(WalkEvent::DirError {
+                path: dir,
+                message: "permission denied".into(),
+            });
             tracing::warn!(path = %dir.display(), "permission denied; skipping");
             return Ok(());
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Race with deletion mid-scan; not worth raising.
             return Ok(());
         }
         Err(e) => {
+            callback(WalkEvent::DirError {
+                path: dir,
+                message: e.to_string(),
+            });
             tracing::warn!(path = %dir.display(), error = %e, "open dir failed; skipping");
             return Ok(());
         }
@@ -45,7 +92,11 @@ fn walk(dir: &Path, cfg: &ScanConfig, out: &mut Vec<FileEntry>) -> Result<()> {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::debug!(error = %e, dir = %dir.display(), "skipping entry");
+                callback(WalkEvent::DirError {
+                    path: dir,
+                    message: format!("entry error: {e}"),
+                });
+                tracing::warn!(error = %e, dir = %dir.display(), "skipping entry");
                 continue;
             }
         };
@@ -53,34 +104,63 @@ fn walk(dir: &Path, cfg: &ScanConfig, out: &mut Vec<FileEntry>) -> Result<()> {
 
         let metadata = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "metadata failed",
+                });
+                tracing::debug!(path = %path.display(), error = %e, "metadata failed; skipping");
+                continue;
+            }
         };
 
         if !cfg.follow_links && metadata.file_type().is_symlink() {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "symlink (use --follow-links to include)",
+            });
             continue;
         }
 
         if metadata.is_dir() {
-            walk(&path, cfg, out)?;
+            walk(&path, cfg, out, callback, depth + 1)?;
             continue;
         }
         if !metadata.is_file() {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "not a regular file",
+            });
             continue;
         }
 
         let size = metadata.len();
         if size < cfg.min_size {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "below min-size",
+            });
             continue;
         }
         if let Some(max) = cfg.max_size {
             if size > max {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "above max-size",
+                });
                 continue;
             }
         }
 
         if !path_passes_globs(&path, cfg) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "filtered by include/exclude",
+            });
             continue;
         }
+
+        callback(WalkEvent::FileFound { path: &path, size });
 
         out.push(FileEntry {
             path,
