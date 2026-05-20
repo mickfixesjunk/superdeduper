@@ -1,0 +1,7 @@
+/target
+Cargo.lock.bak
+*.pdb
+*.profraw
+.vscode/
+.idea/
+*.swp
