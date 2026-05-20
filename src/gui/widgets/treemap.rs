@@ -17,6 +17,15 @@ use crate::gui::state::UiState;
 use crate::gui::theme;
 
 pub fn show(ui: &mut Ui, state: &UiState) {
+    show_filtered(ui, state, None, &[])
+}
+
+pub fn show_filtered(
+    ui: &mut Ui,
+    state: &UiState,
+    drive_root: Option<&std::path::Path>,
+    reference_roots: &[std::path::PathBuf],
+) {
     ui.label(
         RichText::new("Reclaimable map")
             .color(theme::TEXT_LO)
@@ -37,6 +46,7 @@ pub fn show(ui: &mut Ui, state: &UiState) {
         .duplicates
         .iter()
         .enumerate()
+        .filter(|(_, g)| group_passes_filter(g, drive_root, reference_roots))
         .filter_map(|(idx, g)| {
             let dup_count = g.files.len().saturating_sub(1) as u64;
             if dup_count == 0 {
@@ -53,6 +63,14 @@ pub fn show(ui: &mut Ui, state: &UiState) {
             })
         })
         .collect();
+    if tiles.is_empty() {
+        ui.label(
+            RichText::new("No duplicates on this drive.")
+                .color(theme::TEXT_LO)
+                .italics(),
+        );
+        return;
+    }
     tiles.sort_by_key(|t| std::cmp::Reverse(t.savings));
     if tiles.len() > 256 {
         tiles.truncate(256);
@@ -96,6 +114,17 @@ struct Tile {
 struct Placement<'a> {
     tile: &'a Tile,
     rect: Rect,
+}
+
+fn group_passes_filter(
+    g: &crate::gui::events::DuplicateGroupSummary,
+    drive_root: Option<&std::path::Path>,
+    reference_roots: &[std::path::PathBuf],
+) -> bool {
+    let Some(root) = drive_root else { return true };
+    g.files.iter().any(|p| {
+        p.starts_with(root) || reference_roots.iter().any(|r| p.starts_with(r))
+    })
 }
 
 fn tooltip(ui: &mut egui::Ui, tile: &Tile) {

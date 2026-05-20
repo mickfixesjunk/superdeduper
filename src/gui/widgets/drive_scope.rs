@@ -16,8 +16,17 @@ use crate::gui::theme;
 const SCOPE_HEIGHT: f32 = 120.0;
 const SPARK_HEIGHT: f32 = 36.0;
 
-pub fn show(ui: &mut Ui, state: &UiState) {
-    ui.label(RichText::new("Drive scope").color(theme::TEXT_LO).strong());
+/// Returns the drive id the user clicked this frame (caller toggles a
+/// selection in App state and the Groups / Treemap filter to that
+/// drive's paths).
+pub fn show(ui: &mut Ui, state: &UiState, selected: Option<u32>) -> Option<u32> {
+    let mut clicked: Option<u32> = None;
+    ui.label(RichText::new("Drive scope").color(theme::TEXT_LO).strong())
+        .on_hover_text(
+            "Per-drive read activity. Click a drive panel to filter the \
+             Groups and Treemap below to duplicates that live on that \
+             drive — click again or pick another drive to clear.",
+        );
     ui.add_space(4.0);
 
     if state.drives.is_empty() {
@@ -26,7 +35,7 @@ pub fn show(ui: &mut Ui, state: &UiState) {
                 .color(theme::TEXT_LO)
                 .italics(),
         );
-        return;
+        return clicked;
     }
 
     let mut ids: Vec<_> = state.drives.keys().copied().collect();
@@ -35,19 +44,29 @@ pub fn show(ui: &mut Ui, state: &UiState) {
     let now = Instant::now();
     for id in ids {
         let drive = &state.drives[&id];
-        draw_drive_panel(ui, drive, now);
+        let is_selected = selected == Some(id);
+        if draw_drive_panel(ui, drive, now, is_selected) {
+            clicked = Some(id);
+        }
         ui.add_space(8.0);
     }
+    clicked
 }
 
-fn draw_drive_panel(ui: &mut Ui, drive: &DriveLive, now: Instant) {
+/// Returns `true` if the user clicked anywhere on this drive panel.
+fn draw_drive_panel(ui: &mut Ui, drive: &DriveLive, now: Instant, selected: bool) -> bool {
+    let stroke = if selected {
+        Stroke::new(2.0, theme::ACCENT)
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(0x1f, 0x28, 0x36))
+    };
     let frame = egui::Frame::none()
         .fill(theme::PANEL_DEEP)
         .inner_margin(8.0)
         .rounding(6.0)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(0x1f, 0x28, 0x36)));
+        .stroke(stroke);
 
-    frame.show(ui, |ui| {
+    let inner = frame.show(ui, |ui| {
         let mbps = drive.current_mbps();
         let type_color = if drive.info.has_seek_penalty {
             theme::HDD
@@ -87,6 +106,16 @@ fn draw_drive_panel(ui: &mut Ui, drive: &DriveLive, now: Instant) {
         ui.add_space(4.0);
         draw_lcn_trace(ui, drive, now);
     });
+    // The frame itself doesn't receive clicks; we ask egui to
+    // interact with the bounding rect at click sense so a click
+    // anywhere on the panel toggles the filter.
+    let panel_rect = inner.response.rect;
+    let panel_click = ui.interact(
+        panel_rect,
+        ui.id().with(("drive-panel-click", drive.info.id)),
+        egui::Sense::click(),
+    );
+    panel_click.clicked()
 }
 
 fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {

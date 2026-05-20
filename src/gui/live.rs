@@ -24,6 +24,7 @@ use crate::cache::Cache;
 use crate::cli::OutputFormat;
 use crate::config::ScanConfig;
 use crate::gui::checkpoint::{self, Checkpoint};
+use crate::gui::diagnostics::{self, DiagnosticsLog, EngineCounters};
 use crate::gui::events::{
     DriveInfo, DuplicateGroupSummary, EngineEvent, LogLevel, OverallStage, ReadSample, Stage,
 };
@@ -75,6 +76,37 @@ fn run(
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
 ) -> crate::Result<()> {
+    // Diagnostics report file — fresh per scan. Failure to open it
+    // doesn't kill the scan; we just lose self-debug telemetry.
+    let diag = DiagnosticsLog::open();
+    if let Some(d) = &diag {
+        d.log(
+            "SCAN-START",
+            format_args!(
+                "roots={} min_size={} format_aware={} use_cache={} paranoid={} threads={:?}",
+                roots.len(),
+                settings.min_size_bytes,
+                settings.use_format_aware,
+                settings.use_cache,
+                settings.paranoid,
+                settings.threads,
+            ),
+        );
+        for r in &roots {
+            d.log(
+                "ROOT",
+                format_args!(
+                    "path={:?} reference={}",
+                    r.path.display().to_string(),
+                    r.is_reference
+                ),
+            );
+        }
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!("Diagnostics report opened in ./diagnostics/"),
+        });
+    }
     let cfg = build_config(&roots, &settings)?;
     let reference_set: hashbrown::HashSet<PathBuf> = roots
         .iter()
@@ -135,6 +167,26 @@ fn run(
     for (i, r) in root_paths.iter().enumerate() {
         let has_seek_penalty = seek_penalties.get(i).copied().unwrap_or(true);
         let model = if has_seek_penalty { "HDD" } else { "SSD" };
+        // Surface the detection result in BOTH the GUI log and the
+        // diagnostics file. If a drive that should be SSD is being
+        // reported as HDD here, we know the IOCTL fell back to the
+        // safe default and the drive scope will use the wrong pattern.
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Detected drive at {}: {model} (seek_penalty={has_seek_penalty})",
+                r.display(),
+            ),
+        });
+        if let Some(d) = &diag {
+            d.log(
+                "DRIVE",
+                format_args!(
+                    "id={i} path={:?} model={model} seek_penalty={has_seek_penalty}",
+                    r.display().to_string()
+                ),
+            );
+        }
         let _ = tx.send(EngineEvent::DriveDiscovered(DriveInfo {
             id: i as u32,
             model: format!("{model} · Root {}", i + 1),
@@ -252,6 +304,15 @@ fn run(
             total_files, dirs_entered, dirs_denied, entries_skipped, skipped_below_min,
         ),
     });
+    if let Some(d) = &diag {
+        d.log(
+            "STAGE",
+            format_args!(
+                "inventory-done files={total_files} dirs={dirs_entered} \
+                 denied={dirs_denied} skipped={entries_skipped} below_min={skipped_below_min}"
+            ),
+        );
+    }
     if total_files == 0 {
         let mut hint = "Inventory returned 0 files.".to_string();
         if dirs_denied > 0 {
@@ -303,6 +364,15 @@ fn run(
             size_groups.len()
         ),
     });
+    if let Some(d) = &diag {
+        d.log(
+            "STAGE",
+            format_args!(
+                "size-grouping-done candidates={size_candidates} classes={}",
+                size_groups.len()
+            ),
+        );
+    }
 
     if cancel.load(Ordering::Relaxed) {
         emit_paused(&tx);
@@ -360,6 +430,38 @@ fn run(
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hash_failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Counters the diagnostics sampler reads every 10 seconds. They
+    // share Arc<AtomicU64> ownership with the rayon callback so reads
+    // are lock-free even under contention.
+    let diag_counters = Arc::new(EngineCounters {
+        files_hashed: Arc::clone(&files_hashed),
+        bytes_hashed: Arc::clone(&bytes_hashed),
+        hash_failures: Arc::clone(&hash_failures),
+        ..EngineCounters::default()
+    });
+    diag_counters
+        .candidates
+        .store(total_to_hash, Ordering::Relaxed);
+    diag_counters.stage.store(4, Ordering::Relaxed);
+    let sampler_stop = Arc::new(AtomicBool::new(false));
+    let sampler_handle = diag.clone().map(|log| {
+        diagnostics::spawn_state_sampler(
+            log,
+            Arc::clone(&diag_counters),
+            std::time::Duration::from_secs(10),
+            Arc::clone(&sampler_stop),
+        )
+    });
+    if let Some(d) = &diag {
+        d.log(
+            "STAGE",
+            format_args!(
+                "hashing-start chunks={total_chunks} candidates={total_to_hash}"
+            ),
+        );
+    }
 
     let already_reported: hashbrown::HashSet<String> = checkpoint_state
         .completed_hashes
@@ -377,12 +479,26 @@ fn run(
                     });
                 }
             }
+            sampler_stop.store(true, Ordering::Relaxed);
+            if let Some(d) = &diag {
+                d.log(
+                    "SCAN-PAUSED",
+                    format_args!(
+                        "n_hashed={} hash_failures={} dups={} reclaimable={}",
+                        files_hashed.load(Ordering::Relaxed),
+                        hash_failures.load(Ordering::Relaxed),
+                        total_dups,
+                        reclaimable,
+                    ),
+                );
+            }
             emit_paused(&tx);
             return Ok(());
         }
         let progress_tx = tx.clone();
         let progress_files = Arc::clone(&files_hashed);
         let progress_bytes = Arc::clone(&bytes_hashed);
+        let progress_failures = Arc::clone(&hash_failures);
         let progress_drive = (i as u32) % roots.len().max(1) as u32;
         let progress_drive_is_hdd = seek_penalties
             .get(progress_drive as usize)
@@ -390,64 +506,94 @@ fn run(
             .unwrap_or(true);
         let total_to_hash_inner = total_to_hash;
         let hashing_started_inner = hashing_started;
-        let on_file: pipeline::hash::FileProgress = Arc::new(move |path, _tier, bytes| {
-            let n = progress_files.fetch_add(1, Ordering::Relaxed) + 1;
-            let total_bytes =
-                progress_bytes.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
-
-            // Drive-scope dot positioning:
-            //   * HDDs (seek penalty) → cumulative bytes climbs the Y
-            //     axis: a clean diagonal, matches the demo's HDD pattern.
-            //   * SSDs (no seek penalty) → a stable per-file hash of
-            //     the path maps to a scattered Y so the trace spreads
-            //     across the address space ("TV snow"), matching the
-            //     demo's SSD pattern.
-            let lcn_bytes = if progress_drive_is_hdd {
-                total_bytes
-            } else {
-                hash_path_to_lcn(path)
-            };
-
-            // High-frequency events: use try_send so a slow UI drain
-            // never back-pressures rayon. Dropping a periodic
-            // ReadSample / StageTick on a full channel is harmless.
-            // On SSDs we emit more samples so the spray cloud renders
-            // densely the way it does in demo mode.
-            let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
-            if n.is_multiple_of(read_modulus) {
-                let _ = progress_tx.try_send(EngineEvent::Read(ReadSample {
-                    drive: progress_drive,
-                    lcn_bytes,
-                    bytes,
-                    latency_us: 1,
-                    at: Instant::now(),
-                }));
-            }
-            if n.is_multiple_of(100) {
-                let _ = progress_tx.try_send(EngineEvent::StageTick {
-                    stage: Stage::Tier3Full,
-                    delta: 100,
-                    total: n,
-                });
-                let elapsed = hashing_started_inner.elapsed().as_secs_f32();
-                let frac = if total_to_hash_inner > 0 {
-                    (n as f32 / total_to_hash_inner as f32).clamp(0.0, 1.0)
+        let progress_diag = diag.clone();
+        let on_file: pipeline::hash::FileProgress =
+            Arc::new(move |path, tier, outcome| {
+                // Only Tier 1 fires for every candidate file exactly
+                // once. Counting every tier invocation would let `n`
+                // overshoot `total` (file goes through T0+T1+T2+T3).
+                // Tier 0/2/3 still call the callback so we log
+                // failures and emit ReadSample dots — they just don't
+                // move the headline progress counter.
+                let counts_for_progress = tier == 1;
+                let n = if counts_for_progress {
+                    progress_files.fetch_add(1, Ordering::Relaxed) + 1
                 } else {
-                    0.0
+                    progress_files.load(Ordering::Relaxed)
                 };
-                let eta = if frac > 0.001 {
-                    Some((elapsed * (1.0 - frac) / frac).max(0.0))
+                let bytes_added = match &outcome {
+                    pipeline::hash::ProgressOutcome::Hashed { bytes } => *bytes,
+                    _ => 0,
+                };
+                let total_bytes = progress_bytes
+                    .fetch_add(bytes_added, Ordering::Relaxed)
+                    .saturating_add(bytes_added);
+
+                // Surface unreadable files in the Log tab. Without
+                // this they were dropped silently and the progress
+                // bar's "done" count never reached the total.
+                if let pipeline::hash::ProgressOutcome::Failed { error } = &outcome {
+                    let f = progress_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    if f <= 50 {
+                        let _ = progress_tx.try_send(EngineEvent::Log {
+                            level: LogLevel::Warn,
+                            message: format!("hash failed · {} · {error}", path.display()),
+                        });
+                    } else if f == 51 {
+                        let _ = progress_tx.try_send(EngineEvent::Log {
+                            level: LogLevel::Warn,
+                            message: "…suppressing further per-file hash failures (see counter)".into(),
+                        });
+                    }
+                    if let Some(d) = &progress_diag {
+                        d.log_hash_failure(path, error);
+                    }
+                }
+
+                // Drive-scope dot positioning. On SSDs we use a stable
+                // path-hash for Y (scattered "TV snow"); on HDDs we
+                // use the cumulative-bytes climb (clean diagonal).
+                let lcn_bytes = if progress_drive_is_hdd {
+                    total_bytes
                 } else {
-                    None
+                    hash_path_to_lcn(path)
                 };
-                let _ = progress_tx.try_send(EngineEvent::OverallProgress {
-                    stage: OverallStage::Hashing,
-                    done: n,
-                    total: total_to_hash_inner,
-                    eta_secs: eta,
-                });
-            }
-        });
+
+                let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
+                if n.is_multiple_of(read_modulus) {
+                    let _ = progress_tx.try_send(EngineEvent::Read(ReadSample {
+                        drive: progress_drive,
+                        lcn_bytes,
+                        bytes: bytes_added,
+                        latency_us: 1,
+                        at: Instant::now(),
+                    }));
+                }
+                if n.is_multiple_of(100) {
+                    let _ = progress_tx.try_send(EngineEvent::StageTick {
+                        stage: Stage::Tier3Full,
+                        delta: 100,
+                        total: n,
+                    });
+                    let elapsed = hashing_started_inner.elapsed().as_secs_f32();
+                    let frac = if total_to_hash_inner > 0 {
+                        (n as f32 / total_to_hash_inner as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let eta = if frac > 0.001 {
+                        Some((elapsed * (1.0 - frac) / frac).max(0.0))
+                    } else {
+                        None
+                    };
+                    let _ = progress_tx.try_send(EngineEvent::OverallProgress {
+                        stage: OverallStage::Hashing,
+                        done: n,
+                        total: total_to_hash_inner,
+                        eta_secs: eta,
+                    });
+                }
+            });
 
         let (dups, counters) = pipeline::hash::run_cancellable(
             chunk,
@@ -471,6 +617,15 @@ fn run(
             let savings = g.size.saturating_mul(visible_files.len().saturating_sub(1) as u64);
             reclaimable = reclaimable.saturating_add(savings);
             total_dups += 1;
+            // Keep the diagnostics counters in sync so the 10s
+            // sampler thread sees fresh values without us holding
+            // a lock.
+            diag_counters
+                .confirmed_dups
+                .store(confirmed, Ordering::Relaxed);
+            diag_counters
+                .reclaimable_bytes
+                .store(reclaimable, Ordering::Relaxed);
             let summary = DuplicateGroupSummary {
                 size: g.size,
                 content_hash: g.content_hash,
@@ -534,6 +689,24 @@ fn run(
             crate::gui::theme::humansize(reclaimable)
         ),
     });
+    // Stop the diagnostics sampler and write the final summary.
+    sampler_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = sampler_handle {
+        let _ = h.join();
+    }
+    if let Some(d) = &diag {
+        let n_final = files_hashed.load(Ordering::Relaxed);
+        let f_final = hash_failures.load(Ordering::Relaxed);
+        d.log(
+            "SCAN-COMPLETE",
+            format_args!(
+                "files_inventory={total_files} candidates={total_to_hash} \
+                 n_hashed={n_final} hash_failures={f_final} \
+                 confirmed_dups={total_dups} reclaimable={reclaimable} \
+                 bytes_read={total_bytes_read}"
+            ),
+        );
+    }
     Ok(())
 }
 
