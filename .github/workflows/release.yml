@@ -115,7 +115,18 @@ jobs:
       # from this commit on this workflow run, signed by GitHub's OIDC
       # identity. Verifiable with `gh attestation verify` — no shared
       # secret required and no risk of key compromise.
+      #
+      # GitHub limits attestations to PUBLIC repos and ORG-owned
+      # private repos. User-owned private repos return:
+      #   "Feature not available for user-owned private repositories."
+      # We gate the step on visibility so private-repo runs don't show
+      # a red square, and additionally `continue-on-error: true` keeps
+      # the release upload running even if attestation hiccups for
+      # some other reason. Once the repo is made public (or moved into
+      # an org), this step starts persisting attestations automatically.
       - name: Attest build provenance
+        if: ${{ github.event.repository.visibility != 'private' || github.event.repository.owner.type == 'Organization' }}
+        continue-on-error: true
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: |

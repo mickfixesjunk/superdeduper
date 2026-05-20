@@ -2,20 +2,28 @@
 
 `superdupe` ships as a single `.exe` per architecture, distributed
 exclusively through this repository's GitHub Releases. Every release
-artifact is **reproducibly built in public CI** and **signed twice**:
+artifact is **reproducibly built in public CI** and verifiable via at
+least one of three independent mechanisms:
 
-1. **GitHub artifact attestation (Sigstore-backed).** A
-   tamper-evident bundle in the public transparency log says: "these
-   exact bytes were produced by the `release.yml` workflow running on
-   commit `<sha>` at `<timestamp>`." No shared secret, no signing key
-   to compromise, free, and verifiable by anyone with the GitHub CLI.
-2. **Authenticode (when a code-signing cert is configured).** Windows
+1. **SHA-256 manifest.** Every release includes a `SHA256SUMS` inside
+   the zip plus a sidecar `.sha256` next to it. Always present, easy
+   to spot-check.
+2. **GitHub artifact attestation (Sigstore-backed).** A tamper-evident
+   bundle in the public transparency log says: "these exact bytes were
+   produced by the `release.yml` workflow running on commit `<sha>` at
+   `<timestamp>`." No shared secret, no signing key to compromise,
+   free, verifiable by anyone with the GitHub CLI.
+   **Caveat:** GitHub restricts attestations to public repositories
+   and organization-owned private repositories. User-owned private
+   repos will not have attestations on their releases — for those,
+   rely on the SHA-256 manifest plus Authenticode below.
+3. **Authenticode (when a code-signing cert is configured).** Windows
    SmartScreen / EDR will recognise the binary as coming from the
    `superdupe` publisher, suppress the unknown-publisher prompt, and
    refuse to launch if anything's been modified post-signing.
 
 You only need to verify **one** of these to be confident the binary is
-genuine, but verifying both is the gold standard.
+genuine, but verifying all three is the gold standard.
 
 ## Verifying a downloaded release
 
@@ -32,7 +40,7 @@ if ($expected -ne $actual) { throw "SHA-256 MISMATCH — DO NOT TRUST THIS FILE.
 "OK: $actual"
 ```
 
-### 2. Verify the Sigstore attestation
+### 2. Verify the Sigstore attestation (public / org-private repos only)
 
 ```pwsh
 gh attestation verify superdupe-x86_64-windows.zip --repo mdreeling/superdupe
@@ -41,6 +49,11 @@ gh attestation verify superdupe-x86_64-windows.zip --repo mdreeling/superdupe
 The CLI fetches the attestation from the Sigstore transparency log and
 checks that it was produced by **this** repository's `release.yml`
 workflow. Expected output: `verification succeeded`.
+
+> **If this repo is a user-owned private repo** the attestation step
+> is skipped by the workflow (GitHub doesn't persist attestations for
+> those). The release will note "no attestation" in its body. Fall
+> back to the SHA-256 manifest and Authenticode signature for trust.
 
 ### 3. Verify the Authenticode signature (if present)
 
