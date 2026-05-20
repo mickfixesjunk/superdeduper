@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 /// Which physical drive an event is about. `0` = the first detected
 /// device, etc. The UI never reads beyond this opaque id.
 pub type DriveId = u32;
@@ -70,7 +72,7 @@ pub struct ReadSample {
     pub at: Instant,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DuplicateGroupSummary {
     pub size: u64,
     pub content_hash: String,

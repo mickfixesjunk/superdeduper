@@ -11,6 +11,7 @@
 //! and a squarified treemap of reclaimable space.
 
 pub mod app;
+pub mod checkpoint;
 pub mod demo;
 pub mod events;
 pub mod live;
