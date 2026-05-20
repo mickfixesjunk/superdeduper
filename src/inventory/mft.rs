@@ -85,6 +85,12 @@ fn enumerate_volume(volume: &str, roots: &[PathBuf], cfg: &ScanConfig) -> Result
     // works). Fall back to the trimmed GUID only if no root carries a
     // disk prefix (defensive: the roots have already been
     // canonicalised + verbatim-stripped before we got here).
+    // NB the trailing backslash: on Windows `F:` is drive-relative
+    // (current dir on F:) while `F:\` is the drive root.
+    // `PathBuf::from("F:").push("GitHub")` yields `F:GitHub` —
+    // missing the separator — and `starts_with("F:\\GitHub")` then
+    // returns false for every file. The trailing backslash makes
+    // sure push() does the right thing.
     let volume_root = roots
         .iter()
         .find_map(|r| {
@@ -92,7 +98,7 @@ fn enumerate_volume(volume: &str, roots: &[PathBuf], cfg: &ScanConfig) -> Result
             let mut comps = r.components();
             if let Some(Component::Prefix(p)) = comps.next() {
                 if let Prefix::Disk(letter) = p.kind() {
-                    return Some(PathBuf::from(format!("{}:", letter as char)));
+                    return Some(PathBuf::from(format!("{}:\\", letter as char)));
                 }
             }
             None
@@ -312,4 +318,51 @@ fn path_passes_globs(path: &Path, cfg: &ScanConfig) -> bool {
         }
     }
     true
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    //! Regression coverage for the Windows path-prefix surgery. Tests
+    //! gated on `windows` so the cross-platform CI on Linux still
+    //! passes — these specifically exercise `PathBuf` Windows
+    //! drive-prefix semantics.
+    use super::*;
+
+    #[test]
+    fn volume_root_push_keeps_separator() {
+        // The crux of the F:\Github bug: `PathBuf::from("F:")` is
+        // drive-relative, not drive-root. Pushing "GitHub" produced
+        // "F:GitHub" (no separator) and starts_with("F:\\GitHub")
+        // returned false for every file in the volume.
+        let mut p = PathBuf::from("F:\\");
+        p.push("GitHub");
+        p.push("subdir");
+        assert_eq!(p.to_string_lossy().as_ref(), r"F:\GitHub\subdir");
+
+        // And starts_with against the canonicalised-then-verbatim-
+        // stripped root must succeed:
+        let root = PathBuf::from(r"F:\GitHub");
+        assert!(p.starts_with(&root));
+    }
+
+    #[test]
+    fn drive_relative_root_does_not_satisfy_starts_with() {
+        // Asserts the *opposite* shape — guards against someone
+        // "simplifying" the trailing backslash back out.
+        let mut p = PathBuf::from("F:");
+        p.push("GitHub");
+        let root = PathBuf::from(r"F:\GitHub");
+        assert!(
+            !p.starts_with(&root),
+            "if this assertion ever fires, the Windows PathBuf semantics changed \
+             and the trailing-backslash workaround can be removed"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_drive_form() {
+        let p = PathBuf::from(r"\\?\F:\GitHub");
+        let stripped = strip_verbatim_prefix(&p);
+        assert_eq!(stripped.to_string_lossy().as_ref(), r"F:\GitHub");
+    }
 }
