@@ -30,7 +30,8 @@ use crate::gui::state::{RootEntry, ScanSettings, UiState};
 use crate::gui::widgets::groups_table::GroupAction;
 use crate::gui::widgets::roots_panel::RootsAction;
 use crate::gui::widgets::{
-    drive_scope, funnel, groups_table, header, log_panel, roots_panel, settings_modal, treemap,
+    drive_scope, funnel, groups_table, header, log_panel, overall_bar, roots_panel,
+    settings_modal, treemap,
 };
 use crate::gui::{demo, live, theme};
 
@@ -304,6 +305,15 @@ impl eframe::App for SuperdupeApp {
         if want_demo {
             self.start_demo();
         }
+
+        // Overall progress strip sits directly under the header and
+        // spans the full window so the user always sees "what stage,
+        // how much, how long" without hunting.
+        TopBottomPanel::top("overall-progress")
+            .frame(Frame::default().fill(theme::BG).inner_margin(egui::vec2(8.0, 4.0)))
+            .show(ctx, |ui| {
+                overall_bar::show(ui, &self.state);
+            });
 
         SidePanel::left("sidebar")
             .resizable(true)

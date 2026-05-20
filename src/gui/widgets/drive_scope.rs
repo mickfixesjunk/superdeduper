@@ -90,9 +90,13 @@ fn draw_drive_panel(ui: &mut Ui, drive: &DriveLive, now: Instant) {
 }
 
 fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
-    let (rect, _) = ui.allocate_exact_size(
+    let (rect, resp) = ui.allocate_exact_size(
         vec2(ui.available_width(), SPARK_HEIGHT),
         Sense::hover(),
+    );
+    resp.on_hover_text(
+        "Throughput sparkline — bytes-per-second the engine is reading \
+         from this drive over the last 30 seconds. Right edge = now.",
     );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, theme::BG);
@@ -134,10 +138,22 @@ fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
 }
 
 fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant) {
-    let (rect, _) = ui.allocate_exact_size(
+    let (rect, resp) = ui.allocate_exact_size(
         vec2(ui.available_width(), SCOPE_HEIGHT),
         Sense::hover(),
     );
+    let tip = if drive.info.has_seek_penalty {
+        "LCN-vs-time read trace (HDD). Y = position on the drive, \
+         X = time (right = now). The yellow line climbing diagonally \
+         means the scheduler is reading sequentially — the cheap \
+         pattern on a spinning disk."
+    } else {
+        "LCN-vs-time read trace (SSD). Y = position on the drive, \
+         X = time (right = now). The teal cloud is the random spray \
+         pattern SSDs love — no seek penalty so we read all over \
+         the address space in parallel."
+    };
+    resp.on_hover_text(tip);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, theme::BG);
 

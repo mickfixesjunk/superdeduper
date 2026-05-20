@@ -16,7 +16,13 @@ const BAR_HEIGHT: f32 = 8.0;
 const ROW_GAP: f32 = 10.0;
 
 pub fn show(ui: &mut Ui, state: &UiState) {
-    ui.label(RichText::new("Pipeline").color(theme::TEXT_LO).strong());
+    ui.label(RichText::new("Pipeline").color(theme::TEXT_LO).strong())
+        .on_hover_text(
+            "Five-stage funnel showing how many files survive each \
+             elimination step. Each bar's fill is that stage's count \
+             relative to the largest stage; a recent tick pulses the \
+             outline.",
+        );
     ui.add_space(6.0);
 
     let max_count = Stage::ALL
@@ -55,10 +61,13 @@ pub fn show(ui: &mut Ui, state: &UiState) {
         });
 
         // Bar row.
-        let (rect, _) = ui.allocate_exact_size(
+        let (rect, resp) = ui.allocate_exact_size(
             vec2(ui.available_width(), BAR_HEIGHT),
             Sense::hover(),
         );
+        let stage_label = stage.label();
+        let count = counter.total;
+        resp.on_hover_text(format!("{stage_label}: {count} file(s)"));
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 2.0, theme::PANEL_DEEP);
 
