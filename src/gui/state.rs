@@ -28,7 +28,7 @@ pub struct RootEntry {
 
 /// Persisted user preferences. Loaded via egui's persistence on
 /// startup; survives app restarts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanSettings {
     pub min_size_bytes: u64,
     pub max_size_bytes: Option<u64>,

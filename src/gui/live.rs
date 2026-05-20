@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use crate::cache::Cache;
 use crate::cli::OutputFormat;
 use crate::config::ScanConfig;
+use crate::gui::checkpoint::{self, Checkpoint};
 use crate::gui::events::{
     DriveInfo, DuplicateGroupSummary, EngineEvent, LogLevel, ReadSample, Stage,
 };
@@ -81,6 +82,28 @@ fn run(
         .map(|r| r.path.clone())
         .collect();
     let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
+    let checkpoint_path = checkpoint::default_checkpoint_path().ok();
+    let mut checkpoint_state = Checkpoint::new(roots.clone(), settings.clone());
+    // If a checkpoint already exists from a prior interrupted scan
+    // against THESE EXACT roots and settings, fold its previous
+    // duplicates in so we don't re-report them or lose them.
+    let prior = checkpoint_path
+        .as_ref()
+        .and_then(|p| checkpoint::load(p).ok().flatten())
+        .filter(|cp| cp.roots == roots && cp.settings == settings);
+    if let Some(prior) = prior {
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Resuming from checkpoint — {} duplicate group(s) carried over",
+                prior.previous_duplicates.len()
+            ),
+        });
+        for g in &prior.previous_duplicates {
+            checkpoint_state.record(g);
+            let _ = tx.send(EngineEvent::DuplicateFound(g.clone()));
+        }
+    }
 
     let _ = tx.send(EngineEvent::ScanStarted {
         at: Instant::now(),
@@ -210,8 +233,22 @@ fn run(
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
 
+    let already_reported: hashbrown::HashSet<String> = checkpoint_state
+        .completed_hashes
+        .iter()
+        .cloned()
+        .collect();
+
     for (i, chunk) in chunks.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
+            if let Some(p) = &checkpoint_path {
+                if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                    let _ = tx.send(EngineEvent::Log {
+                        level: LogLevel::Warn,
+                        message: format!("checkpoint save failed: {e}"),
+                    });
+                }
+            }
             emit_paused(&tx);
             return Ok(());
         }
@@ -233,6 +270,9 @@ fn run(
         }));
 
         for g in dups {
+            if already_reported.contains(&g.content_hash) {
+                continue; // carried over from a prior checkpoint
+            }
             let visible_files = filter_reference_only(g.files, &reference_set);
             if visible_files.len() < 2 {
                 continue;
@@ -241,11 +281,20 @@ fn run(
             let savings = g.size.saturating_mul(visible_files.len().saturating_sub(1) as u64);
             reclaimable = reclaimable.saturating_add(savings);
             total_dups += 1;
-            let _ = tx.send(EngineEvent::DuplicateFound(DuplicateGroupSummary {
+            let summary = DuplicateGroupSummary {
                 size: g.size,
                 content_hash: g.content_hash,
                 files: visible_files,
-            }));
+            };
+            checkpoint_state.record(&summary);
+            let _ = tx.send(EngineEvent::DuplicateFound(summary));
+        }
+
+        // Periodic checkpoint flush so an unexpected crash doesn't
+        // lose progress beyond the last chunk. JSON encode + atomic
+        // rename is cheap relative to the hashing work.
+        if let Some(p) = &checkpoint_path {
+            let _ = checkpoint::save(p, &checkpoint_state);
         }
 
         tier3_done += 1;
@@ -265,6 +314,11 @@ fn run(
             total_chunks,
             total_dups
         )));
+    }
+
+    // Scan finished cleanly — the checkpoint has served its purpose.
+    if let Some(p) = &checkpoint_path {
+        let _ = checkpoint::delete(p);
     }
 
     let _ = tx.send(EngineEvent::ScanFinished {

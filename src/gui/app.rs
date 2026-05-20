@@ -66,6 +66,10 @@ pub struct SuperdupeApp {
     /// Cancel-token; the engine checks it cooperatively to honour
     /// Pause / Cancel from the UI.
     cancel: Arc<AtomicBool>,
+    /// True iff a checkpoint from a prior (paused or crashed) scan
+    /// is sitting on disk and the current roots+settings match it.
+    /// Drives the "Resume" label on the primary scan button.
+    can_resume: bool,
 }
 
 impl SuperdupeApp {
@@ -76,6 +80,7 @@ impl SuperdupeApp {
             .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdupe.app.v1"))
             .unwrap_or_default();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
+        let can_resume = check_resumable(&persisted);
         let mut app = Self {
             state: UiState::default(),
             rx,
@@ -86,7 +91,14 @@ impl SuperdupeApp {
             persisted,
             groups_state: groups_table::GroupsTableState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
+            can_resume,
         };
+        if can_resume {
+            app.state.push_log(
+                crate::gui::events::LogLevel::Info,
+                "A paused scan was found on disk. Click Resume to continue.".into(),
+            );
+        }
         if start_in_demo {
             app.start_demo();
         }
@@ -111,6 +123,10 @@ impl SuperdupeApp {
         self.is_scanning = true;
         self.demo_mode = false;
         self.cancel.store(false, Ordering::Relaxed);
+        // Once the engine completes successfully, it deletes the
+        // checkpoint file; clear our flag so the next launch doesn't
+        // see a stale Resume.
+        self.can_resume = false;
         live::spawn_with_settings(
             self.tx.clone(),
             self.persisted.roots.clone(),
@@ -299,7 +315,7 @@ impl eframe::App for SuperdupeApp {
                     ui,
                     &self.persisted.roots,
                     self.is_scanning,
-                    false, // resume tracking lands in pass 2
+                    self.can_resume,
                 );
                 if let Some(a) = roots_action {
                     self.dispatch_root_action(a);
@@ -359,6 +375,19 @@ impl eframe::App for SuperdupeApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "superdupe.app.v1", &self.persisted);
+    }
+}
+
+fn check_resumable(persisted: &PersistedAppState) -> bool {
+    use crate::gui::checkpoint;
+    let Ok(path) = checkpoint::default_checkpoint_path() else {
+        return false;
+    };
+    match checkpoint::load(&path) {
+        Ok(Some(cp)) => {
+            cp.roots == persisted.roots && cp.settings == persisted.settings
+        }
+        _ => false,
     }
 }
 
