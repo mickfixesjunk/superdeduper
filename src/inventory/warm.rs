@@ -122,6 +122,20 @@ pub fn try_warm(
             reason: "journal rolled past cursor",
         });
     }
+    if saved_meta.last_usn > live.next_usn {
+        // Saved cursor is beyond what the journal has allocated.
+        // Shouldn't happen with the pre-enum-cursor fix in
+        // `inventory::mft::persist_cold_snapshot`, but if a stale
+        // snapshot from a build that had the
+        // `max(max_usn, next_usn)` bug is still on disk, this
+        // would otherwise hit ERROR_INVALID_PARAMETER on the
+        // FSCTL_READ_USN_JOURNAL call. Invalidate and cold-walk;
+        // the fresh snapshot we write at the end will be in range.
+        cache.lock().invalidate_inventory_snapshot(volume_guid)?;
+        return Ok(WarmOutcome::Fallback {
+            reason: "saved cursor past journal head (stale snapshot from older build)",
+        });
+    }
 
     // Load every saved record for this volume into a HashMap keyed
     // by file_ref. `reconstruct_path` will use it just like the

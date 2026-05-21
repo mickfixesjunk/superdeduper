@@ -122,17 +122,24 @@ fn enumerate_volume(
 ) -> Result<Vec<FileEntry>> {
     use hashbrown::HashMap;
 
-    use crate::winapi_wrappers::{UsnEnum, UsnRecord};
+    use crate::winapi_wrappers::{query_usn_journal_state, UsnEnum, UsnJournalState, UsnRecord};
+
+    // Capture the journal state BEFORE doing the MFT enumeration so
+    // the cursor we persist is consistent: anything written to the
+    // volume *during* enumeration will be > this `next_usn` and
+    // therefore picked up by the next scan's delta. If we queried
+    // *after* enum (which is what an earlier version did) the
+    // saved cursor would skip past concurrent activity, leaving
+    // those changes invisible until the file involved is touched
+    // again. Skipping the query entirely is fine — we just won't
+    // be warm-eligible next time.
+    let pre_enum_journal: Option<UsnJournalState> = query_usn_journal_state(volume).ok();
 
     let mut by_ref: HashMap<u64, UsnRecord> = HashMap::new();
-    let mut max_usn: i64 = 0;
 
     let mut enumerator = UsnEnum::open(volume)?;
     while let Some(batch) = enumerator.next_batch()? {
         for r in batch {
-            if r.usn > max_usn {
-                max_usn = r.usn;
-            }
             by_ref.insert(r.file_ref, r);
         }
     }
@@ -274,12 +281,20 @@ fn enumerate_volume(
     // observed. Errors are non-fatal: the cold scan already
     // succeeded, we just lose the next-warm-scan optimisation.
     if let Some(c) = cache {
-        if let Err(e) = persist_cold_snapshot(volume, &by_ref, max_usn, c) {
-            tracing::warn!(
+        if let Some(journal) = pre_enum_journal {
+            if let Err(e) = persist_cold_snapshot(volume, &by_ref, journal, c) {
+                tracing::warn!(
+                    volume = %volume,
+                    error = %e,
+                    "failed to persist inventory snapshot after cold MFT walk — \
+                     next scan will pay full cold cost too"
+                );
+            }
+        } else {
+            tracing::info!(
                 volume = %volume,
-                error = %e,
-                "failed to persist inventory snapshot after cold MFT walk — \
-                 next scan will pay full cold cost too"
+                "no pre-enum USN journal state captured (FSCTL_QUERY_USN_JOURNAL \
+                 failed earlier); skipping snapshot save"
             );
         }
     }
@@ -290,31 +305,19 @@ fn enumerate_volume(
 /// Save the post-cold-walk snapshot for `volume` so subsequent
 /// scans can take the warm path. Pulled into its own function so
 /// the cold-walk loop above doesn't grow another bloc of cache
-/// manipulation.
+/// manipulation. The `journal` argument is the state captured
+/// **before** the MFT enumeration started — using that as the
+/// cursor guarantees the next scan's delta covers anything written
+/// during the (potentially long) MFT walk.
 #[cfg(windows)]
 fn persist_cold_snapshot(
     volume: &str,
     by_ref: &hashbrown::HashMap<u64, crate::winapi_wrappers::UsnRecord>,
-    max_usn: i64,
+    journal: crate::winapi_wrappers::UsnJournalState,
     cache: &std::sync::Arc<parking_lot::Mutex<crate::cache::Cache>>,
 ) -> Result<()> {
     use crate::cache::{InventoryMeta, InventoryRecord};
-    use crate::winapi_wrappers::query_usn_journal_state;
 
-    // Query the journal so we record `journal_id` next to the
-    // cursor — without it the warm path can't tell if the journal
-    // got recreated between scans.
-    let journal = match query_usn_journal_state(volume) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::info!(
-                volume = %volume,
-                error = %e,
-                "journal state unavailable; skipping snapshot save"
-            );
-            return Ok(());
-        }
-    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -349,7 +352,19 @@ fn persist_cold_snapshot(
 
     let meta = InventoryMeta {
         journal_id: journal.journal_id,
-        last_usn: max_usn.max(journal.next_usn),
+        // Use the pre-enum `next_usn` as the cursor. Critically NOT
+        // `max(max_usn_from_records, next_usn)`: a record's stored
+        // USN can be anything ≤ the journal's next_usn-at-write-
+        // time, but if the journal was recreated/reset between
+        // the record being written and our snapshot, the record's
+        // USN can be *higher* than the new journal's next_usn —
+        // and `FSCTL_READ_USN_JOURNAL(StartUsn = that)` rejects
+        // with ERROR_INVALID_PARAMETER on the next scan. Using
+        // pre-enum journal.next_usn keeps the cursor inside the
+        // live journal's range; concurrent writes during enum
+        // land at USNs > this point and surface as delta records
+        // on the next scan.
+        last_usn: journal.next_usn,
         captured_at_unix: now,
     };
     cache

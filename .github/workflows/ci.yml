@@ -80,8 +80,13 @@ jobs:
       # in src/winapi_wrappers/windows_impl.rs that DO run here.
       - run: cargo test --workspace --locked --lib --bins -- --test-threads=1
       - run: cargo test --workspace --locked --test smoke -- --test-threads=1
-      - run: cargo build --release --locked --features gui --bin superdupe-gui
-      - run: cargo build --release --locked --bin superdupe
+      # One `cargo build` call so cargo compiles shared deps (egui's
+      # dep tree is huge but most of it is also used by the CLI's
+      # tracing/serde graph; building both bins together lets cargo
+      # share the codegen instead of duplicating per-bin work). Previous
+      # two-step shape took ~7 minutes for GUI + ~1 minute for CLI;
+      # the combined build typically lands closer to ~7 minutes total.
+      - run: cargo build --release --locked --features gui --bin superdupe --bin superdupe-gui
       # Upload the built EXEs as a workflow artifact on every push to
       # main so we can iterate without cutting a tagged release. The
       # bundle lives under the run's Artifacts section for 14 days.
