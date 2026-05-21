@@ -111,8 +111,30 @@ pub fn volume_for_path(path: &Path) -> Result<String> {
 }
 
 /// Open the raw volume device for read access. Use the returned handle
-/// with FSCTL_ENUM_USN_DATA / FSCTL_READ_USN_JOURNAL.
+/// with FSCTL_ENUM_USN_DATA / FSCTL_READ_USN_JOURNAL — both need
+/// `GENERIC_READ` because they stream MFT bytes back to userspace.
 pub fn open_volume_handle(volume_guid: &str) -> Result<OwnedHandle> {
+    open_volume_handle_with_access(volume_guid, GENERIC_READ.0)
+}
+
+/// Open the volume with `desired_access = 0` — sufficient for IOCTLs
+/// that only METADATA-query the device (no bytes streamed), and
+/// crucially works for non-admin users. Required-access list per
+/// MSDN:
+///
+/// * `IOCTL_STORAGE_QUERY_PROPERTY` → no access needed (0 works).
+/// * `IOCTL_STORAGE_GET_DEVICE_NUMBER` → no access needed.
+///
+/// Using GENERIC_READ here would fail with ERROR_ACCESS_DENIED for
+/// users without elevation — which is what the `drive-info`
+/// subcommand was hitting when invoked from a non-elevated shell or
+/// via WSL interop. The query path now succeeds for any user who
+/// can see the volume.
+pub fn open_volume_handle_for_query(volume_guid: &str) -> Result<OwnedHandle> {
+    open_volume_handle_with_access(volume_guid, 0)
+}
+
+fn open_volume_handle_with_access(volume_guid: &str, desired_access: u32) -> Result<OwnedHandle> {
     // Win32 expects the volume path without the trailing backslash to
     // open the device, e.g. `\\?\Volume{…}` not `\\?\Volume{…}\`.
     let trimmed = volume_guid.trim_end_matches('\\');
@@ -123,7 +145,7 @@ pub fn open_volume_handle(volume_guid: &str) -> Result<OwnedHandle> {
     let h = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            GENERIC_READ.0,
+            desired_access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -191,7 +213,9 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
         PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
     };
 
-    let handle = open_volume_handle(volume_guid)?;
+    // `_for_query` uses desired_access=0 so this works for non-admin
+    // users + WSL interop. The IOCTLs below don't need GENERIC_READ.
+    let handle = open_volume_handle_for_query(volume_guid)?;
 
     // Device + partition number.
     let mut sdn = STORAGE_DEVICE_NUMBER::default();
