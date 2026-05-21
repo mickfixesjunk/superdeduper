@@ -70,7 +70,7 @@ fn run_scan(root: &Path, threads: usize, min_size: u64) -> Vec<pipeline::Duplica
         io_threads: 4,
         hash_algo: superdupe::pipeline::hash::HashAlgo::Blake3,
     };
-    let files = inventory::enumerate(&cfg).unwrap();
+    let files = inventory::enumerate(&cfg, None).unwrap();
     let size_groups = pipeline::grouping::group_by_size(files);
     let laid = pipeline::layout::resolve(size_groups).unwrap();
     pipeline::hash::run(laid, &cfg).unwrap()

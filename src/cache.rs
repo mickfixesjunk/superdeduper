@@ -21,14 +21,19 @@ use crate::{Error, Result};
 ///   hashes are different bytes for the same file).
 /// * v3 was a no-op shape bump after the crate rename to `river5`
 ///   so pre-rename `"ddh128"`-tagged rows got dropped in one go.
-/// * v4 is another no-op shape bump for the river5 v2 → v3 swap.
+/// * v4 was another no-op shape bump for the river5 v2 → v3 swap.
 ///   v3 changes per-block mixing so byte outputs diverge from v2
 ///   even for the same input; bumping clears v2-era `"river5"`
 ///   rows in one sweep rather than waiting for natural eviction.
+/// * v5 adds the inventory-snapshot tables (`inventory_meta` +
+///   `inventory_records`) so the warm-path Stage 1 enumerator can
+///   apply a USN-journal delta against a cached baseline instead
+///   of re-walking the whole MFT. Drops the v4 hash rows in the
+///   process, which is fine — they re-populate on next scan.
 ///
 /// Bumping this string causes init_schema to drop and recreate the
 /// tables; any cached data from older versions is discarded.
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
 #[derive(Debug, Clone)]
 pub struct CacheKey {
@@ -50,6 +55,43 @@ pub struct CachedHashes {
     pub tier1_hash: Option<Vec<u8>>,
     pub tier2_hash: Option<Vec<u8>>,
     pub tier3_hash: Option<Vec<u8>>,
+}
+
+/// Persistent companion to the warm-path Stage 1 enumerator.
+/// `journal_id` and `last_usn` together identify "the journal state
+/// at the moment we last enumerated this volume". When we come back
+/// for a rescan, we ask Win32 for the current journal state — if
+/// `journal_id` still matches and `last_usn` is still inside the
+/// journal's live range, applying a delta from `last_usn` is safe.
+#[derive(Debug, Clone)]
+pub struct InventoryMeta {
+    pub journal_id: i64,
+    pub last_usn: i64,
+    pub captured_at_unix: i64,
+}
+
+/// One persisted MFT record. We store directories AND files in the
+/// same table — directories are needed for `reconstruct_path`'s
+/// parent-chain walk, files are the actual scan output. Directories
+/// use `size = -1`, `mtime = 0` as sentinels; the warm-path
+/// enumerator filters them out before returning `FileEntry`s.
+#[derive(Debug, Clone)]
+pub struct InventoryRecord {
+    pub parent_ref: u64,
+    pub usn: i64,
+    pub attributes: u32,
+    pub name: String,
+    pub size: i64,
+    pub mtime: u64,
+}
+
+impl InventoryRecord {
+    /// `FILE_ATTRIBUTE_DIRECTORY = 0x10`. The check is duplicated in
+    /// a couple of places — pulled into one constant so future
+    /// MFT-record refactors only touch this file.
+    pub fn is_directory(&self) -> bool {
+        (self.attributes & 0x10) != 0
+    }
 }
 
 impl CachedHashes {
@@ -117,9 +159,15 @@ impl Cache {
         match existing.as_deref() {
             Some(v) if v == SCHEMA_VERSION => {}
             Some(_) => {
-                // Schema mismatch — drop and recreate.
-                self.conn
-                    .execute_batch("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS volumes;")?;
+                // Schema mismatch — drop and recreate. List every
+                // table we own here so a future schema bump can't
+                // leave orphaned rows behind on an older client.
+                self.conn.execute_batch(
+                    "DROP TABLE IF EXISTS files;
+                     DROP TABLE IF EXISTS volumes;
+                     DROP TABLE IF EXISTS inventory_meta;
+                     DROP TABLE IF EXISTS inventory_records;",
+                )?;
             }
             None => {}
         }
@@ -146,7 +194,38 @@ impl Cache {
                 PRIMARY KEY (volume_guid, file_ref, hash_algo)
             );
             CREATE INDEX IF NOT EXISTS idx_size ON files(size);
-            CREATE INDEX IF NOT EXISTS idx_tier3 ON files(tier3_hash) WHERE tier3_hash IS NOT NULL;",
+            CREATE INDEX IF NOT EXISTS idx_tier3 ON files(tier3_hash) WHERE tier3_hash IS NOT NULL;
+
+            -- v5 inventory-snapshot tables. The warm-path Stage 1
+            -- enumerator validates `journal_id` + `last_usn` against
+            -- the current FSCTL_QUERY_USN_JOURNAL output to decide
+            -- whether a delta scan is safe; if either changed we
+            -- nuke the snapshot rows for that volume and fall back
+            -- to a cold MFT walk.
+            CREATE TABLE IF NOT EXISTS inventory_meta (
+                volume_guid       TEXT PRIMARY KEY,
+                journal_id        INTEGER NOT NULL,
+                last_usn          INTEGER NOT NULL,
+                captured_at_unix  INTEGER NOT NULL
+            );
+
+            -- One row per MFT record (directories AND files).
+            -- Directories carry size = -1 / mtime = 0 since their
+            -- only use is the parent-chain lookup that
+            -- reconstruct_path() walks.
+            CREATE TABLE IF NOT EXISTS inventory_records (
+                volume_guid TEXT    NOT NULL,
+                file_ref    INTEGER NOT NULL,
+                parent_ref  INTEGER NOT NULL,
+                usn         INTEGER NOT NULL,
+                attributes  INTEGER NOT NULL,
+                name        TEXT    NOT NULL,
+                size        INTEGER NOT NULL,
+                mtime       INTEGER NOT NULL,
+                PRIMARY KEY (volume_guid, file_ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_inventory_records_volume
+                ON inventory_records (volume_guid);",
         )?;
 
         self.conn.execute(
@@ -268,6 +347,130 @@ impl Cache {
     pub fn clear(&self) -> Result<()> {
         self.conn.execute("DELETE FROM files", [])?;
         self.conn.execute("DELETE FROM volumes", [])?;
+        self.conn.execute("DELETE FROM inventory_meta", [])?;
+        self.conn.execute("DELETE FROM inventory_records", [])?;
+        Ok(())
+    }
+
+    /// Read the saved inventory-meta block for a volume. `None` ⇒ no
+    /// snapshot for this volume yet (or the warm path explicitly
+    /// invalidated it). Caller pairs this with
+    /// `winapi_wrappers::query_usn_journal_state` to decide whether
+    /// the snapshot is still useful — if `journal_id` doesn't match
+    /// or `last_usn` is older than the journal's current `first_usn`,
+    /// the journal wrapped and we must cold-scan again.
+    pub fn load_inventory_meta(&self, volume_guid: &str) -> Result<Option<InventoryMeta>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT journal_id, last_usn, captured_at_unix
+                 FROM inventory_meta WHERE volume_guid = ?1",
+                params![volume_guid],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(
+            row.map(|(journal_id, last_usn, captured_at_unix)| InventoryMeta {
+                journal_id,
+                last_usn,
+                captured_at_unix,
+            }),
+        )
+    }
+
+    /// Read every persisted MFT record for a volume. Returns them as
+    /// `(file_ref, InventoryRecord)` pairs the caller can drop
+    /// straight into a `HashMap<u64, InventoryRecord>` for the path
+    /// reconstruction loop. Memory cost ≈ 100 bytes/row × N rows;
+    /// 500k AppData files ≈ 50 MB, well within budget.
+    pub fn load_inventory_records(&self, volume_guid: &str) -> Result<Vec<(u64, InventoryRecord)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_ref, parent_ref, usn, attributes, name, size, mtime
+             FROM inventory_records WHERE volume_guid = ?1",
+        )?;
+        let rows = stmt.query_map(params![volume_guid], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                InventoryRecord {
+                    parent_ref: r.get::<_, i64>(1)? as u64,
+                    usn: r.get::<_, i64>(2)?,
+                    attributes: r.get::<_, i64>(3)? as u32,
+                    name: r.get::<_, String>(4)?,
+                    size: r.get::<_, i64>(5)?,
+                    mtime: r.get::<_, i64>(6)? as u64,
+                },
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Overwrite the snapshot for `volume_guid` with the supplied
+    /// records + cursor in a single transaction. Stale rows for the
+    /// volume are deleted up front so callers don't need to compute
+    /// per-row diffs against the existing snapshot.
+    pub fn save_inventory_snapshot(
+        &mut self,
+        volume_guid: &str,
+        meta: &InventoryMeta,
+        records: &[(u64, InventoryRecord)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM inventory_records WHERE volume_guid = ?1",
+            params![volume_guid],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO inventory_meta
+                 (volume_guid, journal_id, last_usn, captured_at_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                volume_guid,
+                meta.journal_id,
+                meta.last_usn,
+                meta.captured_at_unix
+            ],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO inventory_records
+                     (volume_guid, file_ref, parent_ref, usn, attributes, name, size, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (file_ref, rec) in records {
+                stmt.execute(params![
+                    volume_guid,
+                    *file_ref as i64,
+                    rec.parent_ref as i64,
+                    rec.usn,
+                    rec.attributes as i64,
+                    rec.name,
+                    rec.size,
+                    rec.mtime as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop the snapshot for one volume — used when journal
+    /// validation fails so the next scan starts clean.
+    pub fn invalidate_inventory_snapshot(&self, volume_guid: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM inventory_meta WHERE volume_guid = ?1",
+            params![volume_guid],
+        )?;
+        self.conn.execute(
+            "DELETE FROM inventory_records WHERE volume_guid = ?1",
+            params![volume_guid],
+        )?;
         Ok(())
     }
 

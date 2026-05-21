@@ -18,10 +18,10 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{
-    FSCTL_ENUM_USN_DATA, FSCTL_GET_RETRIEVAL_POINTERS, FSCTL_READ_USN_JOURNAL,
-    IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY, MFT_ENUM_DATA_V0,
-    READ_USN_JOURNAL_DATA_V0, RETRIEVAL_POINTERS_BUFFER, STARTING_VCN_INPUT_BUFFER,
-    STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY,
+    FSCTL_ENUM_USN_DATA, FSCTL_GET_RETRIEVAL_POINTERS, FSCTL_QUERY_USN_JOURNAL,
+    FSCTL_READ_USN_JOURNAL, IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY,
+    MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0, RETRIEVAL_POINTERS_BUFFER,
+    STARTING_VCN_INPUT_BUFFER, STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY, USN_JOURNAL_DATA_V0,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
@@ -74,6 +74,14 @@ pub struct UsnRecord {
     pub mtime_filetime: i64,
     pub attributes: u32,
     pub name: String,
+    /// `Reason` field from `USN_RECORD_V2`. Bitfield of
+    /// `USN_REASON_*` flags (see ntifs.h / Win32 docs). The warm-
+    /// path delta consumer in `inventory::warm` keys off
+    /// `USN_REASON_FILE_DELETE` (0x200) to distinguish "file
+    /// deleted" events from "file modified". Cold-path callers
+    /// (FSCTL_ENUM_USN_DATA) get `0` because that FSCTL doesn't
+    /// populate the field.
+    pub reason: u32,
 }
 
 /// Resolve the volume that contains `path`. Returns the volume's GUID
@@ -569,6 +577,7 @@ fn parse_usn_records(buf: &[u8]) -> Vec<UsnRecord> {
             let parent_ref = u64::from_le_bytes(buf[pos + 16..pos + 24].try_into().unwrap());
             let usn = i64::from_le_bytes(buf[pos + 24..pos + 32].try_into().unwrap());
             let timestamp = i64::from_le_bytes(buf[pos + 32..pos + 40].try_into().unwrap());
+            let reason = u32::from_le_bytes(buf[pos + 40..pos + 44].try_into().unwrap());
             let attributes = u32::from_le_bytes(buf[pos + 52..pos + 56].try_into().unwrap());
             let name_len = u16::from_le_bytes(buf[pos + 56..pos + 58].try_into().unwrap()) as usize;
             let name_off = u16::from_le_bytes(buf[pos + 58..pos + 60].try_into().unwrap()) as usize;
@@ -587,12 +596,62 @@ fn parse_usn_records(buf: &[u8]) -> Vec<UsnRecord> {
                     mtime_filetime: timestamp,
                     attributes,
                     name,
+                    reason,
                 });
             }
         }
         pos += record_len;
     }
     out
+}
+
+/// Current state of the USN journal on a volume — what
+/// `FSCTL_QUERY_USN_JOURNAL` returns. The warm-path inventory
+/// validates a saved snapshot by checking:
+/// 1. `journal_id` matches what we stored last time, AND
+/// 2. our stored cursor is `>= first_usn` (i.e. still in range)
+/// If either fails, the journal was deleted/recreated/wrapped and
+/// we have to fall back to a full MFT walk.
+#[derive(Debug, Clone, Copy)]
+pub struct UsnJournalState {
+    pub journal_id: i64,
+    /// Oldest USN still in the journal. Anything older than this is
+    /// gone; the journal has rolled over those entries.
+    pub first_usn: i64,
+    /// USN that will be assigned to the next change. Use this as
+    /// the new cursor after a successful delta read.
+    pub next_usn: i64,
+}
+
+/// Query journal metadata via `FSCTL_QUERY_USN_JOURNAL`. Required
+/// before reading a delta so we can detect journal wrap-around.
+pub fn query_usn_journal_state(volume_guid: &str) -> Result<UsnJournalState> {
+    let handle = open_volume_handle(volume_guid)?;
+    let mut buf: USN_JOURNAL_DATA_V0 = unsafe { std::mem::zeroed() };
+    let mut returned = 0u32;
+    // SAFETY: output buffer is correctly sized for V0 query layout.
+    // No input buffer is required for this FSCTL.
+    unsafe {
+        DeviceIoControl(
+            handle.0,
+            FSCTL_QUERY_USN_JOURNAL,
+            None,
+            0,
+            Some(&mut buf as *mut _ as *mut std::ffi::c_void),
+            std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32,
+            Some(&mut returned),
+            None,
+        )
+        .map_err(|e| Error::UsnJournal {
+            volume: volume_guid.into(),
+            source: std::io::Error::other(format!("{e}")),
+        })?;
+    }
+    Ok(UsnJournalState {
+        journal_id: buf.UsnJournalID as i64,
+        first_usn: buf.FirstUsn,
+        next_usn: buf.NextUsn,
+    })
 }
 
 /// Read the USN journal forward from `since_usn` and yield change

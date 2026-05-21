@@ -50,6 +50,17 @@ pub fn get_retrieval_pointers(_path: &Path) -> Result<Vec<ExtentRun>> {
     ))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct UsnJournalState {
+    pub journal_id: i64,
+    pub first_usn: i64,
+    pub next_usn: i64,
+}
+
+pub fn query_usn_journal_state(_volume_guid: &str) -> Result<UsnJournalState> {
+    Err(Error::Unsupported("Windows-only USN journal query"))
+}
+
 pub fn recycle(_p: &Path) -> Result<()> {
     Err(Error::Unsupported("Windows-only Recycle Bin"))
 }

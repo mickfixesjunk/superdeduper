@@ -13,9 +13,14 @@
 
 pub mod mft;
 pub mod walk;
+pub mod warm;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use parking_lot::Mutex;
+
+use crate::cache::Cache;
 use crate::config::ScanConfig;
 use crate::winapi_wrappers::FileRef;
 use crate::Result;
@@ -43,8 +48,14 @@ pub struct FileEntry {
 /// Tries MFT enum first; on failure (or non-NTFS), falls back to walking.
 /// Filtering against `min_size` / `max_size` / include / exclude globs
 /// happens here so downstream stages never see ineligible files.
-pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
-    match mft::enumerate(cfg) {
+///
+/// `cache` is optional — when provided it enables the warm-path
+/// inventory: a USN-journal delta is applied to a saved baseline
+/// rather than re-walking the MFT. First-ever scan still pays the
+/// full cold cost. Pass `None` to disable warm-path entirely (the
+/// `superdupe scan --no-cache` codepath does this).
+pub fn enumerate(cfg: &ScanConfig, cache: Option<&Arc<Mutex<Cache>>>) -> Result<Vec<FileEntry>> {
+    match mft::enumerate(cfg, cache) {
         Ok(v) => Ok(v),
         Err(e) => {
             tracing::warn!(error = %e, "MFT enumeration unavailable, falling back to directory walk");

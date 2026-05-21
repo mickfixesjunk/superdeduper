@@ -63,7 +63,7 @@ fn finds_planted_duplicates() {
         hash_algo: superdupe::pipeline::hash::HashAlgo::Blake3,
     };
 
-    let inv = superdupe::inventory::enumerate(&cfg).unwrap();
+    let inv = superdupe::inventory::enumerate(&cfg, None).unwrap();
     assert_eq!(
         inv.len(),
         4,
@@ -109,7 +109,7 @@ fn empty_directory_yields_no_groups() {
         io_threads: 4,
         hash_algo: superdupe::pipeline::hash::HashAlgo::Blake3,
     };
-    let inv = superdupe::inventory::enumerate(&cfg).unwrap();
+    let inv = superdupe::inventory::enumerate(&cfg, None).unwrap();
     assert!(inv.is_empty());
     let groups = pipeline::grouping::group_by_size(inv);
     assert!(groups.is_empty());
