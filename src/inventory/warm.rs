@@ -141,7 +141,14 @@ pub fn try_warm(
     // by file_ref. `reconstruct_path` will use it just like the
     // cold path uses its fresh `by_ref` build.
     let baseline = cache.lock().load_inventory_records(volume_guid)?;
+    let baseline_loaded = baseline.len();
     let mut by_ref: HashMap<u64, InventoryRecord> = baseline.into_iter().collect();
+    tracing::info!(
+        volume = %volume_guid,
+        baseline_rows = baseline_loaded,
+        by_ref_after_load = by_ref.len(),
+        "warm-path baseline snapshot loaded"
+    );
 
     // Drain the delta. We pass the journal ID the snapshot stored
     // (already validated against `live.journal_id` above) — Windows
@@ -350,7 +357,11 @@ fn volume_root_for(volume_guid: &str, roots: &[PathBuf]) -> PathBuf {
 /// Convert the in-memory record map to `FileEntry`s, applying the
 /// scan config's root + glob + size filters. Mirrors the cold MFT
 /// path's filtering loop so warm and cold paths produce identical
-/// outputs.
+/// outputs. Emits a single "warm-path filter pass" tracing line at
+/// the end with per-bucket counts, matching the cold path's
+/// "mft inventory filter pass" line — so a failure mode like
+/// "everything got filtered as not-under-root" is one-line
+/// diagnosable in the run log.
 #[cfg(windows)]
 fn entries_from_records(
     by_ref: &HashMap<u64, InventoryRecord>,
@@ -359,27 +370,49 @@ fn entries_from_records(
     roots: &[PathBuf],
 ) -> Vec<FileEntry> {
     let mut out = Vec::new();
+    let mut filtered_dir = 0usize;
+    let mut filtered_no_path = 0usize;
+    let mut filtered_root = 0usize;
+    let mut filtered_size = 0usize;
+    let mut filtered_glob = 0usize;
+    let total_records = by_ref.len();
+    // Capture one example "rejected" path so the log shows the
+    // shape of paths the under_any_root filter is seeing — most
+    // useful when filtered_root accounts for everything and we
+    // need to compare path shapes against the scan roots.
+    let mut sample_rejected: Option<PathBuf> = None;
     for (file_ref, rec) in by_ref {
         if rec.is_directory() {
+            filtered_dir += 1;
             continue;
         }
         let full = match reconstruct_path(*file_ref, by_ref, volume_root.to_path_buf()) {
             Some(p) => p,
-            None => continue,
+            None => {
+                filtered_no_path += 1;
+                continue;
+            }
         };
         if !under_any_root(&full, roots) {
+            filtered_root += 1;
+            if sample_rejected.is_none() {
+                sample_rejected = Some(full);
+            }
             continue;
         }
         let size = rec.size as u64;
         if size < cfg.min_size {
+            filtered_size += 1;
             continue;
         }
         if let Some(max) = cfg.max_size {
             if size > max {
+                filtered_size += 1;
                 continue;
             }
         }
         if !path_passes_globs(&full, cfg) {
+            filtered_glob += 1;
             continue;
         }
         out.push(FileEntry {
@@ -393,6 +426,19 @@ fn entries_from_records(
             volume_guid: None,
         });
     }
+    tracing::info!(
+        roots = ?roots,
+        volume_root = %volume_root.display(),
+        total_records,
+        accepted = out.len(),
+        filtered_dir,
+        filtered_no_path,
+        filtered_root,
+        filtered_size,
+        filtered_glob,
+        sample_rejected = ?sample_rejected.as_ref().map(|p| p.display().to_string()),
+        "warm-path filter pass",
+    );
     out
 }
 
