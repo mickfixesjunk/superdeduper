@@ -655,8 +655,18 @@ pub fn query_usn_journal_state(volume_guid: &str) -> Result<UsnJournalState> {
 }
 
 /// Read the USN journal forward from `since_usn` and yield change
-/// records. Returns the new "next USN" so the caller can persist it.
-pub fn read_usn_journal_delta(volume_guid: &str, since_usn: i64) -> Result<(Vec<UsnRecord>, i64)> {
+/// records. `journal_id` MUST be the current journal's identifier
+/// — pass the value the caller validated against
+/// `FSCTL_QUERY_USN_JOURNAL`. (MSDN documents `0` as
+/// "bypass identifier verification", but real-world Windows
+/// builds reject the call with ERROR_INVALID_PARAMETER if the
+/// field is zeroed, so we always pass the live ID.) Returns the
+/// new "next USN" so the caller can persist it.
+pub fn read_usn_journal_delta(
+    volume_guid: &str,
+    since_usn: i64,
+    journal_id: i64,
+) -> Result<(Vec<UsnRecord>, i64)> {
     let handle = open_volume_handle(volume_guid)?;
     let mut input = READ_USN_JOURNAL_DATA_V0::default();
     input.StartUsn = since_usn;
@@ -664,7 +674,7 @@ pub fn read_usn_journal_delta(volume_guid: &str, since_usn: i64) -> Result<(Vec<
     input.ReturnOnlyOnClose = 0;
     input.Timeout = 0;
     input.BytesToWaitFor = 0;
-    input.UsnJournalID = 0;
+    input.UsnJournalID = journal_id as u64;
 
     let mut buf = vec![0u8; 256 * 1024];
     let mut returned = 0u32;
