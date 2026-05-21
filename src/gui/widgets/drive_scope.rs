@@ -75,6 +75,16 @@ pub fn show(
             } else {
                 render_overrides.remove(&id);
             }
+            // Persist the new value (or its removal) keyed by the
+            // drive's volume GUID. The GUID is stable across mounts,
+            // unlike the drive letter — so an external drive that
+            // got "A:" today and "F:" tomorrow keeps the override.
+            // We swallow errors silently: a missing AppData write
+            // is non-fatal for this scan, and the in-memory map is
+            // still right for the current session.
+            if !drive.info.volume_guid.is_empty() {
+                let _ = crate::gui::drive_overrides::set(&drive.info.volume_guid, next);
+            }
         }
         ui.add_space(8.0);
     }
