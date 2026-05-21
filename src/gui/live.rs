@@ -81,7 +81,7 @@ fn run(
     let diag = DiagnosticsLog::open();
     let hash_impl: &str = match settings.hash_algo {
         crate::pipeline::hash::HashAlgo::Blake3 => "blake3 (Rust crate)",
-        crate::pipeline::hash::HashAlgo::Ddh128 => ddh128::impl_name(),
+        crate::pipeline::hash::HashAlgo::River5 => river5::impl_name(),
     };
     if let Some(d) = &diag {
         d.log(
@@ -1028,13 +1028,26 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         paranoid: settings.paranoid,
         use_cache: settings.use_cache,
         use_format_aware: settings.use_format_aware,
-        threads: settings
-            .threads
-            .unwrap_or_else(|| {
+        threads: {
+            let t = settings.threads.unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
-            }),
+            });
+            t
+        },
+        io_threads: {
+            // Explicit setting wins; otherwise oversubscribe to
+            // CPU × 3 like the CLI default.
+            let cpu = settings.threads.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
+            settings
+                .io_threads
+                .unwrap_or(cpu.saturating_mul(3).max(1))
+        },
         queue_depth: None,
         output: None,
         follow_links: settings.follow_links,

@@ -863,13 +863,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "ddh128"
-version = "0.1.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2855,6 +2848,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "river5"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "ron"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3276,7 +3276,6 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "csv",
- "ddh128",
  "eframe",
  "egui",
  "egui_extras",
@@ -3288,6 +3287,7 @@ dependencies = [
  "proptest",
  "rayon",
  "rfd",
+ "river5",
  "rusqlite",
  "serde",
  "serde_json",
