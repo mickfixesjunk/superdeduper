@@ -128,19 +128,22 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         tracing::debug!(error = %e, "rayon global pool already initialized; keeping existing");
     }
 
-    // Open the cache early so Stage 1's warm-path enumerator can
-    // pull its USN-delta snapshot through it. Doubles as the hash
-    // cache later in Stage 4. `--no-cache` keeps both disabled.
-    let cache = if cfg.use_cache {
-        match superdupe::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
-            Ok(c) => Some(Arc::new(Mutex::new(c))),
-            Err(e) => {
-                tracing::warn!(error = %e, "cache disabled (couldn't open)");
-                None
-            }
+    // Open the cache up front. `--no-cache` is about benchmarking
+    // clean hash throughput — it should NOT also disable the
+    // inventory-snapshot warm path (which is orthogonal: it speeds
+    // up Stage 1, not Stage 4). So we always try to open; only the
+    // Stage 4 hash-lookup decision below gates on `cfg.use_cache`.
+    // If the open itself fails (permissions, disk full, …) we
+    // surrender both and fall back to fully cacheless behaviour.
+    let cache = match superdupe::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
+        Ok(c) => Some(Arc::new(Mutex::new(c))),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cache disabled (couldn't open) — both warm-path inventory and hash cache off"
+            );
+            None
         }
-    } else {
-        None
     };
 
     let t_inventory = std::time::Instant::now();
@@ -170,9 +173,14 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         "stage 3: layout resolution complete"
     );
 
+    // Stage 4 hash cache: only handed to the hasher when --no-cache
+    // wasn't passed. The cache handle itself stays alive (the warm
+    // path snapshot above used it, and the cold MFT fallback may
+    // still need to write the snapshot in `mft::enumerate`).
+    let hash_cache = if cfg.use_cache { cache.clone() } else { None };
     let t_hash = std::time::Instant::now();
     let (duplicates, counters) =
-        pipeline::hash::run_with_counters(laid_out, &cfg, cache).context("hashing failed")?;
+        pipeline::hash::run_with_counters(laid_out, &cfg, hash_cache).context("hashing failed")?;
     let hash_ms = t_hash.elapsed().as_millis();
     tracing::info!(
         groups = duplicates.len(),
