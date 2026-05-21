@@ -1,6 +1,6 @@
 # Testing Strategy
 
-This document is the testing plan for `superdupe`. It augments the
+This document is the testing plan for `superdeduper`. It augments the
 `Quality Bar` section of the project spec with the concrete test
 shapes, harnesses, and CI matrix we'll maintain.
 
@@ -162,7 +162,7 @@ last-green main:
 ### 3.3 Comparative bench vs fclones
 
 A separate workflow (`bench-vs-fclones.yml`) runs `fclones group` and
-`superdupe scan` on a fixed 50 GB synthetic dataset and writes the
+`superdeduper scan` on a fixed 50 GB synthetic dataset and writes the
 results to `bench-results.md`. The PR comment shows the delta.
 Non-blocking but watched.
 

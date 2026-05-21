@@ -121,13 +121,13 @@ mod tests {
 
     #[test]
     fn blake3_output_is_32_bytes() {
-        let h = hash_oneshot(HashAlgo::Blake3, b"superdupe");
+        let h = hash_oneshot(HashAlgo::Blake3, b"superdeduper");
         assert_eq!(h.len(), 32);
     }
 
     #[test]
     fn river128_output_is_16_bytes() {
-        let h = hash_oneshot(HashAlgo::River5, b"superdupe");
+        let h = hash_oneshot(HashAlgo::River5, b"superdeduper");
         assert_eq!(h.len(), 16);
     }
 
@@ -136,9 +136,10 @@ mod tests {
         for algo in [HashAlgo::Blake3, HashAlgo::River5] {
             let mut h = ContentHasher::new(algo);
             h.update(b"super");
-            h.update(b"dupe");
+            h.update(b"dedup");
+            h.update(b"er");
             let streamed = h.finalize();
-            let one = hash_oneshot(algo, b"superdupe");
+            let one = hash_oneshot(algo, b"superdeduper");
             assert_eq!(streamed, one, "streaming != one-shot for {algo:?}");
         }
     }

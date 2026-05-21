@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn identical_mkvs_match() {
-        let a = make_mkv(123.0, "libsuperdupe-tests");
+        let a = make_mkv(123.0, "libsuperdeduper-tests");
         let mut c1 = Cursor::new(a.clone());
         let mut c2 = Cursor::new(a.clone());
         assert_eq!(

@@ -53,7 +53,7 @@ pub struct FileEntry {
 /// inventory: a USN-journal delta is applied to a saved baseline
 /// rather than re-walking the MFT. First-ever scan still pays the
 /// full cold cost. Pass `None` to disable warm-path entirely (the
-/// `superdupe scan --no-cache` codepath does this).
+/// `superdeduper scan --no-cache` codepath does this).
 pub fn enumerate(cfg: &ScanConfig, cache: Option<&Arc<Mutex<Cache>>>) -> Result<Vec<FileEntry>> {
     match mft::enumerate(cfg, cache) {
         Ok(v) => Ok(v),

@@ -1,4 +1,4 @@
-//! superdupe — the fastest duplicate file finder for Windows / NTFS.
+//! superdeduper — the fastest duplicate file finder for Windows / NTFS.
 //!
 //! This crate is split into focused modules that mirror the five-stage
 //! pipeline described in the project spec:

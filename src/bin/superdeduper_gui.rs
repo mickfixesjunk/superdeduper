@@ -1,4 +1,4 @@
-//! `superdupe-gui` — desktop window for the engine.
+//! `superdeduper-gui` — desktop window for the engine.
 //!
 //! Default: idle "pick a folder to scan" state. Pass `--live <PATH>…`
 //! to start a real scan immediately on those paths.
@@ -15,10 +15,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use superdupe::gui::SuperdupeApp;
+use superdeduper::gui::SuperdeduperApp;
 
 #[derive(Debug, Parser)]
-#[command(name = "superdupe-gui", version, about = "superdupe desktop GUI")]
+#[command(name = "superdeduper-gui", version, about = "superdeduper desktop GUI")]
 struct Args {
     /// Run a real scan against these paths instead of waiting for the
     /// user to click "Scan".
@@ -36,7 +36,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1100.0, 720.0])
-            .with_title("superdupe"),
+            .with_title("superdeduper"),
         vsync: true,
         ..Default::default()
     };
@@ -53,10 +53,10 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "superdupe",
+        "superdeduper",
         native_options,
         Box::new(move |cc| {
-            let mut app = SuperdupeApp::new(cc);
+            let mut app = SuperdeduperApp::new(cc);
             for p in &seed_roots {
                 app.add_root(p.clone(), false);
             }

@@ -24,9 +24,9 @@ pub enum RootsAction {
     Pause,
     Cancel,
     /// Walk every root (reference included) and strip the
-    /// `.superdupe` suffix from any file that has it — the safe-mode
+    /// `.superdeduper` suffix from any file that has it — the safe-mode
     /// undo. Doesn't require a prior scan.
-    Unsuperdupe,
+    Unsuperdeduper,
     /// Prompt the user for a destination folder, then move every
     /// duplicate-but-not-keeper to that folder with the original
     /// directory tree preserved. Writes a manifest next to the
@@ -135,7 +135,7 @@ pub fn show(
     ui.add_space(6.0);
 
     let can_scan = !roots.is_empty() && !is_scanning;
-    let can_unsuperdupe = !roots.is_empty() && !is_scanning;
+    let can_unsuperdeduper = !roots.is_empty() && !is_scanning;
     ui.horizontal(|ui| {
         let primary_label = if is_scanning {
             "⏸  Pause"
@@ -159,21 +159,22 @@ pub fn show(
             });
         }
 
-        // Unsuperdupe sits beside Start scan — no scan required, just
-        // walks the roots and strips `.superdupe` extensions back.
-        let unsuperdupe = egui::Button::new(RichText::new("↩  Unsuperdupe").color(theme::TEXT_HI))
-            .fill(theme::PANEL_DEEP)
-            .min_size(vec2(140.0, 28.0));
+        // Unsuperdeduper sits beside Start scan — no scan required, just
+        // walks the roots and strips `.superdeduper` extensions back.
+        let unsuperdeduper =
+            egui::Button::new(RichText::new("↩  Unsuperdeduper").color(theme::TEXT_HI))
+                .fill(theme::PANEL_DEEP)
+                .min_size(vec2(140.0, 28.0));
         if ui
-            .add_enabled(can_unsuperdupe, unsuperdupe)
+            .add_enabled(can_unsuperdeduper, unsuperdeduper)
             .on_hover_text(
-                "Walk every root and rename any *.superdupe file back \
+                "Walk every root and rename any *.superdeduper file back \
                  to its original. Reverses safe-mode rename. No scan \
                  required.",
             )
             .clicked()
         {
-            action = Some(RootsAction::Unsuperdupe);
+            action = Some(RootsAction::Unsuperdeduper);
         }
 
         // Archive button: only useful after a scan has produced

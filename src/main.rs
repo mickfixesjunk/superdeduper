@@ -7,10 +7,10 @@ use clap::Parser;
 use parking_lot::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use superdupe::cache::Cache;
-use superdupe::cli::{CacheCommand, Cli, Command, DedupeArgs, ScanArgs};
-use superdupe::config::ScanConfig;
-use superdupe::{dedupe, inventory, output, pipeline};
+use superdeduper::cache::Cache;
+use superdeduper::cli::{CacheCommand, Cli, Command, DedupeArgs, ScanArgs};
+use superdeduper::config::ScanConfig;
+use superdeduper::{dedupe, inventory, output, pipeline};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -38,7 +38,7 @@ fn run_drive_info() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         use std::path::PathBuf;
-        use superdupe::winapi_wrappers::{bus_type_name, query_storage_device, volume_for_path};
+        use superdeduper::winapi_wrappers::{bus_type_name, query_storage_device, volume_for_path};
         // Enumerate drive letters A..Z; skip any that GetDriveTypeW
         // says aren't real fixed/removable/network drives. Probing
         // is per-letter to avoid pulling in another IOCTL.
@@ -135,7 +135,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     // Stage 4 hash-lookup decision below gates on `cfg.use_cache`.
     // If the open itself fails (permissions, disk full, …) we
     // surrender both and fall back to fully cacheless behaviour.
-    let cache = match superdupe::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
+    let cache = match superdeduper::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
         Ok(c) => Some(Arc::new(Mutex::new(c))),
         Err(e) => {
             tracing::warn!(
@@ -310,7 +310,7 @@ fn run_dedupe(args: DedupeArgs) -> anyhow::Result<()> {
 }
 
 fn run_cache(cmd: CacheCommand) -> anyhow::Result<()> {
-    let path = superdupe::cache::default_cache_path()?;
+    let path = superdeduper::cache::default_cache_path()?;
     let cache = Cache::open(&path).context("opening cache database")?;
     match cmd {
         CacheCommand::Info => {
@@ -337,7 +337,7 @@ fn run_cache(cmd: CacheCommand) -> anyhow::Result<()> {
 fn init_logging(verbose: u8, quiet: bool) {
     let filter = if quiet {
         EnvFilter::new("error")
-    } else if let Ok(env) = std::env::var("SUPERDUPE_LOG") {
+    } else if let Ok(env) = std::env::var("SUPERDEDUPER_LOG") {
         EnvFilter::new(env)
     } else {
         EnvFilter::new(match verbose {

@@ -14,12 +14,12 @@
 set -euo pipefail
 
 TARGET="${1:?usage: $0 <scan-path>}"
-BIN="${SUPERDUPE_BIN:-./target/release/superdupe}"
+BIN="${SUPERDEDUPER_BIN:-./target/release/superdeduper}"
 SWEEP="${SWEEP_LOG:-/tmp/iothread-sweep.log}"
 THREADS_LIST="${SWEEP_THREADS:-1 4 8 16 24 48 96}"
 
 if [[ ! -x "$BIN" ]]; then
-    echo "$BIN not found — run 'cargo build --release --bin superdupe' first." >&2
+    echo "$BIN not found — run 'cargo build --release --bin superdeduper' first." >&2
     exit 1
 fi
 

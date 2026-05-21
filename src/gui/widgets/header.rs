@@ -15,7 +15,7 @@ pub fn show(ui: &mut Ui, state: &UiState, _is_scanning: bool) -> HeaderAction {
     let mut action = HeaderAction::None;
     ui.horizontal(|ui| {
         ui.add_space(4.0);
-        ui.label(RichText::new("superdupe").color(theme::ACCENT).heading());
+        ui.label(RichText::new("superdeduper").color(theme::ACCENT).heading());
         ui.label(RichText::new(env!("CARGO_PKG_VERSION")).color(theme::TEXT_LO));
         ui.add_space(8.0);
 

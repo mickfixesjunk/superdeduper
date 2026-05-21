@@ -35,8 +35,8 @@ pub enum GroupAction {
     },
     /// Open the keeper's containing folder in Explorer.
     Reveal(PathBuf),
-    /// Safe-mode: append `.superdupe` to every non-keeper. Reversible
-    /// via Unsuperdupe; nothing is deleted.
+    /// Safe-mode: append `.superdeduper` to every non-keeper. Reversible
+    /// via Unsuperdeduper; nothing is deleted.
     SafeRenameOthers {
         keeper: PathBuf,
         dupes: Vec<PathBuf>,
@@ -136,7 +136,7 @@ pub fn show_filtered(
 
     // Bulk safe-rename header row — one button to safe-rename every
     // non-keeper across every visible group. Reversible via the
-    // Unsuperdupe button in the Roots panel; never deletes anything.
+    // Unsuperdeduper button in the Roots panel; never deletes anything.
     let visible_dupe_count: usize = sorted
         .iter()
         .map(|(_, g)| g.files.len().saturating_sub(1))
@@ -153,8 +153,8 @@ pub fn show_filtered(
         if ui
             .add_enabled(visible_dupe_count > 0, btn)
             .on_hover_text(
-                "Append .superdupe to every non-keeper across every visible group. \
-                 Reversible: click Unsuperdupe in the Roots panel to restore. \
+                "Append .superdeduper to every non-keeper across every visible group. \
+                 Reversible: click Unsuperdeduper in the Roots panel to restore. \
                  Reference paths are never touched.",
             )
             .clicked()
@@ -249,8 +249,8 @@ pub fn show_filtered(
                                                 RichText::new("🛡 Safe-rename").color(theme::ACCENT),
                                             )
                                             .on_hover_text(
-                                                "Append .superdupe to every dupe. Reversible \
-                                             via Unsuperdupe; nothing deleted.",
+                                                "Append .superdeduper to every dupe. Reversible \
+                                             via Unsuperdeduper; nothing deleted.",
                                             )
                                             .clicked()
                                         {

@@ -1,7 +1,7 @@
 //! Pause / resume checkpoint that survives an app restart.
 //!
 //! When the user pauses (or the app exits mid-scan), the engine
-//! serialises a `Checkpoint` to `%LOCALAPPDATA%\superdupe\scan-checkpoint.json`
+//! serialises a `Checkpoint` to `%LOCALAPPDATA%\superdeduper\scan-checkpoint.json`
 //! (and the XDG equivalent on non-Windows). On next launch, the GUI
 //! offers to resume.
 //!
@@ -64,7 +64,7 @@ pub struct Checkpoint {
 impl Checkpoint {
     pub fn new(roots: Vec<RootEntry>, settings: ScanSettings) -> Self {
         Self {
-            schema: "superdupe.checkpoint.v1".into(),
+            schema: "superdeduper.checkpoint.v1".into(),
             created_at_unix: now_unix(),
             roots,
             settings,
@@ -95,7 +95,7 @@ pub fn load(path: &Path) -> Result<Option<Checkpoint>> {
     };
     let cp: Checkpoint = serde_json::from_slice(&bytes)
         .map_err(|e| Error::other(format!("checkpoint parse: {e}")))?;
-    if !cp.schema.starts_with("superdupe.checkpoint") {
+    if !cp.schema.starts_with("superdeduper.checkpoint") {
         return Ok(None);
     }
     Ok(Some(cp))
@@ -252,7 +252,7 @@ mod tests {
         assert!(loaded.roots[0].is_reference);
         assert_eq!(loaded.completed_hashes, vec!["deadbeef".to_string()]);
         assert_eq!(loaded.previous_duplicates.len(), 1);
-        assert_eq!(loaded.schema, "superdupe.checkpoint.v1");
+        assert_eq!(loaded.schema, "superdeduper.checkpoint.v1");
     }
 
     #[test]

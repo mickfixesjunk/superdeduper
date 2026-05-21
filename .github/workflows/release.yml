@@ -34,10 +34,10 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: superdupe-x86_64-windows
+            artifact: superdeduper-x86_64-windows
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            artifact: superdupe-aarch64-windows
+            artifact: superdeduper-aarch64-windows
     steps:
       - uses: actions/checkout@v4
 
@@ -52,16 +52,16 @@ jobs:
       - name: Build (locked, release)
         shell: pwsh
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} --bin superdupe
-          cargo build --release --locked --target ${{ matrix.target }} --features gui --bin superdupe-gui
+          cargo build --release --locked --target ${{ matrix.target }} --bin superdeduper
+          cargo build --release --locked --target ${{ matrix.target }} --features gui --bin superdeduper-gui
 
       - name: Stage artifacts
         shell: pwsh
         run: |
           $stage = "stage/${{ matrix.artifact }}"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/superdupe.exe $stage/
-          Copy-Item target/${{ matrix.target }}/release/superdupe-gui.exe $stage/
+          Copy-Item target/${{ matrix.target }}/release/superdeduper.exe $stage/
+          Copy-Item target/${{ matrix.target }}/release/superdeduper-gui.exe $stage/
           Copy-Item LICENSE $stage/
           Copy-Item README.md $stage/
 
@@ -83,9 +83,9 @@ jobs:
           $stage = "stage/${{ matrix.artifact }}"
           & $signtool sign /fd SHA256 /f $pfx /p $env:PFX_PASSWORD `
             /tr "http://timestamp.digicert.com" /td SHA256 `
-            "$stage\superdupe.exe" "$stage\superdupe-gui.exe"
-          & $signtool verify /pa "$stage\superdupe.exe"
-          & $signtool verify /pa "$stage\superdupe-gui.exe"
+            "$stage\superdeduper.exe" "$stage\superdeduper-gui.exe"
+          & $signtool verify /pa "$stage\superdeduper.exe"
+          & $signtool verify /pa "$stage\superdeduper-gui.exe"
           Remove-Item $pfx
 
       - name: Compute SHA-256 checksums

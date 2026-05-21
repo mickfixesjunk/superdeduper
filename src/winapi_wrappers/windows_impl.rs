@@ -1,6 +1,6 @@
 //! Windows implementations of the safe wrappers.
 //!
-//! Every `unsafe` block in `superdupe` lives in this file. Each
+//! Every `unsafe` block in `superdeduper` lives in this file. Each
 //! `unsafe` block carries a `// SAFETY:` comment naming the FFI
 //! contract it relies on.
 
@@ -746,8 +746,8 @@ pub fn recycle(path: &Path) -> Result<()> {
 /// rename-aside / restore-on-failure dance as the hardlink action.
 pub fn replace_with_reflink(target: &Path, keeper: &Path) -> Result<()> {
     use std::fs;
-    let tmp_dest = target.with_extension("superdupe.reflink.tmp");
-    let tmp_orig = target.with_extension("superdupe.tmp");
+    let tmp_dest = target.with_extension("superdeduper.reflink.tmp");
+    let tmp_orig = target.with_extension("superdeduper.tmp");
     if tmp_dest.exists() {
         fs::remove_file(&tmp_dest)?;
     }
@@ -848,7 +848,7 @@ fn block_clone(dest: &Path, source: &Path, size: u64) -> Result<()> {
 /// Atomically replace `target` with a hardlink to `keeper`.
 pub fn replace_with_hardlink(target: &Path, keeper: &Path) -> Result<()> {
     use std::fs;
-    let tmp = target.with_extension("superdupe.tmp");
+    let tmp = target.with_extension("superdeduper.tmp");
     if tmp.exists() {
         fs::remove_file(&tmp)?;
     }

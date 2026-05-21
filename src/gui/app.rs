@@ -51,7 +51,7 @@ struct PersistedAppState {
     results_tab: ResultsTab,
 }
 
-pub struct SuperdupeApp {
+pub struct SuperdeduperApp {
     state: UiState,
     rx: Receiver<EngineEvent>,
     tx: Sender<EngineEvent>,
@@ -81,7 +81,7 @@ pub struct SuperdupeApp {
     /// user to pick. While this is `Some`, the rest of the UI stays
     /// behind the modal so Start Fresh can safely wipe state.
     pending_resume: Option<crate::gui::checkpoint::CheckpointSummary>,
-    /// Filesystem path of the currently-open .superdupe project
+    /// Filesystem path of the currently-open .superdeduper project
     /// folder. `None` ⇒ no project loaded (default on launch, and
     /// after File → New). Save Project writes here when present;
     /// when `None` it falls through to Save As behaviour.
@@ -104,7 +104,7 @@ enum MenuAction {
     /// Wipe the current project. Roots cleared, results cleared,
     /// settings kept. Cache untouched.
     New,
-    /// Folder picker → load that `.superdupe` bundle.
+    /// Folder picker → load that `.superdeduper` bundle.
     OpenProject,
     /// Write to `current_project_path` if Some, else prompt.
     Save,
@@ -117,12 +117,12 @@ enum MenuAction {
     OpenRecent(PathBuf),
 }
 
-impl SuperdupeApp {
+impl SuperdeduperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
         let persisted: PersistedAppState = cc
             .storage
-            .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdupe.app.v1"))
+            .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdeduper.app.v1"))
             .unwrap_or_default();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
 
@@ -211,7 +211,7 @@ impl SuperdupeApp {
             self.state.push_log(
                 crate::gui::events::LogLevel::Info,
                 format!(
-                    "Restored {} duplicate group(s) from a prior scan — folders haven't changed. Safe-rename / Unsuperdupe pick up where you left off.",
+                    "Restored {} duplicate group(s) from a prior scan — folders haven't changed. Safe-rename / Unsuperdeduper pick up where you left off.",
                     dup_count
                 ),
             );
@@ -379,7 +379,7 @@ impl SuperdupeApp {
 
     fn menu_open_project(&mut self) {
         let dir = match rfd::FileDialog::new()
-            .set_title("Open superdupe project — pick the .superdupe folder")
+            .set_title("Open superdeduper project — pick the .superdeduper folder")
             .pick_folder()
         {
             Some(p) => p,
@@ -447,7 +447,9 @@ impl SuperdupeApp {
     fn menu_save_as(&mut self) {
         let default_name = crate::gui::project::default_bundle_name(&self.persisted.roots);
         let dir = match rfd::FileDialog::new()
-            .set_title("Save superdupe project — choose where to create the .superdupe folder")
+            .set_title(
+                "Save superdeduper project — choose where to create the .superdeduper folder",
+            )
             .set_file_name(&default_name)
             .save_file()
         {
@@ -455,10 +457,10 @@ impl SuperdupeApp {
             None => return,
         };
         // rfd's save_file returns a file path even when we want a
-        // folder name — appending the .superdupe suffix if missing
+        // folder name — appending the .superdeduper suffix if missing
         // turns it into a bundle name. e.g. user types "weekly-scan"
-        // → "weekly-scan.superdupe/".
-        let bundle = if dir.extension().and_then(|s| s.to_str()) == Some("superdupe")
+        // → "weekly-scan.superdeduper/".
+        let bundle = if dir.extension().and_then(|s| s.to_str()) == Some("superdeduper")
             || dir
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -554,7 +556,7 @@ impl SuperdupeApp {
     fn run_archive_restore_threaded(&self, manifest: crate::gui::archive::ArchiveManifest) {
         let tx = self.tx.clone();
         std::thread::Builder::new()
-            .name("superdupe-archive-restore".into())
+            .name("superdeduper-archive-restore".into())
             .spawn(move || {
                 let total = manifest.entries.len() as u64;
                 let _ = tx.send(EngineEvent::Status(format!(
@@ -660,7 +662,7 @@ impl SuperdupeApp {
         }
         if scan_just_finished {
             // Persist results + per-root fingerprint in the background
-            // so safe-rename / Unsuperdupe pick up where we left off
+            // so safe-rename / Unsuperdeduper pick up where we left off
             // after a restart.
             self.persist_results_after_scan();
         }
@@ -713,7 +715,7 @@ impl SuperdupeApp {
                 self.request_pause();
                 self.persisted.results_tab = ResultsTab::Log;
             }
-            RootsAction::Unsuperdupe => self.run_unsuperdupe_threaded(),
+            RootsAction::Unsuperdeduper => self.run_unsuperdeduper_threaded(),
             RootsAction::ArchiveDupes => self.pick_archive_dest_and_run(),
         }
     }
@@ -779,7 +781,7 @@ impl SuperdupeApp {
             .collect();
         let total: u64 = groups.iter().map(|(_, _, _, d)| d.len() as u64).sum();
         std::thread::Builder::new()
-            .name("superdupe-archive".into())
+            .name("superdeduper-archive".into())
             .spawn(move || {
                 let _ = tx.send(EngineEvent::Status(format!(
                     "Archiving {} file(s) from {} group(s) → {}",
@@ -847,7 +849,7 @@ impl SuperdupeApp {
                 // so multiple archive runs into the same folder
                 // produce distinct manifests instead of overwriting.
                 let manifest_path = dest.join(format!(
-                    "superdupe-archive-manifest-{}.json",
+                    "superdeduper-archive-manifest-{}.json",
                     iso_timestamp_for_filename()
                 ));
                 let manifest = crate::gui::archive::ArchiveManifest {
@@ -942,7 +944,7 @@ impl SuperdupeApp {
             .collect();
         let total: u64 = groups.iter().map(|(_, d)| d.len() as u64).sum();
         std::thread::Builder::new()
-            .name("superdupe-safe-rename-all".into())
+            .name("superdeduper-safe-rename-all".into())
             .spawn(move || {
                 let _ = tx.send(EngineEvent::Status(format!(
                     "Safe-renaming {} file(s) across {} group(s)…",
@@ -1007,7 +1009,7 @@ impl SuperdupeApp {
 
     /// Snapshot the current duplicate list + roots + settings and
     /// compute a per-root fingerprint, then write the whole bundle to
-    /// `%LOCALAPPDATA%\superdupe\results-state.json` on a background
+    /// `%LOCALAPPDATA%\superdeduper\results-state.json` on a background
     /// thread. Used right after a scan finishes so the next launch
     /// can restore the duplicate list without re-scanning, provided
     /// the folders haven't drifted.
@@ -1016,7 +1018,7 @@ impl SuperdupeApp {
         let roots = self.persisted.roots.clone();
         let settings = self.persisted.settings.clone();
         std::thread::Builder::new()
-            .name("superdupe-results-save".into())
+            .name("superdeduper-results-save".into())
             .spawn(move || {
                 let fingerprints = roots
                     .iter()
@@ -1036,8 +1038,8 @@ impl SuperdupeApp {
     }
 
     /// Walk every root (incl. reference) and rename any
-    /// `*.superdupe` file back to its original. No prior scan needed.
-    fn run_unsuperdupe_threaded(&self) {
+    /// `*.superdeduper` file back to its original. No prior scan needed.
+    fn run_unsuperdeduper_threaded(&self) {
         let tx = self.tx.clone();
         let roots: Vec<PathBuf> = self
             .persisted
@@ -1046,7 +1048,7 @@ impl SuperdupeApp {
             .map(|r| r.path.clone())
             .collect();
         std::thread::Builder::new()
-            .name("superdupe-unsuperdupe".into())
+            .name("superdeduper-unsuperdeduper".into())
             .spawn(move || {
                 let _ = tx.send(EngineEvent::Status(format!(
                     "Unsuperduping {} root(s)…",
@@ -1056,7 +1058,7 @@ impl SuperdupeApp {
                 let mut total_skipped = 0u64;
                 let mut total_errors = 0u64;
                 for r in &roots {
-                    match crate::dedupe::unsuperdupe_root(r) {
+                    match crate::dedupe::unsuperdeduper_root(r) {
                         Ok((renamed, skipped, errors)) => {
                             total_renamed += renamed;
                             total_skipped += skipped;
@@ -1064,7 +1066,7 @@ impl SuperdupeApp {
                             let _ = tx.send(EngineEvent::Log {
                                 level: crate::gui::events::LogLevel::Info,
                                 message: format!(
-                                    "unsuperdupe · {} · renamed={renamed} skipped={skipped} errors={errors}",
+                                    "unsuperdeduper · {} · renamed={renamed} skipped={skipped} errors={errors}",
                                     r.display()
                                 ),
                             });
@@ -1073,7 +1075,7 @@ impl SuperdupeApp {
                             let _ = tx.send(EngineEvent::Log {
                                 level: crate::gui::events::LogLevel::Error,
                                 message: format!(
-                                    "unsuperdupe failed · {} · {e}",
+                                    "unsuperdeduper failed · {} · {e}",
                                     r.display()
                                 ),
                             });
@@ -1082,7 +1084,7 @@ impl SuperdupeApp {
                     }
                 }
                 // Renamed_paths in the saved state no longer reflects
-                // reality — every `.superdupe` file just got restored.
+                // reality — every `.superdeduper` file just got restored.
                 // Clear the renamed list (but keep the duplicates so
                 // the user can act on them again if they want).
                 if let Ok(Some(mut state)) = crate::gui::results_store::load() {
@@ -1090,17 +1092,17 @@ impl SuperdupeApp {
                     let _ = crate::gui::results_store::save(&state);
                 }
                 let _ = tx.send(EngineEvent::Status(format!(
-                    "Unsuperdupe complete · {} renamed, {} skipped, {} errors.",
+                    "Unsuperdeduper complete · {} renamed, {} skipped, {} errors.",
                     total_renamed, total_skipped, total_errors,
                 )));
             })
-            .expect("spawn unsuperdupe thread");
+            .expect("spawn unsuperdeduper thread");
     }
 
     fn run_action_threaded(&self, action: DedupeAction, keeper: PathBuf, dupes: Vec<PathBuf>) {
         let tx = self.tx.clone();
         std::thread::Builder::new()
-            .name("superdupe-action".into())
+            .name("superdeduper-action".into())
             .spawn(move || {
                 let mut done = 0u64;
                 let mut failed = 0u64;
@@ -1150,7 +1152,7 @@ impl SuperdupeApp {
     }
 }
 
-impl eframe::App for SuperdupeApp {
+impl eframe::App for SuperdeduperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         if self.is_scanning {
@@ -1286,7 +1288,7 @@ impl eframe::App for SuperdupeApp {
                         ui.separator();
                         if ui
                             .button("Open Project…")
-                            .on_hover_text("Pick a .superdupe folder previously written with Save Project. Restores roots, settings, and the confirmed-duplicates list.")
+                            .on_hover_text("Pick a .superdeduper folder previously written with Save Project. Restores roots, settings, and the confirmed-duplicates list.")
                             .clicked()
                         {
                             menu_action = Some(MenuAction::OpenProject);
@@ -1303,7 +1305,7 @@ impl eframe::App for SuperdupeApp {
                         };
                         if ui
                             .button(save_label)
-                            .on_hover_text("Write the current roots, settings, and results to the open .superdupe folder. If no project is open, prompts for a folder.")
+                            .on_hover_text("Write the current roots, settings, and results to the open .superdeduper folder. If no project is open, prompts for a folder.")
                             .clicked()
                         {
                             menu_action = Some(MenuAction::Save);
@@ -1311,7 +1313,7 @@ impl eframe::App for SuperdupeApp {
                         }
                         if ui
                             .button("Save Project As…")
-                            .on_hover_text("Write a copy of the current project to a new .superdupe folder.")
+                            .on_hover_text("Write a copy of the current project to a new .superdeduper folder.")
                             .clicked()
                         {
                             menu_action = Some(MenuAction::SaveAs);
@@ -1514,7 +1516,7 @@ impl eframe::App for SuperdupeApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "superdupe.app.v1", &self.persisted);
+        eframe::set_value(storage, "superdeduper.app.v1", &self.persisted);
     }
 }
 

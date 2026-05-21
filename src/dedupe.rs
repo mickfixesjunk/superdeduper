@@ -1,4 +1,4 @@
-//! `superdupe dedupe` — destructive operations against a results file.
+//! `superdeduper dedupe` — destructive operations against a results file.
 //!
 //! Safety contracts enforced here (all of them, at multiple layers):
 //!
@@ -57,7 +57,7 @@ pub fn run(args: &DedupeArgs) -> Result<Outcome> {
     let raw = fs::read_to_string(&args.results_file)?;
     let results: ResultsFile = serde_json::from_str(&raw)
         .map_err(|e| Error::other(format!("parsing results file: {e}")))?;
-    if !results.schema.starts_with("superdupe.scan") {
+    if !results.schema.starts_with("superdeduper.scan") {
         return Err(Error::other(format!(
             "unknown results schema `{}`",
             results.schema
@@ -248,7 +248,7 @@ fn perform_action(action: DedupeAction, path: &Path, keeper: &Path) -> Result<()
 /// File extension we append in safe-rename mode. Chosen to be
 /// distinctive enough that an undo walker won't accidentally touch
 /// user files (e.g. `.bak` or `.tmp` would be too generic).
-pub const SAFE_RENAME_SUFFIX: &str = ".superdupe";
+pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 
 /// Single-file destructive actions, exposed so callers (the GUI) can
 /// run them directly without round-tripping through a results file.
@@ -271,9 +271,9 @@ pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
     replace_with_reflink(target, keeper)
 }
 
-/// Safe-mode rename: append `.superdupe` to the target. Idempotent —
+/// Safe-mode rename: append `.superdeduper` to the target. Idempotent —
 /// files already ending in the suffix are a no-op. Reversible via
-/// `unsuperdupe_root`. Never deletes anything.
+/// `unsuperdeduper_root`. Never deletes anything.
 pub fn action_safe_rename(target: &Path) -> Result<()> {
     let name = target
         .file_name()
@@ -295,15 +295,15 @@ pub fn action_safe_rename(target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Walk `root` and rename every file ending in `.superdupe` back to
-/// its original. Used by the GUI's Unsuperdupe button to reverse a
+/// Walk `root` and rename every file ending in `.superdeduper` back to
+/// its original. Used by the GUI's Unsuperdeduper button to reverse a
 /// safe-rename batch on demand — no scan required first.
 ///
 /// Returns `(renamed, skipped, errors)` so callers can surface a
 /// summary line. Errors are logged via `tracing::warn!` and don't
 /// halt the walk; a single permission-denied subdirectory shouldn't
 /// abort the whole undo.
-pub fn unsuperdupe_root(root: &Path) -> Result<(u64, u64, u64)> {
+pub fn unsuperdeduper_root(root: &Path) -> Result<(u64, u64, u64)> {
     let mut renamed = 0u64;
     let mut skipped = 0u64;
     let mut errors = 0u64;
@@ -312,7 +312,7 @@ pub fn unsuperdupe_root(root: &Path) -> Result<(u64, u64, u64)> {
         let read = match fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(path = %dir.display(), error = %e, "unsuperdupe: dir open failed");
+                tracing::warn!(path = %dir.display(), error = %e, "unsuperdeduper: dir open failed");
                 errors += 1;
                 continue;
             }
@@ -346,7 +346,7 @@ pub fn unsuperdupe_root(root: &Path) -> Result<(u64, u64, u64)> {
             if dest.exists() {
                 tracing::warn!(
                     path = %path.display(),
-                    "unsuperdupe: restore target already exists; skipping"
+                    "unsuperdeduper: restore target already exists; skipping"
                 );
                 skipped += 1;
                 continue;
@@ -354,7 +354,7 @@ pub fn unsuperdupe_root(root: &Path) -> Result<(u64, u64, u64)> {
             match fs::rename(&path, &dest) {
                 Ok(()) => renamed += 1,
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "unsuperdupe: rename failed");
+                    tracing::warn!(path = %path.display(), error = %e, "unsuperdeduper: rename failed");
                     errors += 1;
                 }
             }
@@ -384,7 +384,7 @@ fn replace_with_hardlink(target: &Path, keeper: &Path) -> Result<()> {
 
 #[cfg(not(windows))]
 fn replace_with_hardlink(target: &Path, keeper: &Path) -> Result<()> {
-    let tmp = target.with_extension("superdupe.tmp");
+    let tmp = target.with_extension("superdeduper.tmp");
     if tmp.exists() {
         fs::remove_file(&tmp)?;
     }
@@ -467,7 +467,7 @@ mod tests {
     fn tmpdir() -> PathBuf {
         let mut d = std::env::temp_dir();
         d.push(format!(
-            "superdupe-dedupe-{}-{}",
+            "superdeduper-dedupe-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -494,7 +494,7 @@ mod tests {
 
     fn results(groups: Vec<DuplicateGroup>) -> ResultsFile {
         ResultsFile {
-            schema: "superdupe.scan.v1".into(),
+            schema: "superdeduper.scan.v1".into(),
             groups,
             summary: None,
         }
@@ -579,9 +579,9 @@ mod tests {
         // system-prefixed path and assert the guard refuses it.
         let d = tmpdir();
         #[cfg(windows)]
-        let sys = PathBuf::from("C:\\Windows\\superdupe-fake.bin");
+        let sys = PathBuf::from("C:\\Windows\\superdeduper-fake.bin");
         #[cfg(not(windows))]
-        let sys = PathBuf::from("/etc/superdupe-fake.bin");
+        let sys = PathBuf::from("/etc/superdeduper-fake.bin");
         let other = d.join("ok.bin");
         write_file(&other, b"x");
         let r = results(vec![group(1, vec![other.clone(), sys.clone()])]);

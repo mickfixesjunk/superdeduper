@@ -26,7 +26,7 @@ artifacts.
 
 ## Cutting a release
 
-1. **Update the version** in `Cargo.toml` and run `cargo update -p superdupe`.
+1. **Update the version** in `Cargo.toml` and run `cargo update -p superdeduper`.
 2. **Update `Cargo.lock`** (`cargo build --locked` to verify it's consistent).
 3. **Commit:** `git commit -am "Release vX.Y.Z"`.
 4. **Tag** with the same `vX.Y.Z`:
@@ -45,13 +45,13 @@ After the workflow finishes, sanity-check the published artifacts the
 same way an end user would:
 
 ```pwsh
-gh release download vX.Y.Z --pattern "superdupe-*.zip" --pattern "*.sha256"
+gh release download vX.Y.Z --pattern "superdeduper-*.zip" --pattern "*.sha256"
 foreach ($z in Get-ChildItem *.zip) {
   $exp = (Get-Content "$($z.Name).sha256").Split(' ')[0]
   $act = (Get-FileHash -Algorithm SHA256 $z).Hash.ToLower()
   if ($exp -ne $act) { throw "MISMATCH on $z" }
 }
-gh attestation verify superdupe-x86_64-windows.zip --repo mdreeling/superdupe
+gh attestation verify superdeduper-x86_64-windows.zip --repo mdreeling/superdeduper
 ```
 
 If `attestation verify` returns "verification succeeded" and every

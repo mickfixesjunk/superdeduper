@@ -1,6 +1,6 @@
 //! Safe wrappers over the Win32 / NT APIs we need for the scan pipeline.
 //!
-//! Every `unsafe` block in `superdupe` lives in this module. Each `unsafe`
+//! Every `unsafe` block in `superdeduper` lives in this module. Each `unsafe`
 //! block carries a `// SAFETY:` comment explaining the FFI contract it
 //! upholds. Callers outside this module see only safe Rust types.
 //!

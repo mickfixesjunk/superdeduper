@@ -57,7 +57,7 @@ pub fn spawn_with_settings(
     cancel: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
-        .name("superdupe-engine".into())
+        .name("superdeduper-engine".into())
         .spawn(move || {
             if let Err(e) = run(tx.clone(), roots, settings, cancel) {
                 let _ = tx.send(EngineEvent::Log {
@@ -395,7 +395,7 @@ fn run(
         let mut hint = "Inventory returned 0 files.".to_string();
         if dirs_denied > 0 {
             hint.push_str(&format!(
-                " {} director(ies) were permission-denied — try running superdupe-gui as administrator.",
+                " {} director(ies) were permission-denied — try running superdeduper-gui as administrator.",
                 dirs_denied
             ));
         }

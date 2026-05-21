@@ -1,20 +1,20 @@
 [package]
-name = "superdupe"
+name = "superdeduper"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
-description = "superdupe — the fastest duplicate file finder for Windows / NTFS."
+description = "superdeduper — the fastest duplicate file finder for Windows / NTFS."
 license = "MIT"
-repository = "https://github.com/mdreeling/superdupe"
+repository = "https://github.com/mdreeling/superdeduper"
 readme = "README.md"
 publish = false
 
 [[bin]]
-name = "superdupe"
+name = "superdeduper"
 path = "src/main.rs"
 
 [lib]
-name = "superdupe"
+name = "superdeduper"
 path = "src/lib.rs"
 
 [dependencies]
@@ -59,8 +59,8 @@ default = []
 gui = ["dep:eframe", "dep:egui", "dep:egui_plot", "dep:egui_extras", "dep:crossbeam-channel", "dep:rfd"]
 
 [[bin]]
-name = "superdupe-gui"
-path = "src/bin/superdupe_gui.rs"
+name = "superdeduper-gui"
+path = "src/bin/superdeduper_gui.rs"
 required-features = ["gui"]
 
 [target.'cfg(windows)'.dependencies.windows]

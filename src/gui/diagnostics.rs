@@ -69,7 +69,7 @@ impl DiagnosticsLog {
     /// directory. Failure to create the dir or file is non-fatal —
     /// returns `None` and the engine carries on without diagnostics.
     pub fn open() -> Option<Arc<Self>> {
-        let dir = std::env::var_os("SUPERDUPE_DIAGNOSTICS_DIR")
+        let dir = std::env::var_os("SUPERDEDUPER_DIAGNOSTICS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("diagnostics"));
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -95,7 +95,7 @@ impl DiagnosticsLog {
         // reports later.
         let _ = writeln!(
             bw,
-            "# superdupe diagnostics report\n\
+            "# superdeduper diagnostics report\n\
              # uuid={uuid}\n\
              # started={}\n\
              # path={}",
@@ -208,7 +208,7 @@ pub fn spawn_state_sampler(
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
-        .name("superdupe-diag-sampler".into())
+        .name("superdeduper-diag-sampler".into())
         .spawn(move || loop {
             // Sleep in small chunks so we can react quickly to `stop`.
             for _ in 0..(period.as_millis() / 100).max(1) {

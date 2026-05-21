@@ -24,9 +24,9 @@ use proptest::prelude::*;
 use proptest::test_runner::Config as PropConfig;
 use tempfile::TempDir;
 
-use superdupe::cli::OutputFormat;
-use superdupe::config::ScanConfig;
-use superdupe::{inventory, pipeline};
+use superdeduper::cli::OutputFormat;
+use superdeduper::config::ScanConfig;
+use superdeduper::{inventory, pipeline};
 
 /// Plant N files where each file `i` is assigned to a content class
 /// `classes[i]`; files in the same class have identical bytes.
@@ -68,7 +68,7 @@ fn run_scan(root: &Path, threads: usize, min_size: u64) -> Vec<pipeline::Duplica
         follow_links: false,
         allow_system_paths: false,
         io_threads: 4,
-        hash_algo: superdupe::pipeline::hash::HashAlgo::Blake3,
+        hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
     };
     let files = inventory::enumerate(&cfg, None).unwrap();
     let size_groups = pipeline::grouping::group_by_size(files);

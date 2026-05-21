@@ -1,17 +1,17 @@
-//! `.superdupe` project bundles.
+//! `.superdeduper` project bundles.
 //!
 //! A *project* captures everything a user would want to keep across
 //! sessions for a single scan target: the roots, the engine
 //! settings, the confirmed-duplicates list, and (when applicable) an
 //! archive manifest from a destructive Archive Dupes run. It's
 //! orthogonal to the per-file rusqlite hash cache, which lives in
-//! `%LOCALAPPDATA%\superdupe\cache.db` and is purely a performance
+//! `%LOCALAPPDATA%\superdeduper\cache.db` and is purely a performance
 //! optimisation — projects are *user state*, cache is *derived data*.
 //!
 //! On disk a project is a folder, not a single file:
 //!
 //! ```text
-//! my-scan.superdupe/
+//! my-scan.superdeduper/
 //!   project.json          # schema + roots + settings + metadata
 //!   duplicates.json       # the confirmed dup groups (can be large)
 //!   archive-manifest.json # optional — present iff Archive Dupes ran
@@ -20,7 +20,7 @@
 //! Bundle-as-folder makes the multi-asset story natural: future
 //! additions (per-session diagnostics, custom annotations, drive
 //! detection overrides) get their own files alongside `project.json`
-//! without forcing a schema bump on every change. The `.superdupe`
+//! without forcing a schema bump on every change. The `.superdeduper`
 //! folder suffix lets Explorer / Finder treat it as one item.
 
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub struct ProjectFile {
     /// a clear error instead of silently misparsed.
     pub schema: String,
     /// Free-form name the user can edit later — defaults to the
-    /// bundle folder's filename without the `.superdupe` suffix.
+    /// bundle folder's filename without the `.superdeduper` suffix.
     pub name: String,
     /// Unix seconds when the project was first saved. Stable across
     /// re-saves; used for the recents list ordering.
@@ -76,11 +76,11 @@ pub struct DuplicatesFile {
     pub duplicates: Vec<DuplicateGroupSummary>,
 }
 
-pub const PROJECT_SCHEMA: &str = "superdupe.project.v1";
-pub const DUPLICATES_SCHEMA: &str = "superdupe.duplicates.v1";
-/// Folder suffix that marks a directory as a superdupe project
+pub const PROJECT_SCHEMA: &str = "superdeduper.project.v1";
+pub const DUPLICATES_SCHEMA: &str = "superdeduper.duplicates.v1";
+/// Folder suffix that marks a directory as a superdeduper project
 /// bundle. Open / Save dialogs use this to filter folder pickers.
-pub const PROJECT_SUFFIX: &str = ".superdupe";
+pub const PROJECT_SUFFIX: &str = ".superdeduper";
 
 /// Save (or overwrite) a project bundle at `dir`. Creates the
 /// directory if missing. Write order is: temp file → rename, so a
@@ -171,7 +171,7 @@ pub fn load(dir: &Path) -> Result<(ProjectFile, Vec<DuplicateGroupSummary>)> {
 }
 
 /// Default name for a new project bundle, derived from the first
-/// root's filename. e.g. `C:\Users\X\AppData` → `AppData.superdupe`.
+/// root's filename. e.g. `C:\Users\X\AppData` → `AppData.superdeduper`.
 pub fn default_bundle_name(roots: &[RootEntry]) -> String {
     let stem = roots
         .first()
@@ -191,7 +191,7 @@ fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 /// Path of the user's "recent projects" index. We keep it in the
-/// existing LocalAppData superdupe folder next to the cache.
+/// existing LocalAppData superdeduper folder next to the cache.
 pub fn recents_path() -> Result<PathBuf> {
     let mut p = crate::cache::default_cache_path()?;
     p.set_file_name("recent-projects.json");
