@@ -27,7 +27,8 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, size: u64) -> std::io::Result<Vec<
     let eof = find_last(&tail, b"%%EOF").ok_or_else(|| io_err("no %%EOF"))?;
     let trailer_region = &tail[..eof + b"%%EOF".len()];
 
-    let startxref_off = find_last(trailer_region, b"startxref").ok_or_else(|| io_err("no startxref"))?;
+    let startxref_off =
+        find_last(trailer_region, b"startxref").ok_or_else(|| io_err("no startxref"))?;
     // Parse the integer after `startxref` to learn where the xref
     // table lives in the file.
     let after = &trailer_region[startxref_off + b"startxref".len()..];

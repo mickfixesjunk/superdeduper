@@ -70,8 +70,7 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, size: u64) -> std::io::Result<Vec<
 
     // Walk frames to count them and find the last header.
     let frame_count_cap = 200_000usize;
-    let (count, last_header) =
-        walk_frames(r, first_header_abs, audio_end, frame_count_cap)?;
+    let (count, last_header) = walk_frames(r, first_header_abs, audio_end, frame_count_cap)?;
     hasher.update(b"COUNT|");
     hasher.update(&(count as u32).to_be_bytes());
     if let Some(h) = last_header {
@@ -82,8 +81,7 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, size: u64) -> std::io::Result<Vec<
 }
 
 fn find_sync(buf: &[u8]) -> Option<usize> {
-    (0..buf.len().saturating_sub(1))
-        .find(|&i| buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0)
+    (0..buf.len().saturating_sub(1)).find(|&i| buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0)
 }
 
 fn walk_frames<R: Read + Seek>(

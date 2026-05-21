@@ -11,7 +11,6 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-
 /// Maximum bytes to scan backwards from EOF when locating the EOCD.
 /// The EOCD comment field can be up to 65 535 bytes, plus the 22-byte
 /// fixed header. Add a small slack so we don't miss the boundary.

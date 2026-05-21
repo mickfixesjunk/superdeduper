@@ -179,15 +179,16 @@ fn run_with_counters_inner(
         .thread_name(|i| format!("superdupe-io-{i}"))
         .build()
         .map_err(|e| Error::other(format!("io thread pool build: {e}")))?;
-    let mut confirmed: Vec<DuplicateGroup> = io_pool.install(|| {
-        groups
-            .into_par_iter()
-            .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref, cancel_ref))
-            .collect::<Result<Vec<_>>>()
-    })?
-    .into_iter()
-    .flatten()
-    .collect();
+    let mut confirmed: Vec<DuplicateGroup> = io_pool
+        .install(|| {
+            groups
+                .into_par_iter()
+                .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref, cancel_ref))
+                .collect::<Result<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect();
 
     confirmed.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.files.cmp(&b.files)));
     let counters = Arc::try_unwrap(counters).unwrap_or_else(|arc| {
@@ -269,7 +270,9 @@ fn run_group(
         return Ok(Vec::new());
     }
     survivors = split_by(&survivors, |f| {
-        tiered(f, Tier::One, algo, cache, counters, on_file, || tier1_hash(f, size, algo))
+        tiered(f, Tier::One, algo, cache, counters, on_file, || {
+            tier1_hash(f, size, algo)
+        })
     })?;
     if survivors.len() < 2 {
         return Ok(Vec::new());
@@ -280,7 +283,9 @@ fn run_group(
             return Ok(Vec::new());
         }
         survivors = split_by(&survivors, |f| {
-            tiered(f, Tier::Two, algo, cache, counters, on_file, || tier2_hash(f, size, algo))
+            tiered(f, Tier::Two, algo, cache, counters, on_file, || {
+                tier2_hash(f, size, algo)
+            })
         })?;
         if survivors.len() < 2 {
             return Ok(Vec::new());
@@ -326,10 +331,8 @@ fn split_by_optional<F>(flat: &[LaidOutFile], hasher: F) -> Result<Vec<LaidOutFi
 where
     F: Fn(&LaidOutFile) -> Option<Vec<u8>> + Send + Sync,
 {
-    let pairs: Vec<(LaidOutFile, Option<Vec<u8>>)> = flat
-        .par_iter()
-        .map(|f| (f.clone(), hasher(f)))
-        .collect();
+    let pairs: Vec<(LaidOutFile, Option<Vec<u8>>)> =
+        flat.par_iter().map(|f| (f.clone(), hasher(f))).collect();
 
     let mut without_fp: Vec<LaidOutFile> = Vec::new();
     let mut by_hash: HashMap<Vec<u8>, Vec<LaidOutFile>> = HashMap::new();
@@ -380,10 +383,7 @@ where
 /// Hash each file and return the buckets keyed by hash. Caller decides
 /// what to do with bucket sizes (Tier 3 keeps everything ≥2; earlier
 /// tiers just want the union of ≥2 buckets).
-fn into_subgroups<F>(
-    flat: &[LaidOutFile],
-    hasher: F,
-) -> Result<HashMap<Vec<u8>, Vec<LaidOutFile>>>
+fn into_subgroups<F>(flat: &[LaidOutFile], hasher: F) -> Result<HashMap<Vec<u8>, Vec<LaidOutFile>>>
 where
     F: Fn(&LaidOutFile) -> std::io::Result<Vec<u8>> + Send + Sync,
 {
@@ -443,7 +443,11 @@ where
             counters.tier_bytes[idx].fetch_add(bytes, Ordering::Relaxed);
             counters.tier_count[idx].fetch_add(1, Ordering::Relaxed);
             if let Some(cb) = on_file {
-                cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
+                cb(
+                    &f.entry.path,
+                    tier_index(tier),
+                    ProgressOutcome::Hashed { bytes },
+                );
             }
             if let Some(c) = cache {
                 if let Some(key) = cache_key(f, algo) {
@@ -461,7 +465,9 @@ where
                 cb(
                     &f.entry.path,
                     tier_index(tier),
-                    ProgressOutcome::Failed { error: e.to_string() },
+                    ProgressOutcome::Failed {
+                        error: e.to_string(),
+                    },
                 );
             }
             Err(e)
@@ -505,7 +511,11 @@ where
             counters.tier_bytes[idx].fetch_add(bytes, Ordering::Relaxed);
             counters.tier_count[idx].fetch_add(1, Ordering::Relaxed);
             if let Some(cb) = on_file {
-                cb(&f.entry.path, tier_index(tier), ProgressOutcome::Hashed { bytes });
+                cb(
+                    &f.entry.path,
+                    tier_index(tier),
+                    ProgressOutcome::Hashed { bytes },
+                );
             }
             if let Some(c) = cache {
                 if let Some(key) = cache_key(f, algo) {
@@ -763,7 +773,10 @@ mod tests {
             files: vec![lo(a, 4096), lo(b, 4096)],
         };
         let result = run(vec![group], &cfg()).unwrap();
-        assert!(result.is_empty(), "files with different heads must not group");
+        assert!(
+            result.is_empty(),
+            "files with different heads must not group"
+        );
         fs::remove_dir_all(&d).ok();
     }
 

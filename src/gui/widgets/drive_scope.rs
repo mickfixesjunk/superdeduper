@@ -99,8 +99,8 @@ fn draw_drive_panel(
     // Effective render mode: explicit override wins, otherwise use
     // the detection result (has_seek_penalty == true ⇒ HDD render).
     let effective_hdd = match override_ssd {
-        Some(true) => false,  // forced SSD render
-        Some(false) => true,  // forced HDD render
+        Some(true) => false, // forced SSD render
+        Some(false) => true, // forced HDD render
         None => drive.info.has_seek_penalty,
     };
     let stroke = if selected {
@@ -184,10 +184,8 @@ fn draw_drive_panel(
 }
 
 fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(ui.available_width(), SPARK_HEIGHT),
-        Sense::hover(),
-    );
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), SPARK_HEIGHT), Sense::hover());
     resp.on_hover_text(
         "Throughput sparkline — bytes-per-second the engine is reading \
          from this drive over the last 30 seconds. Right edge = now.",
@@ -214,7 +212,10 @@ fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
         let x_frac = 1.0 - (age / window).clamp(0.0, 1.0);
         let y_frac = (*bytes as f32 / 1_048_576.0) / max_mbps;
         let p = rect.left_bottom()
-            + vec2(rect.width() * x_frac, -rect.height() * y_frac.clamp(0.0, 1.0));
+            + vec2(
+                rect.width() * x_frac,
+                -rect.height() * y_frac.clamp(0.0, 1.0),
+            );
         if let Some(pp) = prev {
             painter.line_segment([pp, p], Stroke::new(1.5, theme::ACCENT));
         }
@@ -232,10 +233,8 @@ fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
 }
 
 fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant, render_as_hdd: bool) {
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(ui.available_width(), SCOPE_HEIGHT),
-        Sense::hover(),
-    );
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), SCOPE_HEIGHT), Sense::hover());
     let tip = if render_as_hdd {
         "LCN-vs-time read trace (HDD render). Y = position on the \
          drive, X = time (right = now). The yellow line climbing \
@@ -300,7 +299,11 @@ fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant, render_as_hdd: b
         .unwrap_or(1)
         .max(1) as f32;
 
-    let dot_color = if render_as_hdd { theme::HDD } else { theme::SSD };
+    let dot_color = if render_as_hdd {
+        theme::HDD
+    } else {
+        theme::SSD
+    };
 
     let total = drive.reads.len();
     let max_dots = if render_as_hdd { 1024 } else { 768 };
@@ -320,7 +323,10 @@ fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant, render_as_hdd: b
         let y_lcn = effective_lcn(r.lcn_bytes) as f32;
         let y_frac = y_lcn / max_lcn;
         let p = rect.left_bottom()
-            + vec2(rect.width() * x_frac, -rect.height() * y_frac.clamp(0.0, 1.0));
+            + vec2(
+                rect.width() * x_frac,
+                -rect.height() * y_frac.clamp(0.0, 1.0),
+            );
         painter.circle_filled(p, radius, dot_color.gamma_multiply(alpha));
     }
 

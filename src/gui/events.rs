@@ -56,10 +56,7 @@ impl Stage {
     /// selected content-hash algorithm name. Used by the funnel and
     /// overall progress bar so flipping the algo dropdown updates the
     /// UI label too.
-    pub fn label_with_algo(
-        self,
-        algo: crate::pipeline::hash::HashAlgo,
-    ) -> String {
+    pub fn label_with_algo(self, algo: crate::pipeline::hash::HashAlgo) -> String {
         use crate::pipeline::hash::HashAlgo;
         match self {
             Stage::Tier3Full => match algo {
@@ -181,4 +178,3 @@ impl OverallStage {
         }
     }
 }
-

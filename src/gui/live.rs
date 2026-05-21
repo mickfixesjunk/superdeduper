@@ -198,7 +198,11 @@ fn run(
             level: LogLevel::Info,
             message: format!(
                 "  · {}{}",
-                if r.is_reference { "★ reference  " } else { "             " },
+                if r.is_reference {
+                    "★ reference  "
+                } else {
+                    "             "
+                },
                 r.path.display()
             ),
         });
@@ -547,17 +551,12 @@ fn run(
     if let Some(d) = &diag {
         d.log(
             "STAGE",
-            format_args!(
-                "hashing-start chunks={total_chunks} candidates={total_to_hash}"
-            ),
+            format_args!("hashing-start chunks={total_chunks} candidates={total_to_hash}"),
         );
     }
 
-    let already_reported: hashbrown::HashSet<String> = checkpoint_state
-        .completed_hashes
-        .iter()
-        .cloned()
-        .collect();
+    let already_reported: hashbrown::HashSet<String> =
+        checkpoint_state.completed_hashes.iter().cloned().collect();
 
     for (i, chunk) in chunks.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -606,112 +605,109 @@ fn run(
             Arc::clone(&tier_counts[2]),
             Arc::clone(&tier_counts[3]),
         ];
-        let on_file: pipeline::hash::FileProgress =
-            Arc::new(move |path, tier, outcome| {
-                // Bump the per-tier attempt counter (success+cache+fail).
-                // The funnel reads these so each tier shows its own
-                // narrowing count instead of all rolling into Tier 3.
-                let tier_idx = (tier as usize).min(3);
-                let n_tier = progress_tier_counts[tier_idx]
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1;
+        let on_file: pipeline::hash::FileProgress = Arc::new(move |path, tier, outcome| {
+            // Bump the per-tier attempt counter (success+cache+fail).
+            // The funnel reads these so each tier shows its own
+            // narrowing count instead of all rolling into Tier 3.
+            let tier_idx = (tier as usize).min(3);
+            let n_tier = progress_tier_counts[tier_idx].fetch_add(1, Ordering::Relaxed) + 1;
 
-                // Headline progress only counts Tier 1 (which fires
-                // for every candidate file exactly once). Counting
-                // every tier invocation would let `n` overshoot
-                // `total` (a single file goes through T0+T1+T2+T3).
-                let counts_for_progress = tier == 1;
-                let n = if counts_for_progress {
-                    progress_files.fetch_add(1, Ordering::Relaxed) + 1
-                } else {
-                    progress_files.load(Ordering::Relaxed)
-                };
-                let bytes_added = match &outcome {
-                    pipeline::hash::ProgressOutcome::Hashed { bytes } => *bytes,
-                    _ => 0,
-                };
-                let total_bytes = progress_bytes
-                    .fetch_add(bytes_added, Ordering::Relaxed)
-                    .saturating_add(bytes_added);
+            // Headline progress only counts Tier 1 (which fires
+            // for every candidate file exactly once). Counting
+            // every tier invocation would let `n` overshoot
+            // `total` (a single file goes through T0+T1+T2+T3).
+            let counts_for_progress = tier == 1;
+            let n = if counts_for_progress {
+                progress_files.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                progress_files.load(Ordering::Relaxed)
+            };
+            let bytes_added = match &outcome {
+                pipeline::hash::ProgressOutcome::Hashed { bytes } => *bytes,
+                _ => 0,
+            };
+            let total_bytes = progress_bytes
+                .fetch_add(bytes_added, Ordering::Relaxed)
+                .saturating_add(bytes_added);
 
-                // Surface unreadable files in the Log tab. Without
-                // this they were dropped silently and the progress
-                // bar's "done" count never reached the total.
-                if let pipeline::hash::ProgressOutcome::Failed { error } = &outcome {
-                    let f = progress_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                    if f <= 50 {
-                        let _ = progress_tx.try_send(EngineEvent::Log {
-                            level: LogLevel::Warn,
-                            message: format!("hash failed · {} · {error}", path.display()),
-                        });
-                    } else if f == 51 {
-                        let _ = progress_tx.try_send(EngineEvent::Log {
-                            level: LogLevel::Warn,
-                            message: "…suppressing further per-file hash failures (see counter)".into(),
-                        });
-                    }
-                    if let Some(d) = &progress_diag {
-                        d.log_hash_failure(path, error);
-                    }
-                }
-
-                // Drive-scope dot positioning. On SSDs we use a stable
-                // path-hash for Y (scattered "TV snow"); on HDDs we
-                // use the cumulative-bytes climb (clean diagonal).
-                let lcn_bytes = if progress_drive_is_hdd {
-                    total_bytes
-                } else {
-                    hash_path_to_lcn(path)
-                };
-
-                let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
-                if n.is_multiple_of(read_modulus) {
-                    let _ = progress_tx.try_send(EngineEvent::Read(ReadSample {
-                        drive: progress_drive,
-                        lcn_bytes,
-                        bytes: bytes_added,
-                        latency_us: 1,
-                        at: Instant::now(),
-                    }));
-                }
-                // Per-tier funnel tick — uses the tier-local counter
-                // and the matching Stage enum so the funnel rows
-                // narrow as you'd expect: T0 ≥ T1 ≥ T2 ≥ T3.
-                if n_tier.is_multiple_of(100) {
-                    let stage = match tier {
-                        0 => Stage::Tier0Format,
-                        1 => Stage::Tier1Head,
-                        2 => Stage::Tier2HeadMidTail,
-                        _ => Stage::Tier3Full,
-                    };
-                    let _ = progress_tx.try_send(EngineEvent::StageTick {
-                        stage,
-                        delta: 100,
-                        total: n_tier,
+            // Surface unreadable files in the Log tab. Without
+            // this they were dropped silently and the progress
+            // bar's "done" count never reached the total.
+            if let pipeline::hash::ProgressOutcome::Failed { error } = &outcome {
+                let f = progress_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if f <= 50 {
+                    let _ = progress_tx.try_send(EngineEvent::Log {
+                        level: LogLevel::Warn,
+                        message: format!("hash failed · {} · {error}", path.display()),
+                    });
+                } else if f == 51 {
+                    let _ = progress_tx.try_send(EngineEvent::Log {
+                        level: LogLevel::Warn,
+                        message: "…suppressing further per-file hash failures (see counter)".into(),
                     });
                 }
-
-                // Headline OverallProgress + ETA: only Tier 1 advances.
-                if counts_for_progress && n.is_multiple_of(100) {
-                    let elapsed = hashing_started_inner.elapsed().as_secs_f32();
-                    let frac = if total_to_hash_inner > 0 {
-                        (n as f32 / total_to_hash_inner as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let eta = if frac > 0.001 {
-                        Some((elapsed * (1.0 - frac) / frac).max(0.0))
-                    } else {
-                        None
-                    };
-                    let _ = progress_tx.try_send(EngineEvent::OverallProgress {
-                        stage: OverallStage::Hashing,
-                        done: n,
-                        total: total_to_hash_inner,
-                        eta_secs: eta,
-                    });
+                if let Some(d) = &progress_diag {
+                    d.log_hash_failure(path, error);
                 }
-            });
+            }
+
+            // Drive-scope dot positioning. On SSDs we use a stable
+            // path-hash for Y (scattered "TV snow"); on HDDs we
+            // use the cumulative-bytes climb (clean diagonal).
+            let lcn_bytes = if progress_drive_is_hdd {
+                total_bytes
+            } else {
+                hash_path_to_lcn(path)
+            };
+
+            let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
+            if n.is_multiple_of(read_modulus) {
+                let _ = progress_tx.try_send(EngineEvent::Read(ReadSample {
+                    drive: progress_drive,
+                    lcn_bytes,
+                    bytes: bytes_added,
+                    latency_us: 1,
+                    at: Instant::now(),
+                }));
+            }
+            // Per-tier funnel tick — uses the tier-local counter
+            // and the matching Stage enum so the funnel rows
+            // narrow as you'd expect: T0 ≥ T1 ≥ T2 ≥ T3.
+            if n_tier.is_multiple_of(100) {
+                let stage = match tier {
+                    0 => Stage::Tier0Format,
+                    1 => Stage::Tier1Head,
+                    2 => Stage::Tier2HeadMidTail,
+                    _ => Stage::Tier3Full,
+                };
+                let _ = progress_tx.try_send(EngineEvent::StageTick {
+                    stage,
+                    delta: 100,
+                    total: n_tier,
+                });
+            }
+
+            // Headline OverallProgress + ETA: only Tier 1 advances.
+            if counts_for_progress && n.is_multiple_of(100) {
+                let elapsed = hashing_started_inner.elapsed().as_secs_f32();
+                let frac = if total_to_hash_inner > 0 {
+                    (n as f32 / total_to_hash_inner as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let eta = if frac > 0.001 {
+                    Some((elapsed * (1.0 - frac) / frac).max(0.0))
+                } else {
+                    None
+                };
+                let _ = progress_tx.try_send(EngineEvent::OverallProgress {
+                    stage: OverallStage::Hashing,
+                    done: n,
+                    total: total_to_hash_inner,
+                    eta_secs: eta,
+                });
+            }
+        });
 
         let (dups, counters) = pipeline::hash::run_cancellable(
             chunk,
@@ -725,10 +721,10 @@ fn run(
         for i in 0..4 {
             tier_micros_total[i] = tier_micros_total[i]
                 .saturating_add(counters.tier_micros[i].load(Ordering::Relaxed));
-            tier_bytes_total[i] = tier_bytes_total[i]
-                .saturating_add(counters.tier_bytes[i].load(Ordering::Relaxed));
-            tier_count_total[i] = tier_count_total[i]
-                .saturating_add(counters.tier_count[i].load(Ordering::Relaxed));
+            tier_bytes_total[i] =
+                tier_bytes_total[i].saturating_add(counters.tier_bytes[i].load(Ordering::Relaxed));
+            tier_count_total[i] =
+                tier_count_total[i].saturating_add(counters.tier_count[i].load(Ordering::Relaxed));
         }
 
         for g in dups {
@@ -740,7 +736,9 @@ fn run(
                 continue;
             }
             confirmed += 1;
-            let savings = g.size.saturating_mul(visible_files.len().saturating_sub(1) as u64);
+            let savings = g
+                .size
+                .saturating_mul(visible_files.len().saturating_sub(1) as u64);
             reclaimable = reclaimable.saturating_add(savings);
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
@@ -837,7 +835,10 @@ fn run(
         // when diagnosing "algo X is slower than algo Y". CPU-summed
         // microseconds + bytes hashed at each tier so MB/s/thread is
         // a one-line derivation.
-        for (i, name) in ["t0_fmt", "t1_head", "t2_hmt", "t3_full"].iter().enumerate() {
+        for (i, name) in ["t0_fmt", "t1_head", "t2_hmt", "t3_full"]
+            .iter()
+            .enumerate()
+        {
             if tier_count_total[i] == 0 && tier_micros_total[i] == 0 {
                 continue;
             }
@@ -935,9 +936,7 @@ fn filter_reference_only(
     files.sort_by_key(|p| {
         !reference_belongs(p, reference_set) // false (reference) sorts before true (non)
     });
-    let any_non_reference = files
-        .iter()
-        .any(|p| !reference_belongs(p, reference_set));
+    let any_non_reference = files.iter().any(|p| !reference_belongs(p, reference_set));
     if !any_non_reference {
         return Vec::new();
     }
@@ -986,12 +985,12 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         None
     } else {
         let mut b = GlobSetBuilder::new();
-        b.add(Glob::new(&settings.include_glob).map_err(|e| {
-            crate::Error::BadGlob {
+        b.add(
+            Glob::new(&settings.include_glob).map_err(|e| crate::Error::BadGlob {
                 pattern: settings.include_glob.clone(),
                 source: e,
-            }
-        })?);
+            })?,
+        );
         Some(b.build().map_err(|e| crate::Error::BadGlob {
             pattern: settings.include_glob.clone(),
             source: e,
@@ -1001,12 +1000,12 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         None
     } else {
         let mut b = GlobSetBuilder::new();
-        b.add(Glob::new(&settings.exclude_glob).map_err(|e| {
-            crate::Error::BadGlob {
+        b.add(
+            Glob::new(&settings.exclude_glob).map_err(|e| crate::Error::BadGlob {
                 pattern: settings.exclude_glob.clone(),
                 source: e,
-            }
-        })?);
+            })?,
+        );
         Some(b.build().map_err(|e| crate::Error::BadGlob {
             pattern: settings.exclude_glob.clone(),
             source: e,
@@ -1044,9 +1043,7 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
                     .map(|n| n.get())
                     .unwrap_or(1)
             });
-            settings
-                .io_threads
-                .unwrap_or(cpu.saturating_mul(3).max(1))
+            settings.io_threads.unwrap_or(cpu.saturating_mul(3).max(1))
         },
         queue_depth: None,
         output: None,

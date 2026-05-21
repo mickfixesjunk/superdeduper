@@ -23,100 +23,100 @@ pub enum ResumeChoice {
 
 pub fn show(ctx: &Context, summary: &CheckpointSummary) -> Option<ResumeChoice> {
     let mut choice: Option<ResumeChoice> = None;
-    Window::new(RichText::new("Previous scan found").color(theme::TEXT_HI).heading())
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
-        .default_width(520.0)
-        .show(ctx, |ui| {
-            let when = human_time_since(summary.created_at_unix);
+    Window::new(
+        RichText::new("Previous scan found")
+            .color(theme::TEXT_HI)
+            .heading(),
+    )
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+    .default_width(520.0)
+    .show(ctx, |ui| {
+        let when = human_time_since(summary.created_at_unix);
+        ui.label(
+            RichText::new(format!("From {when}."))
+                .color(theme::TEXT_HI)
+                .size(14.0),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "{} duplicate group(s) already confirmed · {} root(s){}",
+                summary.duplicate_count,
+                summary.roots.len(),
+                if summary.has_saved_inventory {
+                    " · file inventory saved (Stage 1 will be skipped)"
+                } else {
+                    " · inventory not yet saved"
+                }
+            ))
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+        ui.add_space(2.0);
+        // Show the roots so the user knows what they're committing
+        // to. Cap at 4 to avoid an oversized modal on big root sets.
+        for (i, r) in summary.roots.iter().take(4).enumerate() {
+            let star = if r.is_reference { "★ " } else { "  " };
             ui.label(
-                RichText::new(format!("From {when}."))
-                    .color(theme::TEXT_HI)
-                    .size(14.0),
+                RichText::new(format!("{star}{}", r.path.display()))
+                    .color(theme::TEXT_LO)
+                    .monospace()
+                    .small(),
             );
-            ui.add_space(4.0);
+            let _ = i;
+        }
+        if summary.roots.len() > 4 {
             ui.label(
-                RichText::new(format!(
-                    "{} duplicate group(s) already confirmed · {} root(s){}",
-                    summary.duplicate_count,
-                    summary.roots.len(),
-                    if summary.has_saved_inventory {
-                        " · file inventory saved (Stage 1 will be skipped)"
-                    } else {
-                        " · inventory not yet saved"
-                    }
-                ))
-                .color(theme::TEXT_LO)
-                .small(),
-            );
-            ui.add_space(2.0);
-            // Show the roots so the user knows what they're committing
-            // to. Cap at 4 to avoid an oversized modal on big root sets.
-            for (i, r) in summary.roots.iter().take(4).enumerate() {
-                let star = if r.is_reference { "★ " } else { "  " };
-                ui.label(
-                    RichText::new(format!("{star}{}", r.path.display()))
-                        .color(theme::TEXT_LO)
-                        .monospace()
-                        .small(),
-                );
-                let _ = i;
-            }
-            if summary.roots.len() > 4 {
-                ui.label(
-                    RichText::new(format!(
-                        "  + {} more…",
-                        summary.roots.len() - 4
-                    ))
+                RichText::new(format!("  + {} more…", summary.roots.len() - 4))
                     .color(theme::TEXT_LO)
                     .small(),
-                );
-            }
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            ui.label(
-                RichText::new(
-                    "Starting fresh keeps your hash cache and renames the previous \
-                     progress file for safekeeping.",
-                )
-                .color(theme::TEXT_LO)
-                .small()
-                .italics(),
             );
-            ui.add_space(10.0);
+        }
 
-            ui.horizontal(|ui| {
-                let resume_btn = egui::Button::new(
-                    RichText::new("▶  Resume previous scan")
-                        .color(theme::PANEL_DEEP)
-                        .strong(),
-                )
-                .fill(theme::ACCENT)
-                .min_size(egui::vec2(200.0, 32.0));
-                if ui.add(resume_btn).clicked() {
-                    choice = Some(ResumeChoice::Resume);
-                }
-                let fresh_btn = egui::Button::new(
-                    RichText::new("✨  Start fresh").color(theme::TEXT_HI),
-                )
-                .min_size(egui::vec2(140.0, 32.0));
-                if ui
-                    .add(fresh_btn)
-                    .on_hover_text(
-                        "Renames the prior checkpoint to a .bak sibling (never deletes it) \
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(
+            RichText::new(
+                "Starting fresh keeps your hash cache and renames the previous \
+                     progress file for safekeeping.",
+            )
+            .color(theme::TEXT_LO)
+            .small()
+            .italics(),
+        );
+        ui.add_space(10.0);
+
+        ui.horizontal(|ui| {
+            let resume_btn = egui::Button::new(
+                RichText::new("▶  Resume previous scan")
+                    .color(theme::PANEL_DEEP)
+                    .strong(),
+            )
+            .fill(theme::ACCENT)
+            .min_size(egui::vec2(200.0, 32.0));
+            if ui.add(resume_btn).clicked() {
+                choice = Some(ResumeChoice::Resume);
+            }
+            let fresh_btn =
+                egui::Button::new(RichText::new("✨  Start fresh").color(theme::TEXT_HI))
+                    .min_size(egui::vec2(140.0, 32.0));
+            if ui
+                .add(fresh_btn)
+                .on_hover_text(
+                    "Renames the prior checkpoint to a .bak sibling (never deletes it) \
                          and clears the GUI back to an empty roots panel. Your BLAKE3 / \
                          DDH-128 cache is preserved.",
-                    )
-                    .clicked()
-                {
-                    choice = Some(ResumeChoice::StartFresh);
-                }
-            });
+                )
+                .clicked()
+            {
+                choice = Some(ResumeChoice::StartFresh);
+            }
         });
+    });
     choice
 }
 

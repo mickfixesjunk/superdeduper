@@ -122,9 +122,9 @@ fn group_passes_filter(
     reference_roots: &[std::path::PathBuf],
 ) -> bool {
     let Some(root) = drive_root else { return true };
-    g.files.iter().any(|p| {
-        p.starts_with(root) || reference_roots.iter().any(|r| p.starts_with(r))
-    })
+    g.files
+        .iter()
+        .any(|p| p.starts_with(root) || reference_roots.iter().any(|r| p.starts_with(r)))
 }
 
 fn tooltip(ui: &mut egui::Ui, tile: &Tile) {
@@ -155,7 +155,11 @@ fn tooltip(ui: &mut egui::Ui, tile: &Tile) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(tag)
-                    .color(if i == 0 { theme::ACCENT } else { theme::TEXT_LO })
+                    .color(if i == 0 {
+                        theme::ACCENT
+                    } else {
+                        theme::TEXT_LO
+                    })
                     .monospace()
                     .small()
                     .strong(),
@@ -286,15 +290,9 @@ fn layout_row<'a>(
             0.0
         };
         let tile_rect = if along_x {
-            Rect::from_min_size(
-                egui::pos2(rect.left(), cursor),
-                vec2(thickness, extent),
-            )
+            Rect::from_min_size(egui::pos2(rect.left(), cursor), vec2(thickness, extent))
         } else {
-            Rect::from_min_size(
-                egui::pos2(cursor, rect.top()),
-                vec2(extent, thickness),
-            )
+            Rect::from_min_size(egui::pos2(cursor, rect.top()), vec2(extent, thickness))
         };
         out.push(Placement {
             tile,
@@ -304,15 +302,9 @@ fn layout_row<'a>(
     }
 
     if along_x {
-        Rect::from_min_max(
-            egui::pos2(rect.left() + thickness, rect.top()),
-            rect.max,
-        )
+        Rect::from_min_max(egui::pos2(rect.left() + thickness, rect.top()), rect.max)
     } else {
-        Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top() + thickness),
-            rect.max,
-        )
+        Rect::from_min_max(egui::pos2(rect.left(), rect.top() + thickness), rect.max)
     }
 }
 
@@ -371,11 +363,7 @@ fn blend3(a: Color32, b: Color32, c: Color32, t: f32) -> Color32 {
 fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| ((x as f32) * (1.0 - t) + (y as f32) * t) as u8;
-    Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 fn contrast(c: Color32) -> Color32 {
@@ -406,9 +394,15 @@ mod tests {
         Tile {
             group_index: group,
             savings,
-            size_each: if count > 0 { savings / count.max(1) as u64 } else { savings },
+            size_each: if count > 0 {
+                savings / count.max(1) as u64
+            } else {
+                savings
+            },
             count,
-            files: (0..count).map(|i| PathBuf::from(format!("/x/g{group}/{i}"))).collect(),
+            files: (0..count)
+                .map(|i| PathBuf::from(format!("/x/g{group}/{i}")))
+                .collect(),
             hash: "deadbeef".repeat(8),
         }
     }
@@ -422,11 +416,7 @@ mod tests {
     /// don't fill the canvas.
     #[test]
     fn tiles_cover_the_rect() {
-        let tiles = vec![
-            tile(1, 600, 2),
-            tile(2, 300, 2),
-            tile(3, 100, 2),
-        ];
+        let tiles = vec![tile(1, 600, 2), tile(2, 300, 2), tile(3, 100, 2)];
         let total: f64 = tiles.iter().map(|t| t.savings as f64).sum();
         let canvas = rect(400.0, 300.0);
         let placed = squarify(&tiles, total, canvas);

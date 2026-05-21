@@ -54,7 +54,11 @@ fn write_text(out: &mut dyn Write, groups: &[DuplicateGroup], summary: &Summary)
             i + 1,
             humansize::format_size(g.size, humansize::BINARY),
             &g.content_hash,
-            if g.link_equivalent { "  (link-equivalent)" } else { "" },
+            if g.link_equivalent {
+                "  (link-equivalent)"
+            } else {
+                ""
+            },
         )?;
         for p in &g.files {
             writeln!(out, "  {}", display_path(p))?;
@@ -73,8 +77,14 @@ fn write_text(out: &mut dyn Write, groups: &[DuplicateGroup], summary: &Summary)
 
 fn write_csv(out: &mut dyn Write, groups: &[DuplicateGroup]) -> Result<()> {
     let mut w = csv::Writer::from_writer(out);
-    w.write_record(["group", "size_bytes", "content_hash", "path", "link_equivalent"])
-        .map_err(csv_err)?;
+    w.write_record([
+        "group",
+        "size_bytes",
+        "content_hash",
+        "path",
+        "link_equivalent",
+    ])
+    .map_err(csv_err)?;
     for (i, g) in groups.iter().enumerate() {
         for p in &g.files {
             w.write_record([

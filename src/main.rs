@@ -126,7 +126,10 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         group_ms,
         layout_ms,
         hash_ms,
-        humansize::format_size(counters.bytes_read.load(Ordering::Relaxed), humansize::BINARY),
+        humansize::format_size(
+            counters.bytes_read.load(Ordering::Relaxed),
+            humansize::BINARY
+        ),
     );
     // CPU-summed time = wall-clock time spent in the per-file
     // open+read+hash closure, summed across all rayon workers. For

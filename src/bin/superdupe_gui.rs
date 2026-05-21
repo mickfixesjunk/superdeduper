@@ -42,7 +42,11 @@ fn main() -> eframe::Result<()> {
     } else {
         None
     };
-    let seed_roots = if !args.live { args.paths.clone() } else { Vec::new() };
+    let seed_roots = if !args.live {
+        args.paths.clone()
+    } else {
+        Vec::new()
+    };
     let start_demo = args.demo;
 
     eframe::run_native(
@@ -63,4 +67,3 @@ fn main() -> eframe::Result<()> {
         }),
     )
 }
-

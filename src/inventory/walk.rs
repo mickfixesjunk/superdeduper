@@ -29,7 +29,10 @@ pub enum WalkEvent<'a> {
     DirError { path: &'a Path, message: String },
     /// One read_dir entry was skipped because its `metadata()` errored
     /// or it was an unsupported type (junction not followed, etc.).
-    EntrySkipped { path: &'a Path, reason: &'static str },
+    EntrySkipped {
+        path: &'a Path,
+        reason: &'static str,
+    },
 }
 
 pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {

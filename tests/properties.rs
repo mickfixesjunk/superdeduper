@@ -30,7 +30,11 @@ use superdupe::{inventory, pipeline};
 
 /// Plant N files where each file `i` is assigned to a content class
 /// `classes[i]`; files in the same class have identical bytes.
-fn plant_universe(dir: &Path, sizes_by_class: &BTreeMap<u32, u64>, classes: &[u32]) -> Vec<PathBuf> {
+fn plant_universe(
+    dir: &Path,
+    sizes_by_class: &BTreeMap<u32, u64>,
+    classes: &[u32],
+) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(classes.len());
     for (i, &cls) in classes.iter().enumerate() {
         let size = *sizes_by_class.get(&cls).unwrap();
@@ -80,13 +84,17 @@ fn universe_strategy() -> impl Strategy<Value = (Vec<u32>, BTreeMap<u32, u64>)> 
     // numbers so collisions are common.
     let count = 5usize..=25;
     let classes = count.prop_flat_map(|n| prop::collection::vec(0u32..12, n));
-    let sizes = prop::collection::btree_map(0u32..12, prop_oneof![
-        Just(1u64),       // very small (boundary)
-        Just(4_096u64),   // Tier 1 boundary
-        Just(8_192u64),   // small
-        Just(100_000u64), // Tier 2 boundary territory
-        Just(300_000u64), // Tier 2 active
-    ], 1..13);
+    let sizes = prop::collection::btree_map(
+        0u32..12,
+        prop_oneof![
+            Just(1u64),       // very small (boundary)
+            Just(4_096u64),   // Tier 1 boundary
+            Just(8_192u64),   // small
+            Just(100_000u64), // Tier 2 boundary territory
+            Just(300_000u64), // Tier 2 active
+        ],
+        1..13,
+    );
     (classes, sizes).prop_map(|(c, mut s)| {
         // Ensure every class id used in `c` has a size entry.
         for &cls in &c {

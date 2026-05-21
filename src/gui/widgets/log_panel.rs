@@ -14,11 +14,14 @@ use crate::gui::theme;
 pub fn show(ui: &mut Ui, state: &UiState) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Engine log").color(theme::TEXT_LO).strong());
-        let (warn, err) = state.logs.iter().fold((0u32, 0u32), |(w, e), l| match l.level {
-            LogLevel::Warn => (w + 1, e),
-            LogLevel::Error => (w, e + 1),
-            _ => (w, e),
-        });
+        let (warn, err) = state
+            .logs
+            .iter()
+            .fold((0u32, 0u32), |(w, e), l| match l.level {
+                LogLevel::Warn => (w + 1, e),
+                LogLevel::Error => (w, e + 1),
+                _ => (w, e),
+            });
         if warn > 0 {
             ui.label(
                 RichText::new(format!("{} warn", warn))
@@ -57,13 +60,7 @@ pub fn show(ui: &mut Ui, state: &UiState) {
                     LogLevel::Error => ("error", theme::HOT),
                 };
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(tag)
-                            .color(color)
-                            .monospace()
-                            .small()
-                            .strong(),
-                    );
+                    ui.label(RichText::new(tag).color(color).monospace().small().strong());
                     ui.label(
                         RichText::new(&entry.message)
                             .color(theme::TEXT_HI)

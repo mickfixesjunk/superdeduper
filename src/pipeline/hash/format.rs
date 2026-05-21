@@ -59,11 +59,7 @@ impl Format {
 /// Compute the Tier 0 fingerprint for `path` using the supplied
 /// content-hash algorithm. Returns `None` if the path's extension is
 /// unsupported or parsing failed.
-pub fn fingerprint(
-    path: &Path,
-    size: u64,
-    algo: super::HashAlgo,
-) -> Option<Vec<u8>> {
+pub fn fingerprint(path: &Path, size: u64, algo: super::HashAlgo) -> Option<Vec<u8>> {
     let fmt = Format::from_path(path)?;
     let mut file = File::open(path).ok()?;
     let raw = match fmt {

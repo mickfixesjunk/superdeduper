@@ -28,23 +28,21 @@ use crate::cli::DedupeAction;
 use crate::gui::events::EngineEvent;
 use crate::gui::state::{RootEntry, ScanSettings, UiState};
 use crate::gui::widgets::groups_table::GroupAction;
-use crate::gui::widgets::roots_panel::RootsAction;
 use crate::gui::widgets::resume_modal::ResumeChoice;
+use crate::gui::widgets::roots_panel::RootsAction;
 use crate::gui::widgets::{
-    drive_scope, funnel, groups_table, header, log_panel, overall_bar, resume_modal,
-    roots_panel, settings_modal, treemap,
+    drive_scope, funnel, groups_table, header, log_panel, overall_bar, resume_modal, roots_panel,
+    settings_modal, treemap,
 };
 use crate::gui::{demo, live, theme};
 
-#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[derive(Default)]
+#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 enum ResultsTab {
     #[default]
     Treemap,
     Groups,
     Log,
 }
-
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PersistedAppState {
@@ -172,9 +170,10 @@ impl SuperdupeApp {
         if let Some(saved) = saved_results {
             let dup_count = saved.duplicates.len();
             for g in saved.duplicates {
-                let savings = g.size.saturating_mul(g.files.len().saturating_sub(1) as u64);
-                self.state.totals.duplicates =
-                    self.state.totals.duplicates.saturating_add(1);
+                let savings = g
+                    .size
+                    .saturating_mul(g.files.len().saturating_sub(1) as u64);
+                self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
                 self.state.totals.reclaimable_bytes =
                     self.state.totals.reclaimable_bytes.saturating_add(savings);
                 self.state.duplicates.push(g);
@@ -212,9 +211,10 @@ impl SuperdupeApp {
         // come back populated.
         let dup_count = cp.previous_duplicates.len();
         for g in &cp.previous_duplicates {
-            let savings = g.size.saturating_mul(g.files.len().saturating_sub(1) as u64);
-            self.state.totals.duplicates =
-                self.state.totals.duplicates.saturating_add(1);
+            let savings = g
+                .size
+                .saturating_mul(g.files.len().saturating_sub(1) as u64);
+            self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
             self.state.totals.reclaimable_bytes =
                 self.state.totals.reclaimable_bytes.saturating_add(savings);
             self.state.duplicates.push(g.clone());
@@ -605,12 +605,7 @@ impl SuperdupeApp {
             .expect("spawn unsuperdupe thread");
     }
 
-    fn run_action_threaded(
-        &self,
-        action: DedupeAction,
-        keeper: PathBuf,
-        dupes: Vec<PathBuf>,
-    ) {
+    fn run_action_threaded(&self, action: DedupeAction, keeper: PathBuf, dupes: Vec<PathBuf>) {
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("superdupe-action".into())
@@ -722,7 +717,11 @@ impl eframe::App for SuperdupeApp {
         // spans the full window so the user always sees "what stage,
         // how much, how long" without hunting.
         TopBottomPanel::top("overall-progress")
-            .frame(Frame::default().fill(theme::BG).inner_margin(egui::vec2(8.0, 4.0)))
+            .frame(
+                Frame::default()
+                    .fill(theme::BG)
+                    .inner_margin(egui::vec2(8.0, 4.0)),
+            )
             .show(ctx, |ui| {
                 overall_bar::show(ui, &self.state);
             });
@@ -733,12 +732,8 @@ impl eframe::App for SuperdupeApp {
             .min_width(240.0)
             .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
             .show(ctx, |ui| {
-                let roots_action = roots_panel::show(
-                    ui,
-                    &self.persisted.roots,
-                    self.is_scanning,
-                    self.can_resume,
-                );
+                let roots_action =
+                    roots_panel::show(ui, &self.persisted.roots, self.is_scanning, self.can_resume);
                 if let Some(a) = roots_action {
                     self.dispatch_root_action(a);
                 }
@@ -798,12 +793,7 @@ impl eframe::App for SuperdupeApp {
                             .state
                             .drives
                             .get(&id)
-                            .map(|d| {
-                                format!(
-                                    "  ✕ filtered to: {}",
-                                    d.info.volume_label
-                                )
-                            })
+                            .map(|d| format!("  ✕ filtered to: {}", d.info.volume_label))
                             .unwrap_or_else(|| "  ✕ clear filter".into());
                         if ui
                             .selectable_label(true, label)
@@ -824,7 +814,10 @@ impl eframe::App for SuperdupeApp {
                     .map(|r| r.path.clone())
                     .collect();
                 let drive_root = self.selected_drive.and_then(|id| {
-                    self.persisted.roots.get(id as usize).map(|r| r.path.clone())
+                    self.persisted
+                        .roots
+                        .get(id as usize)
+                        .map(|r| r.path.clone())
                 });
                 let mut group_action: Option<GroupAction> = None;
                 match self.persisted.results_tab {
@@ -862,9 +855,7 @@ fn check_resumable(persisted: &PersistedAppState) -> bool {
         return false;
     };
     match checkpoint::load(&path) {
-        Ok(Some(cp)) => {
-            cp.roots == persisted.roots && cp.settings == persisted.settings
-        }
+        Ok(Some(cp)) => cp.roots == persisted.roots && cp.settings == persisted.settings,
         _ => false,
     }
 }

@@ -32,11 +32,15 @@ pub fn volume_for_path(_p: &Path) -> Result<String> {
 }
 
 pub fn query_storage_device(_volume: &str) -> Result<StorageDeviceInfo> {
-    Err(Error::Unsupported("Windows-only IOCTL_STORAGE_QUERY_PROPERTY"))
+    Err(Error::Unsupported(
+        "Windows-only IOCTL_STORAGE_QUERY_PROPERTY",
+    ))
 }
 
 pub fn get_retrieval_pointers(_path: &Path) -> Result<Vec<ExtentRun>> {
-    Err(Error::Unsupported("Windows-only FSCTL_GET_RETRIEVAL_POINTERS"))
+    Err(Error::Unsupported(
+        "Windows-only FSCTL_GET_RETRIEVAL_POINTERS",
+    ))
 }
 
 pub fn recycle(_p: &Path) -> Result<()> {
@@ -48,5 +52,7 @@ pub fn replace_with_hardlink(_t: &Path, _k: &Path) -> Result<()> {
 }
 
 pub fn replace_with_reflink(_t: &Path, _k: &Path) -> Result<()> {
-    Err(Error::Unsupported("Windows-only FSCTL_DUPLICATE_EXTENTS_TO_FILE"))
+    Err(Error::Unsupported(
+        "Windows-only FSCTL_DUPLICATE_EXTENTS_TO_FILE",
+    ))
 }

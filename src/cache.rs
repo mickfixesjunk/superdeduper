@@ -117,9 +117,8 @@ impl Cache {
             Some(v) if v == SCHEMA_VERSION => {}
             Some(_) => {
                 // Schema mismatch — drop and recreate.
-                self.conn.execute_batch(
-                    "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS volumes;",
-                )?;
+                self.conn
+                    .execute_batch("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS volumes;")?;
             }
             None => {}
         }
@@ -299,8 +298,7 @@ fn now_unix() -> i64 {
 
 #[cfg(windows)]
 pub fn default_cache_path() -> Result<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA")
-        .map_err(|_| Error::other("LOCALAPPDATA not set"))?;
+    let local = std::env::var("LOCALAPPDATA").map_err(|_| Error::other("LOCALAPPDATA not set"))?;
     Ok(PathBuf::from(local).join("superdupe").join("cache.db"))
 }
 
@@ -350,7 +348,10 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes {
+            tier3_hash: Some(vec![0xABu8; 32]),
+            ..CachedHashes::default()
+        };
         cache.store(&k, &hashes).unwrap();
 
         let got = cache.lookup(&k).unwrap().expect("row should exist");
@@ -363,7 +364,10 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes {
+            tier3_hash: Some(vec![0xABu8; 32]),
+            ..CachedHashes::default()
+        };
         cache.store(&k, &hashes).unwrap();
 
         let modified = key(42, 2048, 100_000, 7);
@@ -376,7 +380,10 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes {
+            tier3_hash: Some(vec![0xABu8; 32]),
+            ..CachedHashes::default()
+        };
         cache.store(&k, &hashes).unwrap();
         let modified = key(42, 1024, 100_001, 7);
         assert!(cache.lookup(&modified).unwrap().is_none());
@@ -388,7 +395,10 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         let k = key(42, 1024, 100_000, 7);
-        let hashes = CachedHashes { tier3_hash: Some(vec![0xABu8; 32]), ..CachedHashes::default() };
+        let hashes = CachedHashes {
+            tier3_hash: Some(vec![0xABu8; 32]),
+            ..CachedHashes::default()
+        };
         cache.store(&k, &hashes).unwrap();
         let modified = key(42, 1024, 100_000, 8);
         assert!(cache.lookup(&modified).unwrap().is_none());
@@ -412,7 +422,9 @@ mod tests {
         let p = tmp_db();
         let cache = Cache::open(&p).unwrap();
         for i in 0..10 {
-            cache.store(&key(i, 100, 1, 1), &CachedHashes::default()).unwrap();
+            cache
+                .store(&key(i, 100, 1, 1), &CachedHashes::default())
+                .unwrap();
         }
         cache.clear().unwrap();
         assert!(cache.lookup(&key(5, 100, 1, 1)).unwrap().is_none());
