@@ -25,15 +25,20 @@ use crate::{Error, Result};
 ///   v3 changes per-block mixing so byte outputs diverge from v2
 ///   even for the same input; bumping clears v2-era `"river5"`
 ///   rows in one sweep rather than waiting for natural eviction.
-/// * v5 adds the inventory-snapshot tables (`inventory_meta` +
+/// * v5 added the inventory-snapshot tables (`inventory_meta` +
 ///   `inventory_records`) so the warm-path Stage 1 enumerator can
 ///   apply a USN-journal delta against a cached baseline instead
-///   of re-walking the whole MFT. Drops the v4 hash rows in the
-///   process, which is fine — they re-populate on next scan.
+///   of re-walking the whole MFT.
+/// * v6 is another no-op shape bump for the river5 v3 → v15
+///   promotion. v15 changes the mixer (≈ 2× throughput) and
+///   produces byte-different outputs from v3 for the same input;
+///   bumping clears v3-era `"river5"` hash rows in one sweep so
+///   warm cache lookups can't accidentally pair a v3 hash with a
+///   v15 hash and silently report a wrong "duplicate".
 ///
 /// Bumping this string causes init_schema to drop and recreate the
 /// tables; any cached data from older versions is discarded.
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 
 #[derive(Debug, Clone)]
 pub struct CacheKey {
