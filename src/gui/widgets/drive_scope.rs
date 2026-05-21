@@ -164,17 +164,19 @@ fn draw_drive_panel(
         ui.add_space(4.0);
         draw_lcn_trace(ui, drive, now, effective_hdd);
     });
-    // The frame itself doesn't receive clicks; we ask egui to
-    // interact with the bounding rect at click sense so a click
-    // anywhere on the panel toggles the filter. The badge above is
-    // its own click target via the inner Sense::click so it doesn't
-    // also fire the filter toggle.
-    let panel_rect = inner.response.rect;
-    let panel_click = ui.interact(
-        panel_rect,
-        ui.id().with(("drive-panel-click", drive.info.id)),
-        egui::Sense::click(),
-    );
+    // Panel-level click toggles drive filter. We deliberately *don't*
+    // call ui.interact() over the full panel rect after the badge has
+    // drawn — egui's later interaction wins overlapping clicks, so
+    // re-interacting the whole rect here was swallowing the badge
+    // click and the user's HDD/SSD override never registered.
+    //
+    // Instead, treat the panel click as "panel was clicked AND no
+    // child widget claimed it" by using the egui response chain.
+    // `inner.response.interact(Sense::click())` interacts with the
+    // outer Frame's rect at the same z-level the badge was drawn at,
+    // so the badge's click (which was registered FIRST as part of
+    // frame.show()) takes precedence cleanly.
+    let panel_click = inner.response.interact(egui::Sense::click());
     if panel_click.clicked() && !action.badge_clicked {
         action.panel_clicked = true;
     }
