@@ -239,12 +239,18 @@ fn run(
                 ),
             );
         }
+        // Resolve the volume GUID once per root so the UI can use it
+        // as a stable key for persisted HDD/SSD overrides. Falls
+        // back to an empty string on non-Windows or when the lookup
+        // fails — overrides for that drive then just won't persist.
+        let volume_guid = volume_guid_for(r.as_path()).unwrap_or_default();
         let _ = tx.send(EngineEvent::DriveDiscovered(DriveInfo {
             id: i as u32,
             model: format!("{model} · Root {}", i + 1),
             has_seek_penalty,
             capacity_bytes: 0,
             volume_label: r.to_string_lossy().into_owned(),
+            volume_guid,
         }));
     }
     let seek_penalties = Arc::new(seek_penalties);
@@ -874,6 +880,23 @@ fn truncate_tail(s: &str, n: usize) -> String {
     }
     let tail: String = chars[chars.len() - (n - 1)..].iter().collect();
     format!("…{tail}")
+}
+
+/// Volume GUID for the path's underlying volume, as the stable key
+/// for persisted HDD/SSD render overrides. Returns `None` on
+/// non-Windows or when the Win32 lookup fails — callers store the
+/// empty string in that case and the override system skips
+/// persistence for that drive.
+pub fn volume_guid_for(path: &std::path::Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        crate::winapi_wrappers::volume_for_path(path).ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Best-effort detection of whether a path's underlying device has a

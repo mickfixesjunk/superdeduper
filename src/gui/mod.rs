@@ -11,8 +11,10 @@
 //! and a squarified treemap of reclaimable space.
 
 pub mod app;
+pub mod archive;
 pub mod checkpoint;
 pub mod diagnostics;
+pub mod drive_overrides;
 pub mod events;
 pub mod live;
 pub mod project;

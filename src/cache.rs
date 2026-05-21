@@ -19,15 +19,16 @@ use crate::{Error, Result};
 /// * v2 added the `hash_algo` column so the same volume+file_ref can
 ///   carry separate rows for Blake3 and the 128-bit hash (their
 ///   hashes are different bytes for the same file).
-/// * v3 is the same shape as v2 but bumps the version string so v2
-///   caches — which tagged the 128-bit rows as `"ddh128"` — get
-///   discarded after the crate rename to `river128`. Old rows are
-///   functionally orphaned (new lookups use the new tag), and the
-///   cache is cheap to rebuild.
+/// * v3 was a no-op shape bump after the crate rename to `river5`
+///   so pre-rename `"ddh128"`-tagged rows got dropped in one go.
+/// * v4 is another no-op shape bump for the river5 v2 → v3 swap.
+///   v3 changes per-block mixing so byte outputs diverge from v2
+///   even for the same input; bumping clears v2-era `"river5"`
+///   rows in one sweep rather than waiting for natural eviction.
 ///
 /// Bumping this string causes init_schema to drop and recreate the
 /// tables; any cached data from older versions is discarded.
-const SCHEMA_VERSION: &str = "3";
+const SCHEMA_VERSION: &str = "4";
 
 #[derive(Debug, Clone)]
 pub struct CacheKey {

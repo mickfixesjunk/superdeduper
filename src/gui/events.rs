@@ -75,6 +75,13 @@ pub struct DriveInfo {
     pub has_seek_penalty: bool,
     pub capacity_bytes: u64,
     pub volume_label: String,
+    /// Volume GUID, used as the persistent key for HDD/SSD render
+    /// overrides — drive letters reshuffle when external drives are
+    /// re-plugged, but the GUID is stable across mounts. Empty
+    /// string when the engine couldn't determine one (e.g. mount
+    /// path lookup failed); the override system treats empty as
+    /// "skip persistence for this drive".
+    pub volume_guid: String,
 }
 
 /// One completed read submitted to the UI for the LCN trace and the

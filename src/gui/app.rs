@@ -89,6 +89,11 @@ pub struct SuperdupeApp {
     /// Unix seconds of the open project's first save, kept so a
     /// re-save preserves `created_at_unix`. Zero ⇒ no project.
     current_project_created_at: u64,
+    /// Archive manifest the user just opened, waiting for explicit
+    /// confirm before we start moving files back. `None` ⇒ no
+    /// pending restore. The confirmation modal in `update()`
+    /// renders summary + Restore / Cancel buttons.
+    pending_archive_restore: Option<crate::gui::archive::ArchiveManifest>,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -160,6 +165,7 @@ impl SuperdupeApp {
             pending_resume,
             current_project_path: None,
             current_project_created_at: 0,
+            pending_archive_restore: None,
         };
 
         // Intentionally NO auto-load of prior scan results on launch.
@@ -514,38 +520,102 @@ impl SuperdupeApp {
             Some(p) => p,
             None => return,
         };
-        // Placeholder: we just read the file enough to confirm the
-        // schema and print summary info. The actual restore-to-
-        // originals loader is not implemented yet — file slot
-        // exists so the user can see the menu item working.
-        match std::fs::read(&file).and_then(|b| {
-            serde_json::from_slice::<serde_json::Value>(&b)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        }) {
-            Ok(v) => {
-                let schema = v.get("schema").and_then(|s| s.as_str()).unwrap_or("?");
-                let n = v
-                    .get("entries")
-                    .and_then(|e| e.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
+        let manifest = match crate::gui::archive::load_manifest(&file) {
+            Ok(m) => m,
+            Err(e) => {
                 self.state.push_log(
-                    crate::gui::events::LogLevel::Info,
-                    format!(
-                        "Archive manifest loaded · schema={schema} · {n} entries · {}",
-                        file.display()
-                    ),
+                    crate::gui::events::LogLevel::Error,
+                    format!("Manifest read failed: {e}"),
                 );
-                self.state.push_log(
-                    crate::gui::events::LogLevel::Info,
-                    "Restore-to-originals loader is not implemented yet; manifest opened read-only.".into(),
-                );
+                return;
             }
-            Err(e) => self.state.push_log(
-                crate::gui::events::LogLevel::Error,
-                format!("Manifest read failed: {e}"),
+        };
+        // Park the loaded manifest in a pending-restore slot. The
+        // confirmation modal in `update()` will render summary +
+        // Restore / Cancel buttons — we deliberately don't kick off
+        // the move immediately so the user gets one explicit "yes"
+        // step before files start moving.
+        let n = manifest.entries.len();
+        let total_bytes: u64 = manifest.entries.iter().map(|e| e.size).sum();
+        self.state.push_log(
+            crate::gui::events::LogLevel::Info,
+            format!(
+                "Archive manifest loaded · {} entries · {} · click Restore in the confirmation dialog.",
+                n,
+                humansize::format_size(total_bytes, humansize::BINARY)
             ),
-        }
+        );
+        self.pending_archive_restore = Some(manifest);
+    }
+
+    /// Kick off the actual move-back operation against the
+    /// previously-loaded manifest. Runs on a worker thread; reports
+    /// progress via the event channel.
+    fn run_archive_restore_threaded(&self, manifest: crate::gui::archive::ArchiveManifest) {
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("superdupe-archive-restore".into())
+            .spawn(move || {
+                let total = manifest.entries.len() as u64;
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Restoring {total} archived file(s) from manifest…"
+                )));
+                let mut summary = crate::gui::archive::RestoreSummary::default();
+                for entry in &manifest.entries {
+                    match crate::gui::archive::restore_one(entry) {
+                        crate::gui::archive::RestoreOutcome::Restored => {
+                            summary.restored += 1;
+                        }
+                        crate::gui::archive::RestoreOutcome::ArchivedMissing => {
+                            summary.archived_missing += 1;
+                            let _ = tx.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Warn,
+                                message: format!(
+                                    "restore: archived file missing · {} (expected at {})",
+                                    entry.original_path.display(),
+                                    entry.archived_path.display()
+                                ),
+                            });
+                        }
+                        crate::gui::archive::RestoreOutcome::OriginalExists => {
+                            summary.original_exists += 1;
+                            let _ = tx.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Warn,
+                                message: format!(
+                                    "restore: target already exists, skipped · {}",
+                                    entry.original_path.display()
+                                ),
+                            });
+                        }
+                        crate::gui::archive::RestoreOutcome::IoError(e) => {
+                            summary.io_errors += 1;
+                            let _ = tx.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Error,
+                                message: format!("restore: I/O error · {e}"),
+                            });
+                        }
+                    }
+                }
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Restore complete · {} of {} restored ({} missing, {} conflicts, {} I/O errors).",
+                    summary.restored,
+                    total,
+                    summary.archived_missing,
+                    summary.original_exists,
+                    summary.io_errors
+                )));
+                let _ = tx.send(EngineEvent::Log {
+                    level: crate::gui::events::LogLevel::Info,
+                    message: format!(
+                        "archive restore · restored={} missing={} conflicts={} errors={}",
+                        summary.restored,
+                        summary.archived_missing,
+                        summary.original_exists,
+                        summary.io_errors
+                    ),
+                });
+            })
+            .expect("spawn archive-restore thread");
     }
 
     fn request_pause(&mut self) {
@@ -567,6 +637,19 @@ impl SuperdupeApp {
                         }
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;
+                        }
+                        EngineEvent::DriveDiscovered(info) => {
+                            // Restore any saved override for this
+                            // volume into the live HashMap so the
+                            // user's previous "this is actually an
+                            // SSD" decision survives across runs.
+                            if !info.volume_guid.is_empty() {
+                                if let Ok(saved) = crate::gui::drive_overrides::load() {
+                                    if let Some(&v) = saved.overrides.get(&info.volume_guid) {
+                                        self.drive_render_overrides.insert(info.id, v);
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -706,7 +789,8 @@ impl SuperdupeApp {
                 )));
                 let mut moved = 0u64;
                 let mut failed = 0u64;
-                let mut manifest_entries: Vec<ArchiveManifestEntry> = Vec::new();
+                let mut manifest_entries: Vec<crate::gui::archive::ArchiveManifestEntry> =
+                    Vec::new();
                 for (size, hash, keeper, dupes) in &groups {
                     for src in dupes {
                         // Build the destination path: dest +
@@ -738,7 +822,7 @@ impl SuperdupeApp {
                         match move_result {
                             Ok(()) => {
                                 moved += 1;
-                                manifest_entries.push(ArchiveManifestEntry {
+                                manifest_entries.push(crate::gui::archive::ArchiveManifestEntry {
                                     original_path: src.clone(),
                                     archived_path: archived.clone(),
                                     keeper_path: keeper.clone(),
@@ -766,8 +850,8 @@ impl SuperdupeApp {
                     "superdupe-archive-manifest-{}.json",
                     iso_timestamp_for_filename()
                 ));
-                let manifest = ArchiveManifest {
-                    schema: "superdupe.archive.v1".into(),
+                let manifest = crate::gui::archive::ArchiveManifest {
+                    schema: crate::gui::archive::ARCHIVE_SCHEMA.into(),
                     created_at_unix: now_unix(),
                     destination: dest.clone(),
                     entries: manifest_entries,
@@ -1092,6 +1176,84 @@ impl eframe::App for SuperdupeApp {
             return;
         }
 
+        // Archive-restore confirmation: rendered as a non-blocking
+        // window over the regular UI (vs the Resume modal which
+        // gates everything). The user needs to be able to see what
+        // they're about to undo while reading the prompt.
+        if let Some(manifest) = self.pending_archive_restore.clone() {
+            let mut accept = false;
+            let mut cancel = false;
+            egui::Window::new("Restore archived duplicates?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    let n = manifest.entries.len();
+                    let total_bytes: u64 = manifest.entries.iter().map(|e| e.size).sum();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Move {n} file(s) ({}) from",
+                            humansize::format_size(total_bytes, humansize::BINARY)
+                        ))
+                        .color(theme::TEXT_HI),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("  {}", manifest.destination.display()))
+                            .color(theme::TEXT_LO)
+                            .monospace(),
+                    );
+                    ui.label(egui::RichText::new("back to their original paths.").color(theme::TEXT_HI));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "If a file already exists at the original path we'll skip it (no overwrite). Cross-volume restores fall back to copy + remove automatically.",
+                        )
+                        .color(theme::TEXT_LO)
+                        .small()
+                        .italics(),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("↩  Restore")
+                                        .color(theme::PANEL_DEEP)
+                                        .strong(),
+                                )
+                                .fill(theme::ACCENT)
+                                .min_size(egui::vec2(120.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            accept = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Cancel").color(theme::TEXT_HI),
+                                )
+                                .min_size(egui::vec2(100.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            if accept {
+                self.pending_archive_restore = None;
+                self.run_archive_restore_threaded(manifest);
+            } else if cancel {
+                self.pending_archive_restore = None;
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Info,
+                    "Archive restore cancelled by user.".into(),
+                );
+            }
+        }
+
         // Settings modal first; it doesn't claim screen real estate.
         if self.settings_open {
             let mut open = self.settings_open;
@@ -1376,38 +1538,6 @@ fn reveal_in_explorer(path: &std::path::Path) {
 
 #[cfg(not(windows))]
 fn reveal_in_explorer(_path: &std::path::Path) {}
-
-/// On-disk shape of the archive manifest. Written next to the moved
-/// files when "Archive dupes" runs, consumed by a future
-/// "restore-from-manifest" loader (out of scope for this commit).
-/// `schema` lets the loader pin a parser version so we can evolve
-/// fields without silently misreading old files.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ArchiveManifest {
-    schema: String,
-    created_at_unix: u64,
-    destination: PathBuf,
-    entries: Vec<ArchiveManifestEntry>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ArchiveManifestEntry {
-    /// Where the file lived before the archive run.
-    original_path: PathBuf,
-    /// Where the file is now (under `destination`).
-    archived_path: PathBuf,
-    /// The "keeper" sibling that was left in place. Recorded so the
-    /// loader can verify the keeper still exists before offering to
-    /// restore (you probably don't want to put a file back next to
-    /// a keeper that's since been deleted).
-    keeper_path: PathBuf,
-    /// Content hash from the scan that produced this duplicate set.
-    /// Survives algo switches because the cache keys on `hash_algo`.
-    content_hash: String,
-    /// Bytes; redundant with the file on disk but handy for "are you
-    /// sure you want to restore X GiB?" prompts.
-    size: u64,
-}
 
 /// Map a source path like `C:\Users\X\foo.bin` to its archived
 /// position under `dest`, preserving the drive letter as a folder
