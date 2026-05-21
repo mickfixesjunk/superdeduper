@@ -194,6 +194,13 @@ pub enum KeepStrategy {
     InReference,
     First,
     Interactive,
+    /// Pick the keeper by scoring each file on multiple signals —
+    /// path quality (Recycle Bin / temp / cache penalised, depth
+    /// rewarded), filename patterns (`_final` rewarded,
+    /// `_draft` / `copy of ` / ` (1)` penalised), and mtime. The
+    /// highest-scored file is kept; ties resolve to newest.
+    /// Reasoning is logged so a user can audit a surprising pick.
+    Smart,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

@@ -756,6 +756,13 @@ fn run(
             diag_counters
                 .reclaimable_bytes
                 .store(reclaimable, Ordering::Relaxed);
+            // Reorder so the smart-heuristic keeper lands at
+            // index 0. The GUI's safe-rename / recycle / hardlink
+            // flows all treat `files[0]` as the canonical keeper
+            // — putting the best-scored file there is how we
+            // make `KeepStrategy::Smart` the GUI default without
+            // each downstream action having to know about it.
+            let visible_files = order_keeper_first(visible_files);
             let summary = DuplicateGroupSummary {
                 size: g.size,
                 content_hash: g.content_hash,
@@ -887,6 +894,31 @@ fn truncate_tail(s: &str, n: usize) -> String {
 /// non-Windows or when the Win32 lookup fails — callers store the
 /// empty string in that case and the override system skips
 /// persistence for that drive.
+/// Reorder a duplicate group's `files` list so the smart-heuristic
+/// keeper lands at index 0. The rest stay in their original order
+/// (we only swap the chosen keeper to position 0). This makes
+/// `KeepStrategy::Smart` the implicit GUI default without changing
+/// any downstream action handlers — safe-rename, recycle and
+/// hardlink all treat files[0] as canonical.
+fn order_keeper_first(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    if files.len() < 2 {
+        return files;
+    }
+    // Pull mtimes once so the picker has them for the recency
+    // signal without doing two stat passes.
+    let mtimes: Vec<Option<std::time::SystemTime>> = files
+        .iter()
+        .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .collect();
+    let keeper = crate::keep::pick_keeper(&files, &mtimes);
+    if keeper == 0 {
+        return files;
+    }
+    let mut reordered = files;
+    reordered.swap(0, keeper);
+    reordered
+}
+
 pub fn volume_guid_for(path: &std::path::Path) -> Option<String> {
     #[cfg(windows)]
     {

@@ -333,13 +333,33 @@ pub fn show_filtered(
                                         } else {
                                             ("dupe ", theme::TEXT_LO)
                                         };
-                                        ui.label(
+                                        let label = ui.label(
                                             RichText::new(tag)
                                                 .color(color)
                                                 .small()
                                                 .monospace()
                                                 .strong(),
                                         );
+                                        // Hover the keep / dupe tag
+                                        // to see why this file got
+                                        // its label. Useful when the
+                                        // smart picker makes a
+                                        // surprising call — the
+                                        // breakdown shows every
+                                        // signal that fired.
+                                        let mtime =
+                                            std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                                        let s = crate::keep::score_file(p, mtime);
+                                        let mut tip =
+                                            format!("Smart-keep score: {:+.1}\n", s.total);
+                                        if s.breakdown.is_empty() {
+                                            tip.push_str("  (no signals fired)\n");
+                                        } else {
+                                            for (k, v) in &s.breakdown {
+                                                tip.push_str(&format!("  {:+5.1}  {}\n", v, k));
+                                            }
+                                        }
+                                        label.on_hover_text(tip);
                                     });
                                     row.col(|ui| {
                                         let color = if j == 0 {
