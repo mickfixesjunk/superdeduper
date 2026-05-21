@@ -117,7 +117,7 @@ fn draw_drive_panel(
         .rounding(6.0)
         .stroke(stroke);
 
-    let inner = frame.show(ui, |ui| {
+    let _inner = frame.show(ui, |ui| {
         let mbps = drive.current_mbps();
         let type_color = if effective_hdd { theme::HDD } else { theme::SSD };
         let detected_label = if drive.info.has_seek_penalty { "HDD" } else { "SSD" };
@@ -127,7 +127,13 @@ fn draw_drive_panel(
             None => format!("● {detected_label}"),
         };
 
-        ui.horizontal(|ui| {
+        // Title row — this row IS the panel-click target. The
+        // sparkline + LCN trace below get their own hover tooltips
+        // independently. Splitting it this way means the panel-
+        // level click sense doesn't overlap the trace rect, so the
+        // trace's `Sense::hover()` response wins on its own area
+        // and the tooltip pops up.
+        let title_row = ui.horizontal(|ui| {
             let badge = ui.add(
                 egui::Label::new(
                     RichText::new(badge_label).color(type_color).strong(),
@@ -161,28 +167,24 @@ fn draw_drive_panel(
                 );
             });
         });
+        // Reserve the title row's rect for the filter-toggle click.
+        // The badge inside still wins over this larger rect because
+        // it registered Sense::click() first as part of the
+        // ui.add(Label) call above.
+        let row_click = ui.interact(
+            title_row.response.rect,
+            ui.id().with(("drive-title-click", drive.info.id)),
+            egui::Sense::click(),
+        );
+        if row_click.clicked() && !action.badge_clicked {
+            action.panel_clicked = true;
+        }
 
         ui.add_space(2.0);
         draw_sparkline(ui, drive, now);
         ui.add_space(4.0);
         draw_lcn_trace(ui, drive, now, effective_hdd);
     });
-    // Panel-level click toggles drive filter. We deliberately *don't*
-    // call ui.interact() over the full panel rect after the badge has
-    // drawn — egui's later interaction wins overlapping clicks, so
-    // re-interacting the whole rect here was swallowing the badge
-    // click and the user's HDD/SSD override never registered.
-    //
-    // Instead, treat the panel click as "panel was clicked AND no
-    // child widget claimed it" by using the egui response chain.
-    // `inner.response.interact(Sense::click())` interacts with the
-    // outer Frame's rect at the same z-level the badge was drawn at,
-    // so the badge's click (which was registered FIRST as part of
-    // frame.show()) takes precedence cleanly.
-    let panel_click = inner.response.interact(egui::Sense::click());
-    if panel_click.clicked() && !action.badge_clicked {
-        action.panel_clicked = true;
-    }
     action
 }
 
