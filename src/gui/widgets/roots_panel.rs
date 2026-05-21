@@ -93,13 +93,17 @@ pub fn show(
                 .on_hover_text(path_str.as_ref());
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Big red X — was a small grey ✕ which the user
+                    // couldn't see was a remove button. Bolder glyph,
+                    // larger hit zone, hover state shows the danger
+                    // colour so it visually reads as "destructive".
+                    let btn =
+                        egui::Button::new(RichText::new("✖").color(theme::HOT).size(16.0).strong())
+                            .frame(false)
+                            .min_size(vec2(24.0, 24.0));
                     if ui
-                        .add(
-                            egui::Button::new(RichText::new("✕").color(theme::TEXT_LO))
-                                .frame(false)
-                                .min_size(vec2(18.0, 18.0)),
-                        )
-                        .on_hover_text("Remove from scan list.")
+                        .add(btn)
+                        .on_hover_text("Remove this root from the scan list.")
                         .clicked()
                     {
                         action = Some(RootsAction::Remove(i));

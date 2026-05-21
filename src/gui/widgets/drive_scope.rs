@@ -143,6 +143,15 @@ fn draw_drive_panel(
         // level click sense doesn't overlap the trace rect, so the
         // trace's `Sense::hover()` response wins on its own area
         // and the tooltip pops up.
+        // Hold the badge response across the horizontal closure so
+        // we can carve its rect out of the row-click hit zone
+        // below. Without this exclusion the row-level `ui.interact`
+        // (registered AFTER the badge label) was eating the
+        // badge's click events — clicking the SSD/HDD badge
+        // looked like a no-op even though the override cycle was
+        // wired up correctly. egui resolves clicks to the
+        // later-registered widget when rects overlap.
+        let mut badge_rect: Option<egui::Rect> = None;
         let title_row = ui.horizontal(|ui| {
             let badge = ui.add(
                 egui::Label::new(
@@ -150,6 +159,7 @@ fn draw_drive_panel(
                 )
                 .sense(egui::Sense::click()),
             );
+            badge_rect = Some(badge.rect);
             if badge
                 .on_hover_text(
                     "Click to cycle render style: detected → SSD (scatter) → HDD (diagonal) → detected.",
@@ -177,17 +187,30 @@ fn draw_drive_panel(
                 );
             });
         });
-        // Reserve the title row's rect for the filter-toggle click.
-        // The badge inside still wins over this larger rect because
-        // it registered Sense::click() first as part of the
-        // ui.add(Label) call above.
-        let row_click = ui.interact(
-            title_row.response.rect,
-            ui.id().with(("drive-title-click", drive.info.id)),
-            egui::Sense::click(),
-        );
-        if row_click.clicked() && !action.badge_clicked {
-            action.panel_clicked = true;
+        // Row-click region — everything in the title row EXCEPT
+        // the badge. Clicking model name / MB-s readout selects
+        // the drive; clicking the badge (registered first as a
+        // Label with Sense::click) cycles the render override.
+        // We also gate on the pointer's actual click position
+        // not being inside the badge — egui's hit-test on a
+        // shrunken interact rect would still register a click on
+        // the unshrunken-row pointer position, so the geometric
+        // gate is the reliable one.
+        if let Some(b_rect) = badge_rect {
+            let pointer_in_badge = ui
+                .input(|i| i.pointer.interact_pos())
+                .map(|p| b_rect.contains(p))
+                .unwrap_or(false);
+            if !pointer_in_badge {
+                let row_click = ui.interact(
+                    title_row.response.rect,
+                    ui.id().with(("drive-title-click", drive.info.id)),
+                    egui::Sense::click(),
+                );
+                if row_click.clicked() && !action.badge_clicked {
+                    action.panel_clicked = true;
+                }
+            }
         }
 
         ui.add_space(2.0);

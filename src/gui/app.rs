@@ -94,6 +94,15 @@ pub struct SuperdeduperApp {
     /// pending restore. The confirmation modal in `update()`
     /// renders summary + Restore / Cancel buttons.
     pending_archive_restore: Option<crate::gui::archive::ArchiveManifest>,
+    /// Destructive group-action the user clicked, waiting on the
+    /// "type DELETE" confirmation. `None` ⇒ no action pending.
+    /// Bypassed when `settings.bypass_destructive_confirmation` is
+    /// true; non-destructive Reveal-in-Explorer never lands here.
+    pending_destructive: Option<groups_table::GroupAction>,
+    /// Text the user has typed into the confirmation prompt. Must
+    /// equal `"DELETE"` exactly before the Confirm button enables.
+    /// Cleared every time the modal opens or closes.
+    destructive_confirm_input: String,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -166,6 +175,8 @@ impl SuperdeduperApp {
             current_project_path: None,
             current_project_created_at: 0,
             pending_archive_restore: None,
+            pending_destructive: None,
+            destructive_confirm_input: String::new(),
         };
 
         // Intentionally NO auto-load of prior scan results on launch.
@@ -645,13 +656,39 @@ impl SuperdeduperApp {
                             // volume into the live HashMap so the
                             // user's previous "this is actually an
                             // SSD" decision survives across runs.
+                            //
+                            // Also log the resolved render decision —
+                            // detected vs override vs effective — so
+                            // a "my NVMe shows as HDD" mystery (the
+                            // user has reported this exact one) is
+                            // one-grep away in the run log instead
+                            // of needing source inspection.
+                            let mut override_value: Option<bool> = None;
                             if !info.volume_guid.is_empty() {
                                 if let Ok(saved) = crate::gui::drive_overrides::load() {
                                     if let Some(&v) = saved.overrides.get(&info.volume_guid) {
                                         self.drive_render_overrides.insert(info.id, v);
+                                        override_value = Some(v);
                                     }
                                 }
                             }
+                            let detected_hdd = info.has_seek_penalty;
+                            let effective_hdd = match override_value {
+                                Some(true) => false,
+                                Some(false) => true,
+                                None => detected_hdd,
+                            };
+                            tracing::info!(
+                                drive_id = info.id,
+                                volume_label = %info.volume_label,
+                                volume_guid = %info.volume_guid,
+                                model = %info.model,
+                                detected = if detected_hdd { "HDD" } else { "SSD" },
+                                manual_override = ?override_value
+                                    .map(|v| if v { "force-SSD" } else { "force-HDD" }),
+                                effective_render = if effective_hdd { "HDD" } else { "SSD" },
+                                "drive discovered"
+                            );
                         }
                         _ => {}
                     }
@@ -889,7 +926,25 @@ impl SuperdeduperApp {
             .expect("spawn archive thread");
     }
 
+    /// Gate destructive group actions on the "type DELETE" modal
+    /// (unless the user has explicitly opted to bypass via Settings →
+    /// Safety). Reveal-in-Explorer is non-destructive and fires
+    /// immediately; everything else stashes into `pending_destructive`
+    /// for the modal in `update()` to handle.
     fn dispatch_group_action(&mut self, action: GroupAction) {
+        // Reveal touches nothing — bypass the modal unconditionally.
+        if matches!(action, GroupAction::Reveal(_)) {
+            return self.dispatch_group_action_unchecked(action);
+        }
+        if self.persisted.settings.bypass_destructive_confirmation {
+            return self.dispatch_group_action_unchecked(action);
+        }
+        // Stash for the modal to confirm or cancel.
+        self.pending_destructive = Some(action);
+        self.destructive_confirm_input.clear();
+    }
+
+    fn dispatch_group_action_unchecked(&mut self, action: GroupAction) {
         match action {
             GroupAction::RecycleOthers { keeper, dupes } => {
                 self.run_action_threaded(DedupeAction::Recycle, keeper, dupes);
@@ -1256,6 +1311,90 @@ impl eframe::App for SuperdeduperApp {
             }
         }
 
+        // Destructive-action confirmation modal — "type DELETE".
+        // Gates Recycle / SafeRename / Hardlink / SafeRenameAll;
+        // Reveal-in-Explorer and Unsuperdeduper bypass this. The
+        // bypass-for-all setting in Settings → Safety skips the
+        // modal entirely on dispatch (so we never reach this
+        // branch when bypass is on).
+        if let Some(action) = self.pending_destructive.clone() {
+            let mut confirm = false;
+            let mut cancel = false;
+            let description = describe_destructive_action(&action);
+            egui::Window::new(
+                egui::RichText::new("⚠ Confirm destructive action")
+                    .color(theme::HOT)
+                    .strong(),
+            )
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(description)
+                        .color(theme::TEXT_HI)
+                        .size(14.0),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "This cannot be auto-undone from the app. \
+                         Recycle is reversible from the Recycle Bin; \
+                         Safe-rename is reversible via the Unsuperdeduper button; \
+                         Hardlink is NOT reversible without the original data still being elsewhere.",
+                    )
+                    .color(theme::TEXT_LO)
+                    .small(),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("Type DELETE to confirm:")
+                        .color(theme::TEXT_HI)
+                        .strong(),
+                );
+                ui.text_edit_singleline(&mut self.destructive_confirm_input);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let can_confirm = self.destructive_confirm_input == "DELETE";
+                    if ui
+                        .add_enabled(
+                            can_confirm,
+                            egui::Button::new(
+                                egui::RichText::new("Confirm")
+                                    .color(if can_confirm { theme::PANEL_DEEP } else { theme::TEXT_LO })
+                                    .strong(),
+                            )
+                            .fill(if can_confirm { theme::HOT } else { theme::PANEL }),
+                        )
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.add_space(20.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "(Tip: Settings → Safety can bypass this prompt for future actions.)",
+                        )
+                        .color(theme::TEXT_LO)
+                        .small()
+                        .italics(),
+                    );
+                });
+            });
+            if confirm {
+                self.pending_destructive = None;
+                self.destructive_confirm_input.clear();
+                self.dispatch_group_action_unchecked(action);
+            } else if cancel {
+                self.pending_destructive = None;
+                self.destructive_confirm_input.clear();
+            }
+        }
+
         // Settings modal first; it doesn't claim screen real estate.
         if self.settings_open {
             let mut open = self.settings_open;
@@ -1528,6 +1667,43 @@ fn check_resumable(persisted: &PersistedAppState) -> bool {
     match checkpoint::load(&path) {
         Ok(Some(cp)) => cp.roots == persisted.roots && cp.settings == persisted.settings,
         _ => false,
+    }
+}
+
+/// One-line summary of a pending destructive action — shown at the
+/// top of the "type DELETE" confirmation modal. Keep it factual:
+/// what, how many, target paths. The detail/reversibility paragraph
+/// is rendered separately by the modal itself.
+fn describe_destructive_action(action: &GroupAction) -> String {
+    match action {
+        GroupAction::RecycleOthers { keeper, dupes } => format!(
+            "Move {} file(s) to the Recycle Bin, keeping:\n  {}",
+            dupes.len(),
+            keeper.display()
+        ),
+        GroupAction::HardlinkOthers { keeper, dupes } => format!(
+            "Replace {} file(s) with hardlinks to:\n  {}\n(Both copies share the same on-disk bytes after this — \
+             editing one will silently affect the other on filesystems where hardlinks share content.)",
+            dupes.len(),
+            keeper.display()
+        ),
+        GroupAction::SafeRenameOthers { keeper, dupes } => format!(
+            "Append .superdeduper to {} non-keeper file(s) in this group, keeping:\n  {}\n\
+             (Safe-mode: nothing is deleted; the Unsuperdeduper button on the Roots panel reverts the rename.)",
+            dupes.len(),
+            keeper.display()
+        ),
+        GroupAction::SafeRenameAllVisible => {
+            "Append .superdeduper to EVERY non-keeper across EVERY currently visible duplicate group. \
+             Safe-mode: nothing is deleted. Reversible via Unsuperdeduper. Reference paths are never touched."
+                .to_string()
+        }
+        // Reveal should never reach this code path — it bypasses the
+        // modal in `dispatch_group_action` — but document it
+        // anyway in case future refactors widen the dispatcher.
+        GroupAction::Reveal(_) => {
+            "(internal: Reveal-in-Explorer reached the destructive modal — this is a bug)".into()
+        }
     }
 }
 
