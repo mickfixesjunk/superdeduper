@@ -61,7 +61,7 @@ impl Stage {
         match self {
             Stage::Tier3Full => match algo {
                 HashAlgo::Blake3 => "Tier 3 · full BLAKE3".to_string(),
-                HashAlgo::River5 => "Tier 3 · full River5".to_string(),
+                HashAlgo::River5 => "Tier 3 · full RIVER5".to_string(),
             },
             other => other.label().to_string(),
         }

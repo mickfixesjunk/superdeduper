@@ -21,12 +21,19 @@ use serde::{Deserialize, Serialize};
 /// don't mix Blake3 and River5 outputs by accident.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HashAlgo {
-    #[default]
     Blake3,
     /// 16-byte hash from the `river5` crate (was `ddh128`, then
     /// briefly `river128` before the latest rename). Old persisted
     /// settings carrying any of those names are accepted via serde
     /// aliases so old checkpoints load cleanly.
+    ///
+    /// Default since the rename to superdeduper: AES-NI-accelerated
+    /// throughput is ~3× BLAKE3 on bulk content on supported CPUs,
+    /// and the 16-byte output is more than enough for file dedup
+    /// (collisions on non-adversarial real-world content are
+    /// astronomically improbable). BLAKE3 is still available for
+    /// users who need the cryptographic-strength 32-byte digest.
+    #[default]
     #[serde(alias = "Ddh128", alias = "River128")]
     River5,
 }

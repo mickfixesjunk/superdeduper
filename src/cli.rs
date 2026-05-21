@@ -120,12 +120,13 @@ pub struct ScanArgs {
     #[arg(long)]
     pub allow_system_paths: bool,
 
-    /// Content-hash algorithm. `blake3` (default, 32-byte
-    /// cryptographic) or `river5` (16-byte, AES-NI hardware-
-    /// accelerated). The legacy spellings `ddh128` and `river128`
-    /// are accepted as aliases so older scripts keep working after
-    /// the crate renames.
-    #[arg(long, value_enum, default_value_t = HashAlgoArg::Blake3)]
+    /// Content-hash algorithm. `river5` (default, 16-byte,
+    /// AES-NI hardware-accelerated, ~3× faster than BLAKE3 on
+    /// supported CPUs) or `blake3` (32-byte, cryptographic).
+    /// The legacy spellings `ddh128` and `river128` are accepted
+    /// as aliases for `river5` so older scripts keep working
+    /// after the crate renames.
+    #[arg(long, value_enum, default_value_t = HashAlgoArg::River5)]
     pub hash_algo: HashAlgoArg,
 }
 
