@@ -27,6 +27,9 @@ pub fn show(
     state: &UiState,
     selected: Option<u32>,
     render_overrides: &mut hashbrown::HashMap<u32, bool>,
+    // When the scan is finished, pass Some(scan-end-instant) so the
+    // age math freezes instead of decaying after reads stop arriving.
+    frozen_now: Option<Instant>,
 ) -> Option<u32> {
     let mut clicked: Option<u32> = None;
     ui.label(RichText::new("Drive scope").color(theme::TEXT_LO).strong())
@@ -51,7 +54,7 @@ pub fn show(
     let mut ids: Vec<_> = state.drives.keys().copied().collect();
     ids.sort();
 
-    let now = Instant::now();
+    let now = frozen_now.unwrap_or_else(Instant::now);
     for id in ids {
         let drive = &state.drives[&id];
         let is_selected = selected == Some(id);
@@ -235,16 +238,29 @@ fn draw_sparkline(ui: &mut Ui, drive: &DriveLive, now: Instant) {
 fn draw_lcn_trace(ui: &mut Ui, drive: &DriveLive, now: Instant, render_as_hdd: bool) {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), SCOPE_HEIGHT), Sense::hover());
+    // Plain-English explanations first; the technical name (LCN) is
+    // useful for screenshots but isn't what most users need to read.
     let tip = if render_as_hdd {
-        "LCN-vs-time read trace (HDD render). Y = position on the \
-         drive, X = time (right = now). The yellow line climbing \
-         diagonally means reads are running sequentially — the cheap \
-         pattern on a spinning disk."
+        "What you're looking at: where on the disk the engine has \
+         been reading from over the last few seconds.\n\n\
+         X axis = time (right edge = right now, left edge = ~30s ago).\n\
+         Y axis = byte position on the drive (top = start of drive, \
+         bottom = end).\n\n\
+         The yellow line climbing diagonally is the engine working \
+         through files in disk order — that's what we want on a \
+         spinning HDD because the read head doesn't have to jump \
+         back and forth. A messy zig-zag would mean we're thrashing \
+         the head and the scan would crawl."
     } else {
-        "LCN-vs-time read trace (SSD render). Y = position on the \
-         drive, X = time (right = now). The teal cloud is the random \
-         spray pattern SSDs love — no seek penalty so we read all \
-         over the address space in parallel."
+        "What you're looking at: where on the disk the engine has \
+         been reading from over the last few seconds.\n\n\
+         X axis = time (right edge = right now, left edge = ~30s ago).\n\
+         Y axis = byte position on the drive (top = start, bottom = end).\n\n\
+         The teal scatter (\"TV snow\") is the engine reading all \
+         over the SSD at once — perfect for SSDs because they have \
+         no read-head seek cost. The denser the spray, the more \
+         parallel I/O is in flight. A neat diagonal line here would \
+         mean we're under-using the SSD."
     };
     resp.on_hover_text(tip);
     let painter = ui.painter_at(rect);

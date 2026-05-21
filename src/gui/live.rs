@@ -110,7 +110,7 @@ fn run(
         }
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
-            message: format!("Diagnostics report opened in ./diagnostics/"),
+            message: "Diagnostics report opened in ./diagnostics/".to_string(),
         });
     }
     // Surface the linked hash implementation so users running with
@@ -1027,14 +1027,11 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         paranoid: settings.paranoid,
         use_cache: settings.use_cache,
         use_format_aware: settings.use_format_aware,
-        threads: {
-            let t = settings.threads.unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            });
-            t
-        },
+        threads: settings.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        }),
         io_threads: {
             // Explicit setting wins; otherwise oversubscribe to
             // CPU × 3 like the CLI default.

@@ -9,18 +9,14 @@ use crate::gui::theme;
 pub enum HeaderAction {
     None,
     OpenSettings,
-    StartDemo,
 }
 
-pub fn show(ui: &mut Ui, state: &UiState, demo_mode: bool, is_scanning: bool) -> HeaderAction {
+pub fn show(ui: &mut Ui, state: &UiState, _is_scanning: bool) -> HeaderAction {
     let mut action = HeaderAction::None;
     ui.horizontal(|ui| {
         ui.add_space(4.0);
         ui.label(RichText::new("superdupe").color(theme::ACCENT).heading());
         ui.label(RichText::new(env!("CARGO_PKG_VERSION")).color(theme::TEXT_LO));
-        if demo_mode {
-            ui.label(RichText::new("DEMO").color(theme::WARN).small().strong());
-        }
         ui.add_space(8.0);
 
         let settings_btn = egui::Button::new(RichText::new("⚙  Settings").color(theme::TEXT_HI))
@@ -32,17 +28,6 @@ pub fn show(ui: &mut Ui, state: &UiState, demo_mode: bool, is_scanning: bool) ->
             .clicked()
         {
             action = HeaderAction::OpenSettings;
-        }
-
-        let demo_btn = egui::Button::new(RichText::new("▶  Demo").color(theme::TEXT_HI))
-            .fill(theme::PANEL_DEEP)
-            .min_size(vec2(80.0, 28.0));
-        if ui
-            .add_enabled(!is_scanning, demo_btn)
-            .on_hover_text("Replay the synthetic engine demo.")
-            .clicked()
-        {
-            action = HeaderAction::StartDemo;
         }
 
         ui.separator();

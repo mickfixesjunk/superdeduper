@@ -11,3 +11,8 @@ Cargo.lock.bak
 /superdupe-gui.exe
 /diagnostics/
 /superdupe.exe
+
+# Per-developer Cargo overrides — see .cargo/config.toml.example
+# for the river5 path-patch pattern. Tracked example, ignored real
+# config.
+/.cargo/config.toml

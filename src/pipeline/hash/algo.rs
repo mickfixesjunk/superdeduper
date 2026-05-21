@@ -18,9 +18,10 @@ use serde::{Deserialize, Serialize};
 
 /// Which content-hash algorithm a scan should use. Persisted via
 /// `ScanSettings` and recorded in the cache row so warm rescans
-/// don't mix Blake3 and River128 outputs by accident.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// don't mix Blake3 and River5 outputs by accident.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HashAlgo {
+    #[default]
     Blake3,
     /// 16-byte hash from the `river5` crate (was `ddh128`, then
     /// briefly `river128` before the latest rename). Old persisted
@@ -28,12 +29,6 @@ pub enum HashAlgo {
     /// aliases so old checkpoints load cleanly.
     #[serde(alias = "Ddh128", alias = "River128")]
     River5,
-}
-
-impl Default for HashAlgo {
-    fn default() -> Self {
-        HashAlgo::Blake3
-    }
 }
 
 impl HashAlgo {
@@ -69,8 +64,13 @@ impl HashAlgo {
     }
 }
 
-/// Backend dispatch for streaming-hashed content. Sized for stack
-/// allocation; both variants fit in a few hundred bytes.
+/// Backend dispatch for streaming-hashed content. The two variants
+/// have very different sizes (`blake3::Hasher` is ~2 KiB while
+/// `river5::Hasher` is small) — we don't `Box` to dodge the
+/// `large_enum_variant` lint because the hasher is constructed on
+/// every per-file hash call and an extra heap allocation per file
+/// would more than wipe out any size saving on this hot path.
+#[allow(clippy::large_enum_variant)]
 pub enum ContentHasher {
     Blake3(blake3::Hasher),
     River5(river5::Hasher),

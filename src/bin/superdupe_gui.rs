@@ -1,8 +1,15 @@
 //! `superdupe-gui` — desktop window for the engine.
 //!
-//! By default launches into an idle "pick a folder to scan" state.
-//! Pass `--demo` to replay the synthetic engine for screenshots; pass
-//! `--live <PATH>…` to start a real scan immediately on those paths.
+//! Default: idle "pick a folder to scan" state. Pass `--live <PATH>…`
+//! to start a real scan immediately on those paths.
+//!
+//! `windows_subsystem = "windows"` keeps the GUI binary from spawning
+//! a black console window before the eframe viewport appears.
+//! Debugging stdout/stderr still works if you launch it from an
+//! existing terminal (PowerShell / cmd) — Windows only hides the
+//! *auto-allocated* console.
+
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 
@@ -17,9 +24,6 @@ struct Args {
     /// user to click "Scan".
     #[arg(long)]
     live: bool,
-    /// Replay the synthetic demo engine. Useful for screenshots.
-    #[arg(long, conflicts_with = "live")]
-    demo: bool,
     /// Paths to scan when --live is set, or to seed the roots panel.
     #[arg(value_name = "PATHS")]
     paths: Vec<PathBuf>,
@@ -47,13 +51,12 @@ fn main() -> eframe::Result<()> {
     } else {
         Vec::new()
     };
-    let start_demo = args.demo;
 
     eframe::run_native(
         "superdupe",
         native_options,
         Box::new(move |cc| {
-            let mut app = SuperdupeApp::new(cc, start_demo);
+            let mut app = SuperdupeApp::new(cc);
             for p in &seed_roots {
                 app.add_root(p.clone(), false);
             }
