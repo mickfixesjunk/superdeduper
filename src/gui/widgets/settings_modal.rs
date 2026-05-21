@@ -234,6 +234,40 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
                     }
                 });
             });
+
+            ui.add_space(12.0);
+            ui.heading("Safety");
+            // Snapshot the value before the &mut borrow so the label
+            // colour can read it without colliding with the checkbox's
+            // mutable reference.
+            let bypass_on = settings.bypass_destructive_confirmation;
+            let bypass_check = ui.checkbox(
+                &mut settings.bypass_destructive_confirmation,
+                RichText::new("Bypass \"type DELETE\" confirmation for destructive actions").color(
+                    if bypass_on {
+                        theme::HOT
+                    } else {
+                        theme::TEXT_HI
+                    },
+                ),
+            );
+            bypass_check.on_hover_text(
+                "OFF (default): every Recycle / Hardlink / Safe-rename action shows a \
+                 modal asking you to type \"DELETE\" before it fires.\n\n\
+                 ON: actions fire immediately on click — no prompt. Use only when you \
+                 trust the dedup picks (eg. running Smart-keep against the same corpus \
+                 repeatedly and reviewing results before clicking each action).\n\n\
+                 Reveal-in-Explorer and Unsuperdeduper never prompt regardless of this \
+                 setting — Reveal touches nothing, and Unsuperdeduper is a reversal.",
+            );
+            if settings.bypass_destructive_confirmation {
+                ui.label(
+                    RichText::new("⚠ Destructive actions will fire WITHOUT confirmation.")
+                        .color(theme::HOT)
+                        .small()
+                        .italics(),
+                );
+            }
         });
     closed
 }

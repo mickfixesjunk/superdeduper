@@ -47,11 +47,22 @@ pub struct ScanSettings {
     #[serde(default)]
     pub io_threads: Option<usize>,
     pub allow_system_paths: bool,
-    /// Content-hash algorithm: BLAKE3 (default, cryptographic) or
-    /// River128 (16-byte output, AES-NI hardware-accelerated; was
-    /// `ddh128` prior to the crate rename).
+    /// Content-hash algorithm. Defaults to RIVER5 since v0.2 — see
+    /// `HashAlgo::default()`.
     #[serde(default)]
     pub hash_algo: crate::pipeline::hash::HashAlgo,
+    /// Skip the "type DELETE to confirm" modal on every destructive
+    /// action (Recycle / SafeRename / Hardlink / bulk Safe-rename).
+    /// Default `false` — every destructive action prompts. Power
+    /// users who run dedup against the same corpus repeatedly can
+    /// flip this in Settings → Safety to bypass the prompt.
+    ///
+    /// Reveal-in-Explorer and Unsuperdeduper (the reverse operation)
+    /// never prompt regardless — Reveal touches nothing, and
+    /// Unsuperdeduper only RESTORES files that were safe-renamed,
+    /// so the prompt would be more friction than safety.
+    #[serde(default)]
+    pub bypass_destructive_confirmation: bool,
 }
 
 impl Default for ScanSettings {
@@ -68,7 +79,8 @@ impl Default for ScanSettings {
             threads: None,
             io_threads: None,
             allow_system_paths: false,
-            hash_algo: crate::pipeline::hash::HashAlgo::Blake3,
+            hash_algo: crate::pipeline::hash::HashAlgo::default(),
+            bypass_destructive_confirmation: false,
         }
     }
 }
