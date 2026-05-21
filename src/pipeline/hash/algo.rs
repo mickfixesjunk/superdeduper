@@ -1,12 +1,13 @@
 //! Pluggable content-hash algorithm.
 //!
 //! Two backends today: cryptographic-grade [`HashAlgo::Blake3`] (32-byte
-//! output, SIMD + parallel chunk-tree internals) and the new
-//! [`HashAlgo::Ddh128`] which produces a 16-byte output and exists as
-//! a stub today wrapping xxhash3-128 — the AES-NI core lands in
-//! 0.2.0.
+//! output, SIMD + parallel chunk-tree internals) and
+//! [`HashAlgo::River5`] (formerly DDH-128) — a 16-byte hash with an
+//! AES-NI core, maintained out of `../ddh-128` (the crate has been
+//! renamed to `river128` but the directory still carries the old
+//! name).
 //!
-//! Engine code never touches a `blake3::Hasher` or `ddh128::Hasher`
+//! Engine code never touches a `blake3::Hasher` or `river5::Hasher`
 //! directly; instead it constructs a [`ContentHasher`] from the
 //! algo chosen in [`ScanSettings::hash_algo`] and uses the same
 //! `new` / `update` / `finalize` shape regardless of which backend
@@ -17,11 +18,16 @@ use serde::{Deserialize, Serialize};
 
 /// Which content-hash algorithm a scan should use. Persisted via
 /// `ScanSettings` and recorded in the cache row so warm rescans
-/// don't mix Blake3 and Ddh128 outputs by accident.
+/// don't mix Blake3 and River128 outputs by accident.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HashAlgo {
     Blake3,
-    Ddh128,
+    /// 16-byte hash from the `river5` crate (was `ddh128`, then
+    /// briefly `river128` before the latest rename). Old persisted
+    /// settings carrying any of those names are accepted via serde
+    /// aliases so old checkpoints load cleanly.
+    #[serde(alias = "Ddh128", alias = "River128")]
+    River5,
 }
 
 impl Default for HashAlgo {
@@ -35,24 +41,29 @@ impl HashAlgo {
     pub fn output_len(self) -> usize {
         match self {
             HashAlgo::Blake3 => 32,
-            HashAlgo::Ddh128 => 16,
+            HashAlgo::River5 => 16,
         }
     }
 
     /// Lowercase tag stored in the cache schema's `hash_algo` column
-    /// and printed in the diagnostics report. Stable across versions
-    /// so old cache rows stay queryable.
+    /// and printed in the diagnostics report.
     pub fn tag(self) -> &'static str {
         match self {
             HashAlgo::Blake3 => "blake3",
-            HashAlgo::Ddh128 => "ddh128",
+            HashAlgo::River5 => "river5",
         }
     }
 
+    /// Parse the tag from cache/disk. Accepts the legacy `"ddh128"`
+    /// string so existing schema-v2 rows can still be queried even
+    /// though new rows go in as `"river5"`. Cache schema bumps to
+    /// v3 below to invalidate the old rows entirely if the user
+    /// wants a clean slate — but the alias is here in case anyone
+    /// downgrades or rolls forward without a schema reset.
     pub fn from_tag(s: &str) -> Option<Self> {
         match s {
             "blake3" => Some(HashAlgo::Blake3),
-            "ddh128" => Some(HashAlgo::Ddh128),
+            "river5" | "ddh128" => Some(HashAlgo::River5),
             _ => None,
         }
     }
@@ -62,14 +73,14 @@ impl HashAlgo {
 /// allocation; both variants fit in a few hundred bytes.
 pub enum ContentHasher {
     Blake3(blake3::Hasher),
-    Ddh128(ddh128::Hasher),
+    River5(river5::Hasher),
 }
 
 impl ContentHasher {
     pub fn new(algo: HashAlgo) -> Self {
         match algo {
             HashAlgo::Blake3 => ContentHasher::Blake3(blake3::Hasher::new()),
-            HashAlgo::Ddh128 => ContentHasher::Ddh128(ddh128::Hasher::new()),
+            HashAlgo::River5 => ContentHasher::River5(river5::Hasher::new()),
         }
     }
 
@@ -78,7 +89,7 @@ impl ContentHasher {
             ContentHasher::Blake3(h) => {
                 h.update(data);
             }
-            ContentHasher::Ddh128(h) => {
+            ContentHasher::River5(h) => {
                 h.update(data);
             }
         }
@@ -89,7 +100,7 @@ impl ContentHasher {
     pub fn finalize(self) -> Vec<u8> {
         match self {
             ContentHasher::Blake3(h) => h.finalize().as_bytes().to_vec(),
-            ContentHasher::Ddh128(h) => h.finalize().to_vec(),
+            ContentHasher::River5(h) => h.finalize().to_vec(),
         }
     }
 }
@@ -100,7 +111,7 @@ impl ContentHasher {
 pub fn hash_oneshot(algo: HashAlgo, data: &[u8]) -> Vec<u8> {
     match algo {
         HashAlgo::Blake3 => blake3::hash(data).as_bytes().to_vec(),
-        HashAlgo::Ddh128 => ddh128::hash(data).to_vec(),
+        HashAlgo::River5 => river5::hash(data).to_vec(),
     }
 }
 
@@ -115,14 +126,14 @@ mod tests {
     }
 
     #[test]
-    fn ddh128_output_is_16_bytes() {
-        let h = hash_oneshot(HashAlgo::Ddh128, b"superdupe");
+    fn river128_output_is_16_bytes() {
+        let h = hash_oneshot(HashAlgo::River5, b"superdupe");
         assert_eq!(h.len(), 16);
     }
 
     #[test]
     fn streaming_matches_oneshot() {
-        for algo in [HashAlgo::Blake3, HashAlgo::Ddh128] {
+        for algo in [HashAlgo::Blake3, HashAlgo::River5] {
             let mut h = ContentHasher::new(algo);
             h.update(b"super");
             h.update(b"dupe");
@@ -135,14 +146,19 @@ mod tests {
     #[test]
     fn algos_produce_different_outputs() {
         let a = hash_oneshot(HashAlgo::Blake3, b"x");
-        let b = hash_oneshot(HashAlgo::Ddh128, b"x");
+        let b = hash_oneshot(HashAlgo::River5, b"x");
         assert_ne!(a, b);
     }
 
     #[test]
     fn tag_roundtrips() {
-        for algo in [HashAlgo::Blake3, HashAlgo::Ddh128] {
+        for algo in [HashAlgo::Blake3, HashAlgo::River5] {
             assert_eq!(HashAlgo::from_tag(algo.tag()), Some(algo));
         }
+    }
+
+    #[test]
+    fn from_tag_accepts_legacy_ddh128() {
+        assert_eq!(HashAlgo::from_tag("ddh128"), Some(HashAlgo::River5));
     }
 }

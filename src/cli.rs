@@ -87,6 +87,16 @@ pub struct ScanArgs {
     #[arg(long, value_name = "N")]
     pub threads: Option<usize>,
 
+    /// Worker count for the hashing par_iter. Defaults to
+    /// `threads × 3` because the per-file open()/read()/close()
+    /// cycle (Tier 1 + small-file Tier 3) spends most of its time
+    /// blocked in syscalls. Oversubscribe to keep more I/O in
+    /// flight. Set explicitly to sweep — `--io-threads 1` for a
+    /// CPU-only baseline, `--io-threads 64` to find the saturation
+    /// point on a fast SSD.
+    #[arg(long, value_name = "N")]
+    pub io_threads: Option<usize>,
+
     /// Per-drive I/O queue depth. Defaults to auto (HDD=32, SSD=256).
     #[arg(long, value_name = "N")]
     pub queue_depth: Option<usize>,
@@ -103,8 +113,11 @@ pub struct ScanArgs {
     #[arg(long)]
     pub allow_system_paths: bool,
 
-    /// Content-hash algorithm. blake3 (default, 32-byte) or ddh128
-    /// (16-byte, currently an xxhash3-128 stub).
+    /// Content-hash algorithm. `blake3` (default, 32-byte
+    /// cryptographic) or `river5` (16-byte, AES-NI hardware-
+    /// accelerated). The legacy spellings `ddh128` and `river128`
+    /// are accepted as aliases so older scripts keep working after
+    /// the crate renames.
     #[arg(long, value_enum, default_value_t = HashAlgoArg::Blake3)]
     pub hash_algo: HashAlgoArg,
 }
@@ -112,14 +125,15 @@ pub struct ScanArgs {
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum HashAlgoArg {
     Blake3,
-    Ddh128,
+    #[clap(alias = "ddh128", alias = "river128")]
+    River5,
 }
 
 impl From<HashAlgoArg> for crate::pipeline::hash::HashAlgo {
     fn from(v: HashAlgoArg) -> Self {
         match v {
             HashAlgoArg::Blake3 => crate::pipeline::hash::HashAlgo::Blake3,
-            HashAlgoArg::Ddh128 => crate::pipeline::hash::HashAlgo::Ddh128,
+            HashAlgoArg::River5 => crate::pipeline::hash::HashAlgo::River5,
         }
     }
 }

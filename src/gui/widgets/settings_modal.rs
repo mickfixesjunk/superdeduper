@@ -88,7 +88,7 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
                 egui::ComboBox::from_id_source("hash-algo")
                     .selected_text(match algo {
                         crate::pipeline::hash::HashAlgo::Blake3 => "BLAKE3 (32-byte, cryptographic)",
-                        crate::pipeline::hash::HashAlgo::Ddh128 => "DDH-128 (16-byte, in development)",
+                        crate::pipeline::hash::HashAlgo::River5 => "River5 (16-byte, AES-NI)",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
@@ -98,8 +98,8 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
                         );
                         ui.selectable_value(
                             &mut algo,
-                            crate::pipeline::hash::HashAlgo::Ddh128,
-                            "DDH-128 (16-byte, in development — currently an xxhash3-128 stub)",
+                            crate::pipeline::hash::HashAlgo::River5,
+                            "River5 (16-byte, AES-NI hardware-accelerated)",
                         );
                     });
                 if algo != settings.hash_algo {
@@ -108,7 +108,7 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
             });
             ui.label(
                 RichText::new(
-                    "DDH-128 outputs are 16 bytes vs BLAKE3's 32. The cache stores \
+                    "River5 outputs are 16 bytes vs BLAKE3's 32. The cache stores \
                      the algo per row so switching doesn't pull stale hashes.",
                 )
                 .color(theme::TEXT_LO)

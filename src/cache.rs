@@ -15,12 +15,19 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use crate::pipeline::hash::HashAlgo;
 use crate::{Error, Result};
 
-/// The bundled cache schema. v2 adds the `hash_algo` column so the
-/// same volume+file_ref can have separate rows for Blake3 and Ddh128
-/// outputs (their hashes are different bytes for the same file).
+/// The bundled cache schema.
+/// * v2 added the `hash_algo` column so the same volume+file_ref can
+///   carry separate rows for Blake3 and the 128-bit hash (their
+///   hashes are different bytes for the same file).
+/// * v3 is the same shape as v2 but bumps the version string so v2
+///   caches — which tagged the 128-bit rows as `"ddh128"` — get
+///   discarded after the crate rename to `river128`. Old rows are
+///   functionally orphaned (new lookups use the new tag), and the
+///   cache is cheap to rebuild.
+///
 /// Bumping this string causes init_schema to drop and recreate the
 /// tables; any cached data from older versions is discarded.
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 
 #[derive(Debug, Clone)]
 pub struct CacheKey {

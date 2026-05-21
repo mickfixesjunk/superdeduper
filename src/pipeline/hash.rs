@@ -37,7 +37,7 @@ use crate::cache::{Cache, CacheKey, CachedHashes};
 use crate::config::ScanConfig;
 use crate::pipeline::layout::{LaidOutFile, LaidOutGroup};
 use crate::pipeline::DuplicateGroup;
-use crate::Result;
+use crate::{Error, Result};
 
 pub mod algo;
 pub mod format;
@@ -166,13 +166,28 @@ fn run_with_counters_inner(
     let counters = Arc::new(HashCounters::default());
     let on_file_ref = on_file.as_ref();
     let cancel_ref = cancel.as_ref();
-    let mut confirmed: Vec<DuplicateGroup> = groups
-        .into_par_iter()
-        .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref, cancel_ref))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+    // Dedicated pool sized to cfg.io_threads. The hashing par_iter
+    // spends most of its time blocked on CreateFileW / ReadFile /
+    // CloseHandle (especially on the AppData-style small-file
+    // corpus where Tier 1 + small Tier 3 dominate), so
+    // oversubscription versus physical cores is a real win.
+    // Keeping a separate pool from the global rayon means
+    // non-hash rayon usage (layout resolver, paranoid verify) keeps
+    // its CPU-sized parallelism.
+    let io_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.io_threads.max(1))
+        .thread_name(|i| format!("superdupe-io-{i}"))
+        .build()
+        .map_err(|e| Error::other(format!("io thread pool build: {e}")))?;
+    let mut confirmed: Vec<DuplicateGroup> = io_pool.install(|| {
+        groups
+            .into_par_iter()
+            .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref, cancel_ref))
+            .collect::<Result<Vec<_>>>()
+    })?
+    .into_iter()
+    .flatten()
+    .collect();
 
     confirmed.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.files.cmp(&b.files)));
     let counters = Arc::try_unwrap(counters).unwrap_or_else(|arc| {
@@ -726,6 +741,7 @@ mod tests {
             output: None,
             follow_links: false,
             allow_system_paths: false,
+            io_threads: 4,
             hash_algo: HashAlgo::Blake3,
         }
     }

@@ -22,6 +22,14 @@ pub struct ScanConfig {
     pub use_cache: bool,
     pub use_format_aware: bool,
     pub threads: usize,
+    /// Worker count for the hashing par_iter specifically. Defaults
+    /// to `threads × 3` because Tier 1 (and the small-file Tier 3
+    /// fast path) is dominated by `CreateFileW` / `ReadFile` /
+    /// `CloseHandle` syscalls — workers spend most of their wall
+    /// time blocked, so oversubscription buys real throughput
+    /// without saturating the CPU. Set explicitly via `--io-threads`
+    /// to sweep where the curve flattens for a given disk + AV mix.
+    pub io_threads: usize,
     pub queue_depth: Option<usize>,
     pub output: Option<PathBuf>,
     pub follow_links: bool,
@@ -60,6 +68,10 @@ impl ScanConfig {
             use_cache: !args.no_cache,
             use_format_aware: !args.no_format_aware,
             threads: args.threads.unwrap_or_else(num_cpus),
+            io_threads: {
+                let cpu_threads = args.threads.unwrap_or_else(num_cpus);
+                args.io_threads.unwrap_or(cpu_threads.saturating_mul(3).max(1))
+            },
             queue_depth: args.queue_depth,
             output: args.output.clone(),
             follow_links: args.follow_links,

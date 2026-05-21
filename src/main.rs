@@ -29,12 +29,12 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let scan_started = std::time::Instant::now();
     // Tell the user which content-hash core is actually linked. For
     // BLAKE3 this is just the compile-time crate version; for
-    // DDH-128 it's whatever the upstream lib reports via
-    // `impl_name()` — "ddh128-stub-xxh3" vs "ddh128-aesni-v2" tells
-    // you definitively whether the AES-NI core is live.
+    // River5 it's whatever the upstream lib reports via
+    // `impl_name()` — `river5-stub-xxh3` vs `river5-aesni-v2`
+    // tells you definitively whether the AES-NI core is live.
     let hash_impl: &str = match cfg.hash_algo {
         crate::pipeline::hash::HashAlgo::Blake3 => "blake3 (Rust crate)",
-        crate::pipeline::hash::HashAlgo::Ddh128 => ddh128::impl_name(),
+        crate::pipeline::hash::HashAlgo::River5 => river5::impl_name(),
     };
     tracing::info!(
         roots = ?cfg.roots,

@@ -40,10 +40,16 @@ pub struct ScanSettings {
     pub paranoid: bool,
     pub follow_links: bool,
     pub threads: Option<usize>,
+    /// Per-scan I/O worker count for the hashing par_iter. None ⇒
+    /// engine picks `threads × 3` to oversubscribe past the cold-
+    /// metadata `open()` wait on small files. `#[serde(default)]`
+    /// keeps old persisted settings (without this field) loadable.
+    #[serde(default)]
+    pub io_threads: Option<usize>,
     pub allow_system_paths: bool,
     /// Content-hash algorithm: BLAKE3 (default, cryptographic) or
-    /// DDH-128 (16-byte output, currently an xxhash3-128 stub —
-    /// the AES-NI core lands in ddh128 0.2.0).
+    /// River128 (16-byte output, AES-NI hardware-accelerated; was
+    /// `ddh128` prior to the crate rename).
     #[serde(default)]
     pub hash_algo: crate::pipeline::hash::HashAlgo,
 }
@@ -60,6 +66,7 @@ impl Default for ScanSettings {
             paranoid: false,
             follow_links: false,
             threads: None,
+            io_threads: None,
             allow_system_paths: false,
             hash_algo: crate::pipeline::hash::HashAlgo::Blake3,
         }

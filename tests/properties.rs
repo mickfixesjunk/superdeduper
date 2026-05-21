@@ -63,6 +63,7 @@ fn run_scan(root: &Path, threads: usize, min_size: u64) -> Vec<pipeline::Duplica
         output: None,
         follow_links: false,
         allow_system_paths: false,
+        io_threads: 4,
         hash_algo: superdupe::pipeline::hash::HashAlgo::Blake3,
     };
     let files = inventory::enumerate(&cfg).unwrap();
