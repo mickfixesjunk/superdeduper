@@ -190,7 +190,10 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
         .map_err(|e| Error::Other(format!("IOCTL_STORAGE_GET_DEVICE_NUMBER: {e}")))?;
     }
 
-    // Seek penalty.
+    // Seek penalty — first try the direct seek-penalty query, then
+    // fall back to bus-type inspection (NVMe and SATA bus on a fixed
+    // disk are reliable SSD signals when the seek-penalty descriptor
+    // isn't implemented).
     let mut query = STORAGE_PROPERTY_QUERY::default();
     query.PropertyId = StorageDeviceSeekPenaltyProperty;
     query.QueryType = PropertyStandardQuery;
@@ -198,8 +201,8 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
     let mut returned2 = 0u32;
     // SAFETY: Input/output buffers correctly sized per Win32 docs for
     // this exact property query.
-    let has_seek_penalty = unsafe {
-        match DeviceIoControl(
+    let seek_penalty_result = unsafe {
+        DeviceIoControl(
             handle.0,
             IOCTL_STORAGE_QUERY_PROPERTY,
             Some(&query as *const _ as *const std::ffi::c_void),
@@ -208,12 +211,37 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
             std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
             Some(&mut returned2),
             None,
-        ) {
-            Ok(()) => descr.IncursSeekPenalty.as_bool(),
-            // Some drivers (notably virtual disks) don't implement this
-            // property; default to "assume HDD" so we don't aggressively
-            // parallelise on an unknown device.
-            Err(_) => true,
+        )
+    };
+    let has_seek_penalty = match seek_penalty_result {
+        Ok(()) => {
+            let v = descr.IncursSeekPenalty.as_bool();
+            tracing::debug!(
+                volume = %volume_guid,
+                seek_penalty = v,
+                "storage device type: IncursSeekPenalty from IOCTL"
+            );
+            v
+        }
+        Err(e) => {
+            // Common on NVMe + some USB enclosures: the seek-penalty
+            // descriptor isn't reported. Fall back to bus-type
+            // inspection. If even that fails, default to **false**
+            // (SSD) — modern primary drives are overwhelmingly SSDs;
+            // a wrong "assume HDD" disabled the scatter render on
+            // NVMe-root boxes and made the trace look stuck.
+            // unwrap_or(true) ⇒ ambiguous bus (USB enclosure, etc)
+            // defaults to SSD, matching the modern primary-drive
+            // baseline. Wrong "assume HDD" disabled the scatter
+            // render on NVMe-root machines.
+            let bus_says_ssd = bus_type_indicates_ssd(handle.0).unwrap_or(true);
+            tracing::warn!(
+                volume = %volume_guid,
+                error = %e,
+                bus_says_ssd,
+                "seek-penalty IOCTL failed; falling back to bus-type heuristic"
+            );
+            !bus_says_ssd
         }
     };
 
@@ -224,6 +252,53 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
         sector_size: 4096,            // populated by a later commit
         physical_sector_size: 4096,   // populated by a later commit
     })
+}
+
+/// Secondary HDD-vs-SSD signal: query the device's bus type. Used
+/// when the seek-penalty IOCTL fails (NVMe + some USB enclosures).
+/// Returns `Some(true)` if the bus type strongly implies SSD (NVMe,
+/// SD, eMMC), `Some(false)` if it implies HDD (SATA-spinning), or
+/// `None` if the answer is ambiguous (USB enclosure could be either,
+/// for example). Callers default to SSD when this returns None,
+/// matching the modern "primary drive is an SSD" baseline.
+fn bus_type_indicates_ssd(handle: HANDLE) -> Result<bool> {
+    use windows::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageAdapterProperty, STORAGE_ADAPTER_DESCRIPTOR,
+    };
+    let mut query = STORAGE_PROPERTY_QUERY::default();
+    query.PropertyId = StorageAdapterProperty;
+    query.QueryType = PropertyStandardQuery;
+    let mut descr: STORAGE_ADAPTER_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let mut returned = 0u32;
+    // SAFETY: input/output buffers sized to the descriptor; Win32
+    // documents this as the standard query layout.
+    unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&query as *const _ as *const std::ffi::c_void),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(&mut descr as *mut _ as *mut std::ffi::c_void),
+            std::mem::size_of::<STORAGE_ADAPTER_DESCRIPTOR>() as u32,
+            Some(&mut returned),
+            None,
+        )
+        .map_err(|e| Error::Other(format!("StorageAdapterProperty: {e}")))?;
+    }
+    // BusType values per ntddstor.h:
+    //   17 BusTypeNvme  → SSD
+    //   13 BusTypeSd    → SSD-like (no seek penalty)
+    //   14 BusTypeMmc   → SSD-like
+    //   11 BusTypeSata  → ambiguous (modern drive could be either)
+    //   1  BusTypeScsi  → ambiguous
+    //   3  BusTypeAta   → almost always spinning
+    let bus = descr.BusType;
+    let answer = match bus {
+        17 | 13 | 14 => true,   // unambiguous SSD
+        3 => false,             // spinning ATA
+        _ => return Err(Error::Other(format!("ambiguous bus type {bus}"))),
+    };
+    Ok(answer)
 }
 
 /// Get the extent map of a file: `(VCN, LCN, length_in_clusters)` runs.
