@@ -63,6 +63,10 @@ name = "superdeduper-gui"
 path = "src/bin/superdeduper_gui.rs"
 required-features = ["gui"]
 
+[[bin]]
+name = "superdeduper-hash-repro"
+path = "src/bin/hash_repro.rs"
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
