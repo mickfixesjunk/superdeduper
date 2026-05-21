@@ -20,6 +20,79 @@ fn main() -> anyhow::Result<()> {
         Command::Scan(args) => run_scan(args),
         Command::Dedupe(args) => run_dedupe(args),
         Command::Cache(cmd) => run_cache(cmd),
+        Command::DriveInfo => run_drive_info(),
+    }
+}
+
+/// Print one block per drive Windows can see, enumerating the raw
+/// storage-detection inputs (bus type number + name, seek-penalty
+/// IOCTL result, partition + device numbers) plus the rule we used
+/// to pick HDD vs SSD. Designed to be pasted verbatim when a drive
+/// gets misclassified — the data is all in one place.
+fn run_drive_info() -> anyhow::Result<()> {
+    #[cfg(not(windows))]
+    {
+        eprintln!("drive-info is Windows-only.");
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::path::PathBuf;
+        use superdupe::winapi_wrappers::{
+            bus_type_name, query_storage_device, volume_for_path,
+        };
+        // Enumerate drive letters A..Z; skip any that GetDriveTypeW
+        // says aren't real fixed/removable/network drives. Probing
+        // is per-letter to avoid pulling in another IOCTL.
+        for letter in b'A'..=b'Z' {
+            let root = format!("{}:\\", letter as char);
+            let path = PathBuf::from(&root);
+            if !path.exists() {
+                continue;
+            }
+            // Skip CD-ROM / unknown / no-root-dir drives by checking
+            // GetDriveTypeW. We don't have a wrapper for it; query
+            // via the volume_for_path probe which fails on those.
+            let volume = match volume_for_path(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("=== {root} ===\n  (skipped: {e})\n");
+                    continue;
+                }
+            };
+            println!("=== {root} ===");
+            println!("  volume guid:        {volume}");
+            match query_storage_device(&volume) {
+                Ok(info) => {
+                    println!("  device #:           {}", info.device_number);
+                    println!("  partition #:        {}", info.partition_number);
+                    println!(
+                        "  bus type:           {} (0x{:02x}) — {}",
+                        info.bus_type,
+                        info.bus_type,
+                        bus_type_name(info.bus_type),
+                    );
+                    println!(
+                        "  seek-penalty IOCTL: {}",
+                        match info.seek_penalty_ioctl {
+                            Some(true) => "Yes (says HDD)",
+                            Some(false) => "No (says SSD)",
+                            None => "FAILED (IOCTL didn't answer)",
+                        }
+                    );
+                    println!(
+                        "  classified as:      {}",
+                        if info.has_seek_penalty { "HDD" } else { "SSD" }
+                    );
+                    println!("  reason:             {}", info.classification_reason);
+                }
+                Err(e) => {
+                    println!("  (query_storage_device failed: {e})");
+                }
+            }
+            println!();
+        }
+        Ok(())
     }
 }
 

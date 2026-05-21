@@ -38,6 +38,13 @@ pub enum Command {
     /// Inspect or maintain the persistent cache.
     #[command(subcommand)]
     Cache(CacheCommand),
+
+    /// Print storage-device diagnostics for every fixed/external
+    /// drive Windows can see. Use this when superdupe misclassifies
+    /// a drive as HDD-vs-SSD: the output shows the raw bus type,
+    /// the seek-penalty IOCTL result, and the rule that picked the
+    /// final answer. Windows only.
+    DriveInfo,
 }
 
 #[derive(Debug, Args)]

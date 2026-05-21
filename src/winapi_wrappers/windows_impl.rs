@@ -40,6 +40,18 @@ pub struct StorageDeviceInfo {
     pub has_seek_penalty: bool,
     pub sector_size: u32,
     pub physical_sector_size: u32,
+    /// Raw bus type from `IOCTL_STORAGE_QUERY_PROPERTY`. 0 if the
+    /// query failed. Decoded with [`bus_type_name`] for display.
+    pub bus_type: u8,
+    /// `Some(true|false)` if the per-device seek-penalty IOCTL gave
+    /// a definitive answer; `None` if the IOCTL itself failed.
+    /// Recorded so the `drive-info` subcommand can show the raw
+    /// signal next to the final classification.
+    pub seek_penalty_ioctl: Option<bool>,
+    /// One-line human explanation of how we picked `has_seek_penalty`.
+    /// Shown by `drive-info`. Stored as `String` instead of `&'static
+    /// str` so the value survives a clone across thread boundaries.
+    pub classification_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -215,57 +227,21 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
             None,
         )
     };
-    // Always consult the bus type too — some NVMe controllers'
-    // firmware reports IncursSeekPenalty=true even though NVMe by
-    // definition has no seek penalty. We trust bus type as ground
-    // truth: if the bus is unambiguously SSD (NVMe / SD / MMC), the
-    // device is an SSD regardless of what the per-device descriptor
-    // claims. The seek-penalty IOCTL is still the canonical answer
-    // for SATA where the bus is ambiguous.
-    let bus_says_ssd = bus_type_indicates_ssd(handle.0).ok();
-    let has_seek_penalty = match (seek_penalty_result, bus_says_ssd) {
-        // NVMe / SD / MMC bus → never an HDD, regardless of what the
-        // per-device IOCTL or its absence reports. This is the fix
-        // for "my NVMe root drive is detected as HDD": the bus alone
-        // is enough to know.
-        (_, Some(true)) => {
-            tracing::info!(
-                volume = %volume_guid,
-                "storage device type: SSD (bus type is NVMe/SD/MMC; bus type wins)"
-            );
-            false
-        }
-        // Bus says spinning ATA → trust it as HDD even if the
-        // per-device IOCTL was silent.
-        (_, Some(false)) => {
-            tracing::info!(
-                volume = %volume_guid,
-                "storage device type: HDD (bus type is ATA)"
-            );
-            true
-        }
-        // Ambiguous bus (SATA / SCSI / USB) — fall back to the
-        // per-device seek-penalty descriptor when it succeeds.
-        (Ok(()), None) => {
-            let v = descr.IncursSeekPenalty.as_bool();
-            tracing::info!(
-                volume = %volume_guid,
-                seek_penalty = v,
-                "storage device type: bus ambiguous; using IncursSeekPenalty IOCTL"
-            );
-            v
-        }
-        // Bus ambiguous AND IOCTL failed: assume SSD (modern primary-
-        // drive baseline) and warn so we can see it in the log.
-        (Err(e), None) => {
-            tracing::warn!(
-                volume = %volume_guid,
-                error = %e,
-                "storage device type: bus ambiguous and seek-penalty IOCTL failed; defaulting to SSD"
-            );
-            false
-        }
+    let seek_penalty_ioctl = match seek_penalty_result {
+        Ok(()) => Some(descr.IncursSeekPenalty.as_bool()),
+        Err(_) => None,
     };
+    let bus_type_raw = query_bus_type(handle.0).unwrap_or(0);
+    let (has_seek_penalty, reason) = classify_seek_penalty(bus_type_raw, seek_penalty_ioctl);
+    tracing::info!(
+        volume = %volume_guid,
+        bus_type = bus_type_raw,
+        bus_name = bus_type_name(bus_type_raw),
+        seek_penalty_ioctl = ?seek_penalty_ioctl,
+        classified_as = if has_seek_penalty { "HDD" } else { "SSD" },
+        reason,
+        "storage device type"
+    );
 
     Ok(StorageDeviceInfo {
         device_number: sdn.DeviceNumber,
@@ -273,17 +249,103 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
         has_seek_penalty,
         sector_size: 4096,          // populated by a later commit
         physical_sector_size: 4096, // populated by a later commit
+        bus_type: bus_type_raw,
+        seek_penalty_ioctl,
+        classification_reason: reason.to_string(),
     })
 }
 
-/// Secondary HDD-vs-SSD signal: query the device's bus type. Used
-/// when the seek-penalty IOCTL fails (NVMe + some USB enclosures).
-/// Returns `Some(true)` if the bus type strongly implies SSD (NVMe,
-/// SD, eMMC), `Some(false)` if it implies HDD (SATA-spinning), or
-/// `None` if the answer is ambiguous (USB enclosure could be either,
-/// for example). Callers default to SSD when this returns None,
-/// matching the modern "primary drive is an SSD" baseline.
-fn bus_type_indicates_ssd(handle: HANDLE) -> Result<bool> {
+/// Numeric `STORAGE_BUS_TYPE` values from ntddstor.h. Kept as raw
+/// constants so the classification logic + the `drive-info`
+/// subcommand can decode them the same way.
+pub mod bus_type {
+    pub const SCSI: u8 = 0x01;
+    pub const ATAPI: u8 = 0x02;
+    pub const ATA: u8 = 0x03; // ATA bus — typically spinning
+    pub const USB: u8 = 0x07; // external — could be either
+    pub const RAID: u8 = 0x08;
+    pub const ISCSI: u8 = 0x09;
+    pub const SAS: u8 = 0x0A;
+    pub const SATA: u8 = 0x0B; // ambiguous: both HDDs and SSDs live here
+    pub const SD: u8 = 0x0C;   // SSD-like
+    pub const MMC: u8 = 0x0D;  // SSD-like
+    pub const NVME: u8 = 0x11; // always SSD
+    pub const SCM: u8 = 0x12;  // storage-class memory → always SSD
+    pub const UFS: u8 = 0x13;  // SSD-like
+}
+
+/// Decode a bus-type number into the friendly name. Used in
+/// diagnostics output.
+pub fn bus_type_name(b: u8) -> &'static str {
+    match b {
+        0x00 => "Unknown",
+        bus_type::SCSI => "SCSI",
+        bus_type::ATAPI => "ATAPI",
+        bus_type::ATA => "ATA (spinning)",
+        0x04 => "1394",
+        0x05 => "SSA",
+        0x06 => "Fibre",
+        bus_type::USB => "USB",
+        bus_type::RAID => "RAID",
+        bus_type::ISCSI => "iSCSI",
+        bus_type::SAS => "SAS",
+        bus_type::SATA => "SATA",
+        bus_type::SD => "SD",
+        bus_type::MMC => "MMC/eMMC",
+        0x0E => "Virtual",
+        0x0F => "FileBackedVirtual",
+        0x10 => "Storage Spaces",
+        bus_type::NVME => "NVMe",
+        bus_type::SCM => "SCM",
+        bus_type::UFS => "UFS",
+        _ => "?",
+    }
+}
+
+/// Combine bus type and seek-penalty IOCTL into a single
+/// has_seek_penalty bool plus a one-line reason string. Pulled out
+/// so the rules are visible in one place and `drive-info` can
+/// re-run them for explanation.
+pub fn classify_seek_penalty(bus: u8, ioctl: Option<bool>) -> (bool, &'static str) {
+    use bus_type::*;
+    match (bus, ioctl) {
+        // Buses that are SSD by construction — trust them over the
+        // per-device seek-penalty IOCTL, which lies on some NVMe
+        // controllers (\"yes I have a seek penalty\" while sitting
+        // on an NVMe bus).
+        (NVME, _) => (false, "NVMe bus → SSD"),
+        (SCM, _) => (false, "SCM bus → SSD"),
+        (SD, _) => (false, "SD bus → SSD"),
+        (MMC, _) => (false, "MMC/eMMC bus → SSD"),
+        (UFS, _) => (false, "UFS bus → SSD"),
+        // ATA bus = legacy IDE = spinning by construction.
+        (ATA, _) => (true, "ATA bus → HDD"),
+        // Ambiguous bus (SATA, SAS, SCSI, USB, RAID, …) → defer to
+        // the per-device seek-penalty IOCTL when it succeeded.
+        // When it failed too, default to HDD: modern primary drives
+        // have working IOCTL support, so an SATA/USB device that
+        // refuses to answer is far more likely a generic external
+        // HDD than a fancy SSD.
+        (_, Some(v)) => (
+            v,
+            if v {
+                "seek-penalty IOCTL → HDD"
+            } else {
+                "seek-penalty IOCTL → SSD"
+            },
+        ),
+        (_, None) => (
+            true,
+            "ambiguous bus and seek-penalty IOCTL failed → HDD (conservative)",
+        ),
+    }
+}
+
+/// Raw bus type from `IOCTL_STORAGE_QUERY_PROPERTY(StorageAdapterProperty)`.
+/// Returns `Err` if the IOCTL itself failed — the caller still
+/// gets to decide what to do with that (the `drive-info` subcommand
+/// shows the error verbatim).
+pub fn query_bus_type(handle: HANDLE) -> Result<u8> {
     use windows::Win32::System::Ioctl::{
         PropertyStandardQuery, StorageAdapterProperty, STORAGE_ADAPTER_DESCRIPTOR,
     };
@@ -307,20 +369,7 @@ fn bus_type_indicates_ssd(handle: HANDLE) -> Result<bool> {
         )
         .map_err(|e| Error::Other(format!("StorageAdapterProperty: {e}")))?;
     }
-    // BusType values per ntddstor.h:
-    //   17 BusTypeNvme  → SSD
-    //   13 BusTypeSd    → SSD-like (no seek penalty)
-    //   14 BusTypeMmc   → SSD-like
-    //   11 BusTypeSata  → ambiguous (modern drive could be either)
-    //   1  BusTypeScsi  → ambiguous
-    //   3  BusTypeAta   → almost always spinning
-    let bus = descr.BusType;
-    let answer = match bus {
-        17 | 13 | 14 => true, // unambiguous SSD
-        3 => false,           // spinning ATA
-        _ => return Err(Error::Other(format!("ambiguous bus type {bus}"))),
-    };
-    Ok(answer)
+    Ok(descr.BusType)
 }
 
 /// Get the extent map of a file: `(VCN, LCN, length_in_clusters)` runs.

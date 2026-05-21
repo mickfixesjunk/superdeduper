@@ -18,6 +18,13 @@ pub struct StorageDeviceInfo {
     pub has_seek_penalty: bool,
     pub sector_size: u32,
     pub physical_sector_size: u32,
+    pub bus_type: u8,
+    pub seek_penalty_ioctl: Option<bool>,
+    pub classification_reason: String,
+}
+
+pub fn bus_type_name(_b: u8) -> &'static str {
+    "Unknown (non-Windows build)"
 }
 
 #[derive(Debug, Clone)]
