@@ -143,16 +143,22 @@ pub fn try_warm(
     let baseline = cache.lock().load_inventory_records(volume_guid)?;
     let mut by_ref: HashMap<u64, InventoryRecord> = baseline.into_iter().collect();
 
-    // Drain the delta.
+    // Drain the delta. We pass the journal ID the snapshot stored
+    // (already validated against `live.journal_id` above) — Windows
+    // rejects FSCTL_READ_USN_JOURNAL with ERROR_INVALID_PARAMETER
+    // when the ID field is zero, despite MSDN claiming 0 bypasses
+    // verification.
     let (delta, next_usn) =
-        read_usn_journal_delta(volume_guid, saved_meta.last_usn).map_err(|e| {
-            tracing::info!(
-                volume = %volume_guid,
-                error = %e,
-                "USN delta read failed; will fall back"
-            );
-            e
-        })?;
+        read_usn_journal_delta(volume_guid, saved_meta.last_usn, saved_meta.journal_id).map_err(
+            |e| {
+                tracing::info!(
+                    volume = %volume_guid,
+                    error = %e,
+                    "USN delta read failed; will fall back"
+                );
+                e
+            },
+        )?;
 
     let mut created = 0u64;
     let mut updated = 0u64;
