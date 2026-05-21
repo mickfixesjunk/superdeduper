@@ -267,11 +267,11 @@ pub mod bus_type {
     pub const ISCSI: u8 = 0x09;
     pub const SAS: u8 = 0x0A;
     pub const SATA: u8 = 0x0B; // ambiguous: both HDDs and SSDs live here
-    pub const SD: u8 = 0x0C;   // SSD-like
-    pub const MMC: u8 = 0x0D;  // SSD-like
+    pub const SD: u8 = 0x0C; // SSD-like
+    pub const MMC: u8 = 0x0D; // SSD-like
     pub const NVME: u8 = 0x11; // always SSD
-    pub const SCM: u8 = 0x12;  // storage-class memory → always SSD
-    pub const UFS: u8 = 0x13;  // SSD-like
+    pub const SCM: u8 = 0x12; // storage-class memory → always SSD
+    pub const UFS: u8 = 0x13; // SSD-like
 }
 
 /// Decode a bus-type number into the friendly name. Used in

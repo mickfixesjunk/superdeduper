@@ -81,6 +81,35 @@ pub struct SuperdupeApp {
     /// user to pick. While this is `Some`, the rest of the UI stays
     /// behind the modal so Start Fresh can safely wipe state.
     pending_resume: Option<crate::gui::checkpoint::CheckpointSummary>,
+    /// Filesystem path of the currently-open .superdupe project
+    /// folder. `None` ⇒ no project loaded (default on launch, and
+    /// after File → New). Save Project writes here when present;
+    /// when `None` it falls through to Save As behaviour.
+    current_project_path: Option<PathBuf>,
+    /// Unix seconds of the open project's first save, kept so a
+    /// re-save preserves `created_at_unix`. Zero ⇒ no project.
+    current_project_created_at: u64,
+}
+
+/// Top-level File-menu actions the menubar can request. Dispatched
+/// once per frame after rendering the menu so we don't mutate
+/// `self` while drawing.
+#[derive(Debug, Clone)]
+enum MenuAction {
+    /// Wipe the current project. Roots cleared, results cleared,
+    /// settings kept. Cache untouched.
+    New,
+    /// Folder picker → load that `.superdupe` bundle.
+    OpenProject,
+    /// Write to `current_project_path` if Some, else prompt.
+    Save,
+    /// Always prompt for a destination folder.
+    SaveAs,
+    /// Load an `archive-manifest.json` for display. Restore-to-
+    /// originals loader not yet wired.
+    OpenArchiveManifest,
+    /// Open a specific bundle from the Recent Projects submenu.
+    OpenRecent(PathBuf),
 }
 
 impl SuperdupeApp {
@@ -116,7 +145,7 @@ impl SuperdupeApp {
             Err(_) => None,
         };
 
-        let mut app = Self {
+        let app = Self {
             state: UiState::default(),
             rx,
             tx,
@@ -129,16 +158,16 @@ impl SuperdupeApp {
             selected_drive: None,
             drive_render_overrides: hashbrown::HashMap::new(),
             pending_resume,
+            current_project_path: None,
+            current_project_created_at: 0,
         };
 
-        // The previous auto-restore behaviour (load results_state.json
-        // + replay duplicates) only kicks in when there's no
-        // checkpoint asking for an explicit decision. Otherwise the
-        // modal handles the choice and the restore happens inside
-        // `accept_resume`.
-        if app.pending_resume.is_none() {
-            app.auto_restore_results_state();
-        }
+        // Intentionally NO auto-load of prior scan results on launch.
+        // Projects are now explicit — File → Open Project loads one;
+        // File → New / a fresh launch starts empty. The Resume modal
+        // still triggers for *interrupted* scans (paused checkpoints
+        // are separate from saved projects) and the user can pick
+        // Start Fresh from that modal to clear it.
         app
     }
 
@@ -300,6 +329,223 @@ impl SuperdupeApp {
             self.persisted.settings.clone(),
             self.cancel.clone(),
         );
+    }
+
+    /// Route a File-menu action through the right handler. Pulled
+    /// out of `update()` so the menu rendering and the state
+    /// mutation aren't tangled. All handlers are synchronous —
+    /// dialogs block the UI thread but that's expected (and matches
+    /// every other "Pick a folder" path in this app).
+    fn dispatch_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::New => self.menu_new(),
+            MenuAction::OpenProject => self.menu_open_project(),
+            MenuAction::Save => self.menu_save(),
+            MenuAction::SaveAs => self.menu_save_as(),
+            MenuAction::OpenArchiveManifest => self.menu_open_archive_manifest(),
+            MenuAction::OpenRecent(path) => self.load_project_from(&path),
+        }
+    }
+
+    /// File → New scan. Clears everything you'd consider current
+    /// work, keeps settings + drive overrides (preferences). Cache
+    /// is untouched.
+    fn menu_new(&mut self) {
+        if self.is_scanning {
+            self.state.push_log(
+                crate::gui::events::LogLevel::Warn,
+                "Stop the running scan before starting a new project.".into(),
+            );
+            return;
+        }
+        self.state = UiState::default();
+        self.persisted.roots = Vec::new();
+        self.groups_state = groups_table::GroupsTableState::default();
+        self.selected_drive = None;
+        self.can_resume = false;
+        self.current_project_path = None;
+        self.current_project_created_at = 0;
+        self.state.push_log(
+            crate::gui::events::LogLevel::Info,
+            "New scan — project cleared. Hash cache preserved.".into(),
+        );
+    }
+
+    fn menu_open_project(&mut self) {
+        let dir = match rfd::FileDialog::new()
+            .set_title("Open superdupe project — pick the .superdupe folder")
+            .pick_folder()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        self.load_project_from(&dir);
+    }
+
+    fn load_project_from(&mut self, dir: &Path) {
+        match crate::gui::project::load(dir) {
+            Ok((proj, duplicates)) => {
+                // Replace state — opening a project should feel like
+                // a clean slate, not an additive merge.
+                self.state = UiState::default();
+                self.persisted.roots = proj.roots.clone();
+                self.persisted.settings = proj.settings.clone();
+                self.groups_state = groups_table::GroupsTableState::default();
+                self.selected_drive = None;
+                self.can_resume = false;
+                let n = duplicates.len();
+                for g in duplicates {
+                    let savings = g
+                        .size
+                        .saturating_mul(g.files.len().saturating_sub(1) as u64);
+                    self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
+                    self.state.totals.reclaimable_bytes =
+                        self.state.totals.reclaimable_bytes.saturating_add(savings);
+                    self.state.duplicates.push(g);
+                }
+                self.current_project_path = Some(dir.to_path_buf());
+                self.current_project_created_at = proj.created_at_unix;
+                self.persisted.results_tab = if n > 0 {
+                    ResultsTab::Groups
+                } else {
+                    self.persisted.results_tab
+                };
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Info,
+                    format!(
+                        "Opened project {} — {} root(s), {} duplicate group(s).",
+                        proj.name,
+                        proj.roots.len(),
+                        n
+                    ),
+                );
+                let _ = crate::gui::project::touch_recent(dir, &proj.name);
+            }
+            Err(e) => {
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Error,
+                    format!("Open project failed: {e}"),
+                );
+            }
+        }
+    }
+
+    fn menu_save(&mut self) {
+        let dir = match self.current_project_path.clone() {
+            Some(p) => p,
+            None => return self.menu_save_as(), // no project open ⇒ Save As
+        };
+        self.save_project_to(&dir);
+    }
+
+    fn menu_save_as(&mut self) {
+        let default_name = crate::gui::project::default_bundle_name(&self.persisted.roots);
+        let dir = match rfd::FileDialog::new()
+            .set_title("Save superdupe project — choose where to create the .superdupe folder")
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        // rfd's save_file returns a file path even when we want a
+        // folder name — appending the .superdupe suffix if missing
+        // turns it into a bundle name. e.g. user types "weekly-scan"
+        // → "weekly-scan.superdupe/".
+        let bundle = if dir.extension().and_then(|s| s.to_str()) == Some("superdupe")
+            || dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.ends_with(crate::gui::project::PROJECT_SUFFIX))
+                .unwrap_or(false)
+        {
+            dir
+        } else {
+            let mut s = dir.into_os_string();
+            s.push(crate::gui::project::PROJECT_SUFFIX);
+            PathBuf::from(s)
+        };
+        self.save_project_to(&bundle);
+    }
+
+    fn save_project_to(&mut self, dir: &Path) {
+        let name = dir
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled")
+            .to_string();
+        match crate::gui::project::save(
+            dir,
+            &name,
+            self.current_project_created_at,
+            &self.persisted.roots,
+            &self.persisted.settings,
+            &self.state.duplicates,
+        ) {
+            Ok(()) => {
+                self.current_project_path = Some(dir.to_path_buf());
+                if self.current_project_created_at == 0 {
+                    self.current_project_created_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                }
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Info,
+                    format!("Project saved · {}", dir.display()),
+                );
+                let _ = crate::gui::project::touch_recent(dir, &name);
+            }
+            Err(e) => {
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Error,
+                    format!("Save project failed: {e}"),
+                );
+            }
+        }
+    }
+
+    fn menu_open_archive_manifest(&mut self) {
+        let file = match rfd::FileDialog::new()
+            .set_title("Open archive manifest")
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        // Placeholder: we just read the file enough to confirm the
+        // schema and print summary info. The actual restore-to-
+        // originals loader is not implemented yet — file slot
+        // exists so the user can see the menu item working.
+        match std::fs::read(&file).and_then(|b| {
+            serde_json::from_slice::<serde_json::Value>(&b)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }) {
+            Ok(v) => {
+                let schema = v.get("schema").and_then(|s| s.as_str()).unwrap_or("?");
+                let n = v
+                    .get("entries")
+                    .and_then(|e| e.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Info,
+                    format!(
+                        "Archive manifest loaded · schema={schema} · {n} entries · {}",
+                        file.display()
+                    ),
+                );
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Info,
+                    "Restore-to-originals loader is not implemented yet; manifest opened read-only.".into(),
+                );
+            }
+            Err(e) => self.state.push_log(
+                crate::gui::events::LogLevel::Error,
+                format!("Manifest read failed: {e}"),
+            ),
+        }
     }
 
     fn request_pause(&mut self) {
@@ -504,7 +750,10 @@ impl SuperdupeApp {
                                 failed += 1;
                                 let _ = tx.send(EngineEvent::Log {
                                     level: crate::gui::events::LogLevel::Warn,
-                                    message: format!("archive move failed · {} · {e}", src.display()),
+                                    message: format!(
+                                        "archive move failed · {} · {e}",
+                                        src.display()
+                                    ),
                                 });
                             }
                         }
@@ -525,8 +774,7 @@ impl SuperdupeApp {
                 };
                 if let Err(e) = std::fs::write(
                     &manifest_path,
-                    serde_json::to_vec_pretty(&manifest)
-                        .expect("serialise archive manifest"),
+                    serde_json::to_vec_pretty(&manifest).expect("serialise archive manifest"),
                 ) {
                     let _ = tx.send(EngineEvent::Log {
                         level: crate::gui::events::LogLevel::Warn,
@@ -538,10 +786,7 @@ impl SuperdupeApp {
                 } else {
                     let _ = tx.send(EngineEvent::Log {
                         level: crate::gui::events::LogLevel::Info,
-                        message: format!(
-                            "archive manifest written · {}",
-                            manifest_path.display()
-                        ),
+                        message: format!("archive manifest written · {}", manifest_path.display()),
                     });
                 }
                 let _ = tx.send(EngineEvent::Status(format!(
@@ -857,7 +1102,105 @@ impl eframe::App for SuperdupeApp {
             }
         }
 
+        // File menubar — owns project lifecycle (New / Open / Save /
+        // Save As / Open Archive Manifest). Rendered as a thin strip
+        // above the header so it doesn't intrude on the always-visible
+        // status bar.
         let mut want_settings = false;
+        let mut menu_action: Option<MenuAction> = None;
+        TopBottomPanel::top("menubar")
+            .frame(Frame::default().fill(theme::PANEL_DEEP).inner_margin(egui::vec2(8.0, 2.0)))
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui
+                            .button("New scan")
+                            .on_hover_text("Clear the current project so you can start fresh. Doesn't touch your hash cache.")
+                            .clicked()
+                        {
+                            menu_action = Some(MenuAction::New);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Open Project…")
+                            .on_hover_text("Pick a .superdupe folder previously written with Save Project. Restores roots, settings, and the confirmed-duplicates list.")
+                            .clicked()
+                        {
+                            menu_action = Some(MenuAction::OpenProject);
+                            ui.close_menu();
+                        }
+                        let save_label = match &self.current_project_path {
+                            Some(p) => format!(
+                                "Save Project   ({})",
+                                p.file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("project")
+                            ),
+                            None => "Save Project…".to_string(),
+                        };
+                        if ui
+                            .button(save_label)
+                            .on_hover_text("Write the current roots, settings, and results to the open .superdupe folder. If no project is open, prompts for a folder.")
+                            .clicked()
+                        {
+                            menu_action = Some(MenuAction::Save);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("Save Project As…")
+                            .on_hover_text("Write a copy of the current project to a new .superdupe folder.")
+                            .clicked()
+                        {
+                            menu_action = Some(MenuAction::SaveAs);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Open Archive Manifest…")
+                            .on_hover_text("Future: load a manifest produced by a previous Archive Dupes run, then restore the moved files to their original locations. (Restore loader: not implemented yet — manifest opens read-only.)")
+                            .clicked()
+                        {
+                            menu_action = Some(MenuAction::OpenArchiveManifest);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        // Recent projects submenu — most-recently-
+                        // opened first, capped at the index limit.
+                        ui.menu_button("Recent projects", |ui| {
+                            match crate::gui::project::load_recents() {
+                                Ok(recents) if !recents.entries.is_empty() => {
+                                    for r in &recents.entries {
+                                        let label = format!(
+                                            "{}    ({})",
+                                            r.name,
+                                            r.path.display()
+                                        );
+                                        if ui.button(label).clicked() {
+                                            menu_action =
+                                                Some(MenuAction::OpenRecent(r.path.clone()));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    ui.label(
+                                        egui::RichText::new("(none yet)")
+                                            .color(theme::TEXT_LO)
+                                            .italics(),
+                                    );
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if ui.button("Quit").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            ui.close_menu();
+                        }
+                    });
+                });
+            });
+
         TopBottomPanel::top("header")
             .frame(Frame::default().fill(theme::BG).inner_margin(8.0))
             .show(ctx, |ui| {
@@ -868,6 +1211,9 @@ impl eframe::App for SuperdupeApp {
             });
         if want_settings {
             self.settings_open = true;
+        }
+        if let Some(act) = menu_action {
+            self.dispatch_menu_action(act);
         }
 
         // Overall progress strip sits directly under the header and
