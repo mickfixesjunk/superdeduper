@@ -305,9 +305,13 @@ pub fn try_warm(
 
 /// Recover a file's full path by walking parent_ref pointers up to
 /// the volume root. Same algorithm as `inventory::mft::reconstruct_path`
-/// but indexed off the `InventoryRecord` map. Returns `None` when
-/// the chain is broken (malformed metadata) or hits the cycle
-/// guard.
+/// — including the LENIENT "break on missing parent" semantics
+/// which were the bug here before: the warm path was returning
+/// None whenever the chain hit an unwalkable MFT entry (root MFT,
+/// system metadata files, certain reparse points), filtering out
+/// 85% of records that should have come back as files. The cold
+/// path uses `match { None => break }` and produces a usable path
+/// from whatever segments it managed to walk; we now do the same.
 #[cfg(windows)]
 fn reconstruct_path(
     file_ref: u64,
@@ -321,7 +325,12 @@ fn reconstruct_path(
         if cursor == 0 || cursor == file_ref {
             break;
         }
-        let parent = by_ref.get(&cursor)?;
+        // Lenient: missing parent ⇒ stop walking, use what we have.
+        // Matches `inventory::mft::reconstruct_path` byte-for-byte.
+        let parent = match by_ref.get(&cursor) {
+            Some(p) => p,
+            None => break,
+        };
         if !parent.is_directory() {
             return None;
         }
