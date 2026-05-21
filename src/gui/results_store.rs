@@ -179,11 +179,10 @@ pub fn fingerprint_root(root: &Path) -> RootFingerprint {
 ///
 /// Otherwise returns `Ok(None)` and (optionally) deletes the stale
 /// state so the next session starts clean.
-pub fn load_matching(
-    roots: &[RootEntry],
-    settings: &ScanSettings,
-) -> Result<Option<ResultsState>> {
-    let Some(saved) = load()? else { return Ok(None) };
+pub fn load_matching(roots: &[RootEntry], settings: &ScanSettings) -> Result<Option<ResultsState>> {
+    let Some(saved) = load()? else {
+        return Ok(None);
+    };
     if saved.roots != roots || &saved.settings != settings {
         return Ok(None);
     }

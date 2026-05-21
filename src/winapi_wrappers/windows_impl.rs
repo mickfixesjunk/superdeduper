@@ -113,7 +113,9 @@ pub fn open_volume_handle(volume_guid: &str) -> Result<OwnedHandle> {
         .map_err(|e| Error::Other(format!("CreateFileW({trimmed}): {e}")))?
     };
     if h.is_invalid() {
-        return Err(Error::Other(format!("CreateFileW returned invalid handle for {trimmed}")));
+        return Err(Error::Other(format!(
+            "CreateFileW returned invalid handle for {trimmed}"
+        )));
     }
     Ok(OwnedHandle(h))
 }
@@ -166,7 +168,7 @@ impl Drop for OwnedHandle {
 /// partition number, seek penalty (HDD vs SSD), and sector sizes.
 pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
     use windows::Win32::System::Ioctl::{
-        DEVICE_SEEK_PENALTY_DESCRIPTOR, PropertyStandardQuery, StorageDeviceSeekPenaltyProperty,
+        PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
     };
 
     let handle = open_volume_handle(volume_guid)?;
@@ -249,8 +251,8 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
         device_number: sdn.DeviceNumber,
         partition_number: sdn.PartitionNumber,
         has_seek_penalty,
-        sector_size: 4096,            // populated by a later commit
-        physical_sector_size: 4096,   // populated by a later commit
+        sector_size: 4096,          // populated by a later commit
+        physical_sector_size: 4096, // populated by a later commit
     })
 }
 
@@ -294,8 +296,8 @@ fn bus_type_indicates_ssd(handle: HANDLE) -> Result<bool> {
     //   3  BusTypeAta   → almost always spinning
     let bus = descr.BusType;
     let answer = match bus {
-        17 | 13 | 14 => true,   // unambiguous SSD
-        3 => false,             // spinning ATA
+        17 | 13 | 14 => true, // unambiguous SSD
+        3 => false,           // spinning ATA
         _ => return Err(Error::Other(format!("ambiguous bus type {bus}"))),
     };
     Ok(answer)
@@ -526,10 +528,7 @@ fn parse_usn_records(buf: &[u8]) -> Vec<UsnRecord> {
 
 /// Read the USN journal forward from `since_usn` and yield change
 /// records. Returns the new "next USN" so the caller can persist it.
-pub fn read_usn_journal_delta(
-    volume_guid: &str,
-    since_usn: i64,
-) -> Result<(Vec<UsnRecord>, i64)> {
+pub fn read_usn_journal_delta(volume_guid: &str, since_usn: i64) -> Result<(Vec<UsnRecord>, i64)> {
     let handle = open_volume_handle(volume_guid)?;
     let mut input = READ_USN_JOURNAL_DATA_V0::default();
     input.StartUsn = since_usn;
@@ -647,9 +646,7 @@ fn block_clone(dest: &Path, source: &Path, size: u64) -> Result<()> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
-    use windows::Win32::System::Ioctl::{
-        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-    };
+    use windows::Win32::System::Ioctl::{DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE};
 
     // Cluster size is volume-dependent; ReFS standard is 4 KiB, may be
     // 64 KiB. Use the larger value so requests are guaranteed-aligned.
@@ -788,10 +785,7 @@ mod tests {
     #[test]
     fn parse_usn_record_multiple() {
         fn build_one(file_ref: u64, name: &str) -> Vec<u8> {
-            let n: Vec<u8> = name
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect();
+            let n: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
             let unpadded = 60 + n.len();
             let record_len = (unpadded + 7) & !7;
             let mut buf = vec![0u8; record_len];

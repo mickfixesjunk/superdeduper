@@ -70,7 +70,8 @@ impl ScanConfig {
             threads: args.threads.unwrap_or_else(num_cpus),
             io_threads: {
                 let cpu_threads = args.threads.unwrap_or_else(num_cpus);
-                args.io_threads.unwrap_or(cpu_threads.saturating_mul(3).max(1))
+                args.io_threads
+                    .unwrap_or(cpu_threads.saturating_mul(3).max(1))
             },
             queue_depth: args.queue_depth,
             output: args.output.clone(),

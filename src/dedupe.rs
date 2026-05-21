@@ -589,7 +589,10 @@ mod tests {
         let args = make_args(path, false, DedupeAction::Remove);
         let outcome = run(&args).unwrap();
         assert_eq!(outcome.skipped_system, 1);
-        assert!(other.exists(), "real file must not be touched when group is skipped");
+        assert!(
+            other.exists(),
+            "real file must not be touched when group is skipped"
+        );
         fs::remove_dir_all(&d).ok();
     }
 

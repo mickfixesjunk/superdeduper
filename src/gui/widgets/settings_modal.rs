@@ -87,7 +87,9 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
                 let mut algo = settings.hash_algo;
                 egui::ComboBox::from_id_source("hash-algo")
                     .selected_text(match algo {
-                        crate::pipeline::hash::HashAlgo::Blake3 => "BLAKE3 (32-byte, cryptographic)",
+                        crate::pipeline::hash::HashAlgo::Blake3 => {
+                            "BLAKE3 (32-byte, cryptographic)"
+                        }
                         crate::pipeline::hash::HashAlgo::River5 => "River5 (16-byte, AES-NI)",
                     })
                     .show_ui(ui, |ui| {
@@ -115,11 +117,26 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
                 .small(),
             );
             ui.add_space(4.0);
-            ui.checkbox(&mut settings.use_format_aware, "Tier 0 format-aware fingerprints");
-            ui.checkbox(&mut settings.use_cache, "Persistent cache (USN delta + last hashes)");
-            ui.checkbox(&mut settings.paranoid, "Paranoid byte-by-byte confirm before reporting");
-            ui.checkbox(&mut settings.follow_links, "Follow reparse points / symlinks");
-            ui.checkbox(&mut settings.allow_system_paths, "Permit scanning system paths (C:\\Windows etc.)");
+            ui.checkbox(
+                &mut settings.use_format_aware,
+                "Tier 0 format-aware fingerprints",
+            );
+            ui.checkbox(
+                &mut settings.use_cache,
+                "Persistent cache (USN delta + last hashes)",
+            );
+            ui.checkbox(
+                &mut settings.paranoid,
+                "Paranoid byte-by-byte confirm before reporting",
+            );
+            ui.checkbox(
+                &mut settings.follow_links,
+                "Follow reparse points / symlinks",
+            );
+            ui.checkbox(
+                &mut settings.allow_system_paths,
+                "Permit scanning system paths (C:\\Windows etc.)",
+            );
 
             ui.horizontal(|ui| {
                 ui.label("Threads:");

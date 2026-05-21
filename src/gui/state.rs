@@ -237,7 +237,11 @@ impl UiState {
                 let id = info.id;
                 self.drives.insert(id, DriveLive::new(info));
             }
-            EngineEvent::StageTick { stage, delta, total } => {
+            EngineEvent::StageTick {
+                stage,
+                delta,
+                total,
+            } => {
                 let c = self.stage_counts.entry(stage).or_default();
                 c.total = total.max(c.total.saturating_add(delta));
                 c.last_delta = delta;
@@ -251,7 +255,9 @@ impl UiState {
             }
             EngineEvent::DuplicateFound(g) => {
                 self.totals.duplicates = self.totals.duplicates.saturating_add(1);
-                let savings = g.size.saturating_mul(g.files.len().saturating_sub(1) as u64);
+                let savings = g
+                    .size
+                    .saturating_mul(g.files.len().saturating_sub(1) as u64);
                 self.totals.reclaimable_bytes =
                     self.totals.reclaimable_bytes.saturating_add(savings);
                 self.duplicates.push(g);
@@ -287,7 +293,12 @@ impl UiState {
             EngineEvent::Log { level, message } => {
                 self.push_log(level, message);
             }
-            EngineEvent::OverallProgress { stage, done, total, eta_secs } => {
+            EngineEvent::OverallProgress {
+                stage,
+                done,
+                total,
+                eta_secs,
+            } => {
                 self.overall = OverallProgress {
                     stage,
                     done,

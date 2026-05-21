@@ -66,10 +66,8 @@ pub fn show(ui: &mut Ui, state: &UiState) {
         let t = (Instant::now().elapsed().as_secs_f32() * 0.6) % 2.0;
         let wave_w = rect.width() * 0.35;
         let pos = ((t - 1.0).abs() * 0.5) * (rect.width() - wave_w) + rect.left();
-        let mut pulse = egui::Rect::from_min_size(
-            egui::pos2(pos, rect.top()),
-            vec2(wave_w, rect.height()),
-        );
+        let mut pulse =
+            egui::Rect::from_min_size(egui::pos2(pos, rect.top()), vec2(wave_w, rect.height()));
         pulse = pulse.intersect(rect);
         painter.rect_filled(pulse, Rounding::same(4.0), color);
 

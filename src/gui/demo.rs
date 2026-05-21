@@ -16,9 +16,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 
-use crate::gui::events::{
-    DriveInfo, DuplicateGroupSummary, EngineEvent, ReadSample, Stage,
-};
+use crate::gui::events::{DriveInfo, DuplicateGroupSummary, EngineEvent, ReadSample, Stage};
 
 pub fn spawn(tx: Sender<EngineEvent>) -> thread::JoinHandle<()> {
     thread::Builder::new()
@@ -128,19 +126,21 @@ fn run(tx: Sender<EngineEvent>) {
         if frame % 5 == 0 {
             group_id += 1;
             let size = match group_id % 6 {
-                0 => 12 * 1024,                          // text doc
-                1 => 350 * 1024,                         // photo
-                2 => 5 * 1024 * 1024,                    // mp3
-                3 => 42 * 1024 * 1024,                   // raw
-                4 => 1_200 * 1024 * 1024,                // 1.2 GB movie
-                _ => 8_500 * 1024 * 1024,                // 8.5 GB iso
+                0 => 12 * 1024,           // text doc
+                1 => 350 * 1024,          // photo
+                2 => 5 * 1024 * 1024,     // mp3
+                3 => 42 * 1024 * 1024,    // raw
+                4 => 1_200 * 1024 * 1024, // 1.2 GB movie
+                _ => 8_500 * 1024 * 1024, // 8.5 GB iso
             };
             let count = 2 + (group_id % 4) as usize;
             let files: Vec<PathBuf> = (0..count)
                 .map(|i| {
                     PathBuf::from(format!(
                         r"D:\Media\Library\group{:03}\{:02}-copy{}.bin",
-                        group_id, group_id % 50, i
+                        group_id,
+                        group_id % 50,
+                        i
                     ))
                 })
                 .collect();
@@ -196,7 +196,9 @@ fn fake_hash(seed: u64) -> String {
     let mut s = String::with_capacity(64);
     let mut x = seed;
     for _ in 0..32 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         use std::fmt::Write;
         let _ = write!(s, "{:02x}", (x >> 24) as u8);
     }

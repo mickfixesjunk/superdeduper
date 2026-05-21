@@ -64,7 +64,12 @@ fn finds_planted_duplicates() {
     };
 
     let inv = superdupe::inventory::enumerate(&cfg).unwrap();
-    assert_eq!(inv.len(), 4, "expected 4 files in inventory, got {}", inv.len());
+    assert_eq!(
+        inv.len(),
+        4,
+        "expected 4 files in inventory, got {}",
+        inv.len()
+    );
 
     let groups = pipeline::grouping::group_by_size(inv);
     let laid = pipeline::layout::resolve(groups).unwrap();

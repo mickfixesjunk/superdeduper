@@ -62,16 +62,19 @@ pub fn fingerprint<R: Read + Seek>(r: &mut R, _size: u64) -> std::io::Result<Vec
             }
         }
         // SOFn: 0xFFC0..=0xFFCF except 0xFFC4 (DHT) and 0xFFCC (DAC).
-        if (0xFFC0..=0xFFCF).contains(&marker) && marker != 0xFFC4 && marker != 0xFFCC
-            && payload_len >= 5 {
-                let precision = payload[0];
-                let height = u16::from_be_bytes([payload[1], payload[2]]);
-                let width = u16::from_be_bytes([payload[3], payload[4]]);
-                hasher.update(b"SOF|");
-                hasher.update(&[precision]);
-                hasher.update(&height.to_be_bytes());
-                hasher.update(&width.to_be_bytes());
-            }
+        if (0xFFC0..=0xFFCF).contains(&marker)
+            && marker != 0xFFC4
+            && marker != 0xFFCC
+            && payload_len >= 5
+        {
+            let precision = payload[0];
+            let height = u16::from_be_bytes([payload[1], payload[2]]);
+            let width = u16::from_be_bytes([payload[3], payload[4]]);
+            hasher.update(b"SOF|");
+            hasher.update(&[precision]);
+            hasher.update(&height.to_be_bytes());
+            hasher.update(&width.to_be_bytes());
+        }
     }
 
     if let Some(dt) = datetime_original {
@@ -224,7 +227,10 @@ mod tests {
         let j = jpeg_with(b"shot1", 100, 200);
         let mut c1 = Cursor::new(j.clone());
         let mut c2 = Cursor::new(j.clone());
-        assert_eq!(fingerprint(&mut c1, 0).unwrap(), fingerprint(&mut c2, 0).unwrap());
+        assert_eq!(
+            fingerprint(&mut c1, 0).unwrap(),
+            fingerprint(&mut c2, 0).unwrap()
+        );
     }
 
     #[test]
@@ -233,7 +239,10 @@ mod tests {
         let b = jpeg_with(b"shot2", 100, 200);
         let mut ca = Cursor::new(a);
         let mut cb = Cursor::new(b);
-        assert_ne!(fingerprint(&mut ca, 0).unwrap(), fingerprint(&mut cb, 0).unwrap());
+        assert_ne!(
+            fingerprint(&mut ca, 0).unwrap(),
+            fingerprint(&mut cb, 0).unwrap()
+        );
     }
 
     #[test]
@@ -242,7 +251,10 @@ mod tests {
         let b = jpeg_with(b"x", 100, 300);
         let mut ca = Cursor::new(a);
         let mut cb = Cursor::new(b);
-        assert_ne!(fingerprint(&mut ca, 0).unwrap(), fingerprint(&mut cb, 0).unwrap());
+        assert_ne!(
+            fingerprint(&mut ca, 0).unwrap(),
+            fingerprint(&mut cb, 0).unwrap()
+        );
     }
 
     #[test]

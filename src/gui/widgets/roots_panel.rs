@@ -51,7 +51,11 @@ pub fn show(
         for (i, root) in roots.iter().enumerate() {
             ui.horizontal(|ui| {
                 let star = if root.is_reference { "★" } else { "☆" };
-                let star_color = if root.is_reference { theme::WARN } else { theme::TEXT_LO };
+                let star_color = if root.is_reference {
+                    theme::WARN
+                } else {
+                    theme::TEXT_LO
+                };
                 if ui
                     .add(
                         egui::Button::new(RichText::new(star).color(star_color))
@@ -69,7 +73,11 @@ pub fn show(
                 }
 
                 let path_str = root.path.to_string_lossy();
-                let color = if root.is_reference { theme::WARN } else { theme::TEXT_HI };
+                let color = if root.is_reference {
+                    theme::WARN
+                } else {
+                    theme::TEXT_HI
+                };
                 ui.add(egui::Label::new(
                     RichText::new(truncate(&path_str, 40).to_string())
                         .color(color)
@@ -99,10 +107,8 @@ pub fn show(
     ui.horizontal(|ui| {
         if ui
             .add(
-                egui::Button::new(
-                    RichText::new("📁  Add folder").color(theme::TEXT_HI),
-                )
-                .min_size(vec2(110.0, 24.0)),
+                egui::Button::new(RichText::new("📁  Add folder").color(theme::TEXT_HI))
+                    .min_size(vec2(110.0, 24.0)),
             )
             .on_hover_text("Add a folder to scan.")
             .clicked()
@@ -111,8 +117,7 @@ pub fn show(
         }
         if ui
             .add(
-                egui::Button::new(RichText::new("★").color(theme::WARN))
-                    .min_size(vec2(32.0, 24.0)),
+                egui::Button::new(RichText::new("★").color(theme::WARN)).min_size(vec2(32.0, 24.0)),
             )
             .on_hover_text("Add a folder as a reference (source of truth).")
             .clicked()
@@ -134,14 +139,13 @@ pub fn show(
             "▶  Start scan"
         };
         let primary = egui::Button::new(
-            RichText::new(primary_label).color(theme::PANEL_DEEP).strong(),
+            RichText::new(primary_label)
+                .color(theme::PANEL_DEEP)
+                .strong(),
         )
         .fill(theme::ACCENT)
         .min_size(vec2(150.0, 28.0));
-        if ui
-            .add_enabled(can_scan || is_scanning, primary)
-            .clicked()
-        {
+        if ui.add_enabled(can_scan || is_scanning, primary).clicked() {
             action = Some(if is_scanning {
                 RootsAction::Pause
             } else {
@@ -151,11 +155,9 @@ pub fn show(
 
         // Unsuperdupe sits beside Start scan — no scan required, just
         // walks the roots and strips `.superdupe` extensions back.
-        let unsuperdupe = egui::Button::new(
-            RichText::new("↩  Unsuperdupe").color(theme::TEXT_HI),
-        )
-        .fill(theme::PANEL_DEEP)
-        .min_size(vec2(140.0, 28.0));
+        let unsuperdupe = egui::Button::new(RichText::new("↩  Unsuperdupe").color(theme::TEXT_HI))
+            .fill(theme::PANEL_DEEP)
+            .min_size(vec2(140.0, 28.0));
         if ui
             .add_enabled(can_unsuperdupe, unsuperdupe)
             .on_hover_text(
@@ -169,10 +171,8 @@ pub fn show(
         }
 
         if is_scanning {
-            let cancel = egui::Button::new(
-                RichText::new("⏹  Cancel").color(theme::HOT),
-            )
-            .min_size(vec2(90.0, 28.0));
+            let cancel = egui::Button::new(RichText::new("⏹  Cancel").color(theme::HOT))
+                .min_size(vec2(90.0, 28.0));
             if ui.add(cancel).clicked() {
                 action = Some(RootsAction::Cancel);
             }

@@ -182,10 +182,7 @@ impl DiagnosticsLog {
             drop(bw);
         }
         let old = g.current_path.clone();
-        let stem = old
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("report");
+        let stem = old.file_stem().and_then(|s| s.to_str()).unwrap_or("report");
         let parent = old.parent().unwrap_or(std::path::Path::new("."));
         let new_path = parent.join(format!("{stem}-{dur}.txt"));
         if let Err(e) = std::fs::rename(&old, &new_path) {
