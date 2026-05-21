@@ -128,8 +128,23 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         tracing::debug!(error = %e, "rayon global pool already initialized; keeping existing");
     }
 
+    // Open the cache early so Stage 1's warm-path enumerator can
+    // pull its USN-delta snapshot through it. Doubles as the hash
+    // cache later in Stage 4. `--no-cache` keeps both disabled.
+    let cache = if cfg.use_cache {
+        match superdupe::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
+            Ok(c) => Some(Arc::new(Mutex::new(c))),
+            Err(e) => {
+                tracing::warn!(error = %e, "cache disabled (couldn't open)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let t_inventory = std::time::Instant::now();
-    let inventory = inventory::enumerate(&cfg).context("inventory failed")?;
+    let inventory = inventory::enumerate(&cfg, cache.as_ref()).context("inventory failed")?;
     let inventory_ms = t_inventory.elapsed().as_millis();
     tracing::info!(
         count = inventory.len(),
@@ -154,18 +169,6 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         elapsed_ms = layout_ms as u64,
         "stage 3: layout resolution complete"
     );
-
-    let cache = if cfg.use_cache {
-        match superdupe::cache::default_cache_path().and_then(|p| Cache::open(&p)) {
-            Ok(c) => Some(Arc::new(Mutex::new(c))),
-            Err(e) => {
-                tracing::warn!(error = %e, "cache disabled (couldn't open)");
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     let t_hash = std::time::Instant::now();
     let (duplicates, counters) =

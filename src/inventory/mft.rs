@@ -23,7 +23,10 @@ use crate::inventory::FileEntry;
 use crate::Result;
 
 #[cfg(windows)]
-pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
+pub fn enumerate(
+    cfg: &ScanConfig,
+    cache: Option<&std::sync::Arc<parking_lot::Mutex<crate::cache::Cache>>>,
+) -> Result<Vec<FileEntry>> {
     use hashbrown::HashMap;
 
     use crate::winapi_wrappers::volume_for_path;
@@ -47,20 +50,76 @@ pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
 
     let mut out = Vec::new();
     for (volume, roots) in roots_by_volume {
-        out.extend(enumerate_volume(&volume, &roots, cfg)?);
+        // Try the warm path first when we have a cache to persist /
+        // restore the snapshot through. Falls through to the full
+        // MFT walk when there's no snapshot yet, the journal
+        // wrapped, or the delta references a subtree we don't have.
+        let warm_outcome = if let Some(c) = cache {
+            match crate::inventory::warm::try_warm(cfg, &volume, &roots, c) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    tracing::info!(
+                        volume = %volume,
+                        error = %e,
+                        "warm-path errored; falling back to cold MFT"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        match warm_outcome {
+            Some(crate::inventory::warm::WarmOutcome::Applied {
+                files,
+                delta_records,
+                created,
+                updated,
+                deleted,
+            }) => {
+                tracing::info!(
+                    volume = %volume,
+                    files = files.len(),
+                    delta_records,
+                    created,
+                    updated,
+                    deleted,
+                    "warm-path Stage 1: applied USN delta"
+                );
+                out.extend(files);
+                continue;
+            }
+            Some(crate::inventory::warm::WarmOutcome::Fallback { reason }) => {
+                tracing::info!(
+                    volume = %volume,
+                    reason,
+                    "warm-path Stage 1: falling back to cold MFT"
+                );
+            }
+            None => {}
+        }
+        out.extend(enumerate_volume(&volume, &roots, cfg, cache)?);
     }
     Ok(out)
 }
 
 #[cfg(not(windows))]
-pub fn enumerate(_cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
+pub fn enumerate(
+    _cfg: &ScanConfig,
+    _cache: Option<&std::sync::Arc<parking_lot::Mutex<crate::cache::Cache>>>,
+) -> Result<Vec<FileEntry>> {
     Err(crate::Error::Unsupported(
         "inventory::mft: only available on Windows",
     ))
 }
 
 #[cfg(windows)]
-fn enumerate_volume(volume: &str, roots: &[PathBuf], cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
+fn enumerate_volume(
+    volume: &str,
+    roots: &[PathBuf],
+    cfg: &ScanConfig,
+    cache: Option<&std::sync::Arc<parking_lot::Mutex<crate::cache::Cache>>>,
+) -> Result<Vec<FileEntry>> {
     use hashbrown::HashMap;
 
     use crate::winapi_wrappers::{UsnEnum, UsnRecord};
@@ -209,7 +268,94 @@ fn enumerate_volume(volume: &str, roots: &[PathBuf], cfg: &ScanConfig) -> Result
         );
     }
 
+    // Persist a fresh snapshot so the next scan can take the warm
+    // path. Captures every record we walked (directories included
+    // — `reconstruct_path` needs them) plus the USN cursor we just
+    // observed. Errors are non-fatal: the cold scan already
+    // succeeded, we just lose the next-warm-scan optimisation.
+    if let Some(c) = cache {
+        if let Err(e) = persist_cold_snapshot(volume, &by_ref, max_usn, c) {
+            tracing::warn!(
+                volume = %volume,
+                error = %e,
+                "failed to persist inventory snapshot after cold MFT walk — \
+                 next scan will pay full cold cost too"
+            );
+        }
+    }
+
     Ok(out)
+}
+
+/// Save the post-cold-walk snapshot for `volume` so subsequent
+/// scans can take the warm path. Pulled into its own function so
+/// the cold-walk loop above doesn't grow another bloc of cache
+/// manipulation.
+#[cfg(windows)]
+fn persist_cold_snapshot(
+    volume: &str,
+    by_ref: &hashbrown::HashMap<u64, crate::winapi_wrappers::UsnRecord>,
+    max_usn: i64,
+    cache: &std::sync::Arc<parking_lot::Mutex<crate::cache::Cache>>,
+) -> Result<()> {
+    use crate::cache::{InventoryMeta, InventoryRecord};
+    use crate::winapi_wrappers::query_usn_journal_state;
+
+    // Query the journal so we record `journal_id` next to the
+    // cursor — without it the warm path can't tell if the journal
+    // got recreated between scans.
+    let journal = match query_usn_journal_state(volume) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(
+                volume = %volume,
+                error = %e,
+                "journal state unavailable; skipping snapshot save"
+            );
+            return Ok(());
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+
+    let records: Vec<(u64, InventoryRecord)> = by_ref
+        .iter()
+        .map(|(&file_ref, r)| {
+            let is_dir = (r.attributes & 0x10) != 0;
+            (
+                file_ref,
+                InventoryRecord {
+                    parent_ref: r.parent_ref,
+                    usn: r.usn,
+                    attributes: r.attributes,
+                    name: r.name.clone(),
+                    // Cold path doesn't carry size/mtime in the
+                    // record (it lazy-stats per file during the
+                    // filter pass). For the snapshot we want the
+                    // size+mtime that std::fs::metadata returned
+                    // so warm scans can return them without
+                    // re-statting. But our `out` building consumed
+                    // those — keep it simple and use sentinels for
+                    // dirs, then 0/0 for files; the warm path will
+                    // re-stat any delta-affected files anyway.
+                    size: if is_dir { -1 } else { 0 },
+                    mtime: r.mtime_filetime as u64,
+                },
+            )
+        })
+        .collect();
+
+    let meta = InventoryMeta {
+        journal_id: journal.journal_id,
+        last_usn: max_usn.max(journal.next_usn),
+        captured_at_unix: now,
+    };
+    cache
+        .lock()
+        .save_inventory_snapshot(volume, &meta, &records)?;
+    Ok(())
 }
 
 #[cfg(windows)]
