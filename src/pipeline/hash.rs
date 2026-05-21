@@ -46,6 +46,17 @@ pub use algo::{ContentHasher, HashAlgo};
 
 /// Tier 1 sample size — first 4 KiB of the file.
 const TIER1_BYTES: u64 = 4 * 1024;
+/// Files at or below this size go through Tier 3 as a single
+/// `hash_oneshot` call (read whole file → one FFI crossing) instead
+/// of the streaming `new/update/finalize` triple. Targets the
+/// AppData-style workload where Tier 3 fires on hundreds of
+/// thousands of small files and per-file FFI overhead dominates the
+/// 37 KiB hash compute. 1 MiB chosen so the per-worker buffer peak
+/// stays at `threads × 1 MiB` (≤ ~16 MiB total for typical 16-core
+/// boxes). Files above the threshold keep the chunked-read +
+/// cancellation path so multi-GB scans stay interruptible and don't
+/// allocate a gigabyte-sized buffer per worker.
+const TIER3_ONESHOT_THRESHOLD: u64 = 1 << 20;
 /// Tier 2 per-region sample size — 64 KiB at head, mid, and tail.
 const TIER2_REGION: u64 = 64 * 1024;
 /// Files smaller than this skip Tier 2 entirely and go straight to Tier 3.
@@ -559,38 +570,60 @@ fn tier1_hash(f: &LaidOutFile, size: u64, algo: HashAlgo) -> std::io::Result<Vec
 }
 
 fn tier2_hash(f: &LaidOutFile, size: u64, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
+    // Read the three regions into a single contiguous buffer and
+    // dispatch one `hash_oneshot` call. The previous
+    // new/update×3/finalize pattern crossed the C FFI four times per
+    // file (alloc on new, then update×3, then finalize+free); on
+    // DDH-128 + 261k-file Tier 3 corpora that overhead competes with
+    // the AES-NI bulk throughput. BLAKE3 is pure Rust so it sees no
+    // change from this rewrite; DDH-128 sees only one FFI hop with
+    // no heap alloc on the hash side.
     let region = TIER2_REGION as usize;
-    let mut head = vec![0u8; region];
-    let mut mid = vec![0u8; region];
-    let mut tail = vec![0u8; region];
+    let mut combined = vec![0u8; 3 * region];
 
     let mut file = File::open(&f.entry.path)?;
-    read_exact_or_eof(&mut file, &mut head)?;
+    read_exact_or_eof(&mut file, &mut combined[..region])?;
 
     let mid_off = size.saturating_sub(TIER2_REGION) / 2;
     file.seek(SeekFrom::Start(mid_off))?;
-    read_exact_or_eof(&mut file, &mut mid)?;
+    read_exact_or_eof(&mut file, &mut combined[region..2 * region])?;
 
     let tail_off = size.saturating_sub(TIER2_REGION);
     file.seek(SeekFrom::Start(tail_off))?;
-    read_exact_or_eof(&mut file, &mut tail)?;
+    read_exact_or_eof(&mut file, &mut combined[2 * region..])?;
 
-    let mut hasher = ContentHasher::new(algo);
-    hasher.update(&head);
-    hasher.update(&mid);
-    hasher.update(&tail);
-    Ok(hasher.finalize())
+    Ok(algo::hash_oneshot(algo, &combined))
 }
 
-/// Tier 3 full-content hash. Polls an optional cancel flag every
-/// buffer so a multi-GB file becomes interruptible — at worst we
-/// finish the current 1 MiB read and bail.
+/// Tier 3 full-content hash. Two paths:
+/// * **Small files (`size <= TIER3_ONESHOT_THRESHOLD`)** — slurp
+///   the whole file into one buffer and hand it to `hash_oneshot`.
+///   This is the AppData-style hot path: hundreds of thousands of
+///   sub-1-MiB files where per-file FFI/alloc overhead competes
+///   with the actual hash compute. One FFI hop, one heap alloc for
+///   the read buffer, zero hasher-state allocs.
+/// * **Large files** — chunked read + streaming hasher with a
+///   per-buffer cancel check, so a multi-GB hash stays interruptible
+///   (worst-case latency: one TIER3_BUF read) without ever
+///   allocating a gigabyte-sized read buffer.
 fn tier3_hash_cancellable(
     f: &LaidOutFile,
-    _size: u64,
+    size: u64,
     algo: HashAlgo,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> std::io::Result<Vec<u8>> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ));
+    }
+    if size <= TIER3_ONESHOT_THRESHOLD {
+        let mut file = File::open(&f.entry.path)?;
+        let mut buf = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut buf)?;
+        return Ok(algo::hash_oneshot(algo, &buf));
+    }
     let file = File::open(&f.entry.path)?;
     let mut reader = BufReader::with_capacity(TIER3_BUF, file);
     let mut hasher = ContentHasher::new(algo);
