@@ -86,7 +86,7 @@ jobs:
       # share the codegen instead of duplicating per-bin work). Previous
       # two-step shape took ~7 minutes for GUI + ~1 minute for CLI;
       # the combined build typically lands closer to ~7 minutes total.
-      - run: cargo build --release --locked --features gui --bin superdupe --bin superdupe-gui
+      - run: cargo build --release --locked --features gui --bin superdeduper --bin superdeduper-gui
       # Upload the built EXEs as a workflow artifact on every push to
       # main so we can iterate without cutting a tagged release. The
       # bundle lives under the run's Artifacts section for 14 days.
@@ -96,8 +96,8 @@ jobs:
         run: |
           $stage = "ci-build"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item target/release/superdupe.exe $stage/
-          Copy-Item target/release/superdupe-gui.exe $stage/
+          Copy-Item target/release/superdeduper.exe $stage/
+          Copy-Item target/release/superdeduper-gui.exe $stage/
           Copy-Item LICENSE $stage/
           Copy-Item README.md $stage/
           $files = @(Get-ChildItem $stage -File | Where-Object { $_.Name -ne 'SHA256SUMS' })
@@ -111,7 +111,7 @@ jobs:
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: superdupe-windows-${{ github.sha }}
+          name: superdeduper-windows-${{ github.sha }}
           path: ci-build/**
           if-no-files-found: error
           retention-days: 14

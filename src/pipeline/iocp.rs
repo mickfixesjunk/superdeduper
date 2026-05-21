@@ -302,7 +302,7 @@ mod tests {
     fn tmp() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "superdupe-iocp-{}-{}",
+            "superdeduper-iocp-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

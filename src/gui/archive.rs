@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
-pub const ARCHIVE_SCHEMA: &str = "superdupe.archive.v1";
+pub const ARCHIVE_SCHEMA: &str = "superdeduper.archive.v1";
 
 /// One archive run = one of these JSON files. Filename pattern:
-/// `superdupe-archive-manifest-<ISO-timestamp>.json` so multiple
+/// `superdeduper-archive-manifest-<ISO-timestamp>.json` so multiple
 /// runs into the same destination folder produce distinct files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveManifest {

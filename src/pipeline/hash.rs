@@ -176,7 +176,7 @@ fn run_with_counters_inner(
     // its CPU-sized parallelism.
     let io_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.io_threads.max(1))
-        .thread_name(|i| format!("superdupe-io-{i}"))
+        .thread_name(|i| format!("superdeduper-io-{i}"))
         .build()
         .map_err(|e| Error::other(format!("io thread pool build: {e}")))?;
     let mut confirmed: Vec<DuplicateGroup> = io_pool
@@ -707,7 +707,7 @@ mod tests {
     fn tmpdir() -> PathBuf {
         let mut d = std::env::temp_dir();
         d.push(format!(
-            "superdupe-hash-{}-{}",
+            "superdeduper-hash-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

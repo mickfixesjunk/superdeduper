@@ -8,14 +8,14 @@
 use std::fs;
 use std::path::PathBuf;
 
-use superdupe::cli::OutputFormat;
-use superdupe::config::ScanConfig;
-use superdupe::pipeline;
+use superdeduper::cli::OutputFormat;
+use superdeduper::config::ScanConfig;
+use superdeduper::pipeline;
 
 fn temp_root() -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!(
-        "superdupe-smoke-{}-{}",
+        "superdeduper-smoke-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -60,10 +60,10 @@ fn finds_planted_duplicates() {
         follow_links: false,
         allow_system_paths: false,
         io_threads: 4,
-        hash_algo: superdupe::pipeline::hash::HashAlgo::Blake3,
+        hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
     };
 
-    let inv = superdupe::inventory::enumerate(&cfg, None).unwrap();
+    let inv = superdeduper::inventory::enumerate(&cfg, None).unwrap();
     assert_eq!(
         inv.len(),
         4,
@@ -129,9 +129,9 @@ fn empty_directory_yields_no_groups() {
         follow_links: false,
         allow_system_paths: false,
         io_threads: 4,
-        hash_algo: superdupe::pipeline::hash::HashAlgo::Blake3,
+        hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
     };
-    let inv = superdupe::inventory::enumerate(&cfg, None).unwrap();
+    let inv = superdeduper::inventory::enumerate(&cfg, None).unwrap();
     assert!(inv.is_empty());
     let groups = pipeline::grouping::group_by_size(inv);
     assert!(groups.is_empty());

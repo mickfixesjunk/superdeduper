@@ -3,7 +3,7 @@
 //! restarts — provided the root folders haven't materially changed.
 //!
 //! File lives next to the cache and scan-checkpoint in
-//! `%LOCALAPPDATA%\superdupe\results-state.json` on Windows (and the
+//! `%LOCALAPPDATA%\superdeduper\results-state.json` on Windows (and the
 //! equivalent XDG location elsewhere). The flow:
 //!
 //! 1. **On scan completion** — `save()` writes the full duplicate-
@@ -31,7 +31,7 @@ use crate::gui::events::DuplicateGroupSummary;
 use crate::gui::state::{RootEntry, ScanSettings};
 use crate::{Error, Result};
 
-const SCHEMA: &str = "superdupe.results-state.v1";
+const SCHEMA: &str = "superdeduper.results-state.v1";
 
 /// What we remember about a single scan root so a later "did this
 /// change?" check is cheap and approximate.
@@ -78,7 +78,7 @@ impl ResultsState {
 }
 
 /// Canonical on-disk location. Sits next to the cache so removing
-/// the superdupe data dir wipes everything in one stroke.
+/// the superdeduper data dir wipes everything in one stroke.
 pub fn default_results_state_path() -> Result<PathBuf> {
     let mut p = crate::cache::default_cache_path()?;
     p.set_file_name("results-state.json");
@@ -107,7 +107,7 @@ pub fn load() -> Result<Option<ResultsState>> {
     };
     let state: ResultsState = serde_json::from_slice(&bytes)
         .map_err(|e| Error::other(format!("results-state parse: {e}")))?;
-    if !state.schema.starts_with("superdupe.results-state") {
+    if !state.schema.starts_with("superdeduper.results-state") {
         return Ok(None);
     }
     Ok(Some(state))

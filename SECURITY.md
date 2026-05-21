@@ -1,6 +1,6 @@
 # Security & release verification
 
-`superdupe` ships as a single `.exe` per architecture, distributed
+`superdeduper` ships as a single `.exe` per architecture, distributed
 exclusively through this repository's GitHub Releases. Every release
 artifact is **reproducibly built in public CI** and verifiable via at
 least one of three independent mechanisms:
@@ -19,7 +19,7 @@ least one of three independent mechanisms:
    rely on the SHA-256 manifest plus Authenticode below.
 3. **Authenticode (when a code-signing cert is configured).** Windows
    SmartScreen / EDR will recognise the binary as coming from the
-   `superdupe` publisher, suppress the unknown-publisher prompt, and
+   `superdeduper` publisher, suppress the unknown-publisher prompt, and
    refuse to launch if anything's been modified post-signing.
 
 You only need to verify **one** of these to be confident the binary is
@@ -27,15 +27,15 @@ genuine, but verifying all three is the gold standard.
 
 ## Verifying a downloaded release
 
-Pick a release at <https://github.com/mickfixesjunk/superdupe/releases>,
+Pick a release at <https://github.com/mickfixesjunk/superdeduper/releases>,
 download the per-architecture zip plus its `.sha256` file, and:
 
 ### 1. Verify the SHA-256 (one-liner)
 
 ```pwsh
 # PowerShell
-$expected = (Get-Content superdupe-x86_64-windows.zip.sha256).Split(' ')[0]
-$actual   = (Get-FileHash -Algorithm SHA256 superdupe-x86_64-windows.zip).Hash.ToLower()
+$expected = (Get-Content superdeduper-x86_64-windows.zip.sha256).Split(' ')[0]
+$actual   = (Get-FileHash -Algorithm SHA256 superdeduper-x86_64-windows.zip).Hash.ToLower()
 if ($expected -ne $actual) { throw "SHA-256 MISMATCH — DO NOT TRUST THIS FILE." }
 "OK: $actual"
 ```
@@ -43,7 +43,7 @@ if ($expected -ne $actual) { throw "SHA-256 MISMATCH — DO NOT TRUST THIS FILE.
 ### 2. Verify the Sigstore attestation (public / org-private repos only)
 
 ```pwsh
-gh attestation verify superdupe-x86_64-windows.zip --repo mickfixesjunk/superdupe
+gh attestation verify superdeduper-x86_64-windows.zip --repo mickfixesjunk/superdeduper
 ```
 
 The CLI fetches the attestation from the Sigstore transparency log and
@@ -58,7 +58,7 @@ workflow. Expected output: `verification succeeded`.
 ### 3. Verify the Authenticode signature (if present)
 
 ```pwsh
-Get-AuthenticodeSignature .\superdupe.exe | Format-List *
+Get-AuthenticodeSignature .\superdeduper.exe | Format-List *
 ```
 
 Status should read `Valid`. Subject name will be the publisher
@@ -68,8 +68,8 @@ configured in the cert.
 
 | Artifact                                | SHA-256 | Sigstore attestation | Authenticode |
 | --------------------------------------- | :-----: | :-----: | :-----: |
-| `superdupe-x86_64-windows.zip`          | ✅ | ✅ | ✅ when cert configured |
-| `superdupe-aarch64-windows.zip`         | ✅ | ✅ | ✅ when cert configured |
+| `superdeduper-x86_64-windows.zip`          | ✅ | ✅ | ✅ when cert configured |
+| `superdeduper-aarch64-windows.zip`         | ✅ | ✅ | ✅ when cert configured |
 | Individual `.exe`s inside the zip       | indirect | indirect | ✅ when cert configured |
 
 ## Reporting vulnerabilities
@@ -89,5 +89,5 @@ Please don't open public issues for security bugs.
 * Ask you to disable SmartScreen, Defender, or any AV to run the tool.
 * Bundle unrelated software, telemetry, or update-checks.
 
-If you see a "superdupe" binary that doesn't pass the verification
+If you see a "superdeduper" binary that doesn't pass the verification
 steps above, please report it.

@@ -9,7 +9,7 @@
 //! so they don't have to re-do it every session.
 //!
 //! Storage shape: a single JSON file at
-//! `%LOCALAPPDATA%\superdupe\drive-overrides.json`, mapping
+//! `%LOCALAPPDATA%\superdeduper\drive-overrides.json`, mapping
 //! **volume GUID** to override-bool. We key on volume GUID rather
 //! than drive letter because external drives reshuffle letters
 //! depending on plug order — the GUID is stable across mounts.
@@ -42,7 +42,7 @@ pub struct DriveOverrides {
     pub overrides: HashMap<String, bool>,
 }
 
-pub const OVERRIDES_SCHEMA: &str = "superdupe.drive-overrides.v1";
+pub const OVERRIDES_SCHEMA: &str = "superdeduper.drive-overrides.v1";
 
 pub fn overrides_path() -> Result<PathBuf> {
     let mut p = crate::cache::default_cache_path()?;

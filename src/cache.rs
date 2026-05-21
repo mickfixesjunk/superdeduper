@@ -1,8 +1,8 @@
 //! Per-machine persistent cache, keyed by `(volume_guid, file_ref)` and
 //! invalidated whenever `(size, mtime, usn)` changes for a record.
 //!
-//! The cache lives at `%LOCALAPPDATA%\superdupe\cache.db` on Windows
-//! and `$XDG_CACHE_HOME/superdupe/cache.db` (or `~/.cache/superdupe/`)
+//! The cache lives at `%LOCALAPPDATA%\superdeduper\cache.db` on Windows
+//! and `$XDG_CACHE_HOME/superdeduper/cache.db` (or `~/.cache/superdeduper/`)
 //! elsewhere — the non-Windows path exists only so the cross-platform
 //! tests have somewhere to write.
 //!
@@ -573,18 +573,18 @@ fn now_unix() -> i64 {
 #[cfg(windows)]
 pub fn default_cache_path() -> Result<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").map_err(|_| Error::other("LOCALAPPDATA not set"))?;
-    Ok(PathBuf::from(local).join("superdupe").join("cache.db"))
+    Ok(PathBuf::from(local).join("superdeduper").join("cache.db"))
 }
 
 #[cfg(not(windows))]
 pub fn default_cache_path() -> Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        return Ok(PathBuf::from(xdg).join("superdupe").join("cache.db"));
+        return Ok(PathBuf::from(xdg).join("superdeduper").join("cache.db"));
     }
     let home = std::env::var("HOME").map_err(|_| Error::other("HOME not set"))?;
     Ok(PathBuf::from(home)
         .join(".cache")
-        .join("superdupe")
+        .join("superdeduper")
         .join("cache.db"))
 }
 
@@ -596,7 +596,7 @@ mod tests {
     fn tmp_db() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "superdupe-cache-{}-{}.db",
+            "superdeduper-cache-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

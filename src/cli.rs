@@ -6,10 +6,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-/// Top-level CLI for `superdupe`.
+/// Top-level CLI for `superdeduper`.
 #[derive(Debug, Parser)]
 #[command(
-    name = "superdupe",
+    name = "superdeduper",
     version,
     about = "The fastest duplicate file finder for Windows / NTFS.",
     long_about = None,
@@ -40,7 +40,7 @@ pub enum Command {
     Cache(CacheCommand),
 
     /// Print storage-device diagnostics for every fixed/external
-    /// drive Windows can see. Use this when superdupe misclassifies
+    /// drive Windows can see. Use this when superdeduper misclassifies
     /// a drive as HDD-vs-SSD: the output shows the raw bus type,
     /// the seek-penalty IOCTL result, and the rule that picked the
     /// final answer. Windows only.
@@ -206,8 +206,8 @@ pub enum DedupeAction {
     Hardlink,
     /// Replace the file with a reflink / block-clone (ReFS only).
     Reflink,
-    /// Safe-mode: append `.superdupe` to the filename. Reversible by
-    /// running `unsuperdupe` against the root (no deletion happens).
+    /// Safe-mode: append `.superdeduper` to the filename. Reversible by
+    /// running `unsuperdeduper` against the root (no deletion happens).
     SafeRename,
 }
 

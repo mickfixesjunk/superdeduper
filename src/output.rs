@@ -30,7 +30,7 @@ pub fn write(out: &mut dyn Write, format: OutputFormat, groups: &[DuplicateGroup
         OutputFormat::Text => write_text(out, groups, &summary)?,
         OutputFormat::Json => {
             let report = Report {
-                schema: "superdupe.scan.v1",
+                schema: "superdeduper.scan.v1",
                 groups,
                 summary,
             };

@@ -1,5 +1,5 @@
 # scripts/iothread-sweep.ps1 — Windows version of the io-threads
-# sweep. Run from the folder where superdupe.exe lives.
+# sweep. Run from the folder where superdeduper.exe lives.
 #
 # Usage:
 #   .\scripts\iothread-sweep.ps1 -Target "C:\Users\Audio\AppData"
@@ -11,14 +11,14 @@
 
 param(
     [Parameter(Mandatory = $true)] [string]$Target,
-    [string]$Bin = ".\superdupe.exe",
+    [string]$Bin = ".\superdeduper.exe",
     [int[]]$Threads = @(1, 8, 16, 24, 48, 96),
     [string]$ResultsDir = "$env:USERPROFILE\Desktop\iothread-sweep"
 )
 
 $ErrorActionPreference = "Stop"
 if (-not (Test-Path $Bin)) {
-    throw "$Bin not found. Copy the latest superdupe.exe here, or pass -Bin <path>."
+    throw "$Bin not found. Copy the latest superdeduper.exe here, or pass -Bin <path>."
 }
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 

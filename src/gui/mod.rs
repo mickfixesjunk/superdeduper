@@ -1,4 +1,4 @@
-//! `superdupe` desktop GUI built on `egui` / `eframe`.
+//! `superdeduper` desktop GUI built on `egui` / `eframe`.
 //!
 //! Architecture: the engine runs on its own thread (or a real one once
 //! wired up) and emits [`events::EngineEvent`] over a crossbeam channel.
@@ -23,4 +23,4 @@ pub mod state;
 pub mod theme;
 pub mod widgets;
 
-pub use app::SuperdupeApp;
+pub use app::SuperdeduperApp;

@@ -8,9 +8,9 @@ Cargo.lock.bak
 
 # Locally cross-compiled test build dropped next to the repo for
 # the maintainer's iteration loop. Not part of any release.
-/superdupe-gui.exe
+/superdeduper-gui.exe
 /diagnostics/
-/superdupe.exe
+/superdeduper.exe
 
 # Per-developer Cargo overrides — see .cargo/config.toml.example
 # for the river5 path-patch pattern. Tracked example, ignored real

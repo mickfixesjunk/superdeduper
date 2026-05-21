@@ -1,8 +1,8 @@
-# superdupe
+# superdeduper
 
 The fastest duplicate file finder for Windows / NTFS.
 
-`superdupe` is a clean-room Rust implementation built around the observation
+`superdeduper` is a clean-room Rust implementation built around the observation
 that most "fast" cross-platform dedupers leave significant performance on
 the table on Windows by avoiding NTFS- and Win32-specific tricks. By
 targeting Windows exclusively we can lean on direct MFT enumeration,
@@ -33,9 +33,9 @@ near-instant via the USN journal.
 ## Installing a release
 
 Releases are at
-[github.com/mickfixesjunk/superdupe/releases](https://github.com/mickfixesjunk/superdupe/releases).
-Each release ships a per-architecture zip with `superdupe.exe`,
-`superdupe-gui.exe`, the LICENSE, and a `SHA256SUMS` manifest. All
+[github.com/mickfixesjunk/superdeduper/releases](https://github.com/mickfixesjunk/superdeduper/releases).
+Each release ships a per-architecture zip with `superdeduper.exe`,
+`superdeduper-gui.exe`, the LICENSE, and a `SHA256SUMS` manifest. All
 artifacts are reproducibly built in public CI and signed twice —
 once via [GitHub Sigstore attestations][gh-attest] (always) and once
 via Authenticode (when a code-signing cert is configured).
@@ -44,7 +44,7 @@ via Authenticode (when a code-signing cert is configured).
 instructions live in [SECURITY.md](SECURITY.md); the short version is:
 
 ```pwsh
-gh attestation verify superdupe-x86_64-windows.zip --repo mickfixesjunk/superdupe
+gh attestation verify superdeduper-x86_64-windows.zip --repo mickfixesjunk/superdeduper
 ```
 
 If you see anything other than `verification succeeded`, do not run
@@ -58,11 +58,11 @@ the binary — it didn't come from this repo's `release.yml`.
 cargo build --release --locked
 ```
 
-The release binary is a single `target\release\superdupe.exe`. The
+The release binary is a single `target\release\superdeduper.exe`. The
 optional GUI:
 
 ```pwsh
-cargo build --release --locked --features gui --bin superdupe-gui
+cargo build --release --locked --features gui --bin superdeduper-gui
 ```
 
 `rust-toolchain.toml` pins the toolchain; `--locked` enforces the
@@ -72,12 +72,12 @@ match the release workflow.
 ## Usage
 
 ```pwsh
-superdupe scan D:\Media
-superdupe scan C:\Users\me\Pictures --min-size 1M --format json --output dups.json
-superdupe dedupe dups.json --strategy oldest --action recycle --dry-run
+superdeduper scan D:\Media
+superdeduper scan C:\Users\me\Pictures --min-size 1M --format json --output dups.json
+superdeduper dedupe dups.json --strategy oldest --action recycle --dry-run
 ```
 
-See `superdupe --help` for the full CLI.
+See `superdeduper --help` for the full CLI.
 
 ## Non-goals
 
