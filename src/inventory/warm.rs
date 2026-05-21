@@ -171,6 +171,14 @@ pub fn try_warm(
     let mut updated = 0u64;
     let mut deleted = 0u64;
     let mut missing_parent = false;
+    // Track the small set of rows we'll write back to the cache at
+    // the end. The previous shape rewrote the full ~2.4M-row
+    // snapshot every warm scan; tracking only the records the
+    // delta actually touched cuts that to typical inter-scan
+    // churn (~few thousand rows) so the post-warm-write step
+    // stops dominating the wallclock.
+    let mut delta_upserts: Vec<(u64, InventoryRecord)> = Vec::new();
+    let mut delta_deletes: Vec<u64> = Vec::new();
 
     for r in &delta {
         // USN_REASON_FILE_DELETE close = file gone. Mask 0x200 is
@@ -180,6 +188,7 @@ pub fn try_warm(
         if r.reason & USN_REASON_FILE_DELETE != 0 {
             if by_ref.remove(&r.file_ref).is_some() {
                 deleted += 1;
+                delta_deletes.push(r.file_ref);
             }
             continue;
         }
@@ -222,6 +231,13 @@ pub fn try_warm(
                     Some(p) => p,
                     None => {
                         by_ref.remove(&r.file_ref);
+                        // If this record WAS in the snapshot,
+                        // remove it on the next apply too — we
+                        // can't produce a valid path for it any
+                        // more.
+                        if was_present {
+                            delta_deletes.push(r.file_ref);
+                        }
                         continue;
                     }
                 };
@@ -236,24 +252,28 @@ pub fn try_warm(
                         if updated > 0 {
                             updated -= 1;
                         }
+                        // Was in the baseline snapshot — remove
+                        // from disk on the next apply.
+                        delta_deletes.push(r.file_ref);
                     } else if created > 0 {
                         created -= 1;
+                        // Never made it into the snapshot, so
+                        // nothing to delete on disk.
                     }
                     continue;
                 }
             }
         };
-        by_ref.insert(
-            r.file_ref,
-            InventoryRecord {
-                parent_ref: r.parent_ref,
-                usn: r.usn,
-                attributes: r.attributes,
-                name: r.name.clone(),
-                size,
-                mtime,
-            },
-        );
+        let record = InventoryRecord {
+            parent_ref: r.parent_ref,
+            usn: r.usn,
+            attributes: r.attributes,
+            name: r.name.clone(),
+            size,
+            mtime,
+        };
+        by_ref.insert(r.file_ref, record.clone());
+        delta_upserts.push((r.file_ref, record));
     }
 
     if missing_parent {
@@ -267,12 +287,17 @@ pub fn try_warm(
     let volume_root = volume_root_for(volume_guid, roots);
     let files = entries_from_records(&by_ref, &volume_root, cfg, roots);
 
-    // Persist the new snapshot.
+    // Persist ONLY the delta — not the full snapshot. The previous
+    // shape did `save_inventory_snapshot` here, which DELETEd every
+    // row for the volume and re-INSERTed all ~2.4M MFT records.
+    // On Defender-monitored Windows that was 60-90s of pure write
+    // amplification per warm scan. `apply_inventory_delta` does
+    // exactly the writes the delta represents — typical inter-scan
+    // churn is a few thousand rows → sub-second.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0) as i64;
-    let records: Vec<(u64, InventoryRecord)> = by_ref.into_iter().map(|(k, v)| (k, v)).collect();
     let new_meta = InventoryMeta {
         journal_id: live.journal_id,
         last_usn: next_usn,
@@ -280,7 +305,7 @@ pub fn try_warm(
     };
     cache
         .lock()
-        .save_inventory_snapshot(volume_guid, &new_meta, &records)?;
+        .apply_inventory_delta(volume_guid, &new_meta, &delta_upserts, &delta_deletes)?;
 
     Ok(WarmOutcome::Applied {
         files,
