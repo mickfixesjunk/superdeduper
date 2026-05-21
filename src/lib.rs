@@ -21,6 +21,7 @@ pub mod config;
 pub mod dedupe;
 pub mod error;
 pub mod inventory;
+pub mod keep;
 pub mod output;
 pub mod pipeline;
 pub mod winapi_wrappers;
