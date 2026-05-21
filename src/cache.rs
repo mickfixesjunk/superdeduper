@@ -460,6 +460,76 @@ impl Cache {
         Ok(())
     }
 
+    /// Apply a tiny delta to an existing snapshot instead of
+    /// rewriting all 2M+ rows. The warm-path enumerator built
+    /// this delta itself (created/updated/deleted file_refs) —
+    /// passing it through avoids the 60-90s full-rewrite that
+    /// `save_inventory_snapshot` does. Typical inter-scan churn
+    /// is a few thousand records → the apply is sub-second.
+    ///
+    /// Behaviour:
+    /// * `deletes`: rows removed via `DELETE … WHERE volume_guid = ?
+    ///   AND file_ref = ?`.
+    /// * `upserts`: rows inserted via `INSERT OR REPLACE …`. The
+    ///   warm path uses this for both new-file events (created)
+    ///   and modified-file events (updated) since the SQL semantics
+    ///   are the same.
+    /// * `meta` cursor + journal_id always updated.
+    ///
+    /// Single transaction, so a crash mid-apply leaves the previous
+    /// snapshot intact and the warm path's journal-id check will
+    /// still validate the old cursor.
+    pub fn apply_inventory_delta(
+        &mut self,
+        volume_guid: &str,
+        meta: &InventoryMeta,
+        upserts: &[(u64, InventoryRecord)],
+        deletes: &[u64],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO inventory_meta
+                 (volume_guid, journal_id, last_usn, captured_at_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                volume_guid,
+                meta.journal_id,
+                meta.last_usn,
+                meta.captured_at_unix
+            ],
+        )?;
+        if !deletes.is_empty() {
+            let mut del = tx.prepare(
+                "DELETE FROM inventory_records
+                 WHERE volume_guid = ?1 AND file_ref = ?2",
+            )?;
+            for file_ref in deletes {
+                del.execute(params![volume_guid, *file_ref as i64])?;
+            }
+        }
+        if !upserts.is_empty() {
+            let mut up = tx.prepare(
+                "INSERT OR REPLACE INTO inventory_records
+                     (volume_guid, file_ref, parent_ref, usn, attributes, name, size, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (file_ref, rec) in upserts {
+                up.execute(params![
+                    volume_guid,
+                    *file_ref as i64,
+                    rec.parent_ref as i64,
+                    rec.usn,
+                    rec.attributes as i64,
+                    rec.name,
+                    rec.size,
+                    rec.mtime as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drop the snapshot for one volume — used when journal
     /// validation fails so the next scan starts clean.
     pub fn invalidate_inventory_snapshot(&self, volume_guid: &str) -> Result<()> {
