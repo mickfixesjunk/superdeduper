@@ -1507,7 +1507,12 @@ impl eframe::App for SuperdeduperApp {
         TopBottomPanel::top("header")
             .frame(Frame::default().fill(theme::BG).inner_margin(8.0))
             .show(ctx, |ui| {
-                let action = header::show(ui, &self.state, self.is_scanning);
+                let action = header::show(
+                    ui,
+                    &self.state,
+                    self.persisted.settings.hash_algo,
+                    self.is_scanning,
+                );
                 if action == header::HeaderAction::OpenSettings {
                     want_settings = true;
                 }
