@@ -12,7 +12,6 @@
 
 pub mod app;
 pub mod checkpoint;
-pub mod demo;
 pub mod diagnostics;
 pub mod events;
 pub mod live;

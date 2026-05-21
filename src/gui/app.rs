@@ -16,7 +16,7 @@
 //! └──────────────┴───────────────────────────────────────────────────┘
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,7 +34,7 @@ use crate::gui::widgets::{
     drive_scope, funnel, groups_table, header, log_panel, overall_bar, resume_modal, roots_panel,
     settings_modal, treemap,
 };
-use crate::gui::{demo, live, theme};
+use crate::gui::{live, theme};
 
 #[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 enum ResultsTab {
@@ -56,7 +56,6 @@ pub struct SuperdupeApp {
     rx: Receiver<EngineEvent>,
     tx: Sender<EngineEvent>,
     is_scanning: bool,
-    demo_mode: bool,
     settings_open: bool,
     persisted: PersistedAppState,
     groups_state: groups_table::GroupsTableState,
@@ -85,7 +84,7 @@ pub struct SuperdupeApp {
 }
 
 impl SuperdupeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, start_in_demo: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
         let persisted: PersistedAppState = cc
             .storage
@@ -122,7 +121,6 @@ impl SuperdupeApp {
             rx,
             tx,
             is_scanning: false,
-            demo_mode: false,
             settings_open: false,
             persisted,
             groups_state: groups_table::GroupsTableState::default(),
@@ -140,9 +138,6 @@ impl SuperdupeApp {
         // `accept_resume`.
         if app.pending_resume.is_none() {
             app.auto_restore_results_state();
-        }
-        if start_in_demo {
-            app.start_demo();
         }
         app
     }
@@ -243,8 +238,8 @@ impl SuperdupeApp {
     /// leave the rusqlite hash cache untouched so the next scan
     /// silently benefits from prior work.
     fn accept_start_fresh(&mut self) {
-        match crate::gui::checkpoint::default_checkpoint_path() {
-            Ok(path) => match crate::gui::checkpoint::archive(&path) {
+        if let Ok(path) = crate::gui::checkpoint::default_checkpoint_path() {
+            match crate::gui::checkpoint::archive(&path) {
                 Ok(Some(archived)) => {
                     self.state.push_log(
                         crate::gui::events::LogLevel::Info,
@@ -261,8 +256,7 @@ impl SuperdupeApp {
                         format!("Couldn't archive previous checkpoint: {e}"),
                     );
                 }
-            },
-            Err(_) => {}
+            }
         }
         // Wipe everything the user would consider "current results".
         // Settings + drive_render_overrides + persisted.results_tab
@@ -295,7 +289,6 @@ impl SuperdupeApp {
             return;
         }
         self.is_scanning = true;
-        self.demo_mode = false;
         self.cancel.store(false, Ordering::Relaxed);
         // Once the engine completes successfully, it deletes the
         // checkpoint file; clear our flag so the next launch doesn't
@@ -307,15 +300,6 @@ impl SuperdupeApp {
             self.persisted.settings.clone(),
             self.cancel.clone(),
         );
-    }
-
-    pub fn start_demo(&mut self) {
-        if self.is_scanning {
-            return;
-        }
-        self.is_scanning = true;
-        self.demo_mode = true;
-        demo::spawn(self.tx.clone());
     }
 
     fn request_pause(&mut self) {
@@ -351,9 +335,18 @@ impl SuperdupeApp {
             // after a restart.
             self.persist_results_after_scan();
         }
-        let now = Instant::now();
-        for drive in self.state.drives.values_mut() {
-            drive.roll_throughput(now);
+        // Freeze the per-drive sparkline + LCN trace once the scan
+        // finishes. Without this guard the throughput window keeps
+        // ticking forward after we're done — old samples expire off
+        // the left edge and the line "decays" while showing no real
+        // activity, which makes it look like the engine is still
+        // doing something. We want the graph to lock at the last
+        // observed state when is_scanning flips false.
+        if self.is_scanning {
+            let now = Instant::now();
+            for drive in self.state.drives.values_mut() {
+                drive.roll_throughput(now);
+            }
         }
     }
 
@@ -392,7 +385,177 @@ impl SuperdupeApp {
                 self.persisted.results_tab = ResultsTab::Log;
             }
             RootsAction::Unsuperdupe => self.run_unsuperdupe_threaded(),
+            RootsAction::ArchiveDupes => self.pick_archive_dest_and_run(),
         }
+    }
+
+    /// Prompt for a destination folder and, if the user picks one,
+    /// kick off `run_archive_dupes_threaded`. The folder picker call
+    /// is blocking but cheap (a few hundred ms), and is on the UI
+    /// thread on purpose so the dialog parents to the app window.
+    fn pick_archive_dest_and_run(&mut self) {
+        if self.state.duplicates.is_empty() {
+            self.state.push_log(
+                crate::gui::events::LogLevel::Warn,
+                "Archive dupes: no duplicates in the current results — run a scan first.".into(),
+            );
+            return;
+        }
+        let dest = match rfd::FileDialog::new()
+            .set_title("Pick a folder to archive duplicates into")
+            .pick_folder()
+        {
+            Some(p) => p,
+            None => return, // user cancelled the dialog
+        };
+        self.run_archive_dupes_threaded(dest);
+    }
+
+    /// Move every non-keeper, non-reference duplicate into `dest`,
+    /// preserving its original drive-letter + folder hierarchy under
+    /// `dest`. Writes a JSON manifest beside the archived files so a
+    /// future restore can move them back. Runs off the UI thread.
+    fn run_archive_dupes_threaded(&self, dest: std::path::PathBuf) {
+        let tx = self.tx.clone();
+        let reference_roots: Vec<PathBuf> = self
+            .persisted
+            .roots
+            .iter()
+            .filter(|r| r.is_reference)
+            .map(|r| r.path.clone())
+            .collect();
+        // (group_size, content_hash, keeper, dupes-to-move). Keeper
+        // is recorded only for the manifest's "what was this a copy
+        // of" field; we never move or modify it.
+        let groups: Vec<(u64, String, PathBuf, Vec<PathBuf>)> = self
+            .state
+            .duplicates
+            .iter()
+            .filter_map(|g| {
+                if g.files.len() < 2 {
+                    return None;
+                }
+                let keeper = g.files[0].clone();
+                let dupes: Vec<PathBuf> = g.files[1..]
+                    .iter()
+                    .filter(|p| !reference_roots.iter().any(|r| p.starts_with(r)))
+                    .cloned()
+                    .collect();
+                if dupes.is_empty() {
+                    None
+                } else {
+                    Some((g.size, g.content_hash.clone(), keeper, dupes))
+                }
+            })
+            .collect();
+        let total: u64 = groups.iter().map(|(_, _, _, d)| d.len() as u64).sum();
+        std::thread::Builder::new()
+            .name("superdupe-archive".into())
+            .spawn(move || {
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Archiving {} file(s) from {} group(s) → {}",
+                    total,
+                    groups.len(),
+                    dest.display()
+                )));
+                let mut moved = 0u64;
+                let mut failed = 0u64;
+                let mut manifest_entries: Vec<ArchiveManifestEntry> = Vec::new();
+                for (size, hash, keeper, dupes) in &groups {
+                    for src in dupes {
+                        // Build the destination path: dest +
+                        // drive-letter folder (e.g. "C") + the rest
+                        // of the source path. Preserves the tree so
+                        // a restore is unambiguous.
+                        let archived = compose_archive_path(&dest, src);
+                        if let Some(parent) = archived.parent() {
+                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                failed += 1;
+                                let _ = tx.send(EngineEvent::Log {
+                                    level: crate::gui::events::LogLevel::Warn,
+                                    message: format!(
+                                        "archive mkdir failed · {} · {e}",
+                                        parent.display()
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                        // Try rename first (fast, atomic on same
+                        // volume); if it fails with cross-device we
+                        // fall back to copy+remove.
+                        let move_result = std::fs::rename(src, &archived).or_else(|_| {
+                            std::fs::copy(src, &archived)
+                                .and_then(|_| std::fs::remove_file(src))
+                                .map(|_| ())
+                        });
+                        match move_result {
+                            Ok(()) => {
+                                moved += 1;
+                                manifest_entries.push(ArchiveManifestEntry {
+                                    original_path: src.clone(),
+                                    archived_path: archived.clone(),
+                                    keeper_path: keeper.clone(),
+                                    content_hash: hash.clone(),
+                                    size: *size,
+                                });
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                let _ = tx.send(EngineEvent::Log {
+                                    level: crate::gui::events::LogLevel::Warn,
+                                    message: format!("archive move failed · {} · {e}", src.display()),
+                                });
+                            }
+                        }
+                    }
+                }
+                // Write the manifest. Filename includes a timestamp
+                // so multiple archive runs into the same folder
+                // produce distinct manifests instead of overwriting.
+                let manifest_path = dest.join(format!(
+                    "superdupe-archive-manifest-{}.json",
+                    iso_timestamp_for_filename()
+                ));
+                let manifest = ArchiveManifest {
+                    schema: "superdupe.archive.v1".into(),
+                    created_at_unix: now_unix(),
+                    destination: dest.clone(),
+                    entries: manifest_entries,
+                };
+                if let Err(e) = std::fs::write(
+                    &manifest_path,
+                    serde_json::to_vec_pretty(&manifest)
+                        .expect("serialise archive manifest"),
+                ) {
+                    let _ = tx.send(EngineEvent::Log {
+                        level: crate::gui::events::LogLevel::Warn,
+                        message: format!(
+                            "archive manifest write failed · {} · {e}",
+                            manifest_path.display()
+                        ),
+                    });
+                } else {
+                    let _ = tx.send(EngineEvent::Log {
+                        level: crate::gui::events::LogLevel::Info,
+                        message: format!(
+                            "archive manifest written · {}",
+                            manifest_path.display()
+                        ),
+                    });
+                }
+                let _ = tx.send(EngineEvent::Status(format!(
+                    "Archive complete · {moved} moved, {failed} failed."
+                )));
+                let _ = tx.send(EngineEvent::Log {
+                    level: crate::gui::events::LogLevel::Info,
+                    message: format!(
+                        "archive · moved={moved} failed={failed} dest={}",
+                        dest.display()
+                    ),
+                });
+            })
+            .expect("spawn archive thread");
     }
 
     fn dispatch_group_action(&mut self, action: GroupAction) {
@@ -695,22 +858,16 @@ impl eframe::App for SuperdupeApp {
         }
 
         let mut want_settings = false;
-        let mut want_demo = false;
         TopBottomPanel::top("header")
             .frame(Frame::default().fill(theme::BG).inner_margin(8.0))
             .show(ctx, |ui| {
-                let action = header::show(ui, &self.state, self.demo_mode, self.is_scanning);
-                match action {
-                    header::HeaderAction::OpenSettings => want_settings = true,
-                    header::HeaderAction::StartDemo => want_demo = true,
-                    _ => {}
+                let action = header::show(ui, &self.state, self.is_scanning);
+                if action == header::HeaderAction::OpenSettings {
+                    want_settings = true;
                 }
             });
         if want_settings {
             self.settings_open = true;
-        }
-        if want_demo {
-            self.start_demo();
         }
 
         // Overall progress strip sits directly under the header and
@@ -756,11 +913,15 @@ impl eframe::App for SuperdupeApp {
                         egui::ScrollArea::vertical()
                             .id_source("drive-scope")
                             .show(ui, |ui| {
+                                let frozen = (!self.is_scanning)
+                                    .then_some(self.state.scan_finished_at)
+                                    .flatten();
                                 drive_clicked = drive_scope::show(
                                     ui,
                                     &self.state,
                                     self.selected_drive,
                                     &mut self.drive_render_overrides,
+                                    frozen,
                                 );
                             });
                     },
@@ -869,3 +1030,88 @@ fn reveal_in_explorer(path: &std::path::Path) {
 
 #[cfg(not(windows))]
 fn reveal_in_explorer(_path: &std::path::Path) {}
+
+/// On-disk shape of the archive manifest. Written next to the moved
+/// files when "Archive dupes" runs, consumed by a future
+/// "restore-from-manifest" loader (out of scope for this commit).
+/// `schema` lets the loader pin a parser version so we can evolve
+/// fields without silently misreading old files.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArchiveManifest {
+    schema: String,
+    created_at_unix: u64,
+    destination: PathBuf,
+    entries: Vec<ArchiveManifestEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArchiveManifestEntry {
+    /// Where the file lived before the archive run.
+    original_path: PathBuf,
+    /// Where the file is now (under `destination`).
+    archived_path: PathBuf,
+    /// The "keeper" sibling that was left in place. Recorded so the
+    /// loader can verify the keeper still exists before offering to
+    /// restore (you probably don't want to put a file back next to
+    /// a keeper that's since been deleted).
+    keeper_path: PathBuf,
+    /// Content hash from the scan that produced this duplicate set.
+    /// Survives algo switches because the cache keys on `hash_algo`.
+    content_hash: String,
+    /// Bytes; redundant with the file on disk but handy for "are you
+    /// sure you want to restore X GiB?" prompts.
+    size: u64,
+}
+
+/// Map a source path like `C:\Users\X\foo.bin` to its archived
+/// position under `dest`, preserving the drive letter as a folder
+/// name. Drive `C:` becomes `dest/C/Users/X/foo.bin`. On non-Windows
+/// hosts we just join the path components after the root.
+fn compose_archive_path(dest: &Path, src: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut out = dest.to_path_buf();
+    for c in src.components() {
+        match c {
+            Component::Prefix(p) => {
+                if let Prefix::Disk(letter) = p.kind() {
+                    out.push(format!("{}", letter as char));
+                } else {
+                    // Verbatim or UNC — flatten under a literal name
+                    // so we don't try to push `\\?\` segments.
+                    out.push("verbatim");
+                }
+            }
+            Component::RootDir => { /* skip */ }
+            Component::Normal(s) => out.push(s),
+            Component::CurDir | Component::ParentDir => { /* ignore — abs paths only */ }
+        }
+    }
+    out
+}
+
+/// Filename-safe ISO-8601 in UTC: 2026-05-20T14-22-43Z.
+fn iso_timestamp_for_filename() -> String {
+    let secs = now_unix();
+    let days = (secs / 86_400) as i64;
+    let h = ((secs % 86_400) / 3600) as u32;
+    let m = ((secs % 3600) / 60) as u32;
+    let s = (secs % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    format!("{year:04}-{mo:02}-{day:02}T{h:02}-{m:02}-{s:02}Z")
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

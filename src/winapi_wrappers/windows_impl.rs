@@ -215,35 +215,55 @@ pub fn query_storage_device(volume_guid: &str) -> Result<StorageDeviceInfo> {
             None,
         )
     };
-    let has_seek_penalty = match seek_penalty_result {
-        Ok(()) => {
+    // Always consult the bus type too — some NVMe controllers'
+    // firmware reports IncursSeekPenalty=true even though NVMe by
+    // definition has no seek penalty. We trust bus type as ground
+    // truth: if the bus is unambiguously SSD (NVMe / SD / MMC), the
+    // device is an SSD regardless of what the per-device descriptor
+    // claims. The seek-penalty IOCTL is still the canonical answer
+    // for SATA where the bus is ambiguous.
+    let bus_says_ssd = bus_type_indicates_ssd(handle.0).ok();
+    let has_seek_penalty = match (seek_penalty_result, bus_says_ssd) {
+        // NVMe / SD / MMC bus → never an HDD, regardless of what the
+        // per-device IOCTL or its absence reports. This is the fix
+        // for "my NVMe root drive is detected as HDD": the bus alone
+        // is enough to know.
+        (_, Some(true)) => {
+            tracing::info!(
+                volume = %volume_guid,
+                "storage device type: SSD (bus type is NVMe/SD/MMC; bus type wins)"
+            );
+            false
+        }
+        // Bus says spinning ATA → trust it as HDD even if the
+        // per-device IOCTL was silent.
+        (_, Some(false)) => {
+            tracing::info!(
+                volume = %volume_guid,
+                "storage device type: HDD (bus type is ATA)"
+            );
+            true
+        }
+        // Ambiguous bus (SATA / SCSI / USB) — fall back to the
+        // per-device seek-penalty descriptor when it succeeds.
+        (Ok(()), None) => {
             let v = descr.IncursSeekPenalty.as_bool();
-            tracing::debug!(
+            tracing::info!(
                 volume = %volume_guid,
                 seek_penalty = v,
-                "storage device type: IncursSeekPenalty from IOCTL"
+                "storage device type: bus ambiguous; using IncursSeekPenalty IOCTL"
             );
             v
         }
-        Err(e) => {
-            // Common on NVMe + some USB enclosures: the seek-penalty
-            // descriptor isn't reported. Fall back to bus-type
-            // inspection. If even that fails, default to **false**
-            // (SSD) — modern primary drives are overwhelmingly SSDs;
-            // a wrong "assume HDD" disabled the scatter render on
-            // NVMe-root boxes and made the trace look stuck.
-            // unwrap_or(true) ⇒ ambiguous bus (USB enclosure, etc)
-            // defaults to SSD, matching the modern primary-drive
-            // baseline. Wrong "assume HDD" disabled the scatter
-            // render on NVMe-root machines.
-            let bus_says_ssd = bus_type_indicates_ssd(handle.0).unwrap_or(true);
+        // Bus ambiguous AND IOCTL failed: assume SSD (modern primary-
+        // drive baseline) and warn so we can see it in the log.
+        (Err(e), None) => {
             tracing::warn!(
                 volume = %volume_guid,
                 error = %e,
-                bus_says_ssd,
-                "seek-penalty IOCTL failed; falling back to bus-type heuristic"
+                "storage device type: bus ambiguous and seek-penalty IOCTL failed; defaulting to SSD"
             );
-            !bus_says_ssd
+            false
         }
     };
 

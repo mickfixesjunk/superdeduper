@@ -164,7 +164,9 @@ impl DriveLive {
         Self {
             info,
             reads: VecDeque::with_capacity(SCOPE_BUFFER),
-            throughput: VecDeque::with_capacity(64),
+            // Holds ~10 buckets/sec × 30s window = ~300 entries. The
+            // self-trim in roll_throughput keeps it bounded.
+            throughput: VecDeque::with_capacity(320),
             bytes_read: 0,
             last_lcn: 0,
             peak_mbps: 0.0,
@@ -182,12 +184,23 @@ impl DriveLive {
 
     /// Roll the throughput window — call once a frame from the UI.
     ///
-    /// At most one bucket per second; each bucket holds the bytes seen
-    /// in the trailing 1-second window. Old buckets fall off after
+    /// Buckets are at most ~100 ms apart (was 1 s), so the sparkline
+    /// gets ~10 samples per second and the trace looks like a
+    /// continuous line instead of stepping in big chunks. Each bucket
+    /// holds the bytes seen in the trailing 1-second window so the
+    /// reported MB/s is still a stable per-second figure, not a
+    /// tenth-of-a-second spike. Old buckets fall off after
     /// [`THROUGHPUT_WINDOW_SECS`] seconds so the sparkline self-trims.
     pub fn roll_throughput(&mut self, now: Instant) {
+        // 100 ms cadence ⇒ ~10 Hz update; below the screen refresh of
+        // a 60 Hz monitor so we still get a fresh frame every render,
+        // but cheap enough that we're not summing the reads buffer 60
+        // times a second on a quiet drive.
+        const BUCKET_PERIOD_MS: u64 = 100;
         let should_push = match self.throughput.back() {
-            Some((t, _)) => now.saturating_duration_since(*t) >= Duration::from_millis(950),
+            Some((t, _)) => {
+                now.saturating_duration_since(*t) >= Duration::from_millis(BUCKET_PERIOD_MS)
+            }
             None => !self.reads.is_empty(),
         };
         if should_push {

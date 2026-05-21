@@ -1,0 +1,15 @@
+# Local-development override: copy this file to `.cargo/config.toml`
+# (which is gitignored) and Cargo will redirect the river5 git
+# dependency to your local working copy at `../river5`. CI never sees
+# this file so it stays on the pinned-SHA git dep.
+#
+# Use when:
+#   * You're iterating on the river5 crate alongside superdupe.
+#   * You want changes in `../river5/src/lib.rs` to take effect on a
+#     plain `cargo build` here without committing+pushing first.
+#
+# Remove (or rename back to .example) when you want to verify CI's
+# exact dependency graph from a clean local checkout.
+
+[patch."https://github.com/mickfixesjunk/river5"]
+river5 = { path = "../river5" }
