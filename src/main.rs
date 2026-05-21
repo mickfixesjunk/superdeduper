@@ -38,9 +38,7 @@ fn run_drive_info() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         use std::path::PathBuf;
-        use superdupe::winapi_wrappers::{
-            bus_type_name, query_storage_device, volume_for_path,
-        };
+        use superdupe::winapi_wrappers::{bus_type_name, query_storage_device, volume_for_path};
         // Enumerate drive letters A..Z; skip any that GetDriveTypeW
         // says aren't real fixed/removable/network drives. Probing
         // is per-letter to avoid pulling in another IOCTL.
