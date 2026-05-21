@@ -79,10 +79,32 @@ fn finds_planted_duplicates() {
     let g = &dups[0];
     assert_eq!(g.files.len(), 3);
     assert_eq!(g.size, dup_payload.len() as u64);
-    assert!(g.files.contains(&a));
-    assert!(g.files.contains(&b));
-    assert!(g.files.contains(&c));
-    assert!(!g.files.contains(&d));
+
+    // Compare on basenames + suspect that file's directory rather
+    // than exact-path equality. Two cross-platform realities make
+    // exact comparison brittle:
+    //   * NTFS stores filenames in their on-disk case; %TEMP% can
+    //     report the same path in different case. MFT-derived
+    //     paths come back with NTFS's case, walker-derived paths
+    //     match the input.
+    //   * `std::fs::canonicalize` returns a verbatim `\\?\` form
+    //     on Windows; neither MFT nor walk paths carry that
+    //     prefix, so canonicalizing one side doesn't help either.
+    // We do verify that the dup-set is the right three files vs
+    // the unique one — that's the actual property we want.
+    let names: std::collections::HashSet<String> = g
+        .files
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .map(|s| s.to_lowercase())
+        .collect();
+    assert!(names.contains("a.bin"), "missing a.bin in {:?}", g.files);
+    assert!(names.contains("b.bin"), "missing b.bin in {:?}", g.files);
+    assert!(names.contains("c.bin"), "missing c.bin in {:?}", g.files);
+    assert!(
+        !names.contains("unique.bin"),
+        "unique.bin should NOT be in the dup group"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
