@@ -68,7 +68,18 @@ jobs:
           } catch {
             Write-Host "::warning::Could not add Defender exclusions: $_"
           }
-      - run: cargo test --workspace --locked -- --test-threads=1
+      # Run unit tests + smoke; skip the proptest-driven `properties`
+      # binary on Windows. The property tests verify the algorithm
+      # (hashing / size grouping / layout / dedup invariants) which
+      # is OS-agnostic — Linux CI already covers them. On Windows
+      # each test case opens up to ~25 files with
+      # FSCTL_GET_RETRIEVAL_POINTERS, and the runner's I/O subsystem
+      # turns 32 cases × 3 tests into a 20+ minute run even with
+      # Defender exclusions. The Windows-specific surface area (MFT
+      # enum, USN journal, IOCTL wrappers) has dedicated unit tests
+      # in src/winapi_wrappers/windows_impl.rs that DO run here.
+      - run: cargo test --workspace --locked --lib --bins -- --test-threads=1
+      - run: cargo test --workspace --locked --test smoke -- --test-threads=1
       - run: cargo build --release --locked --features gui --bin superdupe-gui
       - run: cargo build --release --locked --bin superdupe
       # Upload the built EXEs as a workflow artifact on every push to
