@@ -2908,6 +2908,7 @@ dependencies = [
 [[package]]
 name = "river5"
 version = "0.1.0"
+source = "git+https://github.com/mdreeling/river5?rev=b38e7b5#b38e7b5451f8ce5a93ff88884e3c4b998899ed05"
 dependencies = [
  "cc",
 ]
