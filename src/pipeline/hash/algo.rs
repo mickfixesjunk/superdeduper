@@ -71,23 +71,28 @@ impl HashAlgo {
     }
 }
 
-/// Backend dispatch for streaming-hashed content. The two variants
-/// have very different sizes (`blake3::Hasher` is ~2 KiB while
-/// `river5::Hasher` is small) — we don't `Box` to dodge the
-/// `large_enum_variant` lint because the hasher is constructed on
-/// every per-file hash call and an extra heap allocation per file
-/// would more than wipe out any size saving on this hot path.
+/// Backend dispatch for streaming-hashed content. Both variants
+/// are now stack-allocatable — `blake3::Hasher` is ~2 KiB inline
+/// and `river5::StackHasher` is ~1 KiB inline (StackHasher avoids
+/// the per-call `river5_new()` heap allocation that
+/// `river5::Hasher` paid). This matters because Tier 0
+/// (format-aware) and Tier 3 large-file paths both construct a
+/// `ContentHasher` per file; on river5 the per-file heap alloc
+/// produced an asymmetric ~3× wall-clock penalty vs BLAKE3 on
+/// real C:\Users scans (the BLAKE3 `Hasher::new()` is stack-only).
+/// `StackHasher` was added river5-side specifically to close this
+/// gap; see river5 commit fd854fe (`feature/stack-hasher`).
 #[allow(clippy::large_enum_variant)]
 pub enum ContentHasher {
     Blake3(blake3::Hasher),
-    River5(river5::Hasher),
+    River5(river5::StackHasher),
 }
 
 impl ContentHasher {
     pub fn new(algo: HashAlgo) -> Self {
         match algo {
             HashAlgo::Blake3 => ContentHasher::Blake3(blake3::Hasher::new()),
-            HashAlgo::River5 => ContentHasher::River5(river5::Hasher::new()),
+            HashAlgo::River5 => ContentHasher::River5(river5::StackHasher::new()),
         }
     }
 
