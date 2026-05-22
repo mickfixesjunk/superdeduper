@@ -181,10 +181,7 @@ pub enum EngineEvent {
     /// running count of processed items; `current` is the path
     /// or short label being worked on right now (shown in the modal
     /// so users see motion).
-    ActionProgress {
-        done: u64,
-        current: Option<String>,
-    },
+    ActionProgress { done: u64, current: Option<String> },
     /// The action thread is done. `summary` becomes the status-line
     /// message. The modal closes the next time `drain_events` runs.
     ActionFinished { summary: String },

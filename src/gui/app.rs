@@ -1347,7 +1347,10 @@ impl SuperdeduperApp {
                         "{:?} · {} file(s) → keeper {}",
                         action,
                         total,
-                        keeper.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| keeper.display().to_string())
+                        keeper
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| keeper.display().to_string())
                     ),
                     total: Some(total),
                 });
@@ -1392,10 +1395,7 @@ impl SuperdeduperApp {
                 }
                 let label = if user_stopped { "stopped" } else { "complete" };
                 let _ = tx.send(EngineEvent::ActionFinished {
-                    summary: format!(
-                        "Action {label} · {} done, {} failed.",
-                        done, failed
-                    ),
+                    summary: format!("Action {label} · {} done, {} failed.", done, failed),
                 });
             })
             .expect("spawn dedupe thread");
@@ -1986,12 +1986,18 @@ fn reveal_in_explorer(path: &std::path::Path) {
     // Windows) so explorer doesn't trip on forward slashes coming
     // out of WSL-cross-compiled binaries.
     let arg = format!("/select,{}", path.display());
-    if std::process::Command::new("explorer.exe").arg(&arg).spawn().is_err() {
+    if std::process::Command::new("explorer.exe")
+        .arg(&arg)
+        .spawn()
+        .is_err()
+    {
         // Fallback: open the parent folder. /select can fail if the
         // file vanished between the click and the spawn (e.g. another
         // action just renamed it).
         if let Some(parent) = path.parent() {
-            let _ = std::process::Command::new("explorer.exe").arg(parent).spawn();
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(parent)
+                .spawn();
         }
     }
 }
@@ -2013,7 +2019,9 @@ fn open_file_default_app(path: &std::path::Path) {
 #[cfg(windows)]
 fn open_enclosing_folder(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
-        let _ = std::process::Command::new("explorer.exe").arg(parent).spawn();
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(parent)
+            .spawn();
     }
 }
 

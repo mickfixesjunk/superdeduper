@@ -27,11 +27,7 @@ pub fn show(ctx: &egui::Context, action: &ActionState) -> bool {
         egui::Id::new("action-progress-dim"),
     ));
     let screen = ctx.screen_rect();
-    painter.rect_filled(
-        screen,
-        0.0,
-        Color32::from_rgba_unmultiplied(0, 0, 0, 130),
-    );
+    painter.rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 130));
 
     let mut cancelled = false;
     egui::Window::new(&action.name)

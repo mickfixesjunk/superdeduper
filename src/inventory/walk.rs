@@ -279,7 +279,11 @@ fn file_id_for(path: &Path) -> Option<(u64, Option<String>)> {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),

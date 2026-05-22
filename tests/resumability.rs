@@ -47,6 +47,7 @@ fn sample_checkpoint() -> Checkpoint {
             PathBuf::from("C:\\a\\dup1.bin"),
             PathBuf::from("C:\\a\\dup2.bin"),
         ],
+        link_equivalent: false,
     });
     cp.record(&DuplicateGroupSummary {
         size: 4096,
@@ -55,6 +56,7 @@ fn sample_checkpoint() -> Checkpoint {
             PathBuf::from("C:\\b\\dup3.bin"),
             PathBuf::from("C:\\b\\dup4.bin"),
         ],
+        link_equivalent: false,
     });
     cp.saved_inventory = Some(vec![SavedFileEntry {
         path: PathBuf::from("C:\\Users\\Audio\\f.bin"),
