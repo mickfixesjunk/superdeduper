@@ -33,8 +33,16 @@ pub enum GroupAction {
         keeper: PathBuf,
         dupes: Vec<PathBuf>,
     },
-    /// Open the keeper's containing folder in Explorer.
+    /// Highlight the keeper in Explorer with the file selected
+    /// inside its parent folder (Windows: `explorer.exe /select,<path>`).
     Reveal(PathBuf),
+    /// Open the file with the user's default application — same as
+    /// double-clicking it in Explorer.
+    OpenFile(PathBuf),
+    /// Open the enclosing directory in Explorer with no file
+    /// selected. Distinct from Reveal because users sometimes want
+    /// "show me this folder" vs "show me this file inside its folder".
+    OpenFolder(PathBuf),
     /// Safe-mode: append `.superdeduper` to every non-keeper. Reversible
     /// via Unsuperdeduper; nothing is deleted.
     SafeRenameOthers {
@@ -76,7 +84,7 @@ pub struct GroupsTableState {
     /// Records "this group has been acted on" so we hide the buttons
     /// after the action is queued (prevents double-clicks before the
     /// UI re-syncs).
-    acted: hashbrown::HashSet<usize>,
+    pub acted: hashbrown::HashSet<usize>,
     /// Sticky selection for the bulk-action dropdown; persists across
     /// re-renders so the user doesn't have to re-pick on every scan.
     pub bulk_action: BulkAction,
@@ -369,7 +377,29 @@ pub fn show_filtered(
                                         }
                                         if ui
                                             .small_button("📂")
-                                            .on_hover_text("Open the keeper in Explorer.")
+                                            .on_hover_text(
+                                                "Open the keeper file with the default app \
+                                                 (same as double-clicking it in Explorer).",
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked = Some(GroupAction::OpenFile(k.clone()));
+                                        }
+                                        if ui
+                                            .small_button("📁")
+                                            .on_hover_text(
+                                                "Open the enclosing folder in Explorer.",
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked = Some(GroupAction::OpenFolder(k.clone()));
+                                        }
+                                        if ui
+                                            .small_button("🎯")
+                                            .on_hover_text(
+                                                "Highlight the keeper in its folder (Explorer \
+                                                 with the file selected).",
+                                            )
                                             .clicked()
                                         {
                                             clicked = Some(GroupAction::Reveal(k.clone()));

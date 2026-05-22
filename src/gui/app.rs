@@ -739,6 +739,18 @@ impl SuperdeduperApp {
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;
                         }
+                        EngineEvent::ActionFinished { .. } => {
+                            // Action's done — clear the per-group
+                            // "acted" badge so the row's buttons come
+                            // back. The user may want to re-trigger
+                            // (e.g. if the first run had failures);
+                            // hiding the buttons forever was a UX
+                            // bug. Safe because the modal blocks
+                            // overlapping actions, so at most one
+                            // group has been touched while the action
+                            // was running.
+                            self.groups_state.acted.clear();
+                        }
                         EngineEvent::DriveDiscovered(info) => {
                             // Restore any saved override for this
                             // volume into the live HashMap so the
@@ -1036,8 +1048,12 @@ impl SuperdeduperApp {
     /// immediately; everything else stashes into `pending_destructive`
     /// for the modal in `update()` to handle.
     fn dispatch_group_action(&mut self, action: GroupAction) {
-        // Reveal touches nothing — bypass the modal unconditionally.
-        if matches!(action, GroupAction::Reveal(_)) {
+        // Reveal / Open* touch nothing — bypass the modal
+        // unconditionally. They're navigational, not destructive.
+        if matches!(
+            action,
+            GroupAction::Reveal(_) | GroupAction::OpenFile(_) | GroupAction::OpenFolder(_)
+        ) {
             return self.dispatch_group_action_unchecked(action);
         }
         if self.persisted.settings.bypass_destructive_confirmation {
@@ -1057,6 +1073,8 @@ impl SuperdeduperApp {
                 self.run_action_threaded(DedupeAction::Hardlink, keeper, dupes);
             }
             GroupAction::Reveal(path) => reveal_in_explorer(&path),
+            GroupAction::OpenFile(path) => open_file_default_app(&path),
+            GroupAction::OpenFolder(path) => open_enclosing_folder(&path),
             GroupAction::SafeRenameOthers { keeper, dupes } => {
                 self.run_action_threaded(DedupeAction::SafeRename, keeper, dupes);
             }
@@ -1941,24 +1959,70 @@ fn describe_destructive_action(action: &GroupAction) -> String {
              JSON is written so the move can be restored later. Reference paths are never touched."
                 .to_string()
         }
-        // Reveal should never reach this code path — it bypasses the
-        // modal in `dispatch_group_action` — but document it
-        // anyway in case future refactors widen the dispatcher.
+        // Reveal / Open* should never reach this code path — they
+        // bypass the modal in `dispatch_group_action` — but
+        // document it anyway in case future refactors widen the
+        // dispatcher.
         GroupAction::Reveal(_) => {
             "(internal: Reveal-in-Explorer reached the destructive modal — this is a bug)".into()
+        }
+        GroupAction::OpenFile(_) => {
+            "(internal: Open-file reached the destructive modal — this is a bug)".into()
+        }
+        GroupAction::OpenFolder(_) => {
+            "(internal: Open-folder reached the destructive modal — this is a bug)".into()
         }
     }
 }
 
 #[cfg(windows)]
 fn reveal_in_explorer(path: &std::path::Path) {
-    let _ = std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .spawn();
+    // /select,<path> highlights the file in its parent folder.
+    // The comma is a literal separator — explorer.exe expects
+    // /select,PATH with no space after the comma. Spaces in the
+    // path are fine because we pass /select,PATH as a single
+    // command-line argument and Command::arg handles its own
+    // quoting. Use the OS-native path repr (backslashes on
+    // Windows) so explorer doesn't trip on forward slashes coming
+    // out of WSL-cross-compiled binaries.
+    let arg = format!("/select,{}", path.display());
+    if std::process::Command::new("explorer.exe").arg(&arg).spawn().is_err() {
+        // Fallback: open the parent folder. /select can fail if the
+        // file vanished between the click and the spawn (e.g. another
+        // action just renamed it).
+        if let Some(parent) = path.parent() {
+            let _ = std::process::Command::new("explorer.exe").arg(parent).spawn();
+        }
+    }
+}
+
+/// Open the file with the user's default application (the
+/// equivalent of double-clicking it in Explorer). Used by the
+/// "📂 Open file" button on each group row.
+#[cfg(windows)]
+fn open_file_default_app(path: &std::path::Path) {
+    // `explorer.exe <file>` invokes the file's registered handler,
+    // matching what double-click does. Using `cmd /c start` works
+    // too but spawns an extra console window on some shells.
+    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+}
+
+/// Open the file's enclosing directory in Explorer, no file
+/// selected. Distinct from `reveal_in_explorer` which highlights
+/// the file inside the folder.
+#[cfg(windows)]
+fn open_enclosing_folder(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("explorer.exe").arg(parent).spawn();
+    }
 }
 
 #[cfg(not(windows))]
 fn reveal_in_explorer(_path: &std::path::Path) {}
+#[cfg(not(windows))]
+fn open_file_default_app(_path: &std::path::Path) {}
+#[cfg(not(windows))]
+fn open_enclosing_folder(_path: &std::path::Path) {}
 
 /// Map a source path like `C:\Users\X\foo.bin` to its archived
 /// position under `dest`, preserving the drive letter as a folder
