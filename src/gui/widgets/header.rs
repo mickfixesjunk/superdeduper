@@ -71,7 +71,7 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, _is_scanning: boo
                 big_stat(
                     ui,
                     "Elapsed",
-                    &format!("{:.1}s", elapsed.as_secs_f64()),
+                    &crate::gui::state::fmt_wallclock(elapsed),
                     theme::TEXT_HI,
                 );
             }
