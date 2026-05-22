@@ -193,15 +193,37 @@ where
 
         callback(WalkEvent::FileFound { path: &path, size });
 
+        // On Windows, populate file_ref + volume_guid from
+        // `GetFileInformationByHandle`. The 64-bit file id (high+low
+        // halves) is the NTFS FileReferenceNumber for the inode, and
+        // the volume serial number identifies the volume. Two
+        // hardlinks of the same file share both values. Without this,
+        // the Stage-4 link_equivalent check
+        // (pipeline/hash.rs::run_group) had no way to detect
+        // hardlinks via the fallback walker, which is the path that
+        // runs when MFT-enum is unavailable (non-elevated process —
+        // CreateFileW on \\?\Volume{…} returns ACCESS_DENIED).
+        // We deliberately call the Win32 API rather than
+        // `std::os::windows::fs::MetadataExt::file_index` because
+        // the latter is unstable behind `windows_by_handle`.
+        // Failure (e.g. file locked, AV deleted between scan and
+        // open) is silent — we just keep the zero/None defaults
+        // and the file won't be hardlink-detected. Better than
+        // refusing to enumerate the rest of the corpus.
+        #[cfg(windows)]
+        let (file_ref, volume_guid) = file_id_for(&path).unwrap_or((0, None));
+        #[cfg(not(windows))]
+        let (file_ref, volume_guid) = (0u64, None);
+
         out.push(FileEntry {
             path,
             size,
             mtime: filetime_ticks(&metadata),
-            file_ref: 0,
+            file_ref,
             parent_ref: 0,
             usn: 0,
             attributes: 0,
-            volume_guid: None,
+            volume_guid,
         });
     }
     Ok(())
@@ -237,4 +259,56 @@ fn filetime_ticks(m: &std::fs::Metadata) -> i64 {
             UNIX_EPOCH_AS_FILETIME + (d.as_nanos() / 100) as i64
         })
         .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn file_id_for(path: &Path) -> Option<(u64, Option<String>)> {
+    // Open the file with FILE_FLAG_BACKUP_SEMANTICS so the call
+    // works for directories as well (we don't use it for dirs
+    // currently but the flag is cheap and removes a footgun for
+    // future callers). Read access is plenty; query-only calls
+    // don't need write. FILE_SHARE_READ|WRITE|DELETE matches what
+    // every other Win32 file open in this codebase uses so we
+    // don't trip on someone else holding the file open.
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        .ok()?
+    };
+    if handle.is_invalid() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info).is_ok() };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if !ok {
+        return None;
+    }
+    // Compose the 64-bit file id from its two halves. This is the
+    // FileReferenceNumber for the inode — two hardlinks share it.
+    let file_ref = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+    // Encode the volume serial as a string so it fits the existing
+    // Option<String> field. Two paths on the same volume produce the
+    // same string; on different volumes they differ.
+    let vol = Some(format!("vol-serial:0x{:08x}", info.dwVolumeSerialNumber));
+    Some((file_ref, vol))
 }

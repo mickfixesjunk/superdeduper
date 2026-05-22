@@ -107,7 +107,11 @@ fn summarize(groups: &[DuplicateGroup]) -> Summary {
     for g in groups {
         files += g.files.len();
         let n = g.files.len() as u64;
-        if n > 1 {
+        // Hardlinked groups (link_equivalent) already share storage
+        // on disk; there's nothing to reclaim by collapsing them.
+        // Counting them overstates the rolling Reclaimable header
+        // figure that downstream tooling reads.
+        if n > 1 && !g.link_equivalent {
             reclaimable_bytes = reclaimable_bytes.saturating_add(g.size.saturating_mul(n - 1));
         }
     }
