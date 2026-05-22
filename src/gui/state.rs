@@ -111,6 +111,24 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// Snapshot of an in-flight long-running user-requested action
+/// (Safe-rename, Archive, Recycle, Hardlink, Unsuperdeduper). Drives
+/// the spinner-modal that pops up while the worker thread is
+/// processing. `total = None` means the worker can't predict its
+/// total upfront (Unsuperdeduper walks for `.superdeduper` markers)
+/// and the modal renders an indeterminate spinner with a running
+/// "X processed" counter.
+#[derive(Debug, Clone)]
+pub struct ActionState {
+    pub name: String,
+    pub total: Option<u64>,
+    pub done: u64,
+    /// Path (or short label) currently being processed. Shown in the
+    /// modal so the user sees motion on what would otherwise look
+    /// like a frozen spinner.
+    pub current: Option<String>,
+}
+
 /// One per-volume summary populated by `App::refresh_cache_banner`
 /// before paint. Lets the banner widget display `{count} files
 /// cached, captured {age}` without re-querying SQLite per frame.
@@ -136,6 +154,11 @@ pub struct UiState {
     /// effect when settings.always_use_cache is `true` (banner
     /// hidden, cache silently used).
     pub use_cache_for_next_scan: bool,
+    /// `Some` while a worker thread is processing a destructive
+    /// action (recycle, hardlink, safe-rename, archive,
+    /// unsuperdeduper). Cleared on `ActionFinished`. Drives the
+    /// modal-with-spinner overlay.
+    pub action_in_progress: Option<ActionState>,
 
     pub stage_counts: HashMap<Stage, StageCounter>,
     pub drives: HashMap<DriveId, DriveLive>,
@@ -157,6 +180,7 @@ impl Default for UiState {
             // common path (user wants the cache) is a single Start
             // click. Flipping off is explicit per-scan opt-out.
             use_cache_for_next_scan: true,
+            action_in_progress: None,
             stage_counts: HashMap::new(),
             drives: HashMap::new(),
             duplicates: Vec::new(),
@@ -406,6 +430,24 @@ impl UiState {
                     total,
                     eta_secs,
                 };
+            }
+            EngineEvent::ActionStarted { name, total } => {
+                self.action_in_progress = Some(ActionState {
+                    name,
+                    total,
+                    done: 0,
+                    current: None,
+                });
+            }
+            EngineEvent::ActionProgress { done, current } => {
+                if let Some(a) = &mut self.action_in_progress {
+                    a.done = done;
+                    a.current = current;
+                }
+            }
+            EngineEvent::ActionFinished { summary } => {
+                self.action_in_progress = None;
+                self.status = summary;
             }
         }
     }

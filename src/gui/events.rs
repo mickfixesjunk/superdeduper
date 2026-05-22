@@ -159,6 +159,26 @@ pub enum EngineEvent {
         total: u64,
         eta_secs: Option<f32>,
     },
+    /// A long-running user-requested action (Safe-rename, Archive,
+    /// Recycle, Hardlink, Unsuperdeduper, Restore-from-manifest)
+    /// has begun on a background thread. The GUI shows a modal with
+    /// a spinner + counter for the duration. `total = None` means
+    /// the action can't predict its total ahead of time (e.g.
+    /// Unsuperdeduper walks the tree looking for `.superdeduper`
+    /// markers); the modal then shows "X processed so far" rather
+    /// than a determinate progress bar.
+    ActionStarted { name: String, total: Option<u64> },
+    /// Per-item progress within the active action. `done` is the
+    /// running count of processed items; `current` is the path
+    /// or short label being worked on right now (shown in the modal
+    /// so users see motion).
+    ActionProgress {
+        done: u64,
+        current: Option<String>,
+    },
+    /// The action thread is done. `summary` becomes the status-line
+    /// message. The modal closes the next time `drain_events` runs.
+    ActionFinished { summary: String },
 }
 
 /// Coarse "what's the engine doing right now" tag. Drives the

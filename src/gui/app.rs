@@ -108,6 +108,13 @@ pub struct SuperdeduperApp {
     /// session. Distinct from `persisted.settings.dismissed_alpha_warning`,
     /// which suppresses the modal across launches.
     alpha_warning_acked_session: bool,
+    /// Shared cancel flag for in-flight destructive actions
+    /// (recycle / hardlink / safe-rename / archive / unsuperdeduper).
+    /// Clicking Stop on the progress modal flips it to `true`;
+    /// worker threads check it between items and bail. Separate from
+    /// `cancel` (the scan-wide cancel) so cancelling an action
+    /// doesn't tear down an unrelated scan.
+    action_cancel: Arc<AtomicBool>,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -183,6 +190,7 @@ impl SuperdeduperApp {
             pending_destructive: None,
             destructive_confirm_input: String::new(),
             alpha_warning_acked_session: false,
+            action_cancel: Arc::new(AtomicBool::new(false)),
         };
         let mut app = app;
         // Populate cache-banner state on first launch — roots may
@@ -630,16 +638,28 @@ impl SuperdeduperApp {
     /// previously-loaded manifest. Runs on a worker thread; reports
     /// progress via the event channel.
     fn run_archive_restore_threaded(&self, manifest: crate::gui::archive::ArchiveManifest) {
+        self.action_cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.action_cancel);
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("superdeduper-archive-restore".into())
             .spawn(move || {
                 let total = manifest.entries.len() as u64;
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Restoring {total} archived file(s) from manifest…"
-                )));
+                let _ = tx.send(EngineEvent::ActionStarted {
+                    name: format!("↪ Archive restore · {total} file(s)"),
+                    total: Some(total),
+                });
                 let mut summary = crate::gui::archive::RestoreSummary::default();
-                for entry in &manifest.entries {
+                let mut user_stopped = false;
+                for (i, entry) in manifest.entries.iter().enumerate() {
+                    if cancel.load(Ordering::Relaxed) {
+                        user_stopped = true;
+                        break;
+                    }
+                    let _ = tx.send(EngineEvent::ActionProgress {
+                        done: i as u64,
+                        current: Some(entry.original_path.display().to_string()),
+                    });
                     match crate::gui::archive::restore_one(entry) {
                         crate::gui::archive::RestoreOutcome::Restored => {
                             summary.restored += 1;
@@ -674,19 +694,22 @@ impl SuperdeduperApp {
                         }
                     }
                 }
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Restore complete · {} of {} restored ({} missing, {} conflicts, {} I/O errors).",
-                    summary.restored,
-                    total,
-                    summary.archived_missing,
-                    summary.original_exists,
-                    summary.io_errors
-                )));
+                let label = if user_stopped { "stopped" } else { "complete" };
                 let _ = tx.send(EngineEvent::Log {
                     level: crate::gui::events::LogLevel::Info,
                     message: format!(
-                        "archive restore · restored={} missing={} conflicts={} errors={}",
+                        "archive restore · restored={} missing={} conflicts={} errors={} stopped={user_stopped}",
                         summary.restored,
+                        summary.archived_missing,
+                        summary.original_exists,
+                        summary.io_errors
+                    ),
+                });
+                let _ = tx.send(EngineEvent::ActionFinished {
+                    summary: format!(
+                        "Restore {label} · {} of {} restored ({} missing, {} conflicts, {} I/O errors).",
+                        summary.restored,
+                        total,
                         summary.archived_missing,
                         summary.original_exists,
                         summary.io_errors
@@ -848,6 +871,8 @@ impl SuperdeduperApp {
     /// `dest`. Writes a JSON manifest beside the archived files so a
     /// future restore can move them back. Runs off the UI thread.
     fn run_archive_dupes_threaded(&self, dest: std::path::PathBuf) {
+        self.action_cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.action_cancel);
         let tx = self.tx.clone();
         let reference_roots: Vec<PathBuf> = self
             .persisted
@@ -884,18 +909,32 @@ impl SuperdeduperApp {
         std::thread::Builder::new()
             .name("superdeduper-archive".into())
             .spawn(move || {
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Archiving {} file(s) from {} group(s) → {}",
-                    total,
-                    groups.len(),
-                    dest.display()
-                )));
+                let _ = tx.send(EngineEvent::ActionStarted {
+                    name: format!(
+                        "📦 Archive · {} file(s) from {} group(s) → {}",
+                        total,
+                        groups.len(),
+                        dest.display()
+                    ),
+                    total: Some(total),
+                });
                 let mut moved = 0u64;
                 let mut failed = 0u64;
+                let mut user_stopped = false;
+                let mut processed = 0u64;
                 let mut manifest_entries: Vec<crate::gui::archive::ArchiveManifestEntry> =
                     Vec::new();
-                for (size, hash, keeper, dupes) in &groups {
+                'outer: for (size, hash, keeper, dupes) in &groups {
                     for src in dupes {
+                        if cancel.load(Ordering::Relaxed) {
+                            user_stopped = true;
+                            break 'outer;
+                        }
+                        let _ = tx.send(EngineEvent::ActionProgress {
+                            done: processed,
+                            current: Some(src.display().to_string()),
+                        });
+                        processed += 1;
                         // Build the destination path: dest +
                         // drive-letter folder (e.g. "C") + the rest
                         // of the source path. Preserves the tree so
@@ -976,15 +1015,16 @@ impl SuperdeduperApp {
                         message: format!("archive manifest written · {}", manifest_path.display()),
                     });
                 }
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Archive complete · {moved} moved, {failed} failed."
-                )));
+                let label = if user_stopped { "stopped" } else { "complete" };
                 let _ = tx.send(EngineEvent::Log {
                     level: crate::gui::events::LogLevel::Info,
                     message: format!(
-                        "archive · moved={moved} failed={failed} dest={}",
+                        "archive · moved={moved} failed={failed} stopped={user_stopped} dest={}",
                         dest.display()
                     ),
+                });
+                let _ = tx.send(EngineEvent::ActionFinished {
+                    summary: format!("Archive {label} · {moved} moved, {failed} failed."),
                 });
             })
             .expect("spawn archive thread");
@@ -1037,6 +1077,11 @@ impl SuperdeduperApp {
     /// safe-rename every non-keeper that isn't a reference path. Runs
     /// on a worker thread so the UI keeps responding.
     fn run_safe_rename_all_threaded(&self) {
+        // Fresh cancel-flag for this run; ANY stale Stop click from
+        // a previous action stays cleared so this thread doesn't
+        // bail on its first iteration.
+        self.action_cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.action_cancel);
         let tx = self.tx.clone();
         let reference_roots: Vec<PathBuf> = self
             .persisted
@@ -1072,17 +1117,33 @@ impl SuperdeduperApp {
         std::thread::Builder::new()
             .name("superdeduper-safe-rename-all".into())
             .spawn(move || {
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Safe-renaming {} file(s) across {} group(s)…",
-                    total,
-                    groups.len()
-                )));
+                let _ = tx.send(EngineEvent::ActionStarted {
+                    name: format!(
+                        "🛡 Safe-rename · {} file(s) across {} group(s)",
+                        total,
+                        groups.len()
+                    ),
+                    total: Some(total),
+                });
                 let mut done = 0u64;
                 let mut failed = 0u64;
                 let mut skipped = 0u64;
                 let mut renamed_paths: Vec<PathBuf> = Vec::new();
-                for (_keeper, dupes) in &groups {
+                let mut processed = 0u64;
+                let mut user_stopped = false;
+                'outer: for (_keeper, dupes) in &groups {
                     for d in dupes {
+                        if cancel.load(Ordering::Relaxed) {
+                            user_stopped = true;
+                            break 'outer;
+                        }
+                        // Emit progress before each file so the
+                        // modal's "current" line updates to the
+                        // file we're about to touch.
+                        let _ = tx.send(EngineEvent::ActionProgress {
+                            done: processed,
+                            current: Some(d.display().to_string()),
+                        });
                         match crate::dedupe::action_safe_rename(d) {
                             Ok(()) => {
                                 done += 1;
@@ -1104,6 +1165,7 @@ impl SuperdeduperApp {
                                 }
                             }
                         }
+                        processed += 1;
                     }
                 }
                 // Persist the renamed set so a restart picks up where
@@ -1119,16 +1181,24 @@ impl SuperdeduperApp {
                         }
                     }
                 }
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Safe-rename complete · {} renamed, {} skipped, {} failed.",
-                    done, skipped, failed
-                )));
+                let summary = if user_stopped {
+                    format!(
+                        "Safe-rename stopped by user · {} renamed, {} skipped, {} failed.",
+                        done, skipped, failed
+                    )
+                } else {
+                    format!(
+                        "Safe-rename complete · {} renamed, {} skipped, {} failed.",
+                        done, skipped, failed
+                    )
+                };
                 let _ = tx.send(EngineEvent::Log {
                     level: crate::gui::events::LogLevel::Info,
                     message: format!(
-                        "safe-rename · renamed={done} skipped={skipped} failed={failed}"
+                        "safe-rename · renamed={done} skipped={skipped} failed={failed} stopped={user_stopped}"
                     ),
                 });
+                let _ = tx.send(EngineEvent::ActionFinished { summary });
             })
             .expect("spawn safe-rename-all thread");
     }
@@ -1166,6 +1236,8 @@ impl SuperdeduperApp {
     /// Walk every root (incl. reference) and rename any
     /// `*.superdeduper` file back to its original. No prior scan needed.
     fn run_unsuperdeduper_threaded(&self) {
+        self.action_cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.action_cancel);
         let tx = self.tx.clone();
         let roots: Vec<PathBuf> = self
             .persisted
@@ -1176,14 +1248,27 @@ impl SuperdeduperApp {
         std::thread::Builder::new()
             .name("superdeduper-unsuperdeduper".into())
             .spawn(move || {
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Unsuperduping {} root(s)…",
-                    roots.len()
-                )));
+                let _ = tx.send(EngineEvent::ActionStarted {
+                    name: format!("↩ Unsuperdeduper · {} root(s)", roots.len()),
+                    // Unsuperdeduper walks the tree; we don't know
+                    // the count of `.superdeduper` markers upfront.
+                    // Spinner is indeterminate, counter shows running
+                    // "X renamed so far".
+                    total: None,
+                });
                 let mut total_renamed = 0u64;
                 let mut total_skipped = 0u64;
                 let mut total_errors = 0u64;
+                let mut user_stopped = false;
                 for r in &roots {
+                    if cancel.load(Ordering::Relaxed) {
+                        user_stopped = true;
+                        break;
+                    }
+                    let _ = tx.send(EngineEvent::ActionProgress {
+                        done: total_renamed,
+                        current: Some(r.display().to_string()),
+                    });
                     match crate::dedupe::unsuperdeduper_root(r) {
                         Ok((renamed, skipped, errors)) => {
                             total_renamed += renamed;
@@ -1217,15 +1302,20 @@ impl SuperdeduperApp {
                     state.renamed_paths.clear();
                     let _ = crate::gui::results_store::save(&state);
                 }
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Unsuperdeduper complete · {} renamed, {} skipped, {} errors.",
-                    total_renamed, total_skipped, total_errors,
-                )));
+                let label = if user_stopped { "stopped" } else { "complete" };
+                let _ = tx.send(EngineEvent::ActionFinished {
+                    summary: format!(
+                        "Unsuperdeduper {label} · {} renamed, {} skipped, {} errors.",
+                        total_renamed, total_skipped, total_errors,
+                    ),
+                });
             })
             .expect("spawn unsuperdeduper thread");
     }
 
     fn run_action_threaded(&self, action: DedupeAction, keeper: PathBuf, dupes: Vec<PathBuf>) {
+        self.action_cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.action_cancel);
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("superdeduper-action".into())
@@ -1233,13 +1323,26 @@ impl SuperdeduperApp {
                 let mut done = 0u64;
                 let mut failed = 0u64;
                 let mut renamed_paths: Vec<PathBuf> = Vec::new();
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "{:?}: {} file(s) → keeper {}",
-                    action,
-                    dupes.len(),
-                    keeper.display()
-                )));
-                for d in &dupes {
+                let total = dupes.len() as u64;
+                let _ = tx.send(EngineEvent::ActionStarted {
+                    name: format!(
+                        "{:?} · {} file(s) → keeper {}",
+                        action,
+                        total,
+                        keeper.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| keeper.display().to_string())
+                    ),
+                    total: Some(total),
+                });
+                let mut user_stopped = false;
+                for (i, d) in dupes.iter().enumerate() {
+                    if cancel.load(Ordering::Relaxed) {
+                        user_stopped = true;
+                        break;
+                    }
+                    let _ = tx.send(EngineEvent::ActionProgress {
+                        done: i as u64,
+                        current: Some(d.display().to_string()),
+                    });
                     let r = match action {
                         DedupeAction::Recycle => crate::dedupe::action_recycle(d),
                         DedupeAction::Hardlink => crate::dedupe::action_hardlink(d, &keeper),
@@ -1269,10 +1372,13 @@ impl SuperdeduperApp {
                         let _ = crate::gui::results_store::save(&state);
                     }
                 }
-                let _ = tx.send(EngineEvent::Status(format!(
-                    "Action complete · {} done, {} failed.",
-                    done, failed
-                )));
+                let label = if user_stopped { "stopped" } else { "complete" };
+                let _ = tx.send(EngineEvent::ActionFinished {
+                    summary: format!(
+                        "Action {label} · {} done, {} failed.",
+                        done, failed
+                    ),
+                });
             })
             .expect("spawn dedupe thread");
     }
@@ -1305,6 +1411,16 @@ impl eframe::App for SuperdeduperApp {
                 }
             }
             return;
+        }
+
+        // Action-progress modal — overlays the GUI while a worker
+        // thread is processing a destructive action (recycle,
+        // hardlink, safe-rename, archive, unsuperdeduper). Force a
+        // 33-ms repaint while it's up so the spinner animates even
+        // when no other event is firing. Rendered AFTER the rest of
+        // the UI below so it sits on top.
+        if self.state.action_in_progress.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         // Launch-time Resume / Start Fresh modal. While
@@ -1760,6 +1876,19 @@ impl eframe::App for SuperdeduperApp {
                     self.dispatch_group_action(a);
                 }
             });
+
+        // Action-progress modal renders LAST so it overlays
+        // everything else (CentralPanel, SidePanel, TopBottomPanels).
+        // egui Window-with-anchor handles the z-order; we just have
+        // to call it after the rest of the UI. Returns true if Stop
+        // was clicked → set the shared cancel atomic so the worker
+        // bails on its next loop iteration.
+        if let Some(action) = self.state.action_in_progress.clone() {
+            let stopped = crate::gui::widgets::action_progress::show(ctx, &action);
+            if stopped {
+                self.action_cancel.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
