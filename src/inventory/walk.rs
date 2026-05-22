@@ -79,8 +79,12 @@ where
         // (the call backing std::fs::read_dir). The verbatim prefix
         // propagates into every DirEntry::path() that the walker
         // emits, so downstream paths in FileEntry retain the prefix.
-        // We strip it back for emitted paths so the user-facing
-        // output (GUI, JSON) doesn't show ugly \\?\C:\... strings.
+        // We intentionally KEEP the prefix end-to-end — File::open
+        // also needs verbatim form to open these files, and
+        // stripping at any later stage would re-introduce the
+        // normalization bug. JSON output therefore shows
+        // \\?\C:\... paths for files under such corpora; uglier
+        // but functional.
         #[cfg(windows)]
         let root_for_walk = to_verbatim(root);
         #[cfg(not(windows))]
