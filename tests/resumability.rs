@@ -84,7 +84,7 @@ fn checkpoint_round_trips_via_save_and_load() {
     assert_eq!(loaded.schema, cp.schema, "schema string");
     assert_eq!(loaded.roots.len(), cp.roots.len(), "roots count");
     assert_eq!(loaded.roots[0].path, cp.roots[0].path);
-    assert_eq!(loaded.roots[1].is_reference, true);
+    assert!(loaded.roots[1].is_reference);
     assert_eq!(
         loaded.completed_hashes, cp.completed_hashes,
         "completed_hashes vec"

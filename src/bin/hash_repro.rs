@@ -257,13 +257,13 @@ fn gen_corpus(
         hashbrown::HashMap::with_capacity(n_groups + (n_files - n_dup_files));
     let mut group_assignments = Vec::with_capacity(n_files);
     let mut actual_sizes = Vec::with_capacity(n_files);
-    for i in 0..n_files {
+    for (i, &raw_sz) in sizes.iter().enumerate().take(n_files) {
         let gid: u64 = if i < n_dup_files {
             (i % n_groups.max(1)) as u64
         } else {
             (n_groups + (i - n_dup_files)) as u64
         };
-        let sz = *group_size_by_gid.entry(gid).or_insert(sizes[i]);
+        let sz = *group_size_by_gid.entry(gid).or_insert(raw_sz);
         group_assignments.push(gid);
         actual_sizes.push(sz);
     }

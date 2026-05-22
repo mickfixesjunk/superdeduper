@@ -16,3 +16,4 @@ Cargo.lock.bak
 # for the river5 path-patch pattern. Tracked example, ignored real
 # config.
 /.cargo/config.toml
+$V/
