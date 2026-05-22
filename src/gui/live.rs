@@ -427,7 +427,12 @@ fn run(
         total: 0,
         eta_secs: None,
     });
-    let size_groups = pipeline::grouping::group_by_size(files);
+    let mut size_groups = pipeline::grouping::group_by_size(files);
+    // Resolve inode ids only on files that survived size grouping —
+    // singletons can't be hardlinks within this scan and don't need
+    // the per-file GetFileInformationByHandle. See the docs on
+    // `pipeline::grouping::resolve_file_ids`.
+    pipeline::grouping::resolve_file_ids(&mut size_groups);
     let size_candidates: u64 = size_groups.iter().map(|g| g.files.len() as u64).sum();
     let _ = tx.send(EngineEvent::StageTick {
         stage: Stage::SizeGroup,

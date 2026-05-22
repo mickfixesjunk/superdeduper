@@ -156,12 +156,23 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     );
 
     let t_group = std::time::Instant::now();
-    let size_groups = pipeline::grouping::group_by_size(inventory);
+    let mut size_groups = pipeline::grouping::group_by_size(inventory);
     let group_ms = t_group.elapsed().as_millis();
     tracing::info!(
         groups = size_groups.len(),
         elapsed_ms = group_ms as u64,
         "stage 2: size grouping complete"
+    );
+
+    // Resolve NTFS file-id + volume-serial for entries that survived
+    // size grouping. Files in singleton size groups never get this
+    // syscall — that's the optimisation. See
+    // `pipeline::grouping::resolve_file_ids` for rationale.
+    let t_ids = std::time::Instant::now();
+    pipeline::grouping::resolve_file_ids(&mut size_groups);
+    tracing::info!(
+        elapsed_ms = t_ids.elapsed().as_millis() as u64,
+        "stage 2b: inode-id resolution complete"
     );
 
     let t_layout = std::time::Instant::now();

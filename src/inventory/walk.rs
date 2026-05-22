@@ -193,37 +193,23 @@ where
 
         callback(WalkEvent::FileFound { path: &path, size });
 
-        // On Windows, populate file_ref + volume_guid from
-        // `GetFileInformationByHandle`. The 64-bit file id (high+low
-        // halves) is the NTFS FileReferenceNumber for the inode, and
-        // the volume serial number identifies the volume. Two
-        // hardlinks of the same file share both values. Without this,
-        // the Stage-4 link_equivalent check
-        // (pipeline/hash.rs::run_group) had no way to detect
-        // hardlinks via the fallback walker, which is the path that
-        // runs when MFT-enum is unavailable (non-elevated process —
-        // CreateFileW on \\?\Volume{…} returns ACCESS_DENIED).
-        // We deliberately call the Win32 API rather than
-        // `std::os::windows::fs::MetadataExt::file_index` because
-        // the latter is unstable behind `windows_by_handle`.
-        // Failure (e.g. file locked, AV deleted between scan and
-        // open) is silent — we just keep the zero/None defaults
-        // and the file won't be hardlink-detected. Better than
-        // refusing to enumerate the rest of the corpus.
-        #[cfg(windows)]
-        let (file_ref, volume_guid) = file_id_for(&path).unwrap_or((0, None));
-        #[cfg(not(windows))]
-        let (file_ref, volume_guid) = (0u64, None);
-
+        // Walker emits FileEntry with file_ref=0 / volume_guid=None.
+        // Inode-id resolution happens later — see
+        // `pipeline::grouping::resolve_file_ids`, called between the
+        // size-grouping and layout stages. Files that don't survive
+        // size grouping (i.e. have unique sizes) never need an inode
+        // id, so resolving here would mean opening every file on the
+        // walk to get information that almost all of them won't
+        // need.
         out.push(FileEntry {
             path,
             size,
             mtime: filetime_ticks(&metadata),
-            file_ref,
+            file_ref: 0,
             parent_ref: 0,
             usn: 0,
             attributes: 0,
-            volume_guid,
+            volume_guid: None,
         });
     }
     Ok(())
@@ -262,7 +248,7 @@ fn filetime_ticks(m: &std::fs::Metadata) -> i64 {
 }
 
 #[cfg(windows)]
-fn file_id_for(path: &Path) -> Option<(u64, Option<String>)> {
+pub(crate) fn file_id_for(path: &Path) -> Option<(u64, Option<String>)> {
     // Open the file with FILE_FLAG_BACKUP_SEMANTICS so the call
     // works for directories as well (we don't use it for dirs
     // currently but the flag is cheap and removes a footgun for
