@@ -50,10 +50,25 @@ pub enum PlaceholderState {
 impl PlaceholderState {
     /// Whether this state should block content reads in the hash
     /// tiers. The "block content read" path is what protects against
-    /// force-hydration; the dedup-reparse case explicitly does NOT
-    /// block reads because the data IS local.
+    /// force-hydration.
+    ///
+    /// `ReparseDedup` does NOT block reads — the data is local (NTFS
+    /// dedup is transparent at the FS API layer) and hashing it is
+    /// safe and informational.
+    ///
+    /// `OtherReparse` DOES block reads. By the time `classify()`
+    /// returns this variant, symlinks and junctions are already
+    /// filtered upstream via `--follow-links`, so what's left is
+    /// genuinely-unknown tags: HSM (tape retrieval), PrjFS (Git VFS
+    /// materialization), unrecognized cloud providers — all
+    /// hydration-class. Safer-by-default. Known-safe tags can be
+    /// promoted to specific variants later if real-world cases
+    /// justify it.
     pub fn blocks_content_read(self) -> bool {
-        matches!(self, Self::RecallOnOpen | Self::RecallOnDataAccess)
+        matches!(
+            self,
+            Self::RecallOnOpen | Self::RecallOnDataAccess | Self::OtherReparse(_)
+        )
     }
 
     /// Whether this state should appear as a skip on the walker's
@@ -144,12 +159,14 @@ mod tests {
     }
 
     #[test]
-    fn blocks_content_read_only_for_recall_states() {
+    fn blocks_content_read_for_recall_and_other_reparse() {
         assert!(!PlaceholderState::NotPlaceholder.blocks_content_read());
         assert!(PlaceholderState::RecallOnOpen.blocks_content_read());
         assert!(PlaceholderState::RecallOnDataAccess.blocks_content_read());
+        // Dedup stays hashable — data is local.
         assert!(!PlaceholderState::ReparseDedup.blocks_content_read());
-        assert!(!PlaceholderState::OtherReparse(0x1234).blocks_content_read());
+        // OtherReparse blocks reads (HSM / PrjFS / unknown cloud).
+        assert!(PlaceholderState::OtherReparse(0x1234).blocks_content_read());
     }
 
     #[test]
