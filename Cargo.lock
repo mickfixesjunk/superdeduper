@@ -2908,7 +2908,7 @@ dependencies = [
 [[package]]
 name = "river5"
 version = "0.1.0"
-source = "git+https://github.com/mickfixesjunk/river5?rev=1b93426a466ba3d2f98a67e3ddbdf28afd8caf33#1b93426a466ba3d2f98a67e3ddbdf28afd8caf33"
+source = "git+https://github.com/mickfixesjunk/river5?rev=2fe9de8b0c0ffb30f8ea74fca46f2a367aea2a72#2fe9de8b0c0ffb30f8ea74fca46f2a367aea2a72"
 dependencies = [
  "cc",
 ]
