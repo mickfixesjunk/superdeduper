@@ -34,13 +34,6 @@ pub struct ScanConfig {
     pub output: Option<PathBuf>,
     pub follow_links: bool,
     pub allow_system_paths: bool,
-    /// Bench-only escape hatch: skip per-file `GetFileInformationByHandle`
-    /// in the fallback walker so wallclock numbers can be compared
-    /// apples-to-apples against tools that skip hardlink detection
-    /// entirely (e.g. another tool with `--allow-hard-links`). Production
-    /// scans leave this `false` — disabling defeats Stage-4
-    /// `link_equivalent` detection on the non-MFT path.
-    pub skip_file_id: bool,
     /// Which content-hash algorithm to use for Tier 1/2/3 + format
     /// fingerprints. BLAKE3 is the default; DDH-128 is the
     /// in-development alternative (currently an xxhash3-128 stub).
@@ -84,7 +77,6 @@ impl ScanConfig {
             output: args.output.clone(),
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
-            skip_file_id: args.no_file_id,
             hash_algo: args.hash_algo.into(),
         })
     }

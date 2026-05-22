@@ -60,7 +60,6 @@ fn finds_planted_duplicates() {
         follow_links: false,
         allow_system_paths: false,
         io_threads: 4,
-        skip_file_id: false,
         hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
     };
 
@@ -130,7 +129,6 @@ fn empty_directory_yields_no_groups() {
         follow_links: false,
         allow_system_paths: false,
         io_threads: 4,
-        skip_file_id: false,
         hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
     };
     let inv = superdeduper::inventory::enumerate(&cfg, None).unwrap();

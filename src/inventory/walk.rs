@@ -211,17 +211,7 @@ where
         // and the file won't be hardlink-detected. Better than
         // refusing to enumerate the rest of the corpus.
         #[cfg(windows)]
-        let (file_ref, volume_guid) = if cfg.skip_file_id {
-            // Bench-only escape hatch (--no-file-id on the CLI).
-            // Skip the per-file GetFileInformationByHandle so
-            // wallclock is comparable to tools that don't pay this
-            // cost (e.g. another tool --allow-hard-links). Defeats
-            // Stage-4 link_equivalent detection on the non-MFT
-            // path; documented on the flag's help text.
-            (0u64, None)
-        } else {
-            file_id_for(&path).unwrap_or((0, None))
-        };
+        let (file_ref, volume_guid) = file_id_for(&path).unwrap_or((0, None));
         #[cfg(not(windows))]
         let (file_ref, volume_guid) = (0u64, None);
 

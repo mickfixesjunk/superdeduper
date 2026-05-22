@@ -768,7 +768,6 @@ mod tests {
             output: None,
             follow_links: false,
             allow_system_paths: false,
-            skip_file_id: false,
             io_threads: 4,
             hash_algo: HashAlgo::Blake3,
         }
