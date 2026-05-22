@@ -176,11 +176,19 @@ pub fn show_filtered(
             TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
-                .column(Column::exact(36.0))
-                .column(Column::exact(90.0))
-                .column(Column::exact(60.0))
-                .column(Column::exact(90.0))
-                .column(Column::exact(220.0))
+                // `Column::exact` looks like it would be resizable
+                // because the table is `.resizable(true)`, but exact
+                // columns deliberately don't draw a drag handle. Use
+                // `Column::initial(N).resizable(true)` for every
+                // data column so the user can drag any of the
+                // dividers — including the one to the left of the
+                // keeper-path column, which is the practical way to
+                // give that column more width on a wide window.
+                .column(Column::initial(36.0).resizable(true))
+                .column(Column::initial(90.0).resizable(true))
+                .column(Column::initial(60.0).resizable(true))
+                .column(Column::initial(90.0).resizable(true))
+                .column(Column::initial(220.0).resizable(true))
                 .column(Column::remainder())
                 .header(20.0, |mut h| {
                     h.col(|ui| {
