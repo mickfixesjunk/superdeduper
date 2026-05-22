@@ -288,9 +288,17 @@ pub fn show_filtered(
                 })
                 .body(|mut body| {
                     for (i, (orig_idx, g)) in sorted.iter().enumerate() {
-                        let savings = g
-                            .size
-                            .saturating_mul(g.files.len().saturating_sub(1) as u64);
+                        // Reclaimable bytes is the (n-1) × size that
+                        // WOULD be freed if you collapsed the group
+                        // — unless the group is already a hardlink
+                        // set, in which case the data is shared and
+                        // there's nothing to reclaim.
+                        let savings = if g.link_equivalent {
+                            0
+                        } else {
+                            g.size
+                                .saturating_mul(g.files.len().saturating_sub(1) as u64)
+                        };
                         let is_open = table_state.expanded.contains(orig_idx);
                         let acted = table_state.acted.contains(orig_idx);
                         let keeper = g.files.first().cloned();
@@ -322,7 +330,24 @@ pub fn show_filtered(
                                 );
                             });
                             row.col(|ui| {
-                                if acted {
+                                if g.link_equivalent {
+                                    // Already-hardlinked groups have no
+                                    // reclaimable space — surface that
+                                    // distinctly so the user knows
+                                    // these aren't worth acting on.
+                                    ui.label(
+                                        RichText::new("🔗 already hardlinked")
+                                            .color(theme::COOL)
+                                            .small()
+                                            .strong(),
+                                    )
+                                    .on_hover_text(
+                                        "Every file in this group is a hardlink to the same \
+                                         data on disk. They occupy ONE copy worth of bytes, \
+                                         not N — Reclaimable correctly shows 0. Recycle/Safe-rename \
+                                         would still work but won't free any space.",
+                                    );
+                                } else if acted {
                                     ui.label(
                                         RichText::new("✓ queued").color(theme::ACCENT).small(),
                                     );

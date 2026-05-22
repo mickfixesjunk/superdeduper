@@ -363,11 +363,20 @@ impl UiState {
             }
             EngineEvent::DuplicateFound(g) => {
                 self.totals.duplicates = self.totals.duplicates.saturating_add(1);
-                let savings = g
-                    .size
-                    .saturating_mul(g.files.len().saturating_sub(1) as u64);
-                self.totals.reclaimable_bytes =
-                    self.totals.reclaimable_bytes.saturating_add(savings);
+                // Hardlinked groups already share storage on disk —
+                // the (n-1) × size figure overcounts the actual
+                // reclaimable space (it's zero, the data is shared).
+                // Exclude them from the header Reclaimable stat so
+                // the user isn't told they can recover space that's
+                // already been recovered. The groups still show in
+                // the table (badged distinctly via the GUI).
+                if !g.link_equivalent {
+                    let savings = g
+                        .size
+                        .saturating_mul(g.files.len().saturating_sub(1) as u64);
+                    self.totals.reclaimable_bytes =
+                        self.totals.reclaimable_bytes.saturating_add(savings);
+                }
                 self.duplicates.push(g);
             }
             EngineEvent::ScanFinished {

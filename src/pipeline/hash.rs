@@ -305,13 +305,30 @@ fn run_group(
         if files.len() < 2 {
             continue;
         }
+        // Hardlink detection: on NTFS, file_ref IS the inode. Two
+        // files with the same (volume_guid, file_ref) are different
+        // names pointing at the same on-disk data — hardlinks of
+        // each other. If EVERY file in this group shares the same
+        // (volume_guid, file_ref) as the first, the entire group is
+        // a single inode with N path aliases. Reclaimable space is
+        // zero (the data is already shared); the GUI badges these
+        // distinctly so the user knows hardlinking was already done
+        // and these groups aren't candidates for further action.
+        let link_equivalent = {
+            let first = &files[0].entry;
+            files.iter().all(|f| {
+                f.entry.file_ref == first.file_ref
+                    && f.entry.volume_guid == first.volume_guid
+                    && first.volume_guid.is_some()
+            })
+        };
         let mut paths: Vec<PathBuf> = files.iter().map(|f| f.entry.path.clone()).collect();
         paths.sort();
         out.push(DuplicateGroup {
             size,
             content_hash: hex(&hash),
             files: paths,
-            link_equivalent: false,
+            link_equivalent,
         });
     }
     Ok(out)

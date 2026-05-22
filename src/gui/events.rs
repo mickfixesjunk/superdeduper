@@ -102,6 +102,15 @@ pub struct DuplicateGroupSummary {
     pub size: u64,
     pub content_hash: String,
     pub files: Vec<PathBuf>,
+    /// All files in this group share the same NTFS file_ref on the
+    /// same volume — i.e. they're hardlinks of each other, not
+    /// separately-stored copies. Reclaimable space is 0 because
+    /// every "duplicate" is already pointing at the same data on
+    /// disk; the GUI badges these distinctly and excludes them from
+    /// the global Reclaimable total. `#[serde(default)]` so old
+    /// checkpoints (without this field) still load.
+    #[serde(default)]
+    pub link_equivalent: bool,
 }
 
 /// Severity tag for [`EngineEvent::Log`] entries.
