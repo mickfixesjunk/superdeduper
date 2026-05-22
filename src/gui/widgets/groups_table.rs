@@ -43,6 +43,31 @@ pub enum GroupAction {
     },
     /// Safe-rename across EVERY visible duplicate group at once.
     SafeRenameAllVisible,
+    /// Archive every dupe across every visible group — the GUI's
+    /// roots panel used to host this as a standalone "Archive dupes"
+    /// button; it now lives next to Safe-rename in the bulk-action
+    /// dropdown above the results table so both bulk actions sit in
+    /// the same place.
+    ArchiveAllVisible,
+}
+
+/// The two bulk-action options the dropdown above the results
+/// table can execute. Both operate across every visible duplicate
+/// group; the user picks the action, the Go button runs it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum BulkAction {
+    #[default]
+    SafeRenameDupes,
+    ArchiveDupes,
+}
+
+impl BulkAction {
+    fn label(self) -> &'static str {
+        match self {
+            BulkAction::SafeRenameDupes => "🛡 Safe-rename dupes",
+            BulkAction::ArchiveDupes => "📦 Archive dupes",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -52,6 +77,9 @@ pub struct GroupsTableState {
     /// after the action is queued (prevents double-clicks before the
     /// UI re-syncs).
     acted: hashbrown::HashSet<usize>,
+    /// Sticky selection for the bulk-action dropdown; persists across
+    /// re-renders so the user doesn't have to re-pick on every scan.
+    pub bulk_action: BulkAction,
 }
 
 /// Render the unfiltered table. Kept for callers that don't need a
@@ -141,28 +169,68 @@ pub fn show_filtered(
         .iter()
         .map(|(_, g)| g.files.len().saturating_sub(1))
         .sum();
+    // Bulk-action row: a dropdown for "what to do across every
+    // visible group" + a Go button to execute it. Replaces the
+    // single Safe-rename-ALL button, and folds in the Archive-dupes
+    // button that used to live on the roots panel — both bulk
+    // actions now sit in the same place.
     ui.horizontal(|ui| {
-        let label = if visible_dupe_count > 0 {
-            format!("🛡  Safe-rename ALL ({} files)", visible_dupe_count)
+        let action_selected = table_state.bulk_action;
+        egui::ComboBox::from_id_source("bulk-action-combo")
+            .selected_text(action_selected.label())
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut table_state.bulk_action,
+                    BulkAction::SafeRenameDupes,
+                    BulkAction::SafeRenameDupes.label(),
+                );
+                ui.selectable_value(
+                    &mut table_state.bulk_action,
+                    BulkAction::ArchiveDupes,
+                    BulkAction::ArchiveDupes.label(),
+                );
+            });
+
+        let go_label = if visible_dupe_count > 0 {
+            format!("Go ({} files)", visible_dupe_count)
         } else {
-            "🛡  Safe-rename ALL".to_string()
+            "Go".to_string()
         };
-        let btn = egui::Button::new(RichText::new(label).color(theme::PANEL_DEEP).strong())
+        let go = egui::Button::new(RichText::new(go_label).color(theme::PANEL_DEEP).strong())
             .fill(theme::ACCENT_DIM)
-            .min_size(egui::vec2(220.0, 24.0));
+            .min_size(egui::vec2(120.0, 24.0));
+        let hover = match table_state.bulk_action {
+            BulkAction::SafeRenameDupes => {
+                "Append .superdeduper to every non-keeper across every \
+                 visible group. Reversible: click Unsuperdeduper in the \
+                 Roots panel to restore. Reference paths are never touched."
+            }
+            BulkAction::ArchiveDupes => {
+                "Pick a destination folder, then move every duplicate \
+                 (except the keeper per group, and never anything under a \
+                 reference root) into that folder. Preserves the original \
+                 directory tree under the destination so a future restore \
+                 can put files back. Writes a manifest JSON alongside."
+            }
+        };
         if ui
-            .add_enabled(visible_dupe_count > 0, btn)
-            .on_hover_text(
-                "Append .superdeduper to every non-keeper across every visible group. \
-                 Reversible: click Unsuperdeduper in the Roots panel to restore. \
-                 Reference paths are never touched.",
-            )
+            .add_enabled(visible_dupe_count > 0, go)
+            .on_hover_text(hover)
             .clicked()
         {
-            clicked = Some(GroupAction::SafeRenameAllVisible);
+            clicked = Some(match table_state.bulk_action {
+                BulkAction::SafeRenameDupes => GroupAction::SafeRenameAllVisible,
+                BulkAction::ArchiveDupes => GroupAction::ArchiveAllVisible,
+            });
         }
+
+        let trailer = match table_state.bulk_action {
+            BulkAction::SafeRenameDupes => "safe-mode (no files deleted)",
+            BulkAction::ArchiveDupes => "moves dupes, writes manifest",
+        };
         ui.label(
-            RichText::new("safe-mode (no files deleted)")
+            RichText::new(trailer)
                 .color(theme::TEXT_LO)
                 .small()
                 .italics(),

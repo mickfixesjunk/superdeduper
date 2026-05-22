@@ -753,7 +753,6 @@ impl SuperdeduperApp {
                 self.persisted.results_tab = ResultsTab::Log;
             }
             RootsAction::Unsuperdeduper => self.run_unsuperdeduper_threaded(),
-            RootsAction::ArchiveDupes => self.pick_archive_dest_and_run(),
         }
     }
 
@@ -958,6 +957,13 @@ impl SuperdeduperApp {
             }
             GroupAction::SafeRenameAllVisible => {
                 self.run_safe_rename_all_threaded();
+            }
+            GroupAction::ArchiveAllVisible => {
+                // Mirror the old roots-panel Archive button flow:
+                // prompt for a destination folder, then dispatch the
+                // archive worker. `pick_archive_dest_and_run` handles
+                // the picker + the threaded run.
+                self.pick_archive_dest_and_run();
             }
         }
     }
@@ -1701,6 +1707,12 @@ fn describe_destructive_action(action: &GroupAction) -> String {
         GroupAction::SafeRenameAllVisible => {
             "Append .superdeduper to EVERY non-keeper across EVERY currently visible duplicate group. \
              Safe-mode: nothing is deleted. Reversible via Unsuperdeduper. Reference paths are never touched."
+                .to_string()
+        }
+        GroupAction::ArchiveAllVisible => {
+            "Move EVERY non-keeper across EVERY currently visible duplicate group into the chosen \
+             archive folder. Original directory tree is preserved under the destination; a manifest \
+             JSON is written so the move can be restored later. Reference paths are never touched."
                 .to_string()
         }
         // Reveal should never reach this code path — it bypasses the
