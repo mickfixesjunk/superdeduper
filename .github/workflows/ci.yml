@@ -86,7 +86,7 @@ jobs:
       # share the codegen instead of duplicating per-bin work). Previous
       # two-step shape took ~7 minutes for GUI + ~1 minute for CLI;
       # the combined build typically lands closer to ~7 minutes total.
-      - run: cargo build --release --locked --features gui --bin superdeduper --bin superdeduper-gui
+      - run: cargo build --release --locked --features "gui audio" --bin superdeduper --bin superdeduper-gui
       # Upload the built EXEs as a workflow artifact on every push to
       # main so we can iterate without cutting a tagged release. The
       # bundle lives under the run's Artifacts section for 14 days.

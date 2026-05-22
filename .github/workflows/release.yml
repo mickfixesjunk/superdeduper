@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         run: |
           cargo build --release --locked --target ${{ matrix.target }} --bin superdeduper
-          cargo build --release --locked --target ${{ matrix.target }} --features gui --bin superdeduper-gui
+          cargo build --release --locked --target ${{ matrix.target }} --features "gui audio" --bin superdeduper-gui
 
       - name: Stage artifacts
         shell: pwsh
@@ -142,3 +142,78 @@ jobs:
           files: |
             ${{ matrix.artifact }}.zip
             ${{ matrix.artifact }}.zip.sha256
+
+  build-linux:
+    # Linux side of the release. Kept as a separate job (rather than
+    # folded into the matrix above) because every step on the Windows
+    # path uses pwsh + signtool + Compress-Archive — the diff to make
+    # them shell-agnostic would dwarf the duplication.
+    name: build (linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install GUI build deps
+        # libasound2-dev is required by alsa-sys, which rodio pulls
+        # in for the scan-done chime. CLI-only builds don't need it
+        # — but we ship both CLI + GUI so we install it unconditionally.
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Build (locked, release)
+        run: |
+          cargo build --release --locked --bin superdeduper
+          cargo build --release --locked --features "gui audio" --bin superdeduper-gui
+
+      - name: Stage artifacts
+        run: |
+          stage="stage/superdeduper-x86_64-linux"
+          mkdir -p "$stage"
+          cp target/release/superdeduper "$stage/"
+          cp target/release/superdeduper-gui "$stage/"
+          cp LICENSE "$stage/"
+          cp README.md "$stage/"
+          # Strip debug symbols — drops the binary size meaningfully
+          # without losing crash-report value (Rust's std panic
+          # handler still reports the panic site by source location).
+          strip "$stage/superdeduper" "$stage/superdeduper-gui" || true
+
+      - name: Compute SHA-256 checksums
+        run: |
+          stage="stage/superdeduper-x86_64-linux"
+          ( cd "$stage" && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Tar artifact
+        # `.tar.gz` matches the typical Linux release shape; doesn't
+        # need the Compress-Archive PowerShell shenanigans the Windows
+        # job has to do. SHA hash of the tarball goes alongside so a
+        # consumer can verify integrity without extracting.
+        run: |
+          tar -czf superdeduper-x86_64-linux.tar.gz -C stage superdeduper-x86_64-linux
+          sha256sum superdeduper-x86_64-linux.tar.gz | tee superdeduper-x86_64-linux.tar.gz.sha256
+
+      - name: Attest build provenance
+        if: ${{ github.event.repository.visibility != 'private' || github.event.repository.owner.type == 'Organization' }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            superdeduper-x86_64-linux.tar.gz
+            superdeduper-x86_64-linux.tar.gz.sha256
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            superdeduper-x86_64-linux.tar.gz
+            superdeduper-x86_64-linux.tar.gz.sha256
