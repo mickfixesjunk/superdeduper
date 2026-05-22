@@ -72,9 +72,58 @@ where
             });
             return Err(crate::Error::PathNotFound(root.clone()));
         }
-        walk(root, cfg, &mut out, &mut callback, 0, cancel)?;
+        // Convert the root to a verbatim (\\?\C:\...) path on
+        // Windows so child enumeration bypasses Win32's path-name
+        // normalization. Without this, filenames with trailing dots
+        // or spaces are silently stripped/dropped by FindFirstFileW
+        // (the call backing std::fs::read_dir). The verbatim prefix
+        // propagates into every DirEntry::path() that the walker
+        // emits, so downstream paths in FileEntry retain the prefix.
+        // We strip it back for emitted paths so the user-facing
+        // output (GUI, JSON) doesn't show ugly \\?\C:\... strings.
+        #[cfg(windows)]
+        let root_for_walk = to_verbatim(root);
+        #[cfg(not(windows))]
+        let root_for_walk = root.clone();
+        walk(&root_for_walk, cfg, &mut out, &mut callback, 0, cancel)?;
     }
     Ok(out)
+}
+
+// Note: emitted paths intentionally keep the `\\?\` prefix when the
+// walker added one (see `to_verbatim` above). The downstream hash
+// stage opens files via `File::open(&entry.path)`, and File::open
+// only sees files with trailing dots/spaces / reserved DOS names
+// when given a verbatim path. Stripping the prefix here would
+// reintroduce the test30 bug. User-visible paths in the JSON output
+// keep the prefix — uglier but functional. If we ever want clean
+// paths in the report, we can strip at the output layer (JSON
+// serialization) instead of in the walker.
+
+/// Convert a regular Windows path (`C:\foo\bar`) to its verbatim form
+/// (`\\?\C:\foo\bar`). Already-verbatim paths and non-disk-prefixed
+/// paths pass through unchanged. The Win32 file APIs interpret
+/// verbatim paths literally and skip the legacy normalization that
+/// strips trailing dots/spaces and remaps reserved DOS names.
+#[cfg(windows)]
+fn to_verbatim(p: &Path) -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
+    // Check if already verbatim by inspecting the wide encoding.
+    let wide_first: Vec<u16> = p.as_os_str().encode_wide().take(4).collect();
+    if wide_first.as_slice().starts_with(&[0x5C, 0x5C, 0x3F, 0x5C]) {
+        // already "\\?\"
+        return p.to_path_buf();
+    }
+    // Only prefix absolute paths with a drive letter — relative or
+    // UNC paths get left alone (verbatim-UNC is a different form).
+    if p.is_absolute() {
+        let mut s = OsString::from(r"\\?\");
+        s.push(p.as_os_str());
+        std::path::PathBuf::from(s)
+    } else {
+        p.to_path_buf()
+    }
 }
 
 fn walk<F>(

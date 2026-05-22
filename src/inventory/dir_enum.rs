@@ -25,7 +25,9 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
     GetFileInformationByHandle, GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION,
@@ -106,13 +108,8 @@ pub fn enumerate_dir(dir: &Path) -> Option<DirInodeMap> {
             FileIdBothDirectoryInfo
         };
         let ok = unsafe {
-            GetFileInformationByHandleEx(
-                handle,
-                class,
-                buf.as_mut_ptr() as _,
-                BUF_SIZE as u32,
-            )
-            .is_ok()
+            GetFileInformationByHandleEx(handle, class, buf.as_mut_ptr() as _, BUF_SIZE as u32)
+                .is_ok()
         };
         if !ok {
             // ERROR_NO_MORE_FILES is the normal loop terminator.
@@ -144,9 +141,8 @@ pub fn enumerate_dir(dir: &Path) -> Option<DirInodeMap> {
             // FileNameLength/2 chars long, starting at the same
             // offset as the FileName field. Construct a slice with
             // the correct length.
-            let name_slice = unsafe {
-                std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len_chars)
-            };
+            let name_slice =
+                unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len_chars) };
             // Skip `.` and `..` directory entries.
             let is_dot = matches!(name_slice, [46] | [46, 46]);
             // Skip child directories — only files contribute file IDs
