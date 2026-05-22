@@ -27,12 +27,6 @@ pub enum RootsAction {
     /// `.superdeduper` suffix from any file that has it — the safe-mode
     /// undo. Doesn't require a prior scan.
     Unsuperdeduper,
-    /// Prompt the user for a destination folder, then move every
-    /// duplicate-but-not-keeper to that folder with the original
-    /// directory tree preserved. Writes a manifest next to the
-    /// archived files so a future "restore from manifest" can move
-    /// them back.
-    ArchiveDupes,
 }
 
 pub fn show(
@@ -181,27 +175,10 @@ pub fn show(
             action = Some(RootsAction::Unsuperdeduper);
         }
 
-        // Archive button: only useful after a scan has produced
-        // duplicates, so we gate it behind !is_scanning AND let the
-        // app decide whether there are any dups to archive (it will
-        // status-bar "no duplicates to archive" if zero).
-        let archive = egui::Button::new(RichText::new("📦  Archive dupes").color(theme::TEXT_HI))
-            .fill(theme::PANEL_DEEP)
-            .min_size(vec2(140.0, 28.0));
-        if ui
-            .add_enabled(!is_scanning, archive)
-            .on_hover_text(
-                "Pick a folder, then move every duplicate (except the \
-                 keeper per group, and never anything under a reference \
-                 root) into that folder. Preserves the original \
-                 directory tree under the destination so a future \
-                 restore can put files back where they came from. \
-                 Writes a manifest JSON alongside the moved files.",
-            )
-            .clicked()
-        {
-            action = Some(RootsAction::ArchiveDupes);
-        }
+        // The Archive Dupes button used to live here. It moved to
+        // the bulk-action dropdown above the duplicate-groups table
+        // so both bulk operations (safe-rename + archive) share
+        // one consolidated control. See widgets/groups_table.rs.
 
         if is_scanning {
             let cancel = egui::Button::new(RichText::new("⏹  Cancel").color(theme::HOT))
