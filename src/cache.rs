@@ -293,6 +293,16 @@ impl Cache {
 
     pub fn store(&self, key: &CacheKey, hashes: &CachedHashes) -> Result<()> {
         let now = now_unix();
+        // Tier columns use COALESCE on conflict so a single-tier
+        // write doesn't clobber the others. The hash pipeline calls
+        // `store` once per tier with only that tier populated; the
+        // earlier "set every column to excluded.X" version meant the
+        // last tier stored erased the prior ones, so on resume only
+        // the deepest tier (typically Tier 3) survived and Tiers 1-2
+        // re-ran from scratch. With COALESCE, NULL-in-the-write
+        // preserves the existing column. Metadata (size/mtime/usn)
+        // still replaces because those are scoped to this file's
+        // current physical state.
         self.conn.execute(
             "INSERT INTO files (
                 volume_guid, file_ref, hash_algo, size, mtime, usn,
@@ -302,10 +312,10 @@ impl Cache {
                 size = excluded.size,
                 mtime = excluded.mtime,
                 usn = excluded.usn,
-                tier0_fingerprint = excluded.tier0_fingerprint,
-                tier1_hash = excluded.tier1_hash,
-                tier2_hash = excluded.tier2_hash,
-                tier3_hash = excluded.tier3_hash,
+                tier0_fingerprint = COALESCE(excluded.tier0_fingerprint, tier0_fingerprint),
+                tier1_hash        = COALESCE(excluded.tier1_hash,        tier1_hash),
+                tier2_hash        = COALESCE(excluded.tier2_hash,        tier2_hash),
+                tier3_hash        = COALESCE(excluded.tier3_hash,        tier3_hash),
                 last_seen = excluded.last_seen",
             params![
                 key.volume_guid,
@@ -745,6 +755,57 @@ mod tests {
         }
         cache.clear().unwrap();
         assert!(cache.lookup(&key(5, 100, 1, 1)).unwrap().is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn store_merges_per_tier_writes_instead_of_replacing() {
+        // Regression for the Pause → Resume hashing bug: the hash
+        // pipeline writes one tier at a time, each call carrying only
+        // that tier populated in CachedHashes. The earlier `store`
+        // SQL set every tier column to `excluded.X`, so the third
+        // write erased the first two. On resume, only the deepest
+        // tier survived and Tiers 1–2 re-ran from cold even though
+        // their results had been computed and (supposedly) cached.
+        let p = tmp_db();
+        let cache = Cache::open(&p).unwrap();
+        let k = key(42, 100, 1, 1);
+
+        // Tier 1 fires first.
+        cache
+            .store(
+                &k,
+                &CachedHashes {
+                    tier1_hash: Some(b"T1".to_vec()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Tier 2 next — only tier2 populated.
+        cache
+            .store(
+                &k,
+                &CachedHashes {
+                    tier2_hash: Some(b"T2".to_vec()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Tier 3 last — only tier3 populated.
+        cache
+            .store(
+                &k,
+                &CachedHashes {
+                    tier3_hash: Some(b"T3".to_vec()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let loaded = cache.lookup(&k).unwrap().expect("row present");
+        assert_eq!(loaded.tier1_hash.as_deref(), Some(b"T1".as_ref()), "tier1");
+        assert_eq!(loaded.tier2_hash.as_deref(), Some(b"T2".as_ref()), "tier2");
+        assert_eq!(loaded.tier3_hash.as_deref(), Some(b"T3".as_ref()), "tier3");
         std::fs::remove_file(&p).ok();
     }
 }
