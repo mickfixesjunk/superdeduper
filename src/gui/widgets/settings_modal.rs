@@ -177,6 +177,22 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
                 &mut settings.use_cache,
                 "Persistent cache (USN delta + last hashes)",
             );
+            // Indent the always-use sub-setting so the relationship
+            // to the cache toggle above it reads visually.
+            ui.indent("always-use-cache-indent", |ui| {
+                ui.add_enabled_ui(settings.use_cache, |ui| {
+                    ui.checkbox(
+                        &mut settings.always_use_cache,
+                        "…and always use it when available (no per-scan prompt)",
+                    )
+                    .on_hover_text(
+                        "When ON, superdeduper silently uses the cached scan if one \
+                         is found for the current scan roots' volume. When OFF \
+                         (default), a banner appears above the scan controls so you \
+                         can opt out of cache reuse per scan.",
+                    );
+                });
+            });
             ui.checkbox(
                 &mut settings.paranoid,
                 "Paranoid byte-by-byte confirm before reporting",

@@ -103,6 +103,11 @@ pub struct SuperdeduperApp {
     /// equal `"DELETE"` exactly before the Confirm button enables.
     /// Cleared every time the modal opens or closes.
     destructive_confirm_input: String,
+    /// `false` on launch; flips to `true` once the user has clicked
+    /// either dismiss button on the alpha-warning modal during this
+    /// session. Distinct from `persisted.settings.dismissed_alpha_warning`,
+    /// which suppresses the modal across launches.
+    alpha_warning_acked_session: bool,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -177,7 +182,12 @@ impl SuperdeduperApp {
             pending_archive_restore: None,
             pending_destructive: None,
             destructive_confirm_input: String::new(),
+            alpha_warning_acked_session: false,
         };
+        let mut app = app;
+        // Populate cache-banner state on first launch — roots may
+        // have been seeded from persistence or a CLI argument.
+        app.refresh_cache_banner();
 
         // Intentionally NO auto-load of prior scan results on launch.
         // Projects are now explicit — File → Open Project loads one;
@@ -328,6 +338,48 @@ impl SuperdeduperApp {
             return;
         }
         self.persisted.roots.push(RootEntry { path, is_reference });
+        self.refresh_cache_banner();
+    }
+
+    /// Recompute `state.cache_volume_summaries` from the current
+    /// scan roots. Called whenever roots are added/removed/loaded.
+    /// Best-effort — silently leaves the list empty if the cache
+    /// file isn't available or any query fails (e.g. fresh install,
+    /// schema mismatch, locked file). The banner is informational;
+    /// a stale or empty list just hides the banner.
+    pub fn refresh_cache_banner(&mut self) {
+        self.state.cache_volume_summaries.clear();
+        let Ok(cache_path) = crate::cache::default_cache_path() else {
+            return;
+        };
+        if !cache_path.exists() {
+            return;
+        }
+        let Ok(cache) = crate::cache::Cache::open(&cache_path) else {
+            return;
+        };
+        // De-dupe per-volume so a scan with multiple roots on the
+        // same drive only contributes one banner entry.
+        let mut seen = std::collections::HashSet::new();
+        for root in &self.persisted.roots {
+            let Some(guid) = live::volume_guid_for(&root.path) else {
+                continue;
+            };
+            if !seen.insert(guid.clone()) {
+                continue;
+            }
+            if let Ok(Some((captured_at, count))) = cache.cache_summary_for_volume(&guid) {
+                if count > 0 {
+                    self.state
+                        .cache_volume_summaries
+                        .push(crate::gui::state::CacheVolumeSummary {
+                            volume_guid: guid,
+                            captured_at_unix: captured_at,
+                            record_count: count,
+                        });
+                }
+            }
+        }
     }
 
     pub fn start_live(&mut self) {
@@ -340,10 +392,23 @@ impl SuperdeduperApp {
         // checkpoint file; clear our flag so the next launch doesn't
         // see a stale Resume.
         self.can_resume = false;
+        // Cache banner: if a per-scan toggle is exposed (banner
+        // visible) AND the user flipped it off, override the
+        // persisted use_cache for this run only. Otherwise honour
+        // settings.always_use_cache and settings.use_cache as before.
+        let mut effective_settings = self.persisted.settings.clone();
+        if !self.persisted.settings.always_use_cache
+            && !self.state.cache_volume_summaries.is_empty()
+        {
+            effective_settings.use_cache = self.state.use_cache_for_next_scan;
+        }
+        // Reset the per-scan toggle so the banner shows ON-by-default
+        // for the next time it appears.
+        self.state.use_cache_for_next_scan = true;
         live::spawn_with_settings(
             self.tx.clone(),
             self.persisted.roots.clone(),
-            self.persisted.settings.clone(),
+            effective_settings,
             self.cancel.clone(),
         );
     }
@@ -1220,6 +1285,28 @@ impl eframe::App for SuperdeduperApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
+        // Alpha-software warning modal — shown on launch unless the
+        // user has previously clicked "Don't show again", in which
+        // case `persisted.settings.dismissed_alpha_warning` is true
+        // and we skip. Once acknowledged this session,
+        // `alpha_warning_acked_session` blocks re-render within the
+        // same run. We render this BEFORE any other UI so a brand
+        // new user sees the warning even before scan controls.
+        if !self.persisted.settings.dismissed_alpha_warning && !self.alpha_warning_acked_session {
+            CentralPanel::default()
+                .frame(Frame::default().fill(theme::BG).inner_margin(0.0))
+                .show(ctx, |_ui| { /* dimmed backdrop only */ });
+            if let Some(choice) = crate::gui::widgets::alpha_warning::show(ctx) {
+                self.alpha_warning_acked_session = true;
+                if choice
+                    == crate::gui::widgets::alpha_warning::AlphaWarningChoice::AcknowledgeForever
+                {
+                    self.persisted.settings.dismissed_alpha_warning = true;
+                }
+            }
+            return;
+        }
+
         // Launch-time Resume / Start Fresh modal. While
         // `pending_resume` is Some we paint a dimmed background and
         // ONLY the modal. The rest of the UI is skipped entirely so
@@ -1549,6 +1636,16 @@ impl eframe::App for SuperdeduperApp {
             .min_width(240.0)
             .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
             .show(ctx, |ui| {
+                // Render the "cached scan available" banner before
+                // the scan controls so it's visible above the Start
+                // button. The banner is a no-op when no cache exists
+                // for the current roots OR when the user has
+                // settings.always_use_cache enabled.
+                crate::gui::widgets::cache_banner::show(
+                    ui,
+                    &mut self.state,
+                    self.persisted.settings.always_use_cache,
+                );
                 let roots_action =
                     roots_panel::show(ui, &self.persisted.roots, self.is_scanning, self.can_resume);
                 if let Some(a) = roots_action {
