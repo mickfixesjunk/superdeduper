@@ -311,6 +311,10 @@ impl UiState {
                     ),
                     None => "Done.".into(),
                 };
+                // Audible "ding" so a user who walked away during a
+                // long scan knows it finished. Fires on a detached
+                // thread, swallows audio-device failures silently.
+                crate::gui::sound::play_done_chime();
                 self.overall = OverallProgress {
                     stage: OverallStage::Idle,
                     done: total_files,
