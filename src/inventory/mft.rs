@@ -54,7 +54,10 @@ pub fn enumerate(
         // restore the snapshot through. Falls through to the full
         // MFT walk when there's no snapshot yet, the journal
         // wrapped, or the delta references a subtree we don't have.
-        let warm_outcome = if let Some(c) = cache {
+        // `--no-cache` (cfg.use_cache=false) also skips the warm
+        // path so a flag named --no-cache really means "fresh
+        // everything", not "fresh hashes but reuse the snapshot."
+        let warm_outcome = if let (Some(c), true) = (cache, cfg.use_cache) {
             match crate::inventory::warm::try_warm(cfg, &volume, &roots, c) {
                 Ok(o) => Some(o),
                 Err(e) => {
@@ -172,6 +175,13 @@ fn enumerate_volume(
         .unwrap_or_else(|| PathBuf::from(volume.trim_end_matches('\\')));
     let mut path_cache: HashMap<u64, PathBuf> = HashMap::new();
     let mut out = Vec::new();
+    // Capture per-file size for the snapshot persistence pass below.
+    // Without this, the snapshot writes `size: 0` for every file and
+    // the warm-path Stage 1 inventory comes back with all-zero sizes
+    // for files that weren't part of the USN delta — collapsing the
+    // entire corpus into a single 0-byte size group. See the bug
+    // reported on `sdd-testwin-superdeduper.md` 2026-05-22T17:35Z.
+    let mut file_sizes: HashMap<u64, u64> = HashMap::new();
     // Filter-pass counters — emitted as a single tracing event at the
     // end so "MFT found 250k records, 0 made it past root match" is a
     // one-line diagnosis instead of mysterious silence. This is what
@@ -211,6 +221,13 @@ fn enumerate_volume(
                 continue;
             }
         };
+        // Remember the size for the cold-snapshot pass below. Files
+        // outside scan scope (filtered_root, filtered_metadata) stay
+        // absent from this map and the snapshot writes 0 for them —
+        // they're never going to be hashed in this run anyway. The
+        // warm-path's metadata re-stat is the safety net if they
+        // ever come into scope on a future run.
+        file_sizes.insert(record.file_ref, size);
         if size < cfg.min_size {
             filtered_size += 1;
             continue;
@@ -282,7 +299,7 @@ fn enumerate_volume(
     // succeeded, we just lose the next-warm-scan optimisation.
     if let Some(c) = cache {
         if let Some(journal) = pre_enum_journal {
-            if let Err(e) = persist_cold_snapshot(volume, &by_ref, journal, c) {
+            if let Err(e) = persist_cold_snapshot(volume, &by_ref, &file_sizes, journal, c) {
                 tracing::warn!(
                     volume = %volume,
                     error = %e,
@@ -313,6 +330,7 @@ fn enumerate_volume(
 fn persist_cold_snapshot(
     volume: &str,
     by_ref: &hashbrown::HashMap<u64, crate::winapi_wrappers::UsnRecord>,
+    file_sizes: &hashbrown::HashMap<u64, u64>,
     journal: crate::winapi_wrappers::UsnJournalState,
     cache: &std::sync::Arc<parking_lot::Mutex<crate::cache::Cache>>,
 ) -> Result<()> {
@@ -327,6 +345,22 @@ fn persist_cold_snapshot(
         .iter()
         .map(|(&file_ref, r)| {
             let is_dir = (r.attributes & 0x10) != 0;
+            // Directories carry the -1 sentinel (they're never
+            // hashed, and the size field is unused for them).
+            // Files use the size stat'd during the filter pass
+            // (file_sizes map). Files outside scan scope weren't
+            // stat'd and stay at 0; warm-path metadata re-stat is
+            // the safety net if they ever come into scope on a
+            // future run. The previous shape unconditionally wrote
+            // size=0 for every file, which made the warm-path
+            // Stage 1 inventory return all-zero sizes for any
+            // file that wasn't part of the USN delta — collapsing
+            // duplicate detection completely.
+            let size = if is_dir {
+                -1
+            } else {
+                file_sizes.get(&file_ref).copied().unwrap_or(0) as i64
+            };
             (
                 file_ref,
                 InventoryRecord {
@@ -334,16 +368,7 @@ fn persist_cold_snapshot(
                     usn: r.usn,
                     attributes: r.attributes,
                     name: r.name.clone(),
-                    // Cold path doesn't carry size/mtime in the
-                    // record (it lazy-stats per file during the
-                    // filter pass). For the snapshot we want the
-                    // size+mtime that std::fs::metadata returned
-                    // so warm scans can return them without
-                    // re-statting. But our `out` building consumed
-                    // those — keep it simple and use sentinels for
-                    // dirs, then 0/0 for files; the warm path will
-                    // re-stat any delta-affected files anyway.
-                    size: if is_dir { -1 } else { 0 },
+                    size,
                     mtime: r.mtime_filetime as u64,
                 },
             )

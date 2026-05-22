@@ -327,7 +327,8 @@ fn run_cache(cmd: CacheCommand) -> anyhow::Result<()> {
         CacheCommand::Info => {
             let stats = cache.stats(&path).context("reading cache stats")?;
             println!("path:           {}", stats.path.display());
-            println!("rows:           {}", stats.rows);
+            println!("hash rows:      {}", stats.rows);
+            println!("snapshot rows:  {}", stats.snapshot_rows);
             println!(
                 "size on disk:   {}",
                 humansize::format_size(stats.bytes_on_disk, humansize::BINARY)

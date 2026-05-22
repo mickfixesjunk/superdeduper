@@ -116,6 +116,11 @@ pub struct Cache {
 pub struct CacheStats {
     pub path: PathBuf,
     pub rows: u64,
+    /// Row count of the inventory-snapshot table (used by the
+    /// warm-path Stage 1 inventory). Distinct from `rows` (hash
+    /// cache) — a heavy snapshot can persist even when hash rows
+    /// have been cleared.
+    pub snapshot_rows: u64,
     pub bytes_on_disk: u64,
 }
 
@@ -606,10 +611,19 @@ impl Cache {
         let rows: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        // Inventory-snapshot row count surfaces the warm-path
+        // state separately from hash-cache rows. Without this,
+        // `cache clear` looks like a no-op when the snapshot is
+        // a few hundred MB but logically empty.
+        let snapshot_rows: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM inventory_records", [], |r| r.get(0))
+            .unwrap_or(0);
         let bytes_on_disk = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         Ok(CacheStats {
             path: path.to_path_buf(),
             rows: rows as u64,
+            snapshot_rows: snapshot_rows as u64,
             bytes_on_disk,
         })
     }
