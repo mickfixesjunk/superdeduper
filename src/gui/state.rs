@@ -301,7 +301,16 @@ impl UiState {
                     duplicates,
                     reclaimable_bytes,
                 };
-                self.status = "Done.".into();
+                // Roll the wallclock into the status so a user
+                // glancing at the bar sees the duration of the
+                // completed scan, not just "Done."
+                self.status = match self.scan_started_at {
+                    Some(start) => format!(
+                        "Done — scanned in {}.",
+                        fmt_wallclock(at.saturating_duration_since(start))
+                    ),
+                    None => "Done.".into(),
+                };
                 self.overall = OverallProgress {
                     stage: OverallStage::Idle,
                     done: total_files,
@@ -349,5 +358,24 @@ impl UiState {
         let start = self.scan_started_at?;
         let end = self.scan_finished_at.unwrap_or_else(Instant::now);
         Some(end.saturating_duration_since(start))
+    }
+}
+
+/// Human-readable wallclock formatter shared by the header tile and
+/// the "Done — Xm Ys" status line. Picks the right unit so a 4-second
+/// scan reads `4.2s` while a 6-minute scan reads `6m 12s` and a
+/// multi-hour run reads `1h 8m`.
+pub fn fmt_wallclock(d: Duration) -> String {
+    let total = d.as_secs_f64();
+    if total < 60.0 {
+        format!("{:.1}s", total)
+    } else if total < 3600.0 {
+        let mins = (total / 60.0) as u64;
+        let secs = (total - (mins as f64) * 60.0) as u64;
+        format!("{}m {:02}s", mins, secs)
+    } else {
+        let hours = (total / 3600.0) as u64;
+        let mins = ((total - (hours as f64) * 3600.0) / 60.0) as u64;
+        format!("{}h {:02}m", hours, mins)
     }
 }
