@@ -120,7 +120,10 @@ fn checkpoint_load_returns_none_when_file_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("does-not-exist.json");
     let result = checkpoint::load(&path).expect("load on missing file is OK");
-    assert!(result.is_none(), "missing checkpoint should be None, not Err");
+    assert!(
+        result.is_none(),
+        "missing checkpoint should be None, not Err"
+    );
 }
 
 #[test]
