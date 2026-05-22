@@ -19,6 +19,7 @@ pub mod events;
 pub mod live;
 pub mod project;
 pub mod results_store;
+pub mod sound;
 pub mod state;
 pub mod theme;
 pub mod widgets;
