@@ -90,6 +90,16 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_format_aware: bool,
 
+    /// Disable per-file `GetFileInformationByHandle` lookups in the
+    /// fallback walker. With this set, the walker leaves `file_ref`
+    /// at 0 and `volume_guid` at `None`, so the Stage-4
+    /// `link_equivalent` hardlink detection can't fire. Use for
+    /// apples-to-apples benchmarks against tools that don't pay this
+    /// cost (e.g. another tool with --allow-hard-links skips inode
+    /// resolution entirely). Production scans should leave this OFF.
+    #[arg(long)]
+    pub no_file_id: bool,
+
     /// Hashing thread count. Defaults to logical CPU count.
     #[arg(long, value_name = "N")]
     pub threads: Option<usize>,

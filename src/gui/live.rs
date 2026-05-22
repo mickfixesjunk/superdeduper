@@ -1102,6 +1102,9 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         output: None,
         follow_links: settings.follow_links,
         allow_system_paths: settings.allow_system_paths,
+        // GUI scans always do hardlink detection — the link_equivalent
+        // badge in the groups table relies on it.
+        skip_file_id: false,
         hash_algo: settings.hash_algo,
     })
 }
