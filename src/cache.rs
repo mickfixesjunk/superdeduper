@@ -554,6 +554,44 @@ impl Cache {
         Ok(())
     }
 
+    /// Lightweight "is there an inventory snapshot for this volume?"
+    /// check used by the GUI's "Cache available" banner. Returns
+    /// `None` if no `inventory_meta` row matches; returns
+    /// `Some((captured_at_unix, record_count))` otherwise. The
+    /// record count is cheap because `inventory_records.volume_guid`
+    /// is indexed.
+    ///
+    /// Per-folder granularity (was the scan root previously covered?)
+    /// would need a separate `scan_roots` table or bulk-path
+    /// reconstruction — both are heavier than we want for a banner
+    /// query that runs on every scan-roots-changed event. Per-volume
+    /// is conservative in the right direction: it triggers more
+    /// often than strictly necessary, but using the cache when it's
+    /// not actually relevant is a no-op (cache misses just become
+    /// cold reads), so there's no harm in the false positive.
+    pub fn cache_summary_for_volume(&self, volume_guid: &str) -> Result<Option<(i64, u64)>> {
+        let meta: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT captured_at_unix FROM inventory_meta WHERE volume_guid = ?",
+                [volume_guid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(captured_at) = meta else {
+            return Ok(None);
+        };
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM inventory_records WHERE volume_guid = ?",
+                [volume_guid],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(Some((captured_at, count as u64)))
+    }
+
     pub fn stats(&self, path: &Path) -> Result<CacheStats> {
         let rows: i64 = self
             .conn

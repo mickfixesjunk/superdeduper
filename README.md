@@ -2,6 +2,29 @@
 
 The fastest duplicate file finder for Windows / NTFS.
 
+> ⚠️  **ALPHA SOFTWARE — USE AT YOUR OWN RISK.**
+>
+> superdeduper performs destructive operations on your files (Recycle,
+> hardlink replacement, archive move, safe-rename). The defaults are
+> reversible (Recycle Bin, safe-rename, archive-with-manifest), but
+> bugs in this codebase **can result in permanent data loss**. Before
+> running this on important data:
+>
+> 1. **Back up first.** Test on copies, not originals.
+> 2. **Read the action you're about to take.** Each destructive
+>    operation requires you to type `DELETE` to confirm by default.
+> 3. **Verify the keeper.** The "smart keep" heuristic picks one file
+>    per duplicate group based on filename / path / mtime signals — it
+>    can be wrong for your specific use case. Click the row before
+>    bulk-deleting.
+> 4. **Don't run on system folders.** `--allow-system-paths` is
+>    deliberately off by default. Don't turn it on unless you know
+>    what you're doing.
+>
+> The authors accept no responsibility for lost data. This is a
+> personal project shared as-is. File issues if something breaks,
+> but expect rough edges until v1.0.
+
 `superdeduper` is a clean-room Rust implementation built around the observation
 that most "fast" cross-platform dedupers leave significant performance on
 the table on Windows by avoiding NTFS- and Win32-specific tricks. By

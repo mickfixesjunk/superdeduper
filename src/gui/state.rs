@@ -63,6 +63,22 @@ pub struct ScanSettings {
     /// so the prompt would be more friction than safety.
     #[serde(default)]
     pub bypass_destructive_confirmation: bool,
+    /// Suppress the "cache available — use it?" banner above the
+    /// scan controls. When `false` (default) the banner appears
+    /// whenever superdeduper finds inventory-meta data for any of
+    /// the scan roots' volumes; the user picks per-scan whether to
+    /// use the cache via the banner's toggle. When `true` the
+    /// banner is hidden and the cache is silently used whenever
+    /// available — the original behavior before v0.1.5.
+    #[serde(default)]
+    pub always_use_cache: bool,
+    /// Suppress the alpha-software warning modal on startup. Flipped
+    /// to `true` when the user clicks "Don't show again" in the
+    /// modal. Default `false` — every launch shows the warning so a
+    /// new user can't accidentally bulk-delete without seeing the
+    /// caveats. Persisted across restarts.
+    #[serde(default)]
+    pub dismissed_alpha_warning: bool,
 }
 
 impl Default for ScanSettings {
@@ -81,6 +97,8 @@ impl Default for ScanSettings {
             allow_system_paths: false,
             hash_algo: crate::pipeline::hash::HashAlgo::default(),
             bypass_destructive_confirmation: false,
+            always_use_cache: false,
+            dismissed_alpha_warning: false,
         }
     }
 }
@@ -93,12 +111,31 @@ pub struct LogEntry {
     pub message: String,
 }
 
-#[derive(Default)]
+/// One per-volume summary populated by `App::refresh_cache_banner`
+/// before paint. Lets the banner widget display `{count} files
+/// cached, captured {age}` without re-querying SQLite per frame.
+#[derive(Debug, Clone)]
+pub struct CacheVolumeSummary {
+    pub volume_guid: String,
+    pub captured_at_unix: i64,
+    pub record_count: u64,
+}
+
 pub struct UiState {
     pub scan_started_at: Option<Instant>,
     pub scan_finished_at: Option<Instant>,
     pub status: String,
     pub roots: Vec<PathBuf>,
+    /// Populated whenever the scan roots change; one entry per
+    /// volume of the current scan roots that has cached inventory
+    /// data. Empty = no banner. See widgets/cache_banner.rs.
+    pub cache_volume_summaries: Vec<CacheVolumeSummary>,
+    /// Banner-toggle state, persisted in-memory across redraws but
+    /// reset between sessions. `true` means the next scan will use
+    /// the cache; user can flip via the banner toggle. Has no
+    /// effect when settings.always_use_cache is `true` (banner
+    /// hidden, cache silently used).
+    pub use_cache_for_next_scan: bool,
 
     pub stage_counts: HashMap<Stage, StageCounter>,
     pub drives: HashMap<DriveId, DriveLive>,
@@ -106,6 +143,28 @@ pub struct UiState {
     pub totals: Totals,
     pub logs: VecDeque<LogEntry>,
     pub overall: OverallProgress,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            scan_started_at: None,
+            scan_finished_at: None,
+            status: String::new(),
+            roots: Vec::new(),
+            cache_volume_summaries: Vec::new(),
+            // Default ON — banner toggle starts checked so the most
+            // common path (user wants the cache) is a single Start
+            // click. Flipping off is explicit per-scan opt-out.
+            use_cache_for_next_scan: true,
+            stage_counts: HashMap::new(),
+            drives: HashMap::new(),
+            duplicates: Vec::new(),
+            totals: Totals::default(),
+            logs: VecDeque::new(),
+            overall: OverallProgress::default(),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]

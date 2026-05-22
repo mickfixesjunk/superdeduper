@@ -1,6 +1,8 @@
 //! Custom widgets that make the GUI worth its silicon. Each widget
 //! takes a small slice of [`UiState`] and renders one concept.
 
+pub mod alpha_warning;
+pub mod cache_banner;
 pub mod drive_scope;
 pub mod funnel;
 pub mod groups_table;
