@@ -51,7 +51,7 @@ foreach ($z in Get-ChildItem *.zip) {
   $act = (Get-FileHash -Algorithm SHA256 $z).Hash.ToLower()
   if ($exp -ne $act) { throw "MISMATCH on $z" }
 }
-gh attestation verify superdeduper-x86_64-windows.zip --repo mdreeling/superdeduper
+gh attestation verify superdeduper-x86_64-windows.zip --repo mickfixesjunk/superdeduper
 ```
 
 If `attestation verify` returns "verification succeeded" and every

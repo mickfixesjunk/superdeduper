@@ -33,7 +33,7 @@ near-instant via the USN journal.
 ## Installing a release
 
 Releases are at
-[github.com/mdreeling/superdeduper/releases](https://github.com/mdreeling/superdeduper/releases).
+[github.com/mickfixesjunk/superdeduper/releases](https://github.com/mickfixesjunk/superdeduper/releases).
 Each release ships a per-architecture zip with `superdeduper.exe`,
 `superdeduper-gui.exe`, the LICENSE, and a `SHA256SUMS` manifest. All
 artifacts are reproducibly built in public CI and signed twice —
@@ -44,7 +44,7 @@ via Authenticode (when a code-signing cert is configured).
 instructions live in [SECURITY.md](SECURITY.md); the short version is:
 
 ```pwsh
-gh attestation verify superdeduper-x86_64-windows.zip --repo mdreeling/superdeduper
+gh attestation verify superdeduper-x86_64-windows.zip --repo mickfixesjunk/superdeduper
 ```
 
 If you see anything other than `verification succeeded`, do not run

@@ -11,5 +11,5 @@
 # Remove (or rename back to .example) when you want to verify CI's
 # exact dependency graph from a clean local checkout.
 
-[patch."https://github.com/mdreeling/river5"]
+[patch."https://github.com/mickfixesjunk/river5"]
 river5 = { path = "../river5" }

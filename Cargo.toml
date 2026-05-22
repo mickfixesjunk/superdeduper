@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.87"
 description = "superdeduper — the fastest duplicate file finder for Windows / NTFS."
 license = "MIT"
-repository = "https://github.com/mdreeling/superdeduper"
+repository = "https://github.com/mickfixesjunk/superdeduper"
 readme = "README.md"
 publish = false
 
@@ -30,9 +30,9 @@ blake3 = { version = "1", features = ["rayon"] }
 # reproducible — bump the SHA when river5 ships AES-NI v2 or any
 # other ABI-affecting change. For local iteration against an
 # unpushed working copy, add to a (gitignored) `.cargo/config.toml`:
-#   [patch."https://github.com/mdreeling/river5"]
+#   [patch."https://github.com/mickfixesjunk/river5"]
 #   river5 = { path = "../river5" }
-river5 = { git = "https://github.com/mdreeling/river5", rev = "3805012771dbafc1d79199f0644ce7941b550229" }
+river5 = { git = "https://github.com/mickfixesjunk/river5", rev = "3805012771dbafc1d79199f0644ce7941b550229" }
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 hashbrown = "0.14"

@@ -27,7 +27,7 @@ genuine, but verifying all three is the gold standard.
 
 ## Verifying a downloaded release
 
-Pick a release at <https://github.com/mdreeling/superdeduper/releases>,
+Pick a release at <https://github.com/mickfixesjunk/superdeduper/releases>,
 download the per-architecture zip plus its `.sha256` file, and:
 
 ### 1. Verify the SHA-256 (one-liner)
@@ -43,7 +43,7 @@ if ($expected -ne $actual) { throw "SHA-256 MISMATCH — DO NOT TRUST THIS FILE.
 ### 2. Verify the Sigstore attestation (public / org-private repos only)
 
 ```pwsh
-gh attestation verify superdeduper-x86_64-windows.zip --repo mdreeling/superdeduper
+gh attestation verify superdeduper-x86_64-windows.zip --repo mickfixesjunk/superdeduper
 ```
 
 The CLI fetches the attestation from the Sigstore transparency log and
