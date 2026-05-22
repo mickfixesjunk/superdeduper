@@ -55,6 +55,17 @@ enum Cmd {
         /// built-in AppData-style distribution.
         #[arg(long)]
         histogram: Option<PathBuf>,
+        /// Fraction of files that are members of a duplicate group
+        /// (0.0 = every file unique; 1.0 = every file is part of
+        /// some duplicate group). Files in the same group share
+        /// size + content. Default 0.0 (back-compatible: no dups).
+        #[arg(long, default_value_t = 0.0)]
+        dup_ratio: f64,
+        /// Average member count per duplicate group. Only meaningful
+        /// when `--dup-ratio > 0`. Default 3 — produces "keeper +
+        /// 2 dups" shape which is what most real workloads show.
+        #[arg(long, default_value_t = 3)]
+        avg_group_size: usize,
     },
     /// Run the Stage-4 tier sequence against an existing corpus.
     Bench {
@@ -208,23 +219,70 @@ fn plan_file_sizes(hist: &[Bucket], total_bytes: u64) -> Vec<u64> {
     sizes
 }
 
-fn gen_corpus(dir: &Path, total_bytes: u64, histogram: Option<PathBuf>) -> anyhow::Result<()> {
+fn gen_corpus(
+    dir: &Path,
+    total_bytes: u64,
+    histogram: Option<PathBuf>,
+    dup_ratio: f64,
+    avg_group_size: usize,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let hist = load_histogram(histogram.as_deref())?;
     let sizes = plan_file_sizes(&hist, total_bytes);
 
+    let dup_ratio = dup_ratio.clamp(0.0, 1.0);
+    let avg_group_size = avg_group_size.max(2);
+    let n_files = sizes.len();
+    // Number of files that should end up in dup groups (rest stay
+    // unique). Round-down so we never accidentally promote a unique
+    // to a dup-of-one.
+    let n_dup_files = ((n_files as f64) * dup_ratio).floor() as usize;
+    // Number of distinct dup groups, each averaging `avg_group_size`
+    // members. Clamp to at least 1 when we have any dup files at all.
+    let n_groups = if n_dup_files == 0 {
+        0
+    } else {
+        (n_dup_files / avg_group_size).max(1)
+    };
+
+    // Per-file "content group id": indices [0, n_dup_files) round-
+    // robin into dup groups [0, n_groups); indices [n_dup_files,
+    // n_files) get unique group ids offset past `n_groups` so they
+    // never collide with dup-group ids and stay byte-distinct.
+    // Files in the SAME group must share size (otherwise their
+    // contents would differ in length and they wouldn't actually be
+    // byte-identical), so we lock each group's size to whatever the
+    // histogram sampled for its first file index.
+    let mut group_size_by_gid: hashbrown::HashMap<u64, u64> =
+        hashbrown::HashMap::with_capacity(n_groups + (n_files - n_dup_files));
+    let mut group_assignments = Vec::with_capacity(n_files);
+    let mut actual_sizes = Vec::with_capacity(n_files);
+    for i in 0..n_files {
+        let gid: u64 = if i < n_dup_files {
+            (i % n_groups.max(1)) as u64
+        } else {
+            (n_groups + (i - n_dup_files)) as u64
+        };
+        let sz = *group_size_by_gid.entry(gid).or_insert(sizes[i]);
+        group_assignments.push(gid);
+        actual_sizes.push(sz);
+    }
+
     println!(
-        "generating {} files into {} (target ~{} bytes)",
-        sizes.len(),
+        "generating {} files into {} (target ~{} bytes, {} dup groups, {} dup-member files)",
+        n_files,
         dir.display(),
-        total_bytes
+        total_bytes,
+        n_groups,
+        n_dup_files
     );
 
     let started = Instant::now();
-    let actual: u64 = sizes
-        .par_iter()
-        .enumerate()
-        .map(|(idx, &sz)| -> anyhow::Result<u64> {
+    let actual: u64 = (0..n_files)
+        .into_par_iter()
+        .map(|idx| -> anyhow::Result<u64> {
+            let sz = actual_sizes[idx];
+            let gid = group_assignments[idx];
             let path = dir.join(format!("f{:09}.bin", idx));
             let mut f = File::create(&path)?;
             // Stream out in 1 MiB chunks so a 64 MiB file doesn't
@@ -232,7 +290,11 @@ fn gen_corpus(dir: &Path, total_bytes: u64, histogram: Option<PathBuf>) -> anyho
             let mut remaining = sz as usize;
             let chunk = (TIER3_BUF).min(remaining.max(1));
             let mut buf = vec![0u8; chunk];
-            let mut seed = (idx as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            // Seed derives from the CONTENT GROUP id, not the file
+            // index. Two files in the same gid get the same initial
+            // seed and the same per-chunk seed-advancement, so they
+            // produce byte-identical content.
+            let mut seed = gid.wrapping_add(0x9E37_79B9_7F4A_7C15);
             while remaining > 0 {
                 let n = remaining.min(buf.len());
                 xorshift_fill(&mut buf[..n], seed);
@@ -247,10 +309,12 @@ fn gen_corpus(dir: &Path, total_bytes: u64, histogram: Option<PathBuf>) -> anyho
         .sum();
 
     println!(
-        "corpus done: {} files, {:.2} GiB written in {:.1}s",
-        sizes.len(),
+        "corpus done: {} files, {:.2} GiB written in {:.1}s ({} dup groups, {} unique files)",
+        n_files,
         actual as f64 / (1024.0 * 1024.0 * 1024.0),
-        started.elapsed().as_secs_f64()
+        started.elapsed().as_secs_f64(),
+        n_groups,
+        n_files - n_dup_files
     );
     Ok(())
 }
@@ -476,8 +540,10 @@ fn main() -> anyhow::Result<()> {
             dir,
             total_bytes,
             histogram,
+            dup_ratio,
+            avg_group_size,
         } => {
-            gen_corpus(&dir, total_bytes, histogram)?;
+            gen_corpus(&dir, total_bytes, histogram, dup_ratio, avg_group_size)?;
         }
         Cmd::Bench {
             dir,
