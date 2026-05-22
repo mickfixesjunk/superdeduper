@@ -11,6 +11,8 @@
 //! Both produce the same [`FileEntry`] stream so the downstream pipeline
 //! stays agnostic to how the inventory was acquired.
 
+#[cfg(windows)]
+pub mod dir_enum;
 pub mod mft;
 pub mod walk;
 pub mod warm;
