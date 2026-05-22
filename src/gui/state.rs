@@ -373,6 +373,10 @@ impl UiState {
                 // Audible "ding" so a user who walked away during a
                 // long scan knows it finished. Fires on a detached
                 // thread, swallows audio-device failures silently.
+                // Gated on the `audio` feature so non-audio builds
+                // (CI tests, headless headless dev) compile without
+                // the rodio/alsa-sys transitive deps.
+                #[cfg(feature = "audio")]
                 crate::gui::sound::play_done_chime();
                 self.overall = OverallProgress {
                     stage: OverallStage::Idle,

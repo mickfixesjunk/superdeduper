@@ -19,6 +19,7 @@ pub mod events;
 pub mod live;
 pub mod project;
 pub mod results_store;
+#[cfg(feature = "audio")]
 pub mod sound;
 pub mod state;
 pub mod theme;

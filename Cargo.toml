@@ -57,7 +57,15 @@ rodio = { version = "0.19", optional = true, default-features = false }
 
 [features]
 default = []
-gui = ["dep:eframe", "dep:egui", "dep:egui_plot", "dep:egui_extras", "dep:crossbeam-channel", "dep:rfd", "dep:rodio"]
+# Rendering + interaction stack. Does NOT pull rodio — see `audio`.
+# Splitting these lets the test/CI matrix run gui-feature checks on
+# Linux without needing libasound2-dev (rodio's transitive build dep).
+gui = ["dep:eframe", "dep:egui", "dep:egui_plot", "dep:egui_extras", "dep:crossbeam-channel", "dep:rfd"]
+# Sound-effect playback (the scan-done chime). Independent of gui so
+# headless builds could in principle play notifications too, though
+# in practice this is GUI-only. Release builds combine both:
+# `--features "gui audio"`.
+audio = ["dep:rodio"]
 
 [[bin]]
 name = "superdeduper-gui"
