@@ -30,8 +30,12 @@ pub fn play_done_chime() {
         // (headless box, locked device, WSL2 without ALSA passthrough).
         // Silently bail — a missing chime isn't a failure mode worth
         // surfacing through the GUI.
-        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else { return; };
-        let Ok(sink) = rodio::Sink::try_new(&handle) else { return; };
+        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+            return;
+        };
+        let Ok(sink) = rodio::Sink::try_new(&handle) else {
+            return;
+        };
 
         let samples = synth_chime();
         sink.append(rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE, samples));
