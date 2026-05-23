@@ -305,6 +305,12 @@ impl SuperdeduperApp {
         // Pull the regular results_store path back in too — if its
         // fingerprint also matches it's a freebie.
         self.auto_restore_results_state();
+        // Auto-launch the resumed scan. The user's click on Resume
+        // in the modal is consent — making them click "Resume scan"
+        // again in the roots panel was a pointless second click.
+        // can_resume=true is set above, so start_live() will skip
+        // pre-flight and call launch_scan() directly.
+        self.start_live();
     }
 
     /// User clicked Start Fresh. Rename the checkpoint to a

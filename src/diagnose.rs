@@ -182,21 +182,68 @@ pub fn run_probes(target_paths: Vec<PathBuf>, skip_io: bool) -> anyhow::Result<D
     } else {
         target_paths
     };
+
+    // Per-probe-stage debug log so a future hang is diagnosable from
+    // disk without rerunning instrumented builds. Best-effort: if we
+    // can't open it, just skip — the probes still run.
+    let mut log = PreflightLog::open();
+    log.line("preflight-start", &format!("targets={}", target_paths.len()));
+    for p in &target_paths {
+        log.line("target", &p.display().to_string());
+    }
+
     let drive_groups = group_by_drive(&target_paths);
+    log.line("drive-groups", &format!("{}", drive_groups.len()));
 
     let mut drives = Vec::with_capacity(drive_groups.len());
     for group in &drive_groups {
-        drives.push(probe_drive(group, skip_io));
+        let started = std::time::Instant::now();
+        log.line("drive-probe-start", &group.identifier);
+        let r = probe_drive(group, skip_io);
+        log.line(
+            "drive-probe-end",
+            &format!(
+                "{} elapsed_ms={} measured={}",
+                group.identifier,
+                started.elapsed().as_millis(),
+                r.tier3.is_some()
+            ),
+        );
+        drives.push(r);
     }
+
+    log.line("system-probe-start", "");
+    let system = probe_system();
+    log.line("system-probe-end", "");
+
+    log.line("hash-probe-start", "");
+    let hash_started = std::time::Instant::now();
+    let hash = probe_hash_throughput();
+    log.line(
+        "hash-probe-end",
+        &format!("elapsed_ms={}", hash_started.elapsed().as_millis()),
+    );
+
+    log.line("defender-probe-start", "");
+    let defender_started = std::time::Instant::now();
+    let defender = probe_defender();
+    log.line(
+        "defender-probe-end",
+        &format!(
+            "elapsed_ms={} method={:?}",
+            defender_started.elapsed().as_millis(),
+            defender.detection_method
+        ),
+    );
 
     let report = DiagnoseReport {
         schema: "superdeduper.diagnose.v2",
         timestamp_unix: now_unix(),
         target_paths: target_paths.iter().map(|p| p.display().to_string()).collect(),
-        system: probe_system(),
-        hash: probe_hash_throughput(),
+        system,
+        hash,
         drives,
-        defender: probe_defender(),
+        defender,
         profile: MachineProfile::Indeterminate,
         recommendations: Vec::new(),
     };
@@ -205,11 +252,51 @@ pub fn run_probes(target_paths: Vec<PathBuf>, skip_io: bool) -> anyhow::Result<D
     // recommendations can reference real numbers.
     let profile = classify_profile(&report);
     let recommendations = build_recommendations(&report, &profile);
+    log.line(
+        "preflight-end",
+        &format!("profile={:?} recs={}", profile, recommendations.len()),
+    );
     Ok(DiagnoseReport {
         profile,
         recommendations,
         ..report
     })
+}
+
+/// Best-effort plain-text log of pre-flight progress. Lives at
+/// `%LOCALAPPDATA%\superdeduper\preflight.log` (or `$XDG_CACHE_HOME/superdeduper/preflight.log`).
+/// Append-only across runs so a hang on the Nth probe leaves the
+/// N-1 lines that completed visible — useful for diagnosing user
+/// reports of "pre-flight hangs on my old Windows 10 machine".
+struct PreflightLog {
+    file: Option<std::fs::File>,
+}
+
+impl PreflightLog {
+    fn open() -> Self {
+        let file = crate::cache::default_cache_path()
+            .ok()
+            .and_then(|mut p| {
+                p.set_file_name("preflight.log");
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+            });
+        Self { file }
+    }
+    fn line(&mut self, tag: &str, body: &str) {
+        if let Some(f) = self.file.as_mut() {
+            use std::io::Write;
+            let ts = now_unix();
+            let _ = writeln!(f, "{ts}  {tag:<20}  {body}");
+            let _ = f.flush();
+        }
+    }
 }
 
 /// Internal: one drive's tier1 + tier3 probe under a scratch dir.
@@ -697,41 +784,88 @@ fn probe_defender() -> DefenderState {
     #[cfg(windows)]
     {
         // Shell out to PowerShell Get-MpComputerStatus and parse
-        // RealTimeProtectionEnabled. Cheap (~150 ms) and avoids the
-        // WMI binding plumbing.
+        // RealTimeProtectionEnabled.
         //
         // CREATE_NO_WINDOW (0x08000000) suppresses the PowerShell
         // console window that would otherwise flash in front of the
-        // GUI whenever this probe runs (every pre-flight). Without
-        // this flag a black PowerShell window appears for ~150ms
-        // every scan — distracting and looks broken.
+        // GUI on every pre-flight.
+        //
+        // Hard timeout: on older Windows 10 builds where the Defender
+        // service is unresponsive (or Get-MpComputerStatus is missing
+        // entirely), the cmdlet hangs forever and the pre-flight
+        // modal blocks on it. Spawn + watchdog-kill at 5s — better
+        // to lose the Defender signal than hang the whole probe.
         use std::os::windows::process::CommandExt;
+        use std::time::Duration;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let output = std::process::Command::new("powershell.exe")
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let mut child = match std::process::Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-Command",
                 "(Get-MpComputerStatus).RealTimeProtectionEnabled",
             ])
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        match output {
-            Ok(o) if o.status.success() => {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                let rtp = match s.as_str() {
-                    "True" => Some(true),
-                    "False" => Some(false),
-                    _ => None,
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                return DefenderState {
+                    rtp_enabled: None,
+                    detection_method: "powershell.exe could not be spawned".to_string(),
                 };
-                DefenderState {
-                    rtp_enabled: rtp,
-                    detection_method: "powershell Get-MpComputerStatus".to_string(),
+            }
+        };
+
+        let started = std::time::Instant::now();
+        // Poll try_wait every 50ms; bail at PROBE_TIMEOUT.
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return match child.wait_with_output() {
+                        Ok(o) if status.success() => {
+                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            let rtp = match s.as_str() {
+                                "True" => Some(true),
+                                "False" => Some(false),
+                                _ => None,
+                            };
+                            DefenderState {
+                                rtp_enabled: rtp,
+                                detection_method: "powershell Get-MpComputerStatus".to_string(),
+                            }
+                        }
+                        _ => DefenderState {
+                            rtp_enabled: None,
+                            detection_method: "powershell Get-MpComputerStatus FAILED".to_string(),
+                        },
+                    };
+                }
+                Ok(None) => {
+                    if started.elapsed() >= PROBE_TIMEOUT {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return DefenderState {
+                            rtp_enabled: None,
+                            detection_method: format!(
+                                "powershell Get-MpComputerStatus timed out after {}s — \
+                                 Defender service may be unresponsive on this Windows build",
+                                PROBE_TIMEOUT.as_secs()
+                            ),
+                        };
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => {
+                    return DefenderState {
+                        rtp_enabled: None,
+                        detection_method: "powershell try_wait failed".to_string(),
+                    };
                 }
             }
-            _ => DefenderState {
-                rtp_enabled: None,
-                detection_method: "powershell Get-MpComputerStatus FAILED".to_string(),
-            },
         }
     }
     #[cfg(not(windows))]

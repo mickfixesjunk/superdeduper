@@ -371,6 +371,20 @@ fn run(
     // path + size + mtime; serialisation happens inside the next
     // checkpoint::save call below in the hashing loop.
     checkpoint_state.saved_inventory = Some(saved_files_from_runtime(&files));
+    // Write the checkpoint to disk right now, BEFORE any hashing
+    // starts. Previously the first persist happened at the end of
+    // chunk 0, which meant a hard-kill mid-chunk-0 lost the entire
+    // walk and forced a fresh re-walk on the next launch. Saving
+    // here narrows the loss window to "during the walk itself" —
+    // everything after Stage 1 completes survives a process kill.
+    if let Some(p) = &checkpoint_path {
+        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Warn,
+                message: format!("post-walk checkpoint save failed: {e}"),
+            });
+        }
+    }
     let total_files = files.len() as u64;
     let _ = tx.send(EngineEvent::StageTick {
         stage: Stage::Inventory,
