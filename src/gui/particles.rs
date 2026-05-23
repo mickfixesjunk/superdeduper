@@ -33,7 +33,19 @@ pub struct Sparkles {
     last_frame: Option<Instant>,
     rate_ewma: f32,
     fast_forwarding: bool,
+    /// Set on the first tick that flips fast_forwarding to true.
+    /// Used to enforce a hard ceiling on how long the effect runs
+    /// — real hashing on small files can sustain rates above any
+    /// reasonable rate threshold, so the rate alone isn't a reliable
+    /// exit signal. Cap at FF_MAX_DURATION seconds.
+    started_at: Option<Instant>,
 }
+
+/// Hard ceiling on resume catch-up effect duration. The actual
+/// cache fast-forward is usually well under a second; after this
+/// long we KNOW the cache phase is done even if some other signal
+/// keeps the rate elevated.
+const FF_MAX_DURATION_SECS: f32 = 3.0;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SparkleSignals {
@@ -49,6 +61,7 @@ impl Default for Sparkles {
             last_frame: None,
             rate_ewma: 0.0,
             fast_forwarding: false,
+            started_at: None,
         }
     }
 }
@@ -62,6 +75,7 @@ impl Sparkles {
         self.last_frame = None;
         self.rate_ewma = 0.0;
         self.fast_forwarding = false;
+        self.started_at = None;
     }
 
     /// Update once per frame. `fill_rect` is the progress-bar fill
@@ -88,15 +102,25 @@ impl Sparkles {
         self.rate_ewma = 0.35 * self.rate_ewma + 0.65 * rate;
 
         let was_ff = self.fast_forwarding;
-        // Hysteresis: enter at 2000 files/sec, exit at 800. The 800
-        // exit threshold is well above any disk-bound hashing rate
-        // (~tens-to-low-hundreds of files/sec) so the bar flips
-        // back to teal as soon as the cache fast-forward actually
-        // finishes.
+        // Enter on rate spike. Exit on EITHER (a) hard duration cap
+        // (FF_MAX_DURATION_SECS) OR (b) rate drop. Rate alone isn't
+        // reliable as an exit signal — Tier 1 over many small files
+        // with 32 rayon workers can sustain 5K+ files/sec, well
+        // above any reasonable "not fast-forwarding" threshold. The
+        // time cap guarantees the effect always terminates within a
+        // few seconds.
         if !self.fast_forwarding && self.rate_ewma > 2_000.0 {
             self.fast_forwarding = true;
-        } else if self.fast_forwarding && self.rate_ewma < 800.0 {
-            self.fast_forwarding = false;
+            self.started_at = Some(now);
+        } else if self.fast_forwarding {
+            let too_long = self
+                .started_at
+                .map(|t| now.saturating_duration_since(t).as_secs_f32() > FF_MAX_DURATION_SECS)
+                .unwrap_or(false);
+            if too_long || self.rate_ewma < 800.0 {
+                self.fast_forwarding = false;
+                self.started_at = None;
+            }
         }
         let signals = SparkleSignals {
             entered_fast_forward: !was_ff && self.fast_forwarding,

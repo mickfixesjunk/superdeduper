@@ -834,10 +834,6 @@ impl SuperdeduperApp {
                             // vanish with no transition.
                             if self.resume_effect_active && self.sparkles.is_fast_forwarding() {
                                 self.sparkles.force_catch_up(self.last_bar_fill);
-                                #[cfg(feature = "audio")]
-                                {
-                                    crate::gui::sound::play_caught_up();
-                                }
                             }
                             self.resume_effect_active = false;
                             // Don't reset() here — leave the burst
@@ -1897,15 +1893,9 @@ impl eframe::App for SuperdeduperApp {
             let signals = self
                 .sparkles
                 .tick(self.state.overall.done, self.last_bar_fill);
-            #[cfg(feature = "audio")]
-            {
-                if signals.entered_fast_forward {
-                    crate::gui::sound::play_fastforward_start();
-                }
-                if signals.left_fast_forward {
-                    crate::gui::sound::play_caught_up();
-                }
-            }
+            // Resume catch-up sounds intentionally removed — the
+            // synth attempts didn't land. Scan-finish chime in
+            // state.rs is untouched.
             if signals.left_fast_forward {
                 self.resume_effect_active = false;
             }
