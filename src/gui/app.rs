@@ -115,6 +115,11 @@ pub struct SuperdeduperApp {
     /// `cancel` (the scan-wide cancel) so cancelling an action
     /// doesn't tear down an unrelated scan.
     action_cancel: Arc<AtomicBool>,
+    /// Pre-flight modal state. Set to `Probing` when the user clicks
+    /// Scan; transitions to `Showing` once `diagnose::run_probes`
+    /// returns. `Cancel` resets to `Idle`; `Start` resets to `Idle`
+    /// and proceeds to the original `start_live` body.
+    preflight: crate::gui::preflight::PreflightState,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -191,6 +196,7 @@ impl SuperdeduperApp {
             destructive_confirm_input: String::new(),
             alpha_warning_acked_session: false,
             action_cancel: Arc::new(AtomicBool::new(false)),
+            preflight: crate::gui::preflight::PreflightState::Idle,
         };
         let mut app = app;
         // Populate cache-banner state on first launch — roots may
@@ -394,24 +400,30 @@ impl SuperdeduperApp {
         if self.is_scanning || self.persisted.roots.is_empty() {
             return;
         }
+        if self.preflight.is_active() {
+            // Already mid-preflight (probe running or modal showing).
+            return;
+        }
+        // Kick off preflight probe for the first root. Slice 1 probes
+        // a single representative root; future slices can preflight
+        // the union or per-root.
+        let primary_root = self.persisted.roots[0].path.clone();
+        self.preflight = crate::gui::preflight::spawn_probe(primary_root);
+    }
+
+    /// Spawn the actual scan worker. Called by `start_live` only
+    /// AFTER preflight has been dismissed (Cancel branches out, Start
+    /// proceeds here). The body is what `start_live` used to do.
+    fn launch_scan(&mut self) {
         self.is_scanning = true;
         self.cancel.store(false, Ordering::Relaxed);
-        // Once the engine completes successfully, it deletes the
-        // checkpoint file; clear our flag so the next launch doesn't
-        // see a stale Resume.
         self.can_resume = false;
-        // Cache banner: if a per-scan toggle is exposed (banner
-        // visible) AND the user flipped it off, override the
-        // persisted use_cache for this run only. Otherwise honour
-        // settings.always_use_cache and settings.use_cache as before.
         let mut effective_settings = self.persisted.settings.clone();
         if !self.persisted.settings.always_use_cache
             && !self.state.cache_volume_summaries.is_empty()
         {
             effective_settings.use_cache = self.state.use_cache_for_next_scan;
         }
-        // Reset the per-scan toggle so the banner shows ON-by-default
-        // for the next time it appears.
         self.state.use_cache_for_next_scan = true;
         live::spawn_with_settings(
             self.tx.clone(),
@@ -419,6 +431,41 @@ impl SuperdeduperApp {
             effective_settings,
             self.cancel.clone(),
         );
+    }
+
+    /// Drain the preflight channel + render the modal. Called once
+    /// per frame from `update()`. The modal is a floating window —
+    /// the rest of the UI keeps rendering behind it. The natural
+    /// gate against starting a scan twice is `start_live`'s early
+    /// return when `preflight.is_active()`.
+    fn tick_preflight(&mut self, ctx: &egui::Context) {
+        use crate::gui::preflight::{self as pf, PreflightAction, PreflightState};
+        if let PreflightState::Probing { rx, .. } = &self.preflight {
+            if let Ok(probe_result) = rx.try_recv() {
+                self.preflight = match probe_result {
+                    Ok(report) => {
+                        let grade = pf::grade_report(&report);
+                        PreflightState::Showing {
+                            report: Box::new(report),
+                            grade,
+                        }
+                    }
+                    Err(e) => PreflightState::Failed(format!("{:#}", e)),
+                };
+            }
+        }
+        if !self.preflight.is_active() {
+            return;
+        }
+        if let Some(action) =
+            crate::gui::widgets::preflight_modal::show(ctx, &self.preflight)
+        {
+            self.preflight = PreflightState::Idle;
+            match action {
+                PreflightAction::Start => self.launch_scan(),
+                PreflightAction::Cancel => {}
+            }
+        }
     }
 
     /// Route a File-menu action through the right handler. Pulled
@@ -1907,6 +1954,12 @@ impl eframe::App for SuperdeduperApp {
                 self.action_cancel.store(true, Ordering::Relaxed);
             }
         }
+
+        // Pre-flight score-card modal renders after the action-progress
+        // overlay so it sits on top if both are somehow active. In
+        // practice they're mutually exclusive (preflight is pre-scan,
+        // action-progress is post-results).
+        self.tick_preflight(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

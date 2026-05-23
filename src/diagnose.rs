@@ -144,13 +144,12 @@ const TIER1_FILE_COUNT: u32 = 200;
 const TIER1_FILE_BYTES: u64 = 4 * 1024;
 const TIER3_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
-pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
-    let target_path = args
-        .path
-        .clone()
-        .unwrap_or_else(std::env::temp_dir);
+/// Run all probes against `target_path` and return the populated report.
+/// This is the library-level entry point — used by the CLI subcommand
+/// (`run(args)`) and by the GUI preflight modal, which calls this on a
+/// background thread and renders the result.
+pub fn run_probes(target_path: PathBuf, skip_io: bool) -> anyhow::Result<DiagnoseReport> {
     let scratch_root = ensure_scratch_dir(&target_path)?;
-    // Drop guard cleans up the scratch dir even on panic / early return.
     let _scratch_guard = ScratchGuard {
         path: scratch_root.clone(),
     };
@@ -162,25 +161,33 @@ pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
         system: probe_system(),
         hash: probe_hash_throughput(),
         tier1: probe_tier1(&scratch_root)?,
-        tier3: if args.skip_io {
+        tier3: if skip_io {
             None
         } else {
             Some(probe_tier3(&scratch_root)?)
         },
         defender: probe_defender(),
-        profile: MachineProfile::Indeterminate, // filled below
+        profile: MachineProfile::Indeterminate,
         recommendations: Vec::new(),
     };
 
-    // Two-pass: classify + recommend AFTER probes are in hand so
+    // Two-pass: classify + recommend after probes are in hand so
     // recommendations can reference real numbers.
     let profile = classify_profile(&report);
     let recommendations = build_recommendations(&report, &profile);
-    let report = DiagnoseReport {
+    Ok(DiagnoseReport {
         profile,
         recommendations,
         ..report
-    };
+    })
+}
+
+pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
+    let target_path = args
+        .path
+        .clone()
+        .unwrap_or_else(std::env::temp_dir);
+    let report = run_probes(target_path, args.skip_io)?;
 
     use std::io::Write;
     let mut writer: Box<dyn Write> = match &args.output {

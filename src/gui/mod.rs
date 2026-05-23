@@ -17,6 +17,7 @@ pub mod diagnostics;
 pub mod drive_overrides;
 pub mod events;
 pub mod live;
+pub mod preflight;
 pub mod project;
 pub mod results_store;
 #[cfg(feature = "audio")]
