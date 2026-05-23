@@ -275,7 +275,7 @@ fn apply_tier_guards(
         {
             tracing::warn!(
                 path = %f.entry.path.display(),
-                placeholder = ?f.entry.placeholder,
+                placeholder = %f.entry.placeholder,
                 "tier guard: refusing content read for placeholder file",
             );
             // Phase 7: bump the per-state counter the GUI / CLI

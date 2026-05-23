@@ -16,6 +16,8 @@
 //! On non-Windows platforms, every file is `NotPlaceholder` by
 //! definition — the FS API doesn't surface the recall bits.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// What kind of placeholder/reparse semantics a file has.
@@ -117,6 +119,23 @@ impl PlaceholderState {
             Self::NotPlaceholder => false,
             Self::ReparseDedup => !allow_destructive_on_deduped,
             Self::RecallOnOpen | Self::RecallOnDataAccess | Self::OtherReparse(_) => true,
+        }
+    }
+}
+
+/// Snake-case Display tags so WARN log lines (`placeholder = %state`)
+/// match the JSON output's `placeholder` string field. Without this,
+/// the WARN log emits `OtherReparse(0)` while JSON emits
+/// `"other_reparse"` — two surfaces for the same value diverging in
+/// case. Per testdesign cosmetic flag on the 1083a25 re-validation.
+impl fmt::Display for PlaceholderState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPlaceholder => f.write_str("not_placeholder"),
+            Self::RecallOnOpen => f.write_str("recall_on_open"),
+            Self::RecallOnDataAccess => f.write_str("recall_on_data_access"),
+            Self::ReparseDedup => f.write_str("reparse_dedup"),
+            Self::OtherReparse(tag) => write!(f, "other_reparse(0x{:08x})", tag),
         }
     }
 }

@@ -198,13 +198,40 @@ where
             }
         };
 
-        if !cfg.follow_links && metadata.file_type().is_symlink() {
-            callback(WalkEvent::EntrySkipped {
-                path: &path,
-                reason: "symlink (use --follow-links to include)",
-            });
-            continue;
-        }
+        let metadata = if metadata.file_type().is_symlink() {
+            if !cfg.follow_links {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "symlink (use --follow-links to include)",
+                });
+                continue;
+            }
+            // --follow-links: re-stat through the symlink so downstream
+            // checks (is_file / is_dir / classify) see the TARGET's
+            // attributes, not the link's. `entry.metadata()` returns
+            // symlink_metadata on every platform, so a file-symlink
+            // would otherwise be dropped by the `!is_file` branch below.
+            // Per testdesign criterion #5: default.json and follow.json
+            // had been byte-identical because of this — --follow-links
+            // had zero observable effect.
+            match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    callback(WalkEvent::EntrySkipped {
+                        path: &path,
+                        reason: "symlink target unreadable",
+                    });
+                    tracing::debug!(
+                        path = %path.display(),
+                        error = %e,
+                        "symlink target stat failed; skipping",
+                    );
+                    continue;
+                }
+            }
+        } else {
+            metadata
+        };
 
         if metadata.is_dir() {
             walk(&path, cfg, out, callback, depth + 1, cancel)?;
