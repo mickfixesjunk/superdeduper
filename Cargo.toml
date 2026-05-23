@@ -76,6 +76,10 @@ required-features = ["gui"]
 name = "superdeduper-hash-repro"
 path = "src/bin/hash_repro.rs"
 
+[[bin]]
+name = "superdeduper-dir-probe"
+path = "src/bin/dir_probe.rs"
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [

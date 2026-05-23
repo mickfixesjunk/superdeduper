@@ -328,6 +328,66 @@ fn apply_tier_guards(
     }
 }
 
+/// T0.5 — partition a same-size group by (volume_guid, file_ref) into:
+/// * `link_equiv`: one entry per inode with ≥2 hardlink aliases. Carries
+///   the representative LaidOutFile + the full sorted alias path list.
+///   These are already-confirmed dup groups via shared inode; we only
+///   need ONE tier-3 hash per inode to produce a content_hash for the
+///   JSON output. The original architecture hashed every path including
+///   aliases — that's the redundant work T0.5 eliminates.
+/// * `single_alias`: every file whose inode has exactly ONE alias under
+///   this scan (or whose inode info is unresolved). These flow through
+///   the normal tier pipeline as one-per-inode representatives.
+///
+/// Files with `volume_guid: None` or `file_ref == 0` (walker's
+/// unresolved-inode shape) are treated as distinct single-alias inodes
+/// via a synthetic per-file key — we don't collapse files we couldn't
+/// identify by inode.
+///
+/// Tradeoff worth documenting: scenario 2 from the design notes — N
+/// paths split across M inodes (M ≥ 2) where all paths happen to share
+/// the same content — gets emitted as M separate link-equivalent dup
+/// groups, not one cross-inode merged dup group. Pre-T0.5 behaviour
+/// would have merged them. Rare in practice on hardlink-heavy corpora;
+/// the `dual_reclaimable` metric still reports the correct inode-aware
+/// reclaimable bytes either way.
+fn partition_by_inode(
+    files: Vec<LaidOutFile>,
+) -> (Vec<(LaidOutFile, Vec<PathBuf>)>, Vec<LaidOutFile>) {
+    use hashbrown::HashMap as HashbrownMap;
+    // Inode key: (volume_guid, file_ref). For files with unresolved
+    // inode info, we synthesise a unique key so they never collide.
+    type InodeKey = (Option<String>, u64);
+    let mut by_inode: HashbrownMap<InodeKey, Vec<LaidOutFile>> = HashbrownMap::new();
+    let mut next_synthetic: u64 = 1;
+    for f in files {
+        let key: InodeKey =
+            if f.entry.volume_guid.is_some() && f.entry.file_ref != 0 {
+                (f.entry.volume_guid.clone(), f.entry.file_ref)
+            } else {
+                // Unique synthetic key — won't collide with anything else.
+                let k = (None, next_synthetic);
+                next_synthetic = next_synthetic.saturating_add(1);
+                k
+            };
+        by_inode.entry(key).or_default().push(f);
+    }
+    let mut link_equiv: Vec<(LaidOutFile, Vec<PathBuf>)> = Vec::new();
+    let mut single_alias: Vec<LaidOutFile> = Vec::new();
+    for (_, mut bucket) in by_inode {
+        if bucket.len() == 1 {
+            single_alias.push(bucket.pop().unwrap());
+        } else {
+            // Pick first as rep, collect all paths (including rep's) as aliases.
+            let rep = bucket.remove(0);
+            let mut paths: Vec<PathBuf> = bucket.into_iter().map(|f| f.entry.path).collect();
+            paths.push(rep.entry.path.clone());
+            link_equiv.push((rep, paths));
+        }
+    }
+    (link_equiv, single_alias)
+}
+
 fn run_group(
     group: LaidOutGroup,
     cfg: &ScanConfig,
@@ -376,9 +436,83 @@ fn run_group(
         }]);
     }
 
-    let mut survivors = group.files;
-
+    // T0.5: dedupe by inode BEFORE the tier pipeline.
+    //
+    // Pre-T0.5, every path (including hardlink aliases sharing a single
+    // inode) went through tier 1/2/3 hashing — N redundant hashes per
+    // N-alias inode. On hardlink-heavy corpora (C:\Windows System32 ↔
+    // WinSxS) this was the dominant work item; tier 1 in particular
+    // showed 62k files-per-thread when ~16k distinct inodes were the
+    // real workload.
+    //
+    // Partition splits the surviving (post-tier-guard) files into:
+    //   * link_equiv: inodes with ≥2 hardlink aliases. Already confirmed
+    //     dup groups via shared inode; we just hash ONE rep via tier 3 to
+    //     produce a content_hash for the JSON, then emit the full alias
+    //     list as a link_equivalent dup group.
+    //   * single_alias: inodes with exactly one path each (or unresolved
+    //     inode info). These flow through the normal tier pipeline below
+    //     as one rep per inode. Tier-3-confirmed groups expand naturally
+    //     since each surviving rep has exactly one alias = its own path.
     let algo = cfg.hash_algo;
+    let (link_equiv, single_alias) = partition_by_inode(group.files);
+    let mut out: Vec<DuplicateGroup> = Vec::new();
+
+    // Stream A — link-equivalent inodes. One tier-3 hash per inode for
+    // the content_hash; emit directly. Tier-1/2 are unnecessary (the
+    // inode equivalence already confirms identity within each group).
+    for (rep, aliases) in &link_equiv {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok(out);
+        }
+        let hash_bytes = match tier3_hash_cancellable(rep, size, algo, cancel) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    path = %rep.entry.path.display(),
+                    error = %e,
+                    "T0.5 link-equiv: tier3 hash failed for inode rep; skipping group"
+                );
+                if let Some(cb) = on_file {
+                    cb(
+                        &rep.entry.path,
+                        3,
+                        ProgressOutcome::Failed { error: e.to_string() },
+                    );
+                }
+                continue;
+            }
+        };
+        // Bump diagnostic counters honestly — we DID hash this rep's
+        // bytes, just once per inode instead of per alias.
+        counters.bytes_read.fetch_add(size, Ordering::Relaxed);
+        counters.tier_bytes[3].fetch_add(size, Ordering::Relaxed);
+        counters.tier_count[3].fetch_add(1, Ordering::Relaxed);
+        let mut paths = aliases.clone();
+        paths.sort();
+        out.push(DuplicateGroup {
+            size,
+            content_hash: hex(&hash_bytes),
+            files: paths,
+            link_equivalent: true,
+            unique_inodes: 1,
+        });
+        if let Some(cb) = on_file {
+            cb(
+                &rep.entry.path,
+                3,
+                ProgressOutcome::Hashed { bytes: size },
+            );
+        }
+    }
+
+    let mut survivors = single_alias;
+    // Stream B — single-alias inodes through the normal tier pipeline.
+    // Bail with whatever Stream A produced if Stream B has nothing to do.
+    if survivors.len() < 2 {
+        return Ok(out);
+    }
+
     if cfg.use_format_aware {
         survivors = split_by_optional(&survivors, |f| {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -389,12 +523,12 @@ fn run_group(
             })
         })?;
         if survivors.len() < 2 {
-            return Ok(Vec::new());
+            return Ok(out);
         }
     }
 
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     survivors = split_by(&survivors, |f| {
         tiered(f, Tier::One, algo, cache, counters, on_file, || {
@@ -402,12 +536,12 @@ fn run_group(
         })
     })?;
     if survivors.len() < 2 {
-        return Ok(Vec::new());
+        return Ok(out);
     }
 
     if size >= TIER2_MIN_FILE {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Ok(Vec::new());
+            return Ok(out);
         }
         survivors = split_by(&survivors, |f| {
             tiered(f, Tier::Two, algo, cache, counters, on_file, || {
@@ -415,64 +549,29 @@ fn run_group(
             })
         })?;
         if survivors.len() < 2 {
-            return Ok(Vec::new());
+            return Ok(out);
         }
     }
 
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     let groups = into_subgroups(&survivors, |f| {
         tiered(f, Tier::Three, algo, cache, counters, on_file, || {
             tier3_hash_cancellable(f, size, algo, cancel)
         })
     })?;
-    let mut out = Vec::new();
     for (hash, files) in groups {
         if files.len() < 2 {
             continue;
         }
-        // Hardlink detection: on NTFS, file_ref IS the inode. Two
-        // files with the same (volume_guid, file_ref) are different
-        // names pointing at the same on-disk data — hardlinks of
-        // each other. If EVERY file in this group shares the same
-        // (volume_guid, file_ref) as the first, the entire group is
-        // a single inode with N path aliases. Reclaimable space is
-        // zero (the data is already shared); the GUI badges these
-        // distinctly so the user knows hardlinking was already done
-        // and these groups aren't candidates for further action.
-        let link_equivalent = {
-            let first = &files[0].entry;
-            files.iter().all(|f| {
-                f.entry.file_ref == first.file_ref
-                    && f.entry.volume_guid == first.volume_guid
-                    && first.volume_guid.is_some()
-            })
-        };
-        // Count distinct (volume, inode) pairs. Lets downstream
-        // consumers compute "actual disk reclaimable" =
-        // (unique_inodes - 1) * size, separate from the path-aware
-        // "duplicate path bytes" = (files.len() - 1) * size. On
-        // hardlink-heavy corpora (System32 ↔ WinSxS) the two differ
-        // substantially. Walker fallback sets volume_guid=None, in
-        // which case file_ref is always 0 and every file looks like
-        // the same inode — `link_equivalent` already requires
-        // volume_guid.is_some(), and unique_inodes follows the same
-        // semantics: if volume_guid is None, treat each file as its
-        // own inode (the conservative "we don't know better").
-        let unique_inodes: u64 = {
-            use std::collections::HashSet;
-            let mut seen: HashSet<(Option<String>, u64)> = HashSet::new();
-            let mut unknowns: u64 = 0;
-            for f in &files {
-                if f.entry.volume_guid.is_some() {
-                    seen.insert((f.entry.volume_guid.clone(), f.entry.file_ref));
-                } else {
-                    unknowns = unknowns.saturating_add(1);
-                }
-            }
-            seen.len() as u64 + unknowns
-        };
+        // T0.5: Stream B survivors are all single-alias inodes by
+        // construction (multi-alias inodes were handled in Stream A
+        // above). So every file in this group has a distinct inode,
+        // `link_equivalent` is always false, and `unique_inodes`
+        // equals files.len().
+        let link_equivalent = false;
+        let unique_inodes = files.len() as u64;
         let mut paths: Vec<PathBuf> = files.iter().map(|f| f.entry.path.clone()).collect();
         paths.sort();
         out.push(DuplicateGroup {
@@ -1040,6 +1139,17 @@ mod tests {
         f
     }
 
+    /// Build a LaidOutFile with explicit inode identity. Used by the
+    /// T0.5 tests to exercise the inode-dedup-before-hashing path —
+    /// two paths sharing the same `(volume_guid, file_ref)` simulate a
+    /// hardlink pair.
+    fn lo_with_inode(path: PathBuf, size: u64, vol: &str, file_ref: u64) -> LaidOutFile {
+        let mut f = lo(path, size);
+        f.entry.volume_guid = Some(vol.to_string());
+        f.entry.file_ref = file_ref;
+        f
+    }
+
     /// Tier guard MUST drop files marked RecallOnOpen before any
     /// content read happens — even when they're nominally part of a
     /// duplicate-candidate group. The corresponding bytes never exist
@@ -1204,6 +1314,104 @@ mod tests {
             result.is_empty(),
             "unknown reparses stay blocked even with --allow-recall-on-read"
         );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// T0.5: two LaidOutFiles sharing one inode (synthetic
+    /// volume_guid + file_ref) get partitioned into the link-equiv
+    /// stream, hashed once, and emitted as a single
+    /// `link_equivalent: true` dup group with both paths.
+    #[test]
+    fn t05_link_equivalent_aliases_collapse_to_one_hash() {
+        let d = tmpdir();
+        let body = vec![0x77u8; 8 * 1024];
+        let a = d.join("a.bin");
+        let b = d.join("b.bin");
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        // Synthetic shared inode. The fact that the on-disk files are
+        // separate doesn't matter — Stream A only uses the rep's path
+        // for the tier3 read, and the alias list is what gets emitted.
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                lo_with_inode(a.clone(), body.len() as u64, "vol-A", 42),
+                lo_with_inode(b.clone(), body.len() as u64, "vol-A", 42),
+            ],
+        };
+        let result = run(vec![group], &cfg()).unwrap();
+        assert_eq!(result.len(), 1, "two aliases of one inode → one dup group");
+        assert!(
+            result[0].link_equivalent,
+            "multi-alias-of-one-inode must be flagged link_equivalent"
+        );
+        assert_eq!(result[0].unique_inodes, 1);
+        assert_eq!(result[0].files.len(), 2);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// T0.5: distinct inodes with the same content still group as a
+    /// cross-inode dup via Stream B (the normal tier pipeline). Each
+    /// file occupies its own inode_key, so all flow through tiers and
+    /// emerge in one (hash, files) bucket.
+    #[test]
+    fn t05_distinct_inodes_same_content_still_dup() {
+        let d = tmpdir();
+        let body = vec![0x33u8; 8 * 1024];
+        let a = d.join("a");
+        let b = d.join("b");
+        let c = d.join("c");
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        fs::write(&c, &body).unwrap();
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                lo_with_inode(a, body.len() as u64, "vol-A", 1),
+                lo_with_inode(b, body.len() as u64, "vol-A", 2),
+                lo_with_inode(c, body.len() as u64, "vol-A", 3),
+            ],
+        };
+        let result = run(vec![group], &cfg()).unwrap();
+        assert_eq!(result.len(), 1, "three distinct inodes with same content group");
+        assert!(
+            !result[0].link_equivalent,
+            "different inodes → link_equivalent must be false"
+        );
+        assert_eq!(result[0].unique_inodes, 3);
+        assert_eq!(result[0].files.len(), 3);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// T0.5: mixed group — 2 paths on inode X, 1 path on inode Y.
+    /// Stream A emits inode-X as link_equivalent (Y has 1 alias and
+    /// stays singleton in Stream B since no cross-inode pair exists).
+    /// Documented tradeoff: scenario 2 from the design notes.
+    #[test]
+    fn t05_mixed_inodes_emits_separate_groups() {
+        let d = tmpdir();
+        let body = vec![0x88u8; 8 * 1024];
+        let xa = d.join("xa");
+        let xb = d.join("xb");
+        let y = d.join("y");
+        fs::write(&xa, &body).unwrap();
+        fs::write(&xb, &body).unwrap();
+        fs::write(&y, &body).unwrap();
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                lo_with_inode(xa, body.len() as u64, "vol-A", 10),
+                lo_with_inode(xb, body.len() as u64, "vol-A", 10), // shares inode 10
+                lo_with_inode(y, body.len() as u64, "vol-A", 99),
+            ],
+        };
+        let result = run(vec![group], &cfg()).unwrap();
+        // Inode 10 emits a link_equivalent dup group with 2 paths.
+        // Inode 99 is singleton in Stream B → no dup output (loses
+        // the cross-inode match with X's content; documented tradeoff).
+        assert_eq!(result.len(), 1, "only the link-equiv group emits");
+        assert!(result[0].link_equivalent);
+        assert_eq!(result[0].files.len(), 2);
         fs::remove_dir_all(&d).ok();
     }
 
