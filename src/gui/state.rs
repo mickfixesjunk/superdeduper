@@ -87,6 +87,14 @@ pub struct ScanSettings {
     /// this is the persistent always-off preference.
     #[serde(default)]
     pub skip_preflight: bool,
+    /// Which-file-to-keep strategy applied at duplicate-confirm time.
+    /// Default Smart — heuristic scoring against Recycle Bin / temp
+    /// / draft / `(1)` penalties + depth + newness bonuses.
+    /// Other strategies (Oldest, Newest, ShortestPath, …) are
+    /// available via Settings → Keep Strategy. Interactive only makes
+    /// sense in the CLI, so the GUI hides it.
+    #[serde(default)]
+    pub keep_strategy: crate::cli::KeepStrategy,
 }
 
 impl Default for ScanSettings {
@@ -108,6 +116,7 @@ impl Default for ScanSettings {
             always_use_cache: false,
             skip_preflight: false,
             dismissed_alpha_warning: false,
+            keep_strategy: crate::cli::KeepStrategy::Smart,
         }
     }
 }

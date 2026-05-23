@@ -826,7 +826,7 @@ fn run(
             // — putting the best-scored file there is how we
             // make `KeepStrategy::Smart` the GUI default without
             // each downstream action having to know about it.
-            let visible_files = order_keeper_first(visible_files);
+            let visible_files = order_keeper_first(visible_files, settings.keep_strategy);
             let summary = DuplicateGroupSummary {
                 size: g.size,
                 content_hash: g.content_hash,
@@ -991,22 +991,57 @@ fn truncate_tail(s: &str, n: usize) -> String {
 /// `KeepStrategy::Smart` the implicit GUI default without changing
 /// any downstream action handlers — safe-rename, recycle and
 /// hardlink all treat files[0] as canonical.
-fn order_keeper_first(files: Vec<PathBuf>) -> Vec<PathBuf> {
+fn order_keeper_first(
+    files: Vec<PathBuf>,
+    strategy: crate::cli::KeepStrategy,
+) -> Vec<PathBuf> {
     if files.len() < 2 {
         return files;
     }
-    // Pull mtimes once so the picker has them for the recency
-    // signal without doing two stat passes.
+    use crate::cli::KeepStrategy::*;
+    // `First` is a no-op — the engine's natural order already wins.
+    if matches!(strategy, First | Interactive) {
+        return files;
+    }
     let mtimes: Vec<Option<std::time::SystemTime>> = files
         .iter()
         .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
         .collect();
-    let keeper = crate::keep::pick_keeper(&files, &mtimes);
-    if keeper == 0 {
+    let keeper_idx = match strategy {
+        Smart | InReference => crate::keep::pick_keeper(&files, &mtimes),
+        Oldest => mtimes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.map(|m| (i, m)))
+            .min_by_key(|(_, m)| *m)
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+        Newest => mtimes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.map(|m| (i, m)))
+            .max_by_key(|(_, m)| *m)
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+        ShortestPath => files
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.as_os_str().len())
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+        LongestPath => files
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, p)| p.as_os_str().len())
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+        First | Interactive => 0, // already handled above
+    };
+    if keeper_idx == 0 {
         return files;
     }
     let mut reordered = files;
-    reordered.swap(0, keeper);
+    reordered.swap(0, keeper_idx);
     reordered
 }
 

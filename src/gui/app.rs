@@ -57,6 +57,9 @@ pub struct SuperdeduperApp {
     tx: Sender<EngineEvent>,
     is_scanning: bool,
     settings_open: bool,
+    /// Sticky tab selection for the Settings modal. Persists across
+    /// opens within a session; resets when the app restarts.
+    settings_modal_state: crate::gui::widgets::settings_modal::SettingsModalState,
     persisted: PersistedAppState,
     groups_state: groups_table::GroupsTableState,
     /// Cancel-token; the engine checks it cooperatively to honour
@@ -182,6 +185,7 @@ impl SuperdeduperApp {
             tx,
             is_scanning: false,
             settings_open: false,
+            settings_modal_state: Default::default(),
             persisted,
             groups_state: groups_table::GroupsTableState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -1701,7 +1705,12 @@ impl eframe::App for SuperdeduperApp {
         // Settings modal first; it doesn't claim screen real estate.
         if self.settings_open {
             let mut open = self.settings_open;
-            if settings_modal::show(ctx, &mut open, &mut self.persisted.settings) {
+            if settings_modal::show(
+                ctx,
+                &mut open,
+                &mut self.persisted.settings,
+                &mut self.settings_modal_state,
+            ) {
                 self.settings_open = false;
             } else {
                 self.settings_open = open;

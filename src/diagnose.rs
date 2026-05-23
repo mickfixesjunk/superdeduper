@@ -699,12 +699,21 @@ fn probe_defender() -> DefenderState {
         // Shell out to PowerShell Get-MpComputerStatus and parse
         // RealTimeProtectionEnabled. Cheap (~150 ms) and avoids the
         // WMI binding plumbing.
+        //
+        // CREATE_NO_WINDOW (0x08000000) suppresses the PowerShell
+        // console window that would otherwise flash in front of the
+        // GUI whenever this probe runs (every pre-flight). Without
+        // this flag a black PowerShell window appears for ~150ms
+        // every scan — distracting and looks broken.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let output = std::process::Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-Command",
                 "(Get-MpComputerStatus).RealTimeProtectionEnabled",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
         match output {
             Ok(o) if o.status.success() => {

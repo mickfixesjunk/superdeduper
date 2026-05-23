@@ -263,7 +263,9 @@ pub enum OutputFormat {
     Csv,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(
+    Copy, Clone, Debug, ValueEnum, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default,
+)]
 pub enum KeepStrategy {
     Oldest,
     Newest,
@@ -278,6 +280,7 @@ pub enum KeepStrategy {
     /// `_draft` / `copy of ` / ` (1)` penalised), and mtime. The
     /// highest-scored file is kept; ties resolve to newest.
     /// Reasoning is logged so a user can audit a surprising pick.
+    #[default]
     Smart,
 }
 
