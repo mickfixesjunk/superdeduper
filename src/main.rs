@@ -176,6 +176,16 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Block Q: --force-hash bypasses stages 2-3 and runs Tier 3 on
+    // every file regardless of size-grouping. Diagnostic mode for
+    // measuring hash + Tier 3 IO throughput on corpora where most
+    // files have unique sizes (videos, archives) and would otherwise
+    // never enter Tier 3 under the standard dup-detection pipeline.
+    if args.force_hash {
+        run_force_hash_mode(&cfg, &inventory, &skipped, scan_started)?;
+        return Ok(());
+    }
+
     let t_group = std::time::Instant::now();
     let mut size_groups = pipeline::grouping::group_by_size(inventory);
     let group_ms = t_group.elapsed().as_millis();
@@ -339,6 +349,121 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     output::write(writer.as_mut(), cfg.format, &duplicates, &skipped)?;
     writer.flush()?;
 
+    Ok(())
+}
+
+/// Block Q: diagnostic mode. Bypasses dup-detection grouping entirely
+/// and runs a Tier-3 (full-content) hash on every inventoried file in
+/// parallel. Reports throughput numbers but doesn't try to find
+/// duplicates. Use to measure the hash + Tier-3-IO pipeline on real
+/// corpora where most files have unique sizes (and would therefore
+/// never enter Tier 3 under the standard pipeline).
+fn run_force_hash_mode(
+    cfg: &ScanConfig,
+    inventory: &[inventory::FileEntry],
+    skipped: &[superdeduper::pipeline::SkippedFile],
+    scan_started: std::time::Instant,
+) -> anyhow::Result<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::AtomicU64;
+
+    let bytes_hashed = Arc::new(AtomicU64::new(0));
+    let files_hashed = Arc::new(AtomicU64::new(0));
+    let failures = Arc::new(AtomicU64::new(0));
+
+    let t_hash = std::time::Instant::now();
+
+    // Filter out tier-guard placeholders so we don't trigger cloud
+    // hydration here either. Block J's tier guard normally handles
+    // this inside the tier pipeline; force-hash mode replicates the
+    // check.
+    let candidates: Vec<&inventory::FileEntry> = inventory
+        .iter()
+        .filter(|e| {
+            !e.placeholder
+                .blocks_content_read_under_policy(cfg.allow_recall_on_read)
+        })
+        .collect();
+    let skipped_for_placeholder = inventory.len() - candidates.len();
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.io_threads.max(1))
+        .thread_name(|i| format!("superdeduper-force-hash-{i}"))
+        .build()
+        .map_err(|e| anyhow::anyhow!("io thread pool build: {e}"))?;
+    pool.install(|| {
+        candidates.par_iter().for_each(|entry| {
+            let path = &entry.path;
+            match std::fs::File::open(path) {
+                Ok(mut f) => {
+                    let mut buf = Vec::with_capacity(entry.size.min(1 << 26) as usize);
+                    match std::io::Read::read_to_end(&mut f, &mut buf) {
+                        Ok(n) => {
+                            // Hash the bytes — we don't keep the digest,
+                            // we just want the read + compute work to
+                            // happen so the throughput numbers reflect
+                            // both stages.
+                            let _digest = superdeduper::pipeline::hash::algo::hash_oneshot(
+                                cfg.hash_algo,
+                                &buf,
+                            );
+                            bytes_hashed.fetch_add(n as u64, Ordering::Relaxed);
+                            files_hashed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "force-hash read failed");
+                            failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "force-hash open failed");
+                    failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    });
+
+    let hash_wall = t_hash.elapsed();
+    let total_wall = scan_started.elapsed();
+    let bytes = bytes_hashed.load(Ordering::Relaxed);
+    let files = files_hashed.load(Ordering::Relaxed);
+    let fails = failures.load(Ordering::Relaxed);
+    let throughput_mbps = if hash_wall.as_secs_f64() > 0.0 {
+        (bytes as f64 / hash_wall.as_secs_f64()) / 1_048_576.0
+    } else {
+        0.0
+    };
+
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "\n--- force-hash mode ({}) ---\n\
+         files candidates: {}  (skipped {} placeholders, {} read failures)\n\
+         bytes hashed:     {}\n\
+         hash wall:        {} ms\n\
+         total wall:       {} ms\n\
+         throughput:       {:.2} MB/s aggregate ({:.2} MB/s/thread)",
+        cfg.hash_algo.tag(),
+        files,
+        skipped_for_placeholder,
+        fails,
+        humansize::format_size(bytes, humansize::BINARY),
+        hash_wall.as_millis(),
+        total_wall.as_millis(),
+        throughput_mbps,
+        throughput_mbps / cfg.io_threads.max(1) as f64,
+    );
+
+    // Write empty groups[] JSON for compatibility.
+    let mut writer: Box<dyn Write> = match &cfg.output {
+        Some(p) => Box::new(BufWriter::new(
+            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+        )),
+        None => Box::new(BufWriter::new(io::stdout().lock())),
+    };
+    output::write(writer.as_mut(), cfg.format, &[], skipped)?;
+    writer.flush()?;
     Ok(())
 }
 

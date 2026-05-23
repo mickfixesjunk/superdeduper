@@ -129,6 +129,18 @@ pub struct ScanArgs {
     #[arg(long)]
     pub placeholders_only: bool,
 
+    /// Diagnostic / benchmark mode: bypass size-grouping and the tier
+    /// hierarchy entirely. Hashes every file via Tier 3 (full content)
+    /// regardless of whether it has a same-size sibling, then reports
+    /// throughput. Useful for measuring pure hash + Tier 3 IO
+    /// throughput on real corpora where most files have unique sizes
+    /// (videos, archives) and would normally never enter Tier 3 under
+    /// the standard dup-detection pipeline. JSON output's `groups[]`
+    /// is empty in this mode — `summary` carries the throughput
+    /// numbers and the diagnostic message lives on stderr.
+    #[arg(long)]
+    pub force_hash: bool,
+
     /// Allow the hash worker to read cloud-placeholder files
     /// (`RecallOnOpen` / `RecallOnDataAccess`) even though opening them
     /// triggers cloud hydration. Default OFF — the conservative default
