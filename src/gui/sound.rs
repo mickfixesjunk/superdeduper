@@ -73,7 +73,10 @@ pub fn play_fastforward_start() {
         };
         let samples = synth_fastforward_swell();
         sink.append(rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE, samples));
-        sink.set_volume(0.35);
+        // Higher than the original 0.35 so the swell actually
+        // registers over OS notification volume + browser-tab
+        // background.
+        sink.set_volume(0.7);
         sink.sleep_until_end();
     });
 }
@@ -92,88 +95,77 @@ pub fn play_caught_up() {
         };
         let samples = synth_metallic_hit();
         sink.append(rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE, samples));
-        sink.set_volume(0.45);
+        sink.set_volume(0.85);
         sink.sleep_until_end();
     });
 }
 
-/// 350ms swell. Two near-detuned bass sines (slow beating) plus a
-/// pitch-falling high "whoosh" overlay. Slow cosine attack, longer
-/// exponential decay. The combination evokes a metallic hatch
-/// closing / power-system engaging — Fiedel-coded.
+/// 500ms swell. A noise-burst transient + mid-bass metallic ring at
+/// 110Hz / 220Hz / 165Hz with detune-induced beating, plus a brief
+/// pitch-bent ring on top. Mid-frequency-heavy so it actually
+/// reaches laptop and desktop speakers without sounding like a
+/// distant chirp.
 fn synth_fastforward_swell() -> Vec<f32> {
-    let dur_s = 0.35;
+    let dur_s = 0.50;
     let n = (SAMPLE_RATE as f32 * dur_s) as usize;
     let mut out = Vec::with_capacity(n);
-    let fade_in_s = 0.06;
-    let fade_in = (SAMPLE_RATE as f32 * fade_in_s) as usize;
-    let decay = 0.22;
+    let fade_in = (SAMPLE_RATE as f32 * 0.012) as usize;
 
-    // Two slightly detuned low fundamentals → slow phase beating,
-    // ~3 Hz wobble. Sub-bass weight without being muddy.
-    let f_a = 55.0; // A1
-    let f_b = 58.27; // A1 + ~100 cents detune (slight)
-
-    // High sweep: 6 kHz → 1.5 kHz over the swell. Falling pitch
-    // reads as "rushing in" / "locking on" rather than "rising up".
-    let sweep_start = 6_000.0;
-    let sweep_end = 1_500.0;
-    let mut sweep_phase = 0.0_f32;
+    // Mid-bass to low-mid frequencies. Audible on every speaker.
+    // The intervals are not quite a perfect chord — slight detuning
+    // creates the "industrial / sci-fi" beating instead of a tonal
+    // arpeggio.
+    let f_a = 110.0; // A2 fundamental
+    let f_b = 165.5; // ≈ E3 — perfect-fifth above, slight detune
+    let f_c = 221.5; // ≈ A3 — octave + ~1.5 Hz beat against f_a*2
+    let decay_a = 0.32;
+    let decay_b = 0.22;
+    let decay_c = 0.16;
 
     let mut noise_seed: u32 = 0x1357_9bdf;
     for i in 0..n {
         let t = i as f32 / SAMPLE_RATE as f32;
-        let phase_a = TAU * f_a * t;
-        let phase_b = TAU * f_b * t;
-        let bass = 0.55 * phase_a.sin() + 0.45 * phase_b.sin();
+        let ring_a = (TAU * f_a * t).sin() * (-t / decay_a).exp();
+        let ring_b = (TAU * f_b * t).sin() * (-t / decay_b).exp();
+        let ring_c = (TAU * f_c * t).sin() * (-t / decay_c).exp();
+        let ring = 0.55 * ring_a + 0.32 * ring_b + 0.22 * ring_c;
 
-        let sweep_freq = sweep_start + (sweep_end - sweep_start) * (t / dur_s).min(1.0);
-        sweep_phase += TAU * sweep_freq / SAMPLE_RATE as f32;
-        // High sine fades faster than the bass so the tail is
-        // mostly low-end.
-        let sweep_env = (1.0 - (t / 0.18).min(1.0)).powf(1.8);
-        let sweep = 0.18 * sweep_env * sweep_phase.sin();
-
-        // Tiny white-noise grit, low-pass-ish via averaging two
-        // samples. Adds metallic "air" without being audible as
-        // hiss.
+        // Sharp opening noise burst — gone in ~30ms. This is the
+        // "thunk" that makes the swell feel like something
+        // mechanical engaging rather than a tone fading in.
         noise_seed ^= noise_seed << 13;
         noise_seed ^= noise_seed >> 17;
         noise_seed ^= noise_seed << 5;
-        let n1 = (noise_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        noise_seed ^= noise_seed << 7;
-        let n2 = (noise_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        let grit = 0.04 * (n1 + n2) * 0.5 * (1.0 - (t / 0.10).min(1.0));
+        let n_sample = (noise_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        let transient = 0.32 * n_sample * (1.0 - (t / 0.030).min(1.0));
 
         let attack = if i < fade_in {
-            0.5 - 0.5 * ((i as f32 / fade_in as f32) * std::f32::consts::PI).cos()
+            (i as f32 / fade_in as f32).clamp(0.0, 1.0)
         } else {
             1.0
         };
-        let env = attack * (-t / decay).exp();
-        out.push(env * (bass * 0.55 + sweep + grit));
+        out.push(attack * (ring * 0.85 + transient));
     }
     out
 }
 
-/// 650ms metallic resonant hit. Fundamental + inharmonic partials
-/// (2.756x, 5.404x, 8.933x — non-integer ratios are what makes a
-/// hit sound "metallic" rather than "tonal"). Sharp 4ms attack +
-/// long exponential decay. A muffled hammer on a bulkhead.
+/// 700ms metallic resonant hit. Mid-fundamental at A3 (220Hz) with
+/// inharmonic partials at 2.756×, 5.404×, 8.933× — same ratios as
+/// before but pitched up an octave so the hit punches through any
+/// speaker. Sharp transient + long decay tail.
 fn synth_metallic_hit() -> Vec<f32> {
-    let dur_s = 0.65;
+    let dur_s = 0.70;
     let n = (SAMPLE_RATE as f32 * dur_s) as usize;
     let mut out = Vec::with_capacity(n);
-    let fade_in = (SAMPLE_RATE as f32 * 0.004) as usize;
+    let fade_in = (SAMPLE_RATE as f32 * 0.003) as usize;
 
-    // Fundamental + Helmholtz-style inharmonic partials, each with
-    // its own decay so the higher modes die off first (matches a
-    // real metal-plate impulse response).
+    // A3 fundamental + Helmholtz-style inharmonic partials. Each
+    // mode has its own decay so higher modes die off first.
     let modes: &[(f32, f32, f32)] = &[
-        (130.81, 0.55, 0.42), // C3 fundamental, longest decay
-        (360.65, 0.28, 0.20), // 2.756 × — first inharmonic
-        (706.93, 0.15, 0.12), // 5.404 ×
-        (1168.51, 0.08, 0.06), // 8.933 ×
+        (220.0, 0.55, 0.48),     // A3 fundamental
+        (606.32, 0.30, 0.22),    // 2.756 × first inharmonic
+        (1188.88, 0.18, 0.14),   // 5.404 ×
+        (1965.26, 0.10, 0.08),   // 8.933 ×
     ];
 
     let mut noise_seed: u32 = 0xbadd_cafe;
@@ -183,20 +175,20 @@ fn synth_metallic_hit() -> Vec<f32> {
         for &(freq, amp, decay) in modes {
             s += amp * (TAU * freq * t).sin() * (-t / decay).exp();
         }
-        // Initial noise burst (transient hammer-strike), gone in
-        // the first ~25ms.
+        // Initial impulse — sharper and louder than the swell so
+        // the moment of catch-up reads as a HIT, not a hum.
         noise_seed ^= noise_seed << 13;
         noise_seed ^= noise_seed >> 17;
         noise_seed ^= noise_seed << 5;
         let n_sample = (noise_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        let transient = 0.20 * n_sample * (1.0 - (t / 0.025).min(1.0));
+        let transient = 0.40 * n_sample * (1.0 - (t / 0.020).min(1.0));
 
         let attack = if i < fade_in {
             (i as f32 / fade_in as f32).clamp(0.0, 1.0)
         } else {
             1.0
         };
-        out.push(attack * (s * 0.45 + transient));
+        out.push(attack * (s * 0.55 + transient));
     }
     out
 }

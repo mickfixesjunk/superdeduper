@@ -81,12 +81,21 @@ impl Sparkles {
         let delta = files_done.saturating_sub(self.last_files);
         self.last_files = files_done;
         let rate = delta as f32 / dt;
-        self.rate_ewma = 0.6 * self.rate_ewma + 0.4 * rate;
+        // Faster EWMA (more weight on new) so we exit fast-forward
+        // quickly when real hashing starts — previously the 0.6/0.4
+        // split kept the bar red for seconds past the actual
+        // transition because the old rate decayed too slowly.
+        self.rate_ewma = 0.35 * self.rate_ewma + 0.65 * rate;
 
         let was_ff = self.fast_forwarding;
+        // Hysteresis: enter at 2000 files/sec, exit at 800. The 800
+        // exit threshold is well above any disk-bound hashing rate
+        // (~tens-to-low-hundreds of files/sec) so the bar flips
+        // back to teal as soon as the cache fast-forward actually
+        // finishes.
         if !self.fast_forwarding && self.rate_ewma > 2_000.0 {
             self.fast_forwarding = true;
-        } else if self.fast_forwarding && self.rate_ewma < 500.0 {
+        } else if self.fast_forwarding && self.rate_ewma < 800.0 {
             self.fast_forwarding = false;
         }
         let signals = SparkleSignals {
@@ -146,6 +155,23 @@ impl Sparkles {
 
     pub fn is_fast_forwarding(&self) -> bool {
         self.fast_forwarding
+    }
+
+    /// Force a catch-up burst + flip out of fast-forward state.
+    /// Used by the caller when the scan finishes while still in
+    /// fast-forward (a corpus where every file was cache-cached —
+    /// the rate stays high through the entire scan and never
+    /// naturally drops below the exit threshold).
+    pub fn force_catch_up(&mut self, fill_rect: Option<Rect>) {
+        if !self.fast_forwarding {
+            return;
+        }
+        self.fast_forwarding = false;
+        if let Some(rect) = fill_rect {
+            if rect.width() > 4.0 {
+                self.emit_catch_up_burst(rect);
+            }
+        }
     }
 
     pub fn active(&self) -> bool {

@@ -825,11 +825,24 @@ impl SuperdeduperApp {
                             self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
                             scan_just_finished = true;
-                            // End-of-scan also clears the resume
-                            // effect so a fresh subsequent scan
-                            // doesn't accidentally inherit it.
+                            // If we were still in fast-forward at
+                            // scan-end (every file was cache-cached,
+                            // so the rate never dropped to real-
+                            // hashing speed), fire the catch-up
+                            // burst + metallic hit as a finale.
+                            // Otherwise the resume effect would just
+                            // vanish with no transition.
+                            if self.resume_effect_active && self.sparkles.is_fast_forwarding() {
+                                self.sparkles.force_catch_up(self.last_bar_fill);
+                                #[cfg(feature = "audio")]
+                                {
+                                    crate::gui::sound::play_caught_up();
+                                }
+                            }
                             self.resume_effect_active = false;
-                            self.sparkles.reset();
+                            // Don't reset() here — leave the burst
+                            // particles in flight so the user sees
+                            // them; they'll age out on their own.
                         }
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;
