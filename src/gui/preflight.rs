@@ -19,7 +19,7 @@ pub enum PreflightState {
     Idle,
     Probing {
         started_at: Instant,
-        root: PathBuf,
+        roots: Vec<PathBuf>,
         rx: Receiver<anyhow::Result<DiagnoseReport>>,
     },
     Showing {
@@ -45,78 +45,109 @@ impl PreflightState {
 /// percentage of a "saturated for sd's purposes" reference point —
 /// 100% means the machine is fast enough that the axis won't be a
 /// gating factor on typical workloads.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Grade {
     pub letter: char,
     pub overall_percent: u8,
     pub hardware: AxisScore,
-    pub disk: AxisScore,
+    pub disk: DiskAxis,
     pub hash: AxisScore,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct AxisScore {
     pub percent: u8,
-    /// Human-readable raw number for the score-card line, e.g.
-    /// `"45,000 MB/s single-stream"`.
-    pub raw: &'static str,
 }
 
-// Per-axis reference points. A machine at or above these has the axis
-// effectively saturated for sd's purposes. Numbers chosen against
-// 2026-era hardware — adjust as the ecosystem shifts.
+/// Per-drive disk scores + the composite (arithmetic mean of the
+/// measured drives). Drives without a measurement are still surfaced
+/// to the user but excluded from the composite.
+#[derive(Debug, Clone)]
+pub struct DiskAxis {
+    /// Average of the measured drives' percents. `None` ⇒ no drive
+    /// was measurable (all read-only / skip-io).
+    pub composite_percent: Option<u8>,
+    pub drives: Vec<DriveScore>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DriveScore {
+    pub identifier: String,
+    /// MB/s aggregate for this drive's tier3 probe. `None` when the
+    /// drive could not be measured.
+    pub tier3_mbps: Option<f64>,
+    pub percent: Option<u8>,
+    pub error: Option<String>,
+}
+
 const HARDWARE_REF_MBPS: f64 = 20_000.0;
 const DISK_REF_MBPS: f64 = 3_000.0;
 const HASH_REF_MBPS: f64 = 50_000.0;
 
-pub fn spawn_probe(root: PathBuf) -> PreflightState {
+pub fn spawn_probe(roots: Vec<PathBuf>) -> PreflightState {
     let (tx, rx) = std::sync::mpsc::channel();
-    let probe_root = root.clone();
+    let probe_roots = roots.clone();
     std::thread::spawn(move || {
-        let result = diagnose::run_probes(probe_root, false);
+        let result = diagnose::run_probes(probe_roots, false);
         let _ = tx.send(result);
     });
     PreflightState::Probing {
         started_at: Instant::now(),
-        root,
+        roots,
         rx,
     }
 }
 
 pub fn grade_report(r: &DiagnoseReport) -> Grade {
-    let hardware_pct =
-        pct(r.hash.river5_single_thread_mbps.max(r.hash.blake3_single_thread_mbps), HARDWARE_REF_MBPS);
-    let disk_pct = r
-        .tier3
-        .as_ref()
-        .map(|t| pct(t.aggregate_mbps, DISK_REF_MBPS))
-        .unwrap_or(50); // tier3 skipped — show as middle-of-the-road
+    let hardware_pct = pct(
+        r.hash
+            .river5_single_thread_mbps
+            .max(r.hash.blake3_single_thread_mbps),
+        HARDWARE_REF_MBPS,
+    );
     let hash_pct = pct(
         r.hash.river5_aggregate_mbps.max(r.hash.blake3_aggregate_mbps),
         HASH_REF_MBPS,
     );
 
-    let overall = (hardware_pct as u32 + disk_pct as u32 + hash_pct as u32) / 3;
+    let drives: Vec<DriveScore> = r
+        .drives
+        .iter()
+        .map(|d| {
+            let (tier3_mbps, percent) = match &d.tier3 {
+                Some(t) => (Some(t.aggregate_mbps), Some(pct(t.aggregate_mbps, DISK_REF_MBPS))),
+                None => (None, None),
+            };
+            DriveScore {
+                identifier: d.identifier.clone(),
+                tier3_mbps,
+                percent,
+                error: d.error.clone(),
+            }
+        })
+        .collect();
+
+    let measured: Vec<u8> = drives.iter().filter_map(|d| d.percent).collect();
+    let composite_percent = if measured.is_empty() {
+        None
+    } else {
+        Some((measured.iter().map(|&p| p as u32).sum::<u32>() / measured.len() as u32) as u8)
+    };
+
+    let overall = match composite_percent {
+        Some(disk) => (hardware_pct as u32 + disk as u32 + hash_pct as u32) / 3,
+        None => (hardware_pct as u32 + hash_pct as u32) / 2,
+    };
 
     Grade {
         letter: letter_for(overall as u8),
         overall_percent: overall as u8,
-        hardware: AxisScore {
-            percent: hardware_pct,
-            // SAFETY: these are static slogans, not actually populated
-            // from runtime data. The render function will format the
-            // real numbers from the underlying report at draw time —
-            // we only use `raw` for the static label suffix.
-            raw: "single-stream",
+        hardware: AxisScore { percent: hardware_pct },
+        disk: DiskAxis {
+            composite_percent,
+            drives,
         },
-        disk: AxisScore {
-            percent: disk_pct,
-            raw: "Tier 3 sequential read",
-        },
-        hash: AxisScore {
-            percent: hash_pct,
-            raw: "aggregate",
-        },
+        hash: AxisScore { percent: hash_pct },
     }
 }
 

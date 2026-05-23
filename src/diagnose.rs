@@ -43,14 +43,37 @@ use crate::pipeline::hash::{algo, HashAlgo};
 pub struct DiagnoseReport {
     pub schema: &'static str,
     pub timestamp_unix: i64,
-    pub target_path: String,
+    /// All scan-target paths the user is about to scan. Each maps to
+    /// exactly one drive in `drives` via [`drive_identifier`].
+    pub target_paths: Vec<String>,
     pub system: SystemInfo,
     pub hash: HashProbeResult,
-    pub tier1: Tier1ProbeResult,
-    pub tier3: Option<Tier3ProbeResult>,
+    /// One result per unique drive across the scan targets. Drives
+    /// that couldn't be probed (read-only, no writable scratch path)
+    /// still appear here so the modal can surface them, but with
+    /// `tier1`/`tier3` set to `None`.
+    pub drives: Vec<DriveProbeResult>,
     pub defender: DefenderState,
     pub profile: MachineProfile,
     pub recommendations: Vec<Recommendation>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DriveProbeResult {
+    /// `"D:"`, `"\\\\server\\share"`, or platform-equivalent. Stable
+    /// per drive so the modal can dedup if the user has multiple
+    /// roots under the same drive.
+    pub identifier: String,
+    /// The scan-target paths that live on this drive.
+    pub paths: Vec<String>,
+    /// Where we actually ran the disk probes. `None` ⇒ no writable
+    /// scratch location was found anywhere on this drive (read-only).
+    pub scratch_path: Option<String>,
+    pub tier1: Option<Tier1ProbeResult>,
+    pub tier3: Option<Tier3ProbeResult>,
+    /// Set when `tier1` / `tier3` are `None` to explain why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,28 +167,35 @@ const TIER1_FILE_COUNT: u32 = 200;
 const TIER1_FILE_BYTES: u64 = 4 * 1024;
 const TIER3_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Run all probes against `target_path` and return the populated report.
-/// This is the library-level entry point — used by the CLI subcommand
-/// (`run(args)`) and by the GUI preflight modal, which calls this on a
-/// background thread and renders the result.
-pub fn run_probes(target_path: PathBuf, skip_io: bool) -> anyhow::Result<DiagnoseReport> {
-    let scratch_root = ensure_scratch_dir(&target_path)?;
-    let _scratch_guard = ScratchGuard {
-        path: scratch_root.clone(),
+/// Run all probes against `target_paths` and return the populated
+/// report. This is the library-level entry point — used by the CLI
+/// subcommand (`run(args)`) and by the GUI preflight modal, which
+/// calls this on a background thread and renders the result.
+///
+/// `target_paths` are deduped by drive identifier (drive letter on
+/// Windows, share root for UNC, mount root on Linux) and each unique
+/// drive is probed separately. The hash + system + defender probes
+/// are machine-wide and run once.
+pub fn run_probes(target_paths: Vec<PathBuf>, skip_io: bool) -> anyhow::Result<DiagnoseReport> {
+    let target_paths = if target_paths.is_empty() {
+        vec![std::env::temp_dir()]
+    } else {
+        target_paths
     };
+    let drive_groups = group_by_drive(&target_paths);
+
+    let mut drives = Vec::with_capacity(drive_groups.len());
+    for group in &drive_groups {
+        drives.push(probe_drive(group, skip_io));
+    }
 
     let report = DiagnoseReport {
-        schema: "superdeduper.diagnose.v1",
+        schema: "superdeduper.diagnose.v2",
         timestamp_unix: now_unix(),
-        target_path: target_path.display().to_string(),
+        target_paths: target_paths.iter().map(|p| p.display().to_string()).collect(),
         system: probe_system(),
         hash: probe_hash_throughput(),
-        tier1: probe_tier1(&scratch_root)?,
-        tier3: if skip_io {
-            None
-        } else {
-            Some(probe_tier3(&scratch_root)?)
-        },
+        drives,
         defender: probe_defender(),
         profile: MachineProfile::Indeterminate,
         recommendations: Vec::new(),
@@ -182,12 +212,173 @@ pub fn run_probes(target_path: PathBuf, skip_io: bool) -> anyhow::Result<Diagnos
     })
 }
 
+/// Internal: one drive's tier1 + tier3 probe under a scratch dir.
+/// Drives without a writable scratch location are returned with
+/// `tier1`/`tier3` = `None` and an `error` explaining why. The probe
+/// never escapes the drive — falling back to system temp would
+/// silently measure the system drive, which misleads the user.
+fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
+    let paths_str: Vec<String> = group.paths.iter().map(|p| p.display().to_string()).collect();
+    let scratch = find_writable_scratch_on_drive(group);
+    let scratch_path = match scratch {
+        Some(p) => p,
+        None => {
+            return DriveProbeResult {
+                identifier: group.identifier.clone(),
+                paths: paths_str,
+                scratch_path: None,
+                tier1: None,
+                tier3: None,
+                error: Some("no writable scratch location on this drive".to_string()),
+            };
+        }
+    };
+    let _guard = ScratchGuard {
+        path: scratch_path.clone(),
+    };
+    let tier1 = match probe_tier1(&scratch_path) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            return DriveProbeResult {
+                identifier: group.identifier.clone(),
+                paths: paths_str,
+                scratch_path: Some(scratch_path.display().to_string()),
+                tier1: None,
+                tier3: None,
+                error: Some(format!("tier1 probe failed: {}", e)),
+            };
+        }
+    };
+    let tier3 = if skip_io {
+        None
+    } else {
+        match probe_tier3(&scratch_path) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                return DriveProbeResult {
+                    identifier: group.identifier.clone(),
+                    paths: paths_str,
+                    scratch_path: Some(scratch_path.display().to_string()),
+                    tier1,
+                    tier3: None,
+                    error: Some(format!("tier3 probe failed: {}", e)),
+                };
+            }
+        }
+    };
+    DriveProbeResult {
+        identifier: group.identifier.clone(),
+        paths: paths_str,
+        scratch_path: Some(scratch_path.display().to_string()),
+        tier1,
+        tier3,
+        error: None,
+    }
+}
+
+struct DriveGroup {
+    identifier: String,
+    paths: Vec<PathBuf>,
+    /// Best guess at the volume root for `<drive_root>/.superdeduper-...`
+    /// fallback when the per-root scratch is not writable.
+    drive_root: PathBuf,
+}
+
+fn group_by_drive(paths: &[PathBuf]) -> Vec<DriveGroup> {
+    let mut groups: Vec<DriveGroup> = Vec::new();
+    for p in paths {
+        let (ident, root) = drive_identifier(p);
+        if let Some(existing) = groups.iter_mut().find(|g| g.identifier == ident) {
+            existing.paths.push(p.clone());
+        } else {
+            groups.push(DriveGroup {
+                identifier: ident,
+                paths: vec![p.clone()],
+                drive_root: root,
+            });
+        }
+    }
+    groups
+}
+
+/// Returns `(identifier, drive_root)` for a path. On Windows, the
+/// identifier is `"D:"` (drive letter) or `"\\\\server\\share"` (UNC).
+/// On Linux, the identifier is the first path component and the
+/// drive_root is `/` — Linux mounts aren't really comparable to
+/// Windows volumes for sd's purposes.
+fn drive_identifier(path: &Path) -> (String, PathBuf) {
+    let s = path.to_string_lossy();
+    // Strip `\\?\` verbatim prefix if present.
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+    // UNC path: \\server\share\...
+    if let Some(rest) = s.strip_prefix(r"\\") {
+        let mut parts = rest.splitn(3, |c| c == '\\' || c == '/');
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        if !server.is_empty() && !share.is_empty() {
+            let ident = format!(r"\\{}\{}", server, share);
+            let root = PathBuf::from(format!(r"\\{}\{}\", server, share));
+            return (ident, root);
+        }
+    }
+    // Drive letter: X:\... or X:/...
+    let mut chars = s.chars();
+    let first = chars.next();
+    let second = chars.next();
+    if let (Some(letter), Some(':')) = (first, second) {
+        if letter.is_ascii_alphabetic() {
+            let upper = letter.to_ascii_uppercase();
+            let ident = format!("{}:", upper);
+            let root = PathBuf::from(format!("{}:\\", upper));
+            return (ident, root);
+        }
+    }
+    // Linux / non-Windows: identify by the first non-root component.
+    let comp = path.components().nth(1);
+    let ident = match comp {
+        Some(c) => format!("/{}", c.as_os_str().to_string_lossy()),
+        None => "/".to_string(),
+    };
+    (ident, PathBuf::from("/"))
+}
+
+/// Locate a writable scratch path on the drive identified by `group`.
+/// Tries the first scan-target path, then the drive root. Returns
+/// `None` if neither location lets us write — meaning the drive is
+/// effectively read-only and we should skip the disk probes rather
+/// than falling back to a different drive (which would mislead the
+/// user about throughput).
+fn find_writable_scratch_on_drive(group: &DriveGroup) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(first) = group.paths.first() {
+        if first.is_dir() {
+            candidates.push(first.join(".superdeduper-diagnose-scratch"));
+        }
+    }
+    candidates.push(group.drive_root.join(".superdeduper-diagnose-scratch"));
+
+    for candidate in candidates {
+        if candidate.exists() {
+            std::fs::remove_dir_all(&candidate).ok();
+        }
+        if std::fs::create_dir_all(&candidate).is_ok() {
+            let probe = candidate.join(".write-probe");
+            if std::fs::write(&probe, b"ok").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return Some(candidate);
+            }
+            let _ = std::fs::remove_dir_all(&candidate);
+        }
+    }
+    None
+}
+
 pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
     let target_path = args
         .path
         .clone()
         .unwrap_or_else(std::env::temp_dir);
-    let report = run_probes(target_path, args.skip_io)?;
+    let report = run_probes(vec![target_path], args.skip_io)?;
 
     use std::io::Write;
     let mut writer: Box<dyn Write> = match &args.output {
@@ -209,54 +400,6 @@ pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
     }
     writer.flush()?;
     Ok(())
-}
-
-fn ensure_scratch_dir(under: &Path) -> anyhow::Result<PathBuf> {
-    // Preferred location: a hidden subdir of the user's chosen target.
-    // That gives the disk probes a measurement on the same physical
-    // drive as the scan. Falls back to system temp when the target is
-    // read-only / network share / restricted — common in the GUI
-    // preflight flow where users scan locations they don't own.
-    let candidates: Vec<PathBuf> = if under.is_dir() {
-        vec![
-            under.join(".superdeduper-diagnose-scratch"),
-            std::env::temp_dir().join("superdeduper-diagnose-scratch"),
-        ]
-    } else {
-        vec![std::env::temp_dir().join("superdeduper-diagnose-scratch")]
-    };
-
-    let mut last_err: Option<std::io::Error> = None;
-    for candidate in candidates {
-        if candidate.exists() {
-            std::fs::remove_dir_all(&candidate).ok();
-        }
-        match std::fs::create_dir_all(&candidate) {
-            Ok(()) => {
-                // Write-probe a small file too — `create_dir_all` can
-                // succeed on a directory we can't actually write to
-                // (some Windows permissions cases).
-                let probe = candidate.join(".write-probe");
-                match std::fs::write(&probe, b"ok") {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&probe);
-                        return Ok(candidate);
-                    }
-                    Err(e) => {
-                        let _ = std::fs::remove_dir_all(&candidate);
-                        last_err = Some(e);
-                    }
-                }
-            }
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "no writable scratch location found (tried target + system temp): {}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
-    ))
 }
 
 struct ScratchGuard {
@@ -500,18 +643,22 @@ fn probe_defender() -> DefenderState {
 }
 
 fn classify_profile(r: &DiagnoseReport) -> MachineProfile {
-    let Some(tier3) = &r.tier3 else {
+    // Use the average disk read rate across measured drives. Drives
+    // with no tier3 result (read-only / skip-io) are excluded — they
+    // didn't measure the IO subsystem and shouldn't drag the average.
+    let measured: Vec<f64> = r
+        .drives
+        .iter()
+        .filter_map(|d| d.tier3.as_ref().map(|t| t.aggregate_mbps))
+        .collect();
+    if measured.is_empty() {
         return MachineProfile::Indeterminate;
-    };
-    // Compare aggregate disk read rate vs aggregate hash compute rate.
-    // The faster hash backend sets the upper-bound on what we could
-    // sustain if disk weren't the gate; the disk rate is what we
-    // actually observed.
+    }
+    let disk_agg = measured.iter().sum::<f64>() / measured.len() as f64;
     let hash_agg = r
         .hash
         .river5_aggregate_mbps
         .max(r.hash.blake3_aggregate_mbps);
-    let disk_agg = tier3.aggregate_mbps;
     if hash_agg > 4.0 * disk_agg {
         MachineProfile::FastCpuFastNvme
     } else if hash_agg > 1.5 * disk_agg {
@@ -565,16 +712,47 @@ fn build_recommendations(r: &DiagnoseReport, p: &MachineProfile) -> Vec<Recommen
         }
         _ => {}
     }
-    // Tier 1 throughput sanity — if it's really low, raise the alert.
-    if r.tier1.files_per_sec_per_thread < 500.0 {
+    // Tier 1 throughput sanity — if any measured drive is really low,
+    // raise the alert (with the offending drive identifier so the
+    // user knows which volume to investigate).
+    for d in &r.drives {
+        if let Some(t1) = &d.tier1 {
+            if t1.files_per_sec_per_thread < 500.0 {
+                out.push(Recommendation {
+                    impact: RecommendationImpact::Medium,
+                    title: format!("Small-file open throughput is low on {}", d.identifier),
+                    detail: format!(
+                        "Tier 1 syscall throughput on {} is {:.0} files/sec/thread. On \
+                         small-file-dense corpora (browser caches, source repos) this will \
+                         be the gate. Check for AV scanning overhead beyond Defender, or \
+                         storage stack issues on that volume.",
+                        d.identifier, t1.files_per_sec_per_thread
+                    ),
+                    action: None,
+                });
+            }
+        }
+    }
+    // Read-only drives: surface them so the user knows the disk
+    // measurement is partial.
+    let unmeasured: Vec<&str> = r
+        .drives
+        .iter()
+        .filter(|d| d.tier3.is_none() && d.error.is_some())
+        .map(|d| d.identifier.as_str())
+        .collect();
+    if !unmeasured.is_empty() {
         out.push(Recommendation {
-            impact: RecommendationImpact::Medium,
-            title: "Small-file open throughput is low".into(),
+            impact: RecommendationImpact::Informational,
+            title: format!(
+                "{} drive(s) could not be measured",
+                unmeasured.len()
+            ),
             detail: format!(
-                "Tier 1 syscall throughput is {:.0} files/sec/thread. On small-file-dense \
-                 corpora (browser caches, source repos) this will be the gate. \
-                 Check for AV scanning overhead beyond Defender, or storage stack issues.",
-                r.tier1.files_per_sec_per_thread
+                "Skipped disk probes on: {}. The drive(s) are read-only or refused \
+                 our scratch directory. Your scan will still work — superdeduper only \
+                 needs to read these — but the disk score above doesn't include them.",
+                unmeasured.join(", ")
             ),
             action: None,
         });
@@ -587,7 +765,10 @@ fn write_text_report(
     r: &DiagnoseReport,
 ) -> anyhow::Result<()> {
     writeln!(out, "== superdeduper diagnose ==")?;
-    writeln!(out, "Target:        {}", r.target_path)?;
+    writeln!(out, "Targets:")?;
+    for p in &r.target_paths {
+        writeln!(out, "  {}", p)?;
+    }
     writeln!(out, "Schema:        {}", r.schema)?;
     writeln!(out)?;
     writeln!(out, "System:")?;
@@ -612,27 +793,41 @@ fn write_text_report(
         r.hash.blake3_single_thread_mbps
     )?;
     writeln!(out)?;
-    writeln!(out, "Tier 1 syscall throughput:")?;
-    writeln!(
-        out,
-        "  {} × {} B files in {} ms ({:.0} files/sec aggregate, {:.0}/thread)",
-        r.tier1.files_count,
-        r.tier1.bytes_per_file,
-        r.tier1.wall_ms,
-        r.tier1.files_per_sec_aggregate,
-        r.tier1.files_per_sec_per_thread,
-    )?;
-    writeln!(out)?;
-    match &r.tier3 {
-        Some(t3) => {
-            writeln!(out, "Tier 3 sequential read throughput:")?;
-            writeln!(
-                out,
-                "  {} bytes in {} ms ({:.0} MB/s)",
-                t3.file_bytes, t3.wall_ms, t3.aggregate_mbps,
-            )?;
+    writeln!(out, "Per-drive disk throughput:")?;
+    for d in &r.drives {
+        writeln!(out, "  {} ({} root(s))", d.identifier, d.paths.len())?;
+        match (&d.tier1, &d.tier3, &d.error) {
+            (Some(t1), Some(t3), _) => {
+                writeln!(
+                    out,
+                    "    Tier 1:    {} × {} B in {} ms ({:.0} files/sec aggregate, {:.0}/thread)",
+                    t1.files_count,
+                    t1.bytes_per_file,
+                    t1.wall_ms,
+                    t1.files_per_sec_aggregate,
+                    t1.files_per_sec_per_thread,
+                )?;
+                writeln!(
+                    out,
+                    "    Tier 3:    {} bytes in {} ms ({:.0} MB/s)",
+                    t3.file_bytes, t3.wall_ms, t3.aggregate_mbps,
+                )?;
+            }
+            (Some(t1), None, _) => {
+                writeln!(
+                    out,
+                    "    Tier 1:    {:.0} files/sec/thread",
+                    t1.files_per_sec_per_thread
+                )?;
+                writeln!(out, "    Tier 3:    skipped")?;
+            }
+            (None, _, Some(err)) => {
+                writeln!(out, "    NOT MEASURED: {}", err)?;
+            }
+            _ => {
+                writeln!(out, "    NOT MEASURED")?;
+            }
         }
-        None => writeln!(out, "Tier 3: skipped (--skip-io)")?,
     }
     writeln!(out)?;
     writeln!(out, "Defender state:")?;
@@ -663,4 +858,55 @@ fn write_text_report(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_letter_recognized() {
+        let (id, root) = drive_identifier(Path::new(r"D:\Studio\Projects"));
+        assert_eq!(id, "D:");
+        assert_eq!(root, PathBuf::from(r"D:\"));
+    }
+
+    #[test]
+    fn drive_letter_lowercase_canonicalised() {
+        let (id, _) = drive_identifier(Path::new(r"c:\Users\NeoMatrix"));
+        assert_eq!(id, "C:");
+    }
+
+    #[test]
+    fn drive_letter_with_forward_slashes() {
+        let (id, _) = drive_identifier(Path::new("E:/foo/bar"));
+        assert_eq!(id, "E:");
+    }
+
+    #[test]
+    fn verbatim_prefix_stripped() {
+        let (id, _) = drive_identifier(Path::new(r"\\?\D:\Studio"));
+        assert_eq!(id, "D:");
+    }
+
+    #[test]
+    fn unc_share_identified() {
+        let (id, root) = drive_identifier(Path::new(r"\\fileserver\public\dir\sub"));
+        assert_eq!(id, r"\\fileserver\public");
+        assert_eq!(root, PathBuf::from(r"\\fileserver\public\"));
+    }
+
+    #[test]
+    fn group_by_drive_dedups() {
+        let groups = group_by_drive(&[
+            PathBuf::from(r"D:\foo"),
+            PathBuf::from(r"E:\bar"),
+            PathBuf::from(r"D:\baz"),
+        ]);
+        assert_eq!(groups.len(), 2);
+        let d = groups.iter().find(|g| g.identifier == "D:").unwrap();
+        assert_eq!(d.paths.len(), 2);
+        assert!(d.paths.iter().any(|p| p == &PathBuf::from(r"D:\foo")));
+        assert!(d.paths.iter().any(|p| p == &PathBuf::from(r"D:\baz")));
+    }
 }

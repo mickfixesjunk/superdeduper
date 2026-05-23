@@ -404,11 +404,15 @@ impl SuperdeduperApp {
             // Already mid-preflight (probe running or modal showing).
             return;
         }
-        // Kick off preflight probe for the first root. Slice 1 probes
-        // a single representative root; future slices can preflight
-        // the union or per-root.
-        let primary_root = self.persisted.roots[0].path.clone();
-        self.preflight = crate::gui::preflight::spawn_probe(primary_root);
+        // Kick off preflight probe across every drive the scan
+        // touches. Drive deduplication happens inside diagnose.
+        let roots: Vec<PathBuf> = self
+            .persisted
+            .roots
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        self.preflight = crate::gui::preflight::spawn_probe(roots);
     }
 
     /// Spawn the actual scan worker. Called by `start_live` only

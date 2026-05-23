@@ -11,16 +11,16 @@
 use egui::{Color32, Context, RichText, Stroke, Window};
 
 use crate::diagnose::{DiagnoseReport, Recommendation, RecommendationImpact};
-use crate::gui::preflight::{AxisScore, Grade, PreflightAction, PreflightState};
+use crate::gui::preflight::{AxisScore, DiskAxis, DriveScore, Grade, PreflightAction, PreflightState};
 use crate::gui::theme;
 
 pub fn show(ctx: &Context, state: &PreflightState) -> Option<PreflightAction> {
     match state {
         PreflightState::Idle => None,
         PreflightState::Probing {
-            started_at, root, ..
+            started_at, roots, ..
         } => {
-            show_probing(ctx, started_at, root);
+            show_probing(ctx, started_at, roots);
             None
         }
         PreflightState::Showing { report, grade } => show_report(ctx, report, grade),
@@ -28,7 +28,7 @@ pub fn show(ctx: &Context, state: &PreflightState) -> Option<PreflightAction> {
     }
 }
 
-fn show_probing(ctx: &Context, started_at: &std::time::Instant, root: &std::path::Path) {
+fn show_probing(ctx: &Context, started_at: &std::time::Instant, roots: &[std::path::PathBuf]) {
     let elapsed = started_at.elapsed().as_secs_f32();
     Window::new(
         RichText::new("Pre-flight check")
@@ -51,12 +51,14 @@ fn show_probing(ctx: &Context, started_at: &std::time::Instant, root: &std::path
             );
         });
         ui.add_space(6.0);
-        ui.label(
-            RichText::new(format!("Target: {}", root.display()))
-                .color(theme::TEXT_LO)
-                .small()
-                .monospace(),
-        );
+        for r in roots {
+            ui.label(
+                RichText::new(format!("Target: {}", r.display()))
+                    .color(theme::TEXT_LO)
+                    .small()
+                    .monospace(),
+            );
+        }
         ui.label(
             RichText::new(format!("Elapsed: {:.1}s", elapsed))
                 .color(theme::TEXT_LO)
@@ -65,15 +67,14 @@ fn show_probing(ctx: &Context, started_at: &std::time::Instant, root: &std::path
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Measuring hash compute, Tier 1 syscall throughput, Tier 3 disk read, and \
-                 Defender state. Usually 5–15 seconds.",
+                "Measuring hash compute, plus Tier 1 + Tier 3 disk throughput for each \
+                 drive in the scan. Usually 5–15 seconds per drive.",
             )
             .color(theme::TEXT_LO)
             .small()
             .italics(),
         );
     });
-    // Repaint so the spinner animates and the elapsed counter ticks.
     ctx.request_repaint_after(std::time::Duration::from_millis(80));
 }
 
@@ -178,7 +179,6 @@ fn show_report(
         ui.separator();
         ui.add_space(8.0);
 
-        // Three axis bars.
         axis_row(
             ui,
             "Hardware capability",
@@ -189,15 +189,7 @@ fn show_report(
             ),
         );
         ui.add_space(8.0);
-        axis_row(
-            ui,
-            "Disk read",
-            &grade.disk,
-            &match &report.tier3 {
-                Some(t) => format!("{:.0} MB/s sequential", t.aggregate_mbps),
-                None => "(skipped)".to_string(),
-            },
-        );
+        disk_axis_rows(ui, &grade.disk);
         ui.add_space(8.0);
         axis_row(
             ui,
@@ -291,6 +283,124 @@ fn draw_grade_chip(ui: &mut egui::Ui, grade: &Grade) {
         egui::FontId::new(48.0, egui::FontFamily::Proportional),
         bg,
     );
+}
+
+fn disk_axis_rows(ui: &mut egui::Ui, disk: &DiskAxis) {
+    let composite_pct = disk.composite_percent.unwrap_or(0);
+    let composite_color = match disk.composite_percent {
+        Some(p) => color_for_percent(p),
+        None => theme::TEXT_LO,
+    };
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Disk read")
+                    .color(theme::TEXT_HI)
+                    .strong()
+                    .size(13.0),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match disk.composite_percent {
+                    Some(p) => {
+                        ui.label(
+                            RichText::new(format!("{}%", p))
+                                .color(composite_color)
+                                .strong()
+                                .size(13.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "composite of {} measured drive(s)",
+                                disk.drives.iter().filter(|d| d.percent.is_some()).count()
+                            ))
+                            .color(theme::TEXT_LO)
+                            .size(12.0),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("not measured")
+                                .color(theme::WARN)
+                                .strong()
+                                .size(13.0),
+                        );
+                    }
+                }
+            });
+        });
+        ui.add_space(2.0);
+        if disk.composite_percent.is_some() {
+            draw_bar(ui, composite_pct, composite_color);
+        }
+        ui.add_space(4.0);
+
+        for drive in &disk.drives {
+            drive_row(ui, drive);
+        }
+    });
+}
+
+fn drive_row(ui: &mut egui::Ui, drive: &DriveScore) {
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new(format!("• {}", drive.identifier))
+                .color(theme::TEXT_HI)
+                .size(12.0)
+                .monospace(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            match (drive.percent, drive.tier3_mbps) {
+                (Some(p), Some(mbps)) => {
+                    let color = color_for_percent(p);
+                    ui.label(
+                        RichText::new(format!("{}%", p))
+                            .color(color)
+                            .size(12.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("{:.0} MB/s", mbps))
+                            .color(theme::TEXT_LO)
+                            .size(11.0)
+                            .monospace(),
+                    );
+                }
+                _ => {
+                    let note = drive
+                        .error
+                        .as_deref()
+                        .unwrap_or("not measured");
+                    ui.label(
+                        RichText::new(format!("({})", note))
+                            .color(theme::TEXT_LO)
+                            .size(11.0)
+                            .italics(),
+                    );
+                }
+            }
+        });
+    });
+    if let Some(p) = drive.percent {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            let color = color_for_percent(p);
+            let height = 6.0;
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), height),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, theme::PANEL_DEEP);
+            let fill_width = rect.width() * (p as f32 / 100.0);
+            let fill_rect =
+                egui::Rect::from_min_size(rect.min, egui::vec2(fill_width, rect.height()));
+            painter.rect_filled(fill_rect, 2.0, color);
+        });
+    }
+    ui.add_space(2.0);
 }
 
 fn axis_row(ui: &mut egui::Ui, label: &str, score: &AxisScore, raw: &str) {
