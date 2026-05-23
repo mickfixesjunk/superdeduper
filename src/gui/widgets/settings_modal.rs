@@ -205,6 +205,15 @@ pub fn show(ctx: &Context, open: &mut bool, settings: &mut ScanSettings) -> bool
                 &mut settings.allow_system_paths,
                 "Permit scanning system paths (C:\\Windows etc.)",
             );
+            ui.checkbox(
+                &mut settings.skip_preflight,
+                "Skip pre-flight modal before each scan",
+            )
+            .on_hover_text(
+                "When ON, scans start immediately without the score-card modal. \
+                 You can still trigger Diagnose manually from the CLI to see \
+                 your machine's profile.",
+            );
 
             ui.horizontal(|ui| {
                 ui.label("Threads:");

@@ -19,16 +19,18 @@ pub fn show(ctx: &Context, state: &PreflightState) -> Option<PreflightAction> {
         PreflightState::Idle => None,
         PreflightState::Probing {
             started_at, roots, ..
-        } => {
-            show_probing(ctx, started_at, roots);
-            None
-        }
+        } => show_probing(ctx, started_at, roots),
         PreflightState::Showing { report, grade } => show_report(ctx, report, grade),
         PreflightState::Failed(err) => show_failed(ctx, err),
     }
 }
 
-fn show_probing(ctx: &Context, started_at: &std::time::Instant, roots: &[std::path::PathBuf]) {
+fn show_probing(
+    ctx: &Context,
+    started_at: &std::time::Instant,
+    roots: &[std::path::PathBuf],
+) -> Option<PreflightAction> {
+    let mut action: Option<PreflightAction> = None;
     let elapsed = started_at.elapsed().as_secs_f32();
     Window::new(
         RichText::new("Pre-flight check")
@@ -74,8 +76,36 @@ fn show_probing(ctx: &Context, started_at: &std::time::Instant, roots: &[std::pa
             .small()
             .italics(),
         );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel scan").color(theme::TEXT_HI))
+                        .min_size(egui::vec2(110.0, 28.0)),
+                )
+                .clicked()
+            {
+                action = Some(PreflightAction::Cancel);
+            }
+            ui.add_space(8.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Skip pre-flight  →")
+                            .color(theme::PANEL_DEEP)
+                            .strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(170.0, 28.0)),
+                )
+                .clicked()
+            {
+                action = Some(PreflightAction::Start);
+            }
+        });
     });
     ctx.request_repaint_after(std::time::Duration::from_millis(80));
+    action
 }
 
 fn show_failed(ctx: &Context, err: &str) -> Option<PreflightAction> {

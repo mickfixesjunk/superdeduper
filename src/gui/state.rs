@@ -79,6 +79,14 @@ pub struct ScanSettings {
     /// caveats. Persisted across restarts.
     #[serde(default)]
     pub dismissed_alpha_warning: bool,
+    /// Skip the credit-report-style pre-flight modal that runs
+    /// `diagnose` against every drive in the scan before launching.
+    /// Default `false` — pre-flight runs unless the user has flipped
+    /// this in Settings → "Skip pre-flight modal". Independent of the
+    /// per-probe "Skip pre-flight →" button which fires once mid-probe;
+    /// this is the persistent always-off preference.
+    #[serde(default)]
+    pub skip_preflight: bool,
 }
 
 impl Default for ScanSettings {
@@ -98,6 +106,7 @@ impl Default for ScanSettings {
             hash_algo: crate::pipeline::hash::HashAlgo::default(),
             bypass_destructive_confirmation: false,
             always_use_cache: false,
+            skip_preflight: false,
             dismissed_alpha_warning: false,
         }
     }

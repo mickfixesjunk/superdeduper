@@ -728,13 +728,53 @@ fn run(
             }
         });
 
-        let (dups, counters) = pipeline::hash::run_cancellable(
+        let (dups, counters) = match pipeline::hash::run_cancellable(
             chunk,
             &cfg,
             cache.clone(),
             on_file,
             Arc::clone(&cancel),
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // Cancellation came from the per-file Tier 3 streaming
+                // path — it surfaces as Interrupted before the
+                // chunks-loop top can see the cancel atomic. Save the
+                // checkpoint with whatever progress we have, then
+                // emit_paused and exit cleanly. Without this, the
+                // outer `?` would propagate the cancel as a scan
+                // failure and the checkpoint would never write — the
+                // exact bug that breaks resume after a mid-hash cancel.
+                if let Some(p) = &checkpoint_path {
+                    if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                        let _ = tx.send(EngineEvent::Log {
+                            level: LogLevel::Warn,
+                            message: format!("checkpoint save failed: {e}"),
+                        });
+                    }
+                }
+                sampler_stop.store(true, Ordering::Relaxed);
+                if let Some(d) = &diag {
+                    let n = files_hashed.load(Ordering::Relaxed);
+                    let f = hash_failures.load(Ordering::Relaxed);
+                    d.log(
+                        "SCAN-PAUSED",
+                        format_args!(
+                            "n_hashed={n} hash_failures={f} dups={total_dups} \
+                             reclaimable={reclaimable} reason=mid-chunk-cancel"
+                        ),
+                    );
+                    d.finalize(format_args!(
+                        "paused mid-chunk at {}/{} · {total_dups} dup group(s)",
+                        i + 1,
+                        total_chunks
+                    ));
+                }
+                emit_paused(&tx);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let chunk_bytes = counters.bytes_read.load(Ordering::Relaxed);
         total_bytes_read = total_bytes_read.saturating_add(chunk_bytes);
         for i in 0..4 {

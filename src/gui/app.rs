@@ -401,11 +401,16 @@ impl SuperdeduperApp {
             return;
         }
         if self.preflight.is_active() {
-            // Already mid-preflight (probe running or modal showing).
             return;
         }
-        // Kick off preflight probe across every drive the scan
-        // touches. Drive deduplication happens inside diagnose.
+        // Skip preflight when:
+        // * user has flipped the persistent "Skip pre-flight modal" setting
+        // * this is a Resume (checkpoint already adopted; user already chose
+        //   to continue — the score is the same machine we're already on)
+        if self.persisted.settings.skip_preflight || self.can_resume {
+            self.launch_scan();
+            return;
+        }
         let roots: Vec<PathBuf> = self
             .persisted
             .roots
