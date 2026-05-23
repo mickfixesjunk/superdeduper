@@ -70,6 +70,8 @@ pub struct HashProbeResult {
     pub river5_per_thread_mbps: f64,
     pub blake3_aggregate_mbps: f64,
     pub blake3_per_thread_mbps: f64,
+    pub river5_single_thread_mbps: f64,
+    pub blake3_single_thread_mbps: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,8 +291,29 @@ fn probe_hash_throughput() -> HashProbeResult {
         (aggregate_mbps, per_thread_mbps)
     };
 
+    // Single-thread reference measurement. Tells us the per-stream rate
+    // without contention — important for diagnosing workloads where file
+    // count < worker count (only a fraction of cores active during
+    // Tier 3) versus workloads where memory bandwidth caps aggregate.
+    let measure_single = |algo: HashAlgo| -> f64 {
+        let t = Instant::now();
+        let mut bytes: u64 = 0;
+        for _ in 0..HASH_PROBE_ITERATIONS {
+            let _digest = algo::hash_oneshot(algo, &buf);
+            bytes += buf.len() as u64;
+        }
+        let elapsed = t.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            (bytes as f64 / elapsed) / 1_048_576.0
+        } else {
+            0.0
+        }
+    };
+
     let (river5_agg, river5_pt) = measure(HashAlgo::River5);
     let (blake3_agg, blake3_pt) = measure(HashAlgo::Blake3);
+    let river5_single = measure_single(HashAlgo::River5);
+    let blake3_single = measure_single(HashAlgo::Blake3);
 
     HashProbeResult {
         buffer_bytes: HASH_BUFFER_SIZE as u64,
@@ -299,6 +322,8 @@ fn probe_hash_throughput() -> HashProbeResult {
         river5_per_thread_mbps: river5_pt,
         blake3_aggregate_mbps: blake3_agg,
         blake3_per_thread_mbps: blake3_pt,
+        river5_single_thread_mbps: river5_single,
+        blake3_single_thread_mbps: blake3_single,
     }
 }
 
@@ -533,13 +558,17 @@ fn write_text_report(
     writeln!(out, "Hash compute throughput (in-memory):")?;
     writeln!(
         out,
-        "  river5:      {:>10.0} MB/s aggregate  ({:>7.0} MB/s/thread)",
-        r.hash.river5_aggregate_mbps, r.hash.river5_per_thread_mbps
+        "  river5:      {:>10.0} MB/s aggregate  ({:>7.0} MB/s/thread)  ({:>7.0} MB/s single-thread)",
+        r.hash.river5_aggregate_mbps,
+        r.hash.river5_per_thread_mbps,
+        r.hash.river5_single_thread_mbps
     )?;
     writeln!(
         out,
-        "  blake3:      {:>10.0} MB/s aggregate  ({:>7.0} MB/s/thread)",
-        r.hash.blake3_aggregate_mbps, r.hash.blake3_per_thread_mbps
+        "  blake3:      {:>10.0} MB/s aggregate  ({:>7.0} MB/s/thread)  ({:>7.0} MB/s single-thread)",
+        r.hash.blake3_aggregate_mbps,
+        r.hash.blake3_per_thread_mbps,
+        r.hash.blake3_single_thread_mbps
     )?;
     writeln!(out)?;
     writeln!(out, "Tier 1 syscall throughput:")?;
