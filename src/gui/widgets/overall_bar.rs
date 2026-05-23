@@ -26,7 +26,19 @@ pub struct BarRects {
     pub fill: Option<egui::Rect>,
 }
 
+/// While a resume is in cache-fast-forward mode the caller can pass
+/// `fast_forward = true` to swap the fill colour for a dystopian
+/// red. Snaps back to the normal stage colour on the very next
+/// frame after the cache catches up. Default `false`.
+pub fn show_with(ui: &mut Ui, state: &UiState, fast_forward: bool) -> BarRects {
+    show_inner(ui, state, fast_forward)
+}
+
 pub fn show(ui: &mut Ui, state: &UiState) -> BarRects {
+    show_inner(ui, state, false)
+}
+
+fn show_inner(ui: &mut Ui, state: &UiState, fast_forward: bool) -> BarRects {
     let avail = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(avail, BAR_HEIGHT), Sense::hover());
     resp.on_hover_text(
@@ -46,7 +58,14 @@ pub fn show(ui: &mut Ui, state: &UiState) -> BarRects {
 
     let stage = state.overall.stage;
     let label = stage.label();
-    let color = stage_color(stage);
+    let color = if fast_forward {
+        // Resume catch-up: dystopian deep red. Reads as "hostile /
+        // emergency / system overriding" which is the right tone
+        // for the cache rocketing past previously-hashed files.
+        Color32::from_rgb(0xc8, 0x2a, 0x3a)
+    } else {
+        stage_color(stage)
+    };
 
     let mut fill_rect_out: Option<egui::Rect> = None;
     if state.overall.is_determinate() {

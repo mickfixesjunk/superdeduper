@@ -1917,7 +1917,12 @@ impl eframe::App for SuperdeduperApp {
                     .inner_margin(egui::vec2(8.0, 4.0)),
             )
             .show(ctx, |ui| {
-                let bar_rects = overall_bar::show(ui, &self.state);
+                // While the resume cache-fast-forward is active the
+                // bar fills in dystopian red instead of the normal
+                // accent teal. Snaps back the very next frame after
+                // catch-up.
+                let ff = self.resume_effect_active && self.sparkles.is_fast_forwarding();
+                let bar_rects = overall_bar::show_with(ui, &self.state, ff);
                 self.last_bar_fill = bar_rects.fill;
             });
 

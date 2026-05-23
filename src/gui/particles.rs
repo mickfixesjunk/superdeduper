@@ -101,6 +101,17 @@ impl Sparkles {
                 }
             }
         }
+        // Catch-up moment: emit a final dense burst with a brighter
+        // accent palette so the colour-flip away from red has a
+        // visual exclamation mark. After this burst, no more
+        // emission for the rest of the scan.
+        if signals.left_fast_forward {
+            if let Some(rect) = fill_rect {
+                if rect.width() > 4.0 {
+                    self.emit_catch_up_burst(rect);
+                }
+            }
+        }
 
         // Tick particles. No gravity — keep them inside the bar.
         for p in self.particles.iter_mut() {
@@ -202,6 +213,48 @@ impl Sparkles {
                 lifetime,
                 color,
                 radius: 1.3 + rand() * 1.6,
+            });
+        }
+    }
+
+    /// One-shot burst at the moment of catch-up. Brighter palette
+    /// (off-white + cyan), faster radial spread, longer lifetimes
+    /// so the transition reads as a clear "snap" away from the red
+    /// fast-forward bar and back to normal teal.
+    fn emit_catch_up_burst(&mut self, fill_rect: Rect) {
+        let mut seed = (self.particles.len() as u32)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(0xc0ff_eebb);
+        let mut rand = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let count = 60;
+        for _ in 0..count {
+            // Spawn anywhere along the full filled bar — celebratory
+            // sweep across the catch-up extent, not just the lead.
+            let x = fill_rect.min.x + rand() * fill_rect.width();
+            let y = fill_rect.min.y + 0.15 * fill_rect.height()
+                + rand() * 0.7 * fill_rect.height();
+            // Radial outward velocity (gentle), no gravity.
+            let angle = rand() * std::f32::consts::TAU;
+            let speed = 30.0 + rand() * 60.0;
+            let vx = angle.cos() * speed;
+            let vy = angle.sin() * speed * 0.3; // squashed so it stays in-bar
+            let color = match (rand() * 3.0) as u32 {
+                0 => Color32::from_rgb(0xe8, 0xee, 0xf5), // bright off-white
+                1 => theme::ACCENT,                       // teal "all clear"
+                _ => Color32::from_rgb(0xa0, 0xc6, 0xff), // pale blue
+            };
+            self.particles.push(Particle {
+                pos: egui::pos2(x, y),
+                vel: egui::vec2(vx, vy),
+                age: 0.0,
+                lifetime: 0.55 + rand() * 0.4,
+                color,
+                radius: 1.8 + rand() * 1.8,
             });
         }
     }
