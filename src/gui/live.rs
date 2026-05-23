@@ -174,11 +174,18 @@ fn run(
                     placeholder: crate::inventory::PlaceholderState::default(),
                 })
                 .collect();
+            // Cache lookups require volume_guid. If most resumed
+            // entries have None here, the cache fast-forward path
+            // can't fire — every file ends up re-hashed. Surface
+            // the count so a future "resume restarted at 1%"
+            // diagnosis is one log line away.
+            let with_guid = mapped.iter().filter(|f| f.volume_guid.is_some()).count();
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Info,
                 message: format!(
-                    "Resume · skipping Stage 1: reusing {} file(s) from saved inventory",
-                    mapped.len()
+                    "Resume · skipping Stage 1: reusing {} file(s) from saved inventory ({} with volume_guid)",
+                    mapped.len(),
+                    with_guid
                 ),
             });
             resumed_inventory = Some(mapped);
@@ -506,6 +513,21 @@ fn run(
     } else {
         None
     };
+    // Surface cache state at Stage 4 start so users (and the
+    // diagnostics log) can see whether the fast-forward path is
+    // available on a resume. If the cache is None here, every file
+    // will be re-hashed regardless of whether the rusqlite cache file
+    // on disk has matching rows.
+    let _ = tx.send(EngineEvent::Log {
+        level: LogLevel::Info,
+        message: match (cfg.use_cache, cache.is_some()) {
+            (true, true) => "cache enabled — Stage 4 will fast-forward through already-hashed files".to_string(),
+            (true, false) => "cache requested but failed to open — Stage 4 will re-hash everything".to_string(),
+            (false, _) => "cache disabled in settings — Stage 4 will re-hash everything".to_string(),
+        },
+    });
+    let mut total_cache_hits: u64 = 0;
+    let mut total_cache_writes: u64 = 0;
 
     // Smaller chunks → more frequent updates between chunks. We also
     // wire a per-file progress callback into the hasher so the UI
@@ -791,6 +813,10 @@ fn run(
         };
         let chunk_bytes = counters.bytes_read.load(Ordering::Relaxed);
         total_bytes_read = total_bytes_read.saturating_add(chunk_bytes);
+        total_cache_hits = total_cache_hits
+            .saturating_add(counters.cache_hits.load(Ordering::Relaxed));
+        total_cache_writes = total_cache_writes
+            .saturating_add(counters.cache_writes.load(Ordering::Relaxed));
         for i in 0..4 {
             tier_micros_total[i] = tier_micros_total[i]
                 .saturating_add(counters.tier_micros[i].load(Ordering::Relaxed));
@@ -903,6 +929,30 @@ fn run(
             "scan complete: {} group(s), {} reclaimable",
             total_dups,
             crate::gui::theme::humansize(reclaimable)
+        ),
+    });
+    // Cache stats so a resumed scan that *should* have fast-
+    // forwarded but didn't is obvious from the log. Hit rate near
+    // zero on a resume is the smoking gun for a cache-key mismatch.
+    let total_hash_ops = total_cache_hits.saturating_add(
+        tier_count_total[0]
+            .saturating_add(tier_count_total[1])
+            .saturating_add(tier_count_total[2])
+            .saturating_add(tier_count_total[3]),
+    );
+    let hit_rate = if total_hash_ops > 0 {
+        (total_cache_hits as f64 / total_hash_ops as f64) * 100.0
+    } else {
+        0.0
+    };
+    let _ = tx.send(EngineEvent::Log {
+        level: LogLevel::Info,
+        message: format!(
+            "cache: {} hits, {} writes, {} fresh hashes — {:.1}% hit rate",
+            total_cache_hits,
+            total_cache_writes,
+            total_hash_ops.saturating_sub(total_cache_hits),
+            hit_rate
         ),
     });
     // T2.1 phase 7 surface: tell the user how many files the tier
