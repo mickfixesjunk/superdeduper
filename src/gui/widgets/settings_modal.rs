@@ -68,8 +68,11 @@ pub fn show(
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .default_width(640.0)
-        .min_height(440.0)
+        // Locked size so the Done / Reset footer is always visible.
+        // Previously the modal expanded freely to fit content and
+        // pushed the footer below the screen on tabs with lots of
+        // controls (Engine, Keep strategy).
+        .fixed_size(egui::vec2(640.0, 520.0))
         .show(ctx, |ui| {
             ui.label(
                 RichText::new("Knobs apply to the next scan.")
@@ -78,46 +81,54 @@ pub fn show(
             );
             ui.add_space(8.0);
 
-            ui.horizontal_top(|ui| {
-                // Left: tab list.
-                ui.allocate_ui_with_layout(
-                    egui::vec2(140.0, 380.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        for tab in SettingsTab::all() {
-                            let selected = state.tab == tab;
-                            let label = if selected {
-                                RichText::new(tab.label())
-                                    .color(theme::ACCENT)
-                                    .strong()
-                                    .size(14.0)
-                            } else {
-                                RichText::new(tab.label())
-                                    .color(theme::TEXT_HI)
-                                    .size(14.0)
-                            };
-                            let btn = egui::Button::new(label)
-                                .frame(false)
-                                .fill(if selected {
-                                    theme::ACCENT_DIM
+            // Both panels (tab list, content) share an explicit
+            // height so neither can grow past the window's reserved
+            // area. The content panel uses ScrollArea inside this
+            // height so over-long tabs scroll instead of overflow.
+            const PANEL_HEIGHT: f32 = 400.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), PANEL_HEIGHT),
+                egui::Layout::left_to_right(egui::Align::TOP),
+                |ui| {
+                    // Left: tab list.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(140.0, PANEL_HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            for tab in SettingsTab::all() {
+                                let selected = state.tab == tab;
+                                let label = if selected {
+                                    RichText::new(tab.label())
+                                        .color(theme::ACCENT)
+                                        .strong()
+                                        .size(14.0)
                                 } else {
-                                    egui::Color32::TRANSPARENT
-                                })
-                                .min_size(egui::vec2(130.0, 28.0));
-                            if ui.add(btn).clicked() {
-                                state.tab = tab;
+                                    RichText::new(tab.label())
+                                        .color(theme::TEXT_HI)
+                                        .size(14.0)
+                                };
+                                let btn = egui::Button::new(label)
+                                    .frame(false)
+                                    .fill(if selected {
+                                        theme::ACCENT_DIM
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .min_size(egui::vec2(130.0, 28.0));
+                                if ui.add(btn).clicked() {
+                                    state.tab = tab;
+                                }
                             }
-                        }
-                    },
-                );
-
-                ui.separator();
-                ui.add_space(6.0);
-
-                // Right: tab content.
-                ui.vertical(|ui| {
+                        },
+                    );
+                    ui.separator();
+                    ui.add_space(6.0);
+                    // Right: tab content. ScrollArea constrained so
+                    // over-long tabs scroll inside the panel; the
+                    // panel never pushes the footer off-screen.
                     egui::ScrollArea::vertical()
-                        .max_height(380.0)
+                        .max_height(PANEL_HEIGHT)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| match state.tab {
                             SettingsTab::Engine => render_engine(ui, settings),
                             SettingsTab::Cache => render_cache(ui, settings),
@@ -125,8 +136,8 @@ pub fn show(
                             SettingsTab::Safety => render_safety(ui, settings),
                             SettingsTab::Preflight => render_preflight(ui, settings),
                         });
-                });
-            });
+                },
+            );
 
             ui.add_space(10.0);
             ui.separator();
