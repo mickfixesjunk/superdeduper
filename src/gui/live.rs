@@ -268,110 +268,110 @@ fn run(
     let seek_penalties = Arc::new(seek_penalties);
 
     // ---------------- Stage 1: inventory ----------------
-    let _ = tx.send(EngineEvent::Status("Stage 1 — scanning files".into()));
-    let _ = tx.try_send(EngineEvent::OverallProgress {
-        stage: OverallStage::Inventory,
-        done: 0,
-        total: 0,
-        eta_secs: None,
-    });
-    if cancel.load(Ordering::Relaxed) {
-        emit_paused(&tx);
-        return Ok(());
-    }
-    let inv_tx = tx.clone();
-    let mut files_seen: u64 = 0;
+    // Resume fast-path: if we have saved_inventory from a prior
+    // run, skip the walk entirely. Pre-this-block we always walked
+    // even on resume and just discarded the result post-walk, which
+    // made resumes pay full Stage 1 cost for no benefit.
+    let mut files: Vec<crate::inventory::FileEntry> = Vec::new();
     let mut dirs_entered: u64 = 0;
     let mut dirs_denied: u64 = 0;
     let mut entries_skipped: u64 = 0;
     let mut skipped_below_min: u64 = 0;
-    let mut last_emit = Instant::now();
-    let inv_result = inventory::walk::enumerate_cancellable(&cfg, Some(&*cancel), |evt| {
-        use crate::inventory::walk::WalkEvent;
-        // Walker is single-threaded so we don't worry about producer
-        // races, but try_send keeps a slow UI from back-pressuring the
-        // walk itself.
-        match evt {
-            WalkEvent::Entered { path, depth } => {
-                dirs_entered += 1;
-                if last_emit.elapsed() > std::time::Duration::from_millis(250) {
-                    last_emit = Instant::now();
-                    let display = path.display().to_string();
-                    let _ = inv_tx.try_send(EngineEvent::Status(format!(
-                        "Walking: {} ({} dirs, {} files so far)",
-                        truncate_tail(&display, 60),
-                        dirs_entered,
-                        files_seen,
-                    )));
-                    let _ = inv_tx.try_send(EngineEvent::StageTick {
-                        stage: Stage::Inventory,
-                        delta: 0,
-                        total: files_seen,
-                    });
-                }
-                let _ = depth;
-            }
-            WalkEvent::FileFound { size: _, .. } => {
-                files_seen += 1;
-                if files_seen.is_multiple_of(200) {
-                    let _ = inv_tx.try_send(EngineEvent::StageTick {
-                        stage: Stage::Inventory,
-                        delta: 200,
-                        total: files_seen,
-                    });
-                    // Inventory total is unknown until the walk
-                    // finishes, so the overall bar runs as
-                    // indeterminate but we still publish the running
-                    // file count for the label.
-                    let _ = inv_tx.try_send(EngineEvent::OverallProgress {
-                        stage: OverallStage::Inventory,
-                        done: files_seen,
-                        total: 0,
-                        eta_secs: None,
-                    });
-                }
-            }
-            WalkEvent::DirError { path, message } => {
-                dirs_denied += 1;
-                // Errors are rare — use blocking send so the user
-                // always sees the full denial list even under load.
-                let _ = inv_tx.send(EngineEvent::Log {
-                    level: LogLevel::Warn,
-                    message: format!("dir {}: {}", path.display(), message),
-                });
-            }
-            WalkEvent::EntrySkipped { reason, .. } => {
-                entries_skipped += 1;
-                if reason == "below min-size" {
-                    skipped_below_min += 1;
-                }
-            }
-        }
-    });
-    let mut files = match inv_result {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = tx.send(EngineEvent::Log {
-                level: LogLevel::Error,
-                message: format!("inventory failed: {e}"),
-            });
-            return Err(e);
-        }
-    };
-    // Resume fast-path: if the prior pause persisted a complete file
-    // list, override the (possibly partial, possibly cancelled) walk
-    // output with the saved one. Sized after the walk so we still
-    // see the walk's progress events but discard its results when we
-    // have something better.
-    if let Some(saved) = resumed_inventory.take() {
+    let walk_skipped = if let Some(saved) = resumed_inventory.take() {
         files = saved;
+        let _ = tx.send(EngineEvent::Status(
+            "Stage 1 — using saved inventory from prior run".into(),
+        ));
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
             message: format!(
-                "Resume · using {} file(s) from saved inventory; skipping walk result",
+                "Resume · skipping Stage 1 walk entirely: {} file(s) loaded from saved inventory",
                 files.len()
             ),
         });
+        true
+    } else {
+        let _ = tx.send(EngineEvent::Status("Stage 1 — scanning files".into()));
+        let _ = tx.try_send(EngineEvent::OverallProgress {
+            stage: OverallStage::Inventory,
+            done: 0,
+            total: 0,
+            eta_secs: None,
+        });
+        false
+    };
+    if cancel.load(Ordering::Relaxed) {
+        emit_paused(&tx);
+        return Ok(());
+    }
+    if !walk_skipped {
+        let inv_tx = tx.clone();
+        let mut files_seen: u64 = 0;
+        let mut last_emit = Instant::now();
+        let inv_result =
+            inventory::walk::enumerate_cancellable(&cfg, Some(&*cancel), |evt| {
+                use crate::inventory::walk::WalkEvent;
+                match evt {
+                    WalkEvent::Entered { path, depth } => {
+                        dirs_entered += 1;
+                        if last_emit.elapsed() > std::time::Duration::from_millis(250) {
+                            last_emit = Instant::now();
+                            let display = path.display().to_string();
+                            let _ = inv_tx.try_send(EngineEvent::Status(format!(
+                                "Walking: {} ({} dirs, {} files so far)",
+                                truncate_tail(&display, 60),
+                                dirs_entered,
+                                files_seen,
+                            )));
+                            let _ = inv_tx.try_send(EngineEvent::StageTick {
+                                stage: Stage::Inventory,
+                                delta: 0,
+                                total: files_seen,
+                            });
+                        }
+                        let _ = depth;
+                    }
+                    WalkEvent::FileFound { size: _, .. } => {
+                        files_seen += 1;
+                        if files_seen.is_multiple_of(200) {
+                            let _ = inv_tx.try_send(EngineEvent::StageTick {
+                                stage: Stage::Inventory,
+                                delta: 200,
+                                total: files_seen,
+                            });
+                            let _ = inv_tx.try_send(EngineEvent::OverallProgress {
+                                stage: OverallStage::Inventory,
+                                done: files_seen,
+                                total: 0,
+                                eta_secs: None,
+                            });
+                        }
+                    }
+                    WalkEvent::DirError { path, message } => {
+                        dirs_denied += 1;
+                        let _ = inv_tx.send(EngineEvent::Log {
+                            level: LogLevel::Warn,
+                            message: format!("dir {}: {}", path.display(), message),
+                        });
+                    }
+                    WalkEvent::EntrySkipped { reason, .. } => {
+                        entries_skipped += 1;
+                        if reason == "below min-size" {
+                            skipped_below_min += 1;
+                        }
+                    }
+                }
+            });
+        files = match inv_result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Error,
+                    message: format!("inventory failed: {e}"),
+                });
+                return Err(e);
+            }
+        };
     }
     // Volume-guid backfill: cache lookups require volume_guid. The
     // walker's Windows fast path (Block N) populates it via
