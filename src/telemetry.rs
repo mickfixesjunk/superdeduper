@@ -217,3 +217,206 @@ fn now_unix() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+// ============================================================
+// Bucket helpers — pure functions that map raw scan values into
+// the leaderboard spec's coarse buckets. The web agent uses the
+// same string vocabulary on the backend; bumping a bucket
+// definition is a versioned schema change.
+// ============================================================
+
+pub fn bucket_file_count(n: u64) -> &'static str {
+    match n {
+        0..=999 => "<1k",
+        1_000..=9_999 => "1k-10k",
+        10_000..=99_999 => "10k-100k",
+        100_000..=999_999 => "100k-1M",
+        _ => ">1M",
+    }
+}
+
+pub fn bucket_total_size_gb(total_bytes: u64) -> &'static str {
+    let gb = total_bytes / (1024 * 1024 * 1024);
+    match gb {
+        0 => "<1GB",
+        1..=9 => "1-10GB",
+        10..=99 => "10-100GB",
+        100..=999 => "100-1000GB",
+        _ => ">1TB",
+    }
+}
+
+pub fn bucket_avg_file_size(avg_bytes: u64) -> &'static str {
+    let kb = avg_bytes / 1024;
+    match kb {
+        0..=9 => "<10KB",
+        10..=99 => "10-100KB",
+        100..=999 => "100KB-1MB",
+        1_000..=9_999 => "1MB-10MB",
+        10_000..=99_999 => "10MB-100MB",
+        _ => ">100MB",
+    }
+}
+
+pub fn bucket_dup_density(pct: f64) -> &'static str {
+    let p = pct.clamp(0.0, 100.0);
+    if p < 10.0 {
+        "0-10%"
+    } else if p < 25.0 {
+        "10-25%"
+    } else if p < 50.0 {
+        "25-50%"
+    } else {
+        "50-100%"
+    }
+}
+
+pub fn bucket_ram_tier_gb(gb: u32) -> u32 {
+    match gb {
+        0..=16 => 16,
+        17..=32 => 32,
+        33..=64 => 64,
+        _ => 128,
+    }
+}
+
+/// Coarse CPU classification from the model string + thread count.
+/// Backend bucket: x86_64-modern-high / x86_64-modern-mid /
+/// x86_64-legacy / x86_64-low / arm64-modern. Heuristic only —
+/// the canonical list is versioned + maintained on the backend;
+/// the engine ships a best-effort lookup based on the patterns
+/// most likely to appear in `cpu_model` on Windows.
+pub fn classify_cpu(model: &str, threads: usize) -> &'static str {
+    let m = model.to_ascii_lowercase();
+    // ARM (Apple M-series, Snapdragon Elite).
+    if m.contains("apple m") || m.contains("snapdragon") || m.contains("aarch64") {
+        return "arm64-modern";
+    }
+    // Modern high — Ryzen 9, i9 11th+, Threadripper, Xeon W modern.
+    let modern_high = m.contains("ryzen 9")
+        || m.contains("threadripper")
+        || m.contains("xeon w")
+        || (m.contains("i9") && (m.contains("11") || m.contains("12") || m.contains("13") || m.contains("14")));
+    if modern_high && threads >= 16 {
+        return "x86_64-modern-high";
+    }
+    // Modern mid — Ryzen 5/7, i5/i7 10th-14th.
+    let modern_mid = m.contains("ryzen 5")
+        || m.contains("ryzen 7")
+        || (m.contains("i5") && threads >= 8)
+        || (m.contains("i7") && threads >= 8);
+    if modern_mid {
+        return "x86_64-modern-mid";
+    }
+    // Low-end — Celeron / Atom / Pentium / N-series.
+    if m.contains("celeron") || m.contains("atom") || m.contains("pentium") {
+        return "x86_64-low";
+    }
+    // Default = legacy.
+    "x86_64-legacy"
+}
+
+/// Compute a stable per-corpus signature: a BLAKE3 hash of the
+/// sorted file-size-bucket histogram. Two users scanning the same
+/// corpus produce the same signature (modulo skipped files); useful
+/// to detect "user is benching the canonical superdeduper test
+/// corpus" vs random data. Path-free + content-free.
+pub fn corpus_signature_hash(sizes: &[u64]) -> String {
+    // Histogram by avg-file-size bucket (same vocabulary as
+    // bucket_avg_file_size).
+    let mut counts: hashbrown::HashMap<&'static str, u64> = hashbrown::HashMap::new();
+    for &s in sizes {
+        *counts.entry(bucket_avg_file_size(s)).or_insert(0) += 1;
+    }
+    let mut entries: Vec<(&'static str, u64)> = counts.into_iter().collect();
+    entries.sort_by_key(|(k, _)| *k);
+    let mut hasher = blake3::Hasher::new();
+    for (bucket, count) in entries {
+        hasher.update(bucket.as_bytes());
+        hasher.update(b":");
+        hasher.update(&count.to_le_bytes());
+        hasher.update(b"\n");
+    }
+    format!("sha256:{}", hasher.finalize().to_hex())
+}
+
+/// Generate a v4-style 128-bit identifier from system entropy. The
+/// leaderboard's idempotency key — only needs to be unique per
+/// scan-on-this-machine, not cryptographically unguessable.
+pub fn new_run_uuid() -> String {
+    // 128 bits of time + xorshift jitter. Not RFC-4122 compliant
+    // (no version/variant bits); the backend just treats it as an
+    // opaque idempotency key.
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut seed = now_nanos ^ 0x9E37_79B9_7F4A_7C15;
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        bytes[i] = (seed >> 56) as u8;
+    }
+    let h = bytes;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_count_buckets_cover_boundaries() {
+        assert_eq!(bucket_file_count(0), "<1k");
+        assert_eq!(bucket_file_count(999), "<1k");
+        assert_eq!(bucket_file_count(1_000), "1k-10k");
+        assert_eq!(bucket_file_count(10_000), "10k-100k");
+        assert_eq!(bucket_file_count(100_000), "100k-1M");
+        assert_eq!(bucket_file_count(1_000_000), ">1M");
+    }
+
+    #[test]
+    fn size_buckets_cover_boundaries() {
+        assert_eq!(bucket_total_size_gb(0), "<1GB");
+        assert_eq!(bucket_total_size_gb(2 * 1024 * 1024 * 1024), "1-10GB");
+        assert_eq!(bucket_total_size_gb(50 * 1024 * 1024 * 1024), "10-100GB");
+        assert_eq!(bucket_total_size_gb(2 * 1024_u64.pow(4)), ">1TB");
+    }
+
+    #[test]
+    fn cpu_classes_route_correctly() {
+        assert_eq!(classify_cpu("AMD Ryzen 9 9950X3D", 32), "x86_64-modern-high");
+        assert_eq!(classify_cpu("Intel Core i9-13900K", 24), "x86_64-modern-high");
+        assert_eq!(classify_cpu("AMD Ryzen 7 5800X", 16), "x86_64-modern-mid");
+        assert_eq!(classify_cpu("Intel Core i5-12400", 12), "x86_64-modern-mid");
+        assert_eq!(classify_cpu("Intel Celeron N4020", 2), "x86_64-low");
+        assert_eq!(classify_cpu("Apple M3 Pro", 12), "arm64-modern");
+        assert_eq!(classify_cpu("Some Old Xeon", 4), "x86_64-legacy");
+    }
+
+    #[test]
+    fn corpus_signature_is_deterministic_and_size_only() {
+        let sizes_a: Vec<u64> = vec![1024, 1024, 5_000_000, 1024];
+        let sizes_b: Vec<u64> = vec![5_000_000, 1024, 1024, 1024];
+        // Same files, different order → same hash.
+        assert_eq!(corpus_signature_hash(&sizes_a), corpus_signature_hash(&sizes_b));
+        // Different sizes → different hash.
+        let sizes_c: Vec<u64> = vec![1024, 1024, 1024, 1024];
+        assert_ne!(corpus_signature_hash(&sizes_a), corpus_signature_hash(&sizes_c));
+    }
+
+    #[test]
+    fn run_uuid_is_unique_per_call() {
+        let a = new_run_uuid();
+        let b = new_run_uuid();
+        assert_ne!(a, b, "two calls must produce different uuids");
+        // Format: 8-4-4-4-12 hex chars.
+        assert_eq!(a.len(), 36);
+        assert_eq!(a.chars().filter(|&c| c == '-').count(), 4);
+    }
+}
