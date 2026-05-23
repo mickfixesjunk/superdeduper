@@ -153,6 +153,7 @@ mod tests {
             usn: 0,
             attributes: 0,
             volume_guid: None,
+            placeholder: crate::inventory::PlaceholderState::NotPlaceholder,
         }
     }
 

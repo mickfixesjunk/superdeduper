@@ -254,6 +254,11 @@ where
         // id, so resolving here would mean opening every file on the
         // walk to get information that almost all of them won't
         // need.
+        // Extract Win32 file attributes on Windows so cloud-placeholder
+        // classification works on the fallback path too. On other
+        // platforms attributes stays 0 and placeholder.rs's
+        // cross-platform stub returns NotPlaceholder.
+        let attributes = win_file_attributes(&metadata);
         out.push(FileEntry {
             path,
             size,
@@ -261,8 +266,9 @@ where
             file_ref: 0,
             parent_ref: 0,
             usn: 0,
-            attributes: 0,
+            attributes,
             volume_guid: None,
+            placeholder: crate::inventory::placeholder::classify(attributes, None),
         });
     }
     Ok(())
@@ -298,6 +304,17 @@ fn filetime_ticks(m: &std::fs::Metadata) -> i64 {
             UNIX_EPOCH_AS_FILETIME + (d.as_nanos() / 100) as i64
         })
         .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn win_file_attributes(m: &std::fs::Metadata) -> u32 {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes()
+}
+
+#[cfg(not(windows))]
+fn win_file_attributes(_m: &std::fs::Metadata) -> u32 {
+    0
 }
 
 #[cfg(windows)]

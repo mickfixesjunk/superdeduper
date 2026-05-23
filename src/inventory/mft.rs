@@ -251,6 +251,13 @@ fn enumerate_volume(
             usn: record.usn,
             attributes: record.attributes,
             volume_guid: Some(volume.to_string()),
+            // reparse_tag isn't surfaced by FSCTL_ENUM_USN_DATA;
+            // pass None so classify() picks the conservative
+            // OtherReparse(0) for reparse-tagged files. A future
+            // phase can backfill specific tags via
+            // FSCTL_GET_REPARSE_POINT for the files where it
+            // matters (recall-on-open already classified here).
+            placeholder: crate::inventory::placeholder::classify(record.attributes, None),
         });
     }
 

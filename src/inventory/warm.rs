@@ -458,6 +458,7 @@ fn entries_from_records(
             usn: rec.usn,
             attributes: rec.attributes,
             volume_guid: None,
+            placeholder: crate::inventory::placeholder::classify(rec.attributes, None),
         });
     }
     tracing::info!(

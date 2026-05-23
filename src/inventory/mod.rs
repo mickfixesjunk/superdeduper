@@ -14,6 +14,7 @@
 #[cfg(windows)]
 pub mod dir_enum;
 pub mod mft;
+pub mod placeholder;
 pub mod walk;
 pub mod warm;
 
@@ -26,6 +27,8 @@ use crate::cache::Cache;
 use crate::config::ScanConfig;
 use crate::winapi_wrappers::FileRef;
 use crate::Result;
+
+pub use placeholder::PlaceholderState;
 
 /// One file in the inventory.
 ///
@@ -43,6 +46,12 @@ pub struct FileEntry {
     pub attributes: u32,
     /// Volume GUID path (e.g. `\\?\Volume{...}\`) when known.
     pub volume_guid: Option<String>,
+    /// Cloud-placeholder / reparse-point classification, derived
+    /// from `attributes` (and reparse_tag when available) at the
+    /// time this entry was produced. Drives the action-layer and
+    /// tier-guard checks downstream — a `RecallOnOpen` file
+    /// shouldn't be hashed unless the user explicitly opts in.
+    pub placeholder: PlaceholderState,
 }
 
 /// Enumerate every eligible file under the scan roots.
