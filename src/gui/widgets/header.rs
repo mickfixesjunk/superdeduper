@@ -12,7 +12,7 @@ pub enum HeaderAction {
     OpenSettings,
 }
 
-pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, _is_scanning: bool) -> HeaderAction {
+pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool) -> HeaderAction {
     let mut action = HeaderAction::None;
     ui.horizontal(|ui| {
         ui.add_space(4.0);
@@ -22,21 +22,28 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, _is_scanning: boo
 
         // Hash-algo pill — shows the active content-hash algo and
         // doubles as a fast-path to the Settings modal (clicking
-        // opens settings). Pill colour distinguishes the two algos
-        // at a glance.
-        if hash_algo_pill(ui, hash_algo) {
+        // opens settings). Disabled mid-scan; changing the algo while
+        // the engine is running would split the same scan's results
+        // across two hash schemes.
+        if !is_scanning && hash_algo_pill(ui, hash_algo) {
             action = HeaderAction::OpenSettings;
+        } else if is_scanning {
+            hash_algo_pill_disabled(ui, hash_algo);
         }
         ui.add_space(8.0);
 
         let settings_btn = egui::Button::new(RichText::new("⚙  Settings").color(theme::TEXT_HI))
             .fill(theme::PANEL_DEEP)
             .min_size(vec2(110.0, 28.0));
-        if ui
-            .add(settings_btn)
-            .on_hover_text("Engine options (size filters, glob patterns, format-aware, threads).")
-            .clicked()
-        {
+        let settings_resp = ui.add_enabled(!is_scanning, settings_btn);
+        let settings_resp = if is_scanning {
+            settings_resp.on_hover_text("Cancel the running scan before changing settings.")
+        } else {
+            settings_resp.on_hover_text(
+                "Engine options (size filters, glob patterns, format-aware, threads).",
+            )
+        };
+        if settings_resp.clicked() {
             action = HeaderAction::OpenSettings;
         }
 
@@ -138,4 +145,41 @@ fn hash_algo_pill(ui: &mut Ui, algo: HashAlgo) -> bool {
         .interact(Sense::click())
         .on_hover_text(tip);
     resp.clicked()
+}
+
+/// Mid-scan variant: same pill, but inert (no click handler, tip
+/// explains why). Keeps the visual continuity (user still sees the
+/// algo) without letting them open Settings to switch it.
+fn hash_algo_pill_disabled(ui: &mut Ui, algo: HashAlgo) {
+    let (label, fill) = match algo {
+        HashAlgo::Blake3 => ("BLAKE3", theme::COOL),
+        HashAlgo::River5 => ("RIVER5", theme::ACCENT),
+    };
+    let bg = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 32);
+    let frame = Frame::none()
+        .fill(bg)
+        .rounding(Rounding::same(10.0))
+        .stroke(Stroke::new(1.0, fill))
+        .inner_margin(egui::Margin::symmetric(10.0, 4.0));
+    frame
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("#")
+                        .color(fill)
+                        .monospace()
+                        .strong()
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new(label)
+                        .color(fill)
+                        .monospace()
+                        .strong()
+                        .size(13.0),
+                );
+            });
+        })
+        .response
+        .on_hover_text("Hash algorithm can't change mid-scan.");
 }

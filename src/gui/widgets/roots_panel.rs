@@ -95,11 +95,15 @@ pub fn show(
                         egui::Button::new(RichText::new("✖").color(theme::HOT).size(16.0).strong())
                             .frame(false)
                             .min_size(vec2(24.0, 24.0));
-                    if ui
-                        .add(btn)
-                        .on_hover_text("Remove this root from the scan list.")
-                        .clicked()
-                    {
+                    // Disable mid-scan: removing a root while the
+                    // engine is iterating over it would race the walker.
+                    let response = ui.add_enabled(!is_scanning, btn);
+                    let response = if is_scanning {
+                        response.on_hover_text("Cancel the running scan before removing roots.")
+                    } else {
+                        response.on_hover_text("Remove this root from the scan list.")
+                    };
+                    if response.clicked() {
                         action = Some(RootsAction::Remove(i));
                     }
                 });
@@ -109,23 +113,29 @@ pub fn show(
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui
-            .add(
-                egui::Button::new(RichText::new("📁  Add folder").color(theme::TEXT_HI))
-                    .min_size(vec2(110.0, 24.0)),
-            )
-            .on_hover_text("Add a folder to scan.")
-            .clicked()
-        {
+        // Disable add-folder buttons mid-scan: the engine has already
+        // snapshotted the root list; any folder added now would be
+        // silently ignored until the next scan, which is misleading.
+        let add_btn = egui::Button::new(RichText::new("📁  Add folder").color(theme::TEXT_HI))
+            .min_size(vec2(110.0, 24.0));
+        let add_resp = ui.add_enabled(!is_scanning, add_btn);
+        let add_resp = if is_scanning {
+            add_resp.on_hover_text("Cancel the running scan before adding folders.")
+        } else {
+            add_resp.on_hover_text("Add a folder to scan.")
+        };
+        if add_resp.clicked() {
             action = Some(RootsAction::PickFolder);
         }
-        if ui
-            .add(
-                egui::Button::new(RichText::new("★").color(theme::WARN)).min_size(vec2(32.0, 24.0)),
-            )
-            .on_hover_text("Add a folder as a reference (source of truth).")
-            .clicked()
-        {
+        let ref_btn = egui::Button::new(RichText::new("★").color(theme::WARN))
+            .min_size(vec2(32.0, 24.0));
+        let ref_resp = ui.add_enabled(!is_scanning, ref_btn);
+        let ref_resp = if is_scanning {
+            ref_resp.on_hover_text("Cancel the running scan before adding reference folders.")
+        } else {
+            ref_resp.on_hover_text("Add a folder as a reference (source of truth).")
+        };
+        if ref_resp.clicked() {
             action = Some(RootsAction::PickReferenceFolder);
         }
     });

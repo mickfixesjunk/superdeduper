@@ -96,8 +96,9 @@ pub fn show(
     ui: &mut Ui,
     state: &UiState,
     table_state: &mut GroupsTableState,
+    is_scanning: bool,
 ) -> Option<GroupAction> {
-    show_filtered(ui, state, table_state, None, &[])
+    show_filtered(ui, state, table_state, None, &[], is_scanning)
 }
 
 /// Render the table, filtering groups so only those with at least one
@@ -111,6 +112,7 @@ pub fn show_filtered(
     table_state: &mut GroupsTableState,
     drive_root: Option<&std::path::Path>,
     reference_roots: &[std::path::PathBuf],
+    is_scanning: bool,
 ) -> Option<GroupAction> {
     let mut clicked: Option<GroupAction> = None;
 
@@ -222,9 +224,20 @@ pub fn show_filtered(
                  can put files back. Writes a manifest JSON alongside."
             }
         };
+        // Gate Go on (a) something to act on AND (b) the scan having
+        // finished. Mid-scan, the visible dupe set is still growing
+        // and acting on it would leave the engine working against a
+        // moving target.
+        let go_enabled = visible_dupe_count > 0 && !is_scanning;
+        let go_hover = if is_scanning {
+            "Wait for the scan to finish before running bulk actions. \
+             The duplicate set is still being computed."
+        } else {
+            hover
+        };
         if ui
-            .add_enabled(visible_dupe_count > 0, go)
-            .on_hover_text(hover)
+            .add_enabled(go_enabled, go)
+            .on_hover_text(go_hover)
             .clicked()
         {
             clicked = Some(match table_state.bulk_action {

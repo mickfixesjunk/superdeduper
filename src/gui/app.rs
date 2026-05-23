@@ -1942,6 +1942,7 @@ impl eframe::App for SuperdeduperApp {
                             &mut self.groups_state,
                             drive_root.as_deref(),
                             &reference_roots,
+                            self.is_scanning,
                         );
                     }
                     ResultsTab::Log => log_panel::show(ui, &self.state),
