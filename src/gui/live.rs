@@ -167,6 +167,11 @@ fn run(
                     usn: s.usn,
                     attributes: s.attributes,
                     volume_guid: s.volume_guid,
+                    // T2.1 phase 4 default — the saved-inventory format
+                    // doesn't carry placeholder state yet (schema added
+                    // for T2.1 phase 5). Resumed scans will re-rely on
+                    // the tier-guard check against `attributes` instead.
+                    placeholder: crate::inventory::PlaceholderState::default(),
                 })
                 .collect();
             let _ = tx.send(EngineEvent::Log {

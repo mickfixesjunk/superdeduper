@@ -221,6 +221,66 @@ enum Tier {
     Three,
 }
 
+/// Partition a candidate group into files we'll hash and files we'll
+/// refuse to read. Anything whose `placeholder.blocks_content_read()`
+/// returns true is dropped from the survivors list and reported as a
+/// failed progress event with a placeholder-specific error string.
+///
+/// Behaviour for callers:
+/// * The returned `LaidOutGroup` carries the same `size`, with `files`
+///   restricted to entries that may be hashed.
+/// * If every file was blocked, returns an empty `files` vec. The caller's
+///   `survivors.len() < 2` guard handles that uniformly.
+/// * `on_file`, when supplied, sees a `ProgressOutcome::Failed { error }`
+///   for each blocked file with the error string `"placeholder blocks
+///   content read: <state>"` so the GUI Log tab can surface them with
+///   the right reason.
+///
+/// Cost: O(N) over the group; no I/O. Safe to call unconditionally on
+/// every group; on non-Windows or for groups with no placeholders, every
+/// file passes through and no events fire.
+fn apply_tier_guards(group: LaidOutGroup, on_file: Option<&FileProgress>) -> LaidOutGroup {
+    let size = group.size;
+    let mut allowed = Vec::with_capacity(group.files.len());
+    let mut blocked = 0usize;
+    for f in group.files {
+        if f.entry.placeholder.blocks_content_read() {
+            tracing::warn!(
+                path = %f.entry.path.display(),
+                placeholder = ?f.entry.placeholder,
+                "tier guard: refusing content read for placeholder file",
+            );
+            if let Some(cb) = on_file {
+                cb(
+                    &f.entry.path,
+                    0,
+                    ProgressOutcome::Failed {
+                        error: format!(
+                            "placeholder blocks content read: {:?}",
+                            f.entry.placeholder
+                        ),
+                    },
+                );
+            }
+            blocked += 1;
+        } else {
+            allowed.push(f);
+        }
+    }
+    if blocked > 0 {
+        tracing::info!(
+            size,
+            blocked,
+            remaining = allowed.len(),
+            "tier guard blocked placeholders before hashing",
+        );
+    }
+    LaidOutGroup {
+        size,
+        files: allowed,
+    }
+}
+
 fn run_group(
     group: LaidOutGroup,
     cfg: &ScanConfig,
@@ -233,6 +293,16 @@ fn run_group(
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Ok(Vec::new());
     }
+
+    // T2.1 phase 4: tier guards. Refuse to open files whose placeholder
+    // state would force a cloud hydration (RecallOnOpen / RecallOnDataAccess
+    // / unknown reparse). Classify ran at inventory time (phase 2), but
+    // this is defense in depth — if anything slipped through (race between
+    // enum and hash, attributes changed since enumeration, walker fallback
+    // didn't run classify for some reason), the hash worker still refuses
+    // before any ReadFile. NotPlaceholder + ReparseDedup pass through —
+    // their data is local and reading is safe.
+    let group = apply_tier_guards(group, on_file);
 
     // Zero-byte short circuit.
     if size == 0 {
@@ -864,6 +934,118 @@ mod tests {
         let result = run(vec![group], &cfg()).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].files.len(), 3);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// Build a LaidOutFile carrying an explicit placeholder state. Used
+    /// by the T2.1 phase 4 tier-guard tests below — phase 4 doesn't need
+    /// a real on-disk reparse point to validate its filter logic, just
+    /// a FileEntry whose `placeholder` field says what to do.
+    fn lo_with_placeholder(
+        path: PathBuf,
+        size: u64,
+        placeholder: crate::inventory::PlaceholderState,
+    ) -> LaidOutFile {
+        let mut f = lo(path, size);
+        f.entry.placeholder = placeholder;
+        f
+    }
+
+    /// Tier guard MUST drop files marked RecallOnOpen before any
+    /// content read happens — even when they're nominally part of a
+    /// duplicate-candidate group. The corresponding bytes never exist
+    /// locally (cloud stub), so opening them would force a hydration
+    /// the user didn't ask for.
+    #[test]
+    fn tier_guard_drops_recall_on_open() {
+        use crate::inventory::PlaceholderState;
+        let d = tmpdir();
+        let body = vec![0x5Au8; 8 * 1024];
+        let a = d.join("a");
+        let b = d.join("b");
+        let c = d.join("c");
+        // a and b are real files; c is "marked" as a cloud placeholder
+        // even though the bytes exist on disk — the guard only consults
+        // the placeholder field, not actual reparse state.
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        fs::write(&c, &body).unwrap();
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                lo(a, body.len() as u64),
+                lo(b, body.len() as u64),
+                lo_with_placeholder(c, body.len() as u64, PlaceholderState::RecallOnOpen),
+            ],
+        };
+        let result = run(vec![group], &cfg()).unwrap();
+        // Two real duplicates survive; the placeholder is excluded.
+        assert_eq!(result.len(), 1, "two real dupes should still group");
+        assert_eq!(
+            result[0].files.len(),
+            2,
+            "placeholder must not appear in dup group"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// If ALL files in a candidate group are placeholder-blocked, the
+    /// group collapses to zero survivors and no DuplicateGroup is
+    /// emitted. The fewer-than-2 survivors check after the guard
+    /// handles this uniformly with all the other tier collapses.
+    #[test]
+    fn tier_guard_collapses_all_placeholder_group() {
+        use crate::inventory::PlaceholderState;
+        let d = tmpdir();
+        let a = d.join("a");
+        let b = d.join("b");
+        // Files exist so the harness doesn't error, but the placeholder
+        // marker should block them before any open happens.
+        fs::write(&a, b"x").unwrap();
+        fs::write(&b, b"x").unwrap();
+        let group = LaidOutGroup {
+            size: 1,
+            files: vec![
+                lo_with_placeholder(a, 1, PlaceholderState::RecallOnDataAccess),
+                lo_with_placeholder(b, 1, PlaceholderState::OtherReparse(0xC0DECAFE)),
+            ],
+        };
+        let result = run(vec![group], &cfg()).unwrap();
+        assert!(
+            result.is_empty(),
+            "all-placeholder group must collapse to no dup output"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// ReparseDedup is the special case: NTFS dedup'd files ARE
+    /// readable via the standard API (the FS is transparent at this
+    /// layer), so the guard must NOT drop them. Hashing proceeds; the
+    /// `link_equivalent` flag downstream handles the "this group is
+    /// already FS-deduped" framing.
+    #[test]
+    fn tier_guard_lets_reparse_dedup_through() {
+        use crate::inventory::PlaceholderState;
+        let d = tmpdir();
+        let body = vec![0x5Au8; 8 * 1024];
+        let a = d.join("a");
+        let b = d.join("b");
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                lo_with_placeholder(a, body.len() as u64, PlaceholderState::ReparseDedup),
+                lo_with_placeholder(b, body.len() as u64, PlaceholderState::ReparseDedup),
+            ],
+        };
+        let result = run(vec![group], &cfg()).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "ReparseDedup files must still group as duplicates"
+        );
+        assert_eq!(result[0].files.len(), 2);
         fs::remove_dir_all(&d).ok();
     }
 }
