@@ -561,7 +561,7 @@ fn probe_tier3(scratch: &Path) -> anyhow::Result<Tier3ProbeResult> {
     {
         // Write a 256 MiB file with non-trivial content (don't let
         // the FS short-circuit zeroed pages).
-        let mut buf = vec![0u8; 1 << 20]; // 1 MiB stamp
+        let mut buf = vec![0u8; 1 << 20];
         let mut x: u32 = 0x9E37_79B9;
         for byte in buf.iter_mut() {
             x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
@@ -573,22 +573,14 @@ fn probe_tier3(scratch: &Path) -> anyhow::Result<Tier3ProbeResult> {
             std::io::Write::write_all(&mut f, &buf)?;
         }
         std::io::Write::flush(&mut f)?;
+        // Commit pages to the device. Without this, the OS holds the
+        // file in writeback cache and the subsequent read (even with
+        // FILE_FLAG_NO_BUFFERING on Windows) may not reflect what the
+        // drive can actually deliver from media.
+        f.sync_all()?;
     }
-    // Read it sequentially.
-    let t = Instant::now();
-    let mut f = std::fs::File::open(&big)?;
-    let mut total = 0u64;
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = std::io::Read::read(&mut f, &mut buf)?;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-    }
-    drop(f);
-    let wall_ms = t.elapsed().as_millis() as u64;
-    let elapsed = t.elapsed().as_secs_f64();
+    let (total, elapsed) = read_for_disk_throughput(&big)?;
+    let wall_ms = (elapsed * 1000.0) as u64;
     let aggregate_mbps = if elapsed > 0.0 {
         (total as f64 / elapsed) / 1_048_576.0
     } else {
@@ -599,6 +591,106 @@ fn probe_tier3(scratch: &Path) -> anyhow::Result<Tier3ProbeResult> {
         wall_ms,
         aggregate_mbps,
     })
+}
+
+/// Read the entire file and return `(bytes_read, elapsed_secs)`.
+/// On Windows, opens with `FILE_FLAG_NO_BUFFERING` so the read
+/// **bypasses the OS page cache** and goes to the underlying
+/// device — without this, the just-written file sits in RAM and the
+/// "read" measures memory bandwidth, making SSDs and HDDs look
+/// identical (or worse, ranking them backwards due to noise).
+#[cfg(windows)]
+fn read_for_disk_throughput(path: &Path) -> anyhow::Result<(u64, f64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+
+    // 4 KiB is the standard NTFS sector size on modern volumes. We
+    // also require buffer + length to be a multiple of this; 1 MiB
+    // chunks (262144 × 4 KiB) and a 256 MiB total file satisfy both.
+    const SECTOR: usize = 4096;
+    const CHUNK: usize = 1 << 20;
+
+    // Build a sector-aligned 1 MiB slice. Vec allocation is at least
+    // word-aligned but not sector-aligned in general; reserve extra
+    // space and slice into the aligned region.
+    let mut storage = vec![0u8; CHUNK + SECTOR];
+    let base = storage.as_ptr() as usize;
+    let pad = (SECTOR - (base % SECTOR)) % SECTOR;
+    let buf = &mut storage[pad..pad + CHUNK];
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is null-terminated and outlives the call. The
+    // flag combination is documented as compatible with synchronous
+    // ReadFile.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+            HANDLE::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("CreateFileW({}): {e}", path.display()))?
+    };
+    // Tiny RAII so we close on every return path.
+    struct Closer(HANDLE);
+    impl Drop for Closer {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+    let _guard = Closer(handle);
+
+    let t = Instant::now();
+    let mut total = 0u64;
+    loop {
+        let mut read_bytes: u32 = 0;
+        // SAFETY: `buf` is sector-aligned, length is a sector
+        // multiple, handle is open. `read_bytes` is a stable u32.
+        unsafe {
+            ReadFile(
+                handle,
+                Some(buf),
+                Some(&mut read_bytes as *mut u32),
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("ReadFile: {e}"))?;
+        }
+        if read_bytes == 0 {
+            break;
+        }
+        total += read_bytes as u64;
+    }
+    Ok((total, t.elapsed().as_secs_f64()))
+}
+
+#[cfg(not(windows))]
+fn read_for_disk_throughput(path: &Path) -> anyhow::Result<(u64, f64)> {
+    // No portable equivalent of FILE_FLAG_NO_BUFFERING. This branch
+    // is only exercised by Linux dev builds and the measurement is
+    // approximate — Linux production isn't a target platform.
+    let t = Instant::now();
+    let mut f = std::fs::File::open(path)?;
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+    }
+    Ok((total, t.elapsed().as_secs_f64()))
 }
 
 fn probe_defender() -> DefenderState {
