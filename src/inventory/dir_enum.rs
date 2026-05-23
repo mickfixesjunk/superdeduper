@@ -174,3 +174,141 @@ pub fn enumerate_dir(dir: &Path) -> Option<DirInodeMap> {
 // helpers aren't exercised by callers in this file.
 #[allow(dead_code)]
 const _UNUSED_HOOK: FILE_FLAGS_AND_ATTRIBUTES = FILE_FLAG_BACKUP_SEMANTICS;
+
+/// Single directory entry, full info.
+///
+/// Block N — walker fast path. Mirrors what `FILE_ID_BOTH_DIR_INFO`
+/// returns: name, size, attributes, file_id, mtime — all in one
+/// batched call. Lets the walker build `FileEntry` directly without
+/// a second `metadata()` syscall AND without a separate Stage-2b
+/// `resolve_file_ids` pass, since `file_id` is already populated.
+#[derive(Debug, Clone)]
+pub struct DirEntryFull {
+    pub name: OsString,
+    pub size: u64,
+    pub attributes: u32,
+    pub file_id: u64,
+    /// 100ns FILETIME ticks since 1601-01-01 UTC.
+    pub mtime_filetime: i64,
+    pub is_dir: bool,
+}
+
+/// Full-info equivalent of [`enumerate_dir`]. Returns every entry
+/// in the directory (files AND subdirectories — caller decides what
+/// to recurse into), with name + size + attributes + inode +
+/// modification time. Returns `None` on any failure; caller should
+/// fall back to `std::fs::read_dir`.
+///
+/// `volume_guid` follows the same format the rest of the engine
+/// uses: `"vol-serial:0x<8-hex>"` (matches mft.rs's encoding).
+pub struct DirFullEnumeration {
+    pub volume_guid: Option<String>,
+    pub entries: Vec<DirEntryFull>,
+}
+
+pub fn enumerate_dir_full(dir: &Path) -> Option<DirFullEnumeration> {
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        .ok()?
+    };
+    if handle.is_invalid() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut by_handle_info = BY_HANDLE_FILE_INFORMATION::default();
+    let serial_ok = unsafe { GetFileInformationByHandle(handle, &mut by_handle_info).is_ok() };
+    let volume_guid = if serial_ok {
+        Some(format!(
+            "vol-serial:0x{:08x}",
+            by_handle_info.dwVolumeSerialNumber
+        ))
+    } else {
+        None
+    };
+
+    const BUF_SIZE: usize = 64 * 1024;
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut entries: Vec<DirEntryFull> = Vec::new();
+    let mut first_call = true;
+
+    loop {
+        let class = if first_call {
+            FileIdBothDirectoryRestartInfo
+        } else {
+            FileIdBothDirectoryInfo
+        };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(handle, class, buf.as_mut_ptr() as _, BUF_SIZE as u32)
+                .is_ok()
+        };
+        if !ok {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_NO_MORE_FILES {
+                break;
+            }
+            // Soft fail — keep what we have, caller can fall back.
+            break;
+        }
+        first_call = false;
+
+        let mut offset: usize = 0;
+        loop {
+            if offset >= BUF_SIZE {
+                break;
+            }
+            let entry_ptr = unsafe { buf.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO };
+            let entry = unsafe { &*entry_ptr };
+            let name_len_chars = (entry.FileNameLength / 2) as usize;
+            let name_slice =
+                unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len_chars) };
+            // Skip "." and ".." pseudo-entries.
+            let is_dot = matches!(name_slice, [46] | [46, 46]);
+            if !is_dot {
+                let is_dir = (entry.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
+                let name = OsString::from_wide(name_slice);
+                // EndOfFile is a LARGE_INTEGER. windows-rs exposes it
+                // as i64 already.
+                let size = if is_dir {
+                    0
+                } else {
+                    entry.EndOfFile.max(0) as u64
+                };
+                entries.push(DirEntryFull {
+                    name,
+                    size,
+                    attributes: entry.FileAttributes,
+                    file_id: entry.FileId as u64,
+                    mtime_filetime: entry.LastWriteTime,
+                    is_dir,
+                });
+            }
+            let next = entry.NextEntryOffset as usize;
+            if next == 0 {
+                break;
+            }
+            offset += next;
+        }
+    }
+
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+
+    Some(DirFullEnumeration {
+        volume_guid,
+        entries,
+    })
+}

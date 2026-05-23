@@ -146,6 +146,28 @@ where
     }
     callback(WalkEvent::Entered { path: dir, depth });
 
+    // Block N: Windows fast path via FileIdBothDirectoryInfo. Returns
+    // every entry's name + size + attrs + inode + mtime in a single
+    // batched call, eliminating the per-entry `metadata()` cost AND
+    // populating `file_ref` so Stage 2b's resolve_file_ids skips us
+    // entirely (it short-circuits per-file when file_ref != 0).
+    //
+    // On non-NTFS volumes or any API failure, falls through to the
+    // existing `read_dir` path. The fall-through preserves the
+    // original semantics exactly — fast path is opportunistic.
+    #[cfg(windows)]
+    {
+        if let Some(enumeration) = crate::inventory::dir_enum::enumerate_dir_full(dir) {
+            return walk_fast_path(dir, enumeration, cfg, out, callback, depth, cancel);
+        }
+        // Fall through to read_dir (logged at trace level — common on
+        // network shares / non-NTFS where the API doesn't apply).
+        tracing::trace!(
+            path = %dir.display(),
+            "FileIdBothDirectoryInfo unavailable; falling back to read_dir"
+        );
+    }
+
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -309,6 +331,198 @@ where
             attributes,
             volume_guid: None,
             placeholder: crate::inventory::placeholder::classify(attributes, reparse_tag),
+        });
+    }
+    Ok(())
+}
+
+/// Block N — Windows fast path. Iterate `enumeration.entries`, push
+/// FileEntry directly without a per-entry metadata() syscall.
+///
+/// Semantics mirror the read_dir path exactly:
+/// * Reparse points with the symlink tag honour `--follow-links`.
+/// * Other reparse points (dedup, cloud-recall, junctions, unknown)
+///   get a `placeholder` state via `classify()` and flow through the
+///   normal pipeline — guard logic at the action + hash layers
+///   decides what to actually do.
+/// * size/min-size/max-size/glob filters apply identically.
+#[cfg(windows)]
+fn walk_fast_path<F>(
+    dir: &Path,
+    enumeration: crate::inventory::dir_enum::DirFullEnumeration,
+    cfg: &ScanConfig,
+    out: &mut Vec<FileEntry>,
+    callback: &mut F,
+    depth: u32,
+    cancel: Option<&AtomicBool>,
+) -> Result<()>
+where
+    F: FnMut(WalkEvent<'_>),
+{
+    // FILE_ATTRIBUTE_REPARSE_POINT bit — same definition used at
+    // classify() call sites. Inlined to keep the loop tight.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    // IO_REPARSE_TAG_SYMLINK from ntifs.h. The fast path doesn't have
+    // Rust's `is_symlink()` available (that's a metadata-derived
+    // bool); we check the tag explicitly via `fetch_reparse_tag`.
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+    for entry in enumeration.entries {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+        let path = dir.join(&entry.name);
+
+        // For reparse-point entries, fetch the actual tag so we can
+        // tell symlinks (handled specially per --follow-links) from
+        // other reparse types (mount points, dedup, cloud) which get
+        // their placeholder state from classify().
+        let reparse_tag = if (entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            crate::winapi_wrappers::fetch_reparse_tag(&path)
+        } else {
+            None
+        };
+        let is_symlink = reparse_tag == Some(IO_REPARSE_TAG_SYMLINK);
+
+        if is_symlink {
+            if !cfg.follow_links {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "symlink (use --follow-links to include)",
+                });
+                continue;
+            }
+            // Re-stat through the symlink — same handling as the
+            // read_dir path. The target's metadata determines whether
+            // we recurse (target is a dir) or push (target is a file).
+            let target_meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    callback(WalkEvent::EntrySkipped {
+                        path: &path,
+                        reason: "symlink target unreadable",
+                    });
+                    tracing::debug!(
+                        path = %path.display(),
+                        error = %e,
+                        "symlink target stat failed; skipping",
+                    );
+                    continue;
+                }
+            };
+            if target_meta.is_dir() {
+                walk(&path, cfg, out, callback, depth + 1, cancel)?;
+                continue;
+            }
+            if !target_meta.is_file() {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "not a regular file",
+                });
+                continue;
+            }
+            let target_size = target_meta.len();
+            if target_size < cfg.min_size {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "below min-size",
+                });
+                continue;
+            }
+            if let Some(max) = cfg.max_size {
+                if target_size > max {
+                    callback(WalkEvent::EntrySkipped {
+                        path: &path,
+                        reason: "above max-size",
+                    });
+                    continue;
+                }
+            }
+            if !path_passes_globs(&path, cfg) {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "filtered by include/exclude",
+                });
+                continue;
+            }
+            callback(WalkEvent::FileFound {
+                path: &path,
+                size: target_size,
+            });
+            let target_attrs = win_file_attributes(&target_meta);
+            let target_reparse_tag = if (target_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                crate::winapi_wrappers::fetch_reparse_tag(&path)
+            } else {
+                None
+            };
+            out.push(FileEntry {
+                path,
+                size: target_size,
+                mtime: filetime_ticks(&target_meta),
+                // Target file_ref isn't available cheaply — leave 0
+                // and let Stage 2b resolve via the slow path.
+                // Symlink targets are rare enough that the per-file
+                // cost is fine.
+                file_ref: 0,
+                parent_ref: 0,
+                usn: 0,
+                attributes: target_attrs,
+                volume_guid: None,
+                placeholder: crate::inventory::placeholder::classify(
+                    target_attrs,
+                    target_reparse_tag,
+                ),
+            });
+            continue;
+        }
+
+        if entry.is_dir {
+            walk(&path, cfg, out, callback, depth + 1, cancel)?;
+            continue;
+        }
+
+        // Regular file branch — apply the same filter ladder as the
+        // read_dir path, using the batched metadata from the dir
+        // enumeration.
+        let size = entry.size;
+        if size < cfg.min_size {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "below min-size",
+            });
+            continue;
+        }
+        if let Some(max) = cfg.max_size {
+            if size > max {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "above max-size",
+                });
+                continue;
+            }
+        }
+        if !path_passes_globs(&path, cfg) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "filtered by include/exclude",
+            });
+            continue;
+        }
+        callback(WalkEvent::FileFound { path: &path, size });
+
+        out.push(FileEntry {
+            path,
+            size,
+            mtime: entry.mtime_filetime,
+            // file_ref + volume_guid already resolved by the batched
+            // call — Stage 2b will short-circuit per-file when both
+            // are non-default.
+            file_ref: entry.file_id,
+            parent_ref: 0,
+            usn: 0,
+            attributes: entry.attributes,
+            volume_guid: enumeration.volume_guid.clone(),
+            placeholder: crate::inventory::placeholder::classify(entry.attributes, reparse_tag),
         });
     }
     Ok(())
