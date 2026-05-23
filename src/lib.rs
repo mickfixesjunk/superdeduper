@@ -31,4 +31,10 @@ pub mod winapi_wrappers;
 #[cfg(feature = "gui")]
 pub mod gui;
 
+// G-track (leaderboards + achievements + canonical-bench).
+// Gated behind the `telemetry` Cargo feature so distro / paranoid
+// builds can ship without the network + crypto stack.
+#[cfg(feature = "telemetry")]
+pub mod leaderboard;
+
 pub use error::{Error, Result};

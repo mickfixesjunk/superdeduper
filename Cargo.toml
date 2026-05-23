@@ -55,6 +55,21 @@ crossbeam-channel = { version = "0.5", optional = true }
 rfd = { version = "0.14", optional = true }
 rodio = { version = "0.19", optional = true, default-features = false }
 
+# G-track (gamification + leaderboards) deps — optional, gated
+# behind the `telemetry` feature. Default-on in release builds;
+# distros / paranoid users can build with --no-default-features to
+# strip the network + crypto code paths entirely.
+#
+# * ureq: blocking HTTP client. Single-dep blast radius; no tokio.
+# * hmac + sha2: RustCrypto, audited, no_std. HMAC-SHA256 signing.
+# * uuid: install_id generation; the existing telemetry::new_run_uuid
+#   helper is xorshift-based and fine for idempotency keys, but
+#   install_id wants a real RFC 4122 v4 UUID per client-spec §4.3.
+ureq = { version = "2.10", optional = true, default-features = false, features = ["json", "tls"] }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+uuid = { version = "1.10", optional = true, features = ["v4"] }
+
 [features]
 default = []
 # Rendering + interaction stack. Does NOT pull rodio — see `audio`.
@@ -66,6 +81,10 @@ gui = ["dep:eframe", "dep:egui", "dep:egui_plot", "dep:egui_extras", "dep:crossb
 # in practice this is GUI-only. Release builds combine both:
 # `--features "gui audio"`.
 audio = ["dep:rodio"]
+# G-track leaderboards + achievements. Pulls the HMAC + ureq stack
+# so the engine can register + sign + submit. Off by default until
+# G1 lands and the release matrix turns it on.
+telemetry = ["dep:ureq", "dep:hmac", "dep:sha2", "dep:uuid"]
 
 [[bin]]
 name = "superdeduper-gui"
