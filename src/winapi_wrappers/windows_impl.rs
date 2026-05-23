@@ -734,6 +734,27 @@ pub(crate) fn pathbuf_from_wide(wide: &[u16]) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_wide(&wide[..len]))
 }
 
+/// Drop the leading `\\?\` verbatim-path prefix, if present. The walker
+/// (src/inventory/walk.rs::to_verbatim) adds this prefix to every
+/// emitted path so legacy Win32 APIs accept trailing-dot / reserved-DOS
+/// names / >MAX_PATH lengths. Shell-namespace APIs such as
+/// `SHCreateItemFromParsingName` REJECT the prefix with E_INVALIDARG —
+/// callers about to hand a path to one of those APIs need to strip it
+/// first. Modern shell APIs handle long paths natively, so dropping the
+/// prefix doesn't re-introduce legacy MAX_PATH truncation.
+///
+/// Unchanged when no prefix is present.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let wide_first: Vec<u16> = path.as_os_str().encode_wide().take(4).collect();
+    // \\?\ == [0x5C, 0x5C, 0x3F, 0x5C]
+    if wide_first.as_slice() == [0x5C, 0x5C, 0x3F, 0x5C] {
+        let rest: Vec<u16> = path.as_os_str().encode_wide().skip(4).collect();
+        PathBuf::from(std::ffi::OsString::from_wide(&rest))
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Send `path` to the Recycle Bin via the modern `IFileOperation` COM
 /// interface. Restorable via the standard shell APIs.
 ///
@@ -756,10 +777,18 @@ pub fn recycle(path: &Path) -> Result<()> {
         FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
     };
 
-    // Build a null-terminated UTF-16 path. IFileOperation handles long
-    // paths natively, so the legacy `\\?\` prefix is not required (but
-    // is tolerated if a caller passed one).
-    let wide: Vec<u16> = path
+    // Build a null-terminated UTF-16 path. SHCreateItemFromParsingName
+    // (the modern shell-namespace entry point) REJECTS the `\\?\`
+    // verbatim prefix with E_INVALIDARG (0x80070057) — confirmed by
+    // benchmarker on the T2.3 recycle smoke test. The walker's verbatim
+    // prefix (added in T0.4 for `FindFirstFileW` long-path / trailing-
+    // dot correctness) flows through every FileEntry.path and reaches
+    // here unchanged. Strip it before the shell call. Modern shell APIs
+    // do their own canonicalization and support long paths natively,
+    // so dropping the prefix doesn't re-introduce the legacy
+    // truncation issue.
+    let stripped = strip_verbatim_prefix(path);
+    let wide: Vec<u16> = stripped
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
