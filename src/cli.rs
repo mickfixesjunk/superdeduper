@@ -45,6 +45,13 @@ pub enum Command {
     /// the seek-penalty IOCTL result, and the rule that picked the
     /// final answer. Windows only.
     DriveInfo,
+
+    /// Probe the user's machine + workload and report where their
+    /// scans are bound (Tier 1 syscall, Tier 3 IO, hash compute).
+    /// Outputs both human-readable text and structured JSON
+    /// (when --format json). The GUI preflight ("credit report")
+    /// consumes the JSON form.
+    Diagnose(DiagnoseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +219,31 @@ pub struct DedupeArgs {
     /// guard against cloud-hydration, not FS-dedup transparency.
     #[arg(long)]
     pub allow_destructive_on_deduped: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DiagnoseArgs {
+    /// Path to probe against. The diagnose probes write a small
+    /// temporary scratch directory under this path (or the system
+    /// temp dir if not writable), then clean up. If omitted, uses
+    /// the system temp directory.
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
+
+    /// Output format. Default `text` is human-readable; `json` is
+    /// the structured form the GUI preflight consumes.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+
+    /// Write the diagnostic report to a file instead of stdout.
+    #[arg(long, short, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Skip the Tier 3 sequential-read probe. Useful when running
+    /// against a remote/slow filesystem where writing a 256 MiB
+    /// scratch file would take too long for a "quick check."
+    #[arg(long)]
+    pub skip_io: bool,
 }
 
 #[derive(Debug, Subcommand)]

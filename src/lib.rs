@@ -19,6 +19,7 @@ pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod dedupe;
+pub mod diagnose;
 pub mod error;
 pub mod inventory;
 pub mod keep;

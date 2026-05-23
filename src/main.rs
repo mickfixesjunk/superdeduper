@@ -21,6 +21,7 @@ fn main() -> anyhow::Result<()> {
         Command::Dedupe(args) => run_dedupe(args),
         Command::Cache(cmd) => run_cache(cmd),
         Command::DriveInfo => run_drive_info(),
+        Command::Diagnose(args) => superdeduper::diagnose::run(args),
     }
 }
 
