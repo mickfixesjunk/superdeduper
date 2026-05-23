@@ -274,6 +274,40 @@ fn perform_action(action: DedupeAction, path: &Path, keeper: &Path) -> Result<()
     }
 }
 
+/// Refuse destructive action against cloud-placeholder and
+/// reparse-tagged files. Stats `path`, classifies via
+/// `inventory::placeholder::classify()`, and returns an error if
+/// the resulting `PlaceholderState` blocks destructive action.
+///
+/// Cross-platform: on non-Windows, attributes are always 0 →
+/// `NotPlaceholder` → never blocks. The guard is a no-op on those
+/// platforms.
+fn guard_destructive(path: &Path) -> Result<()> {
+    let state = placeholder_state_for(path)?;
+    if state.blocks_destructive_action() {
+        return Err(Error::other(format!(
+            "refusing destructive action on placeholder/reparse file ({state:?}): {}",
+            path.display(),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn placeholder_state_for(path: &Path) -> Result<crate::inventory::PlaceholderState> {
+    use std::os::windows::fs::MetadataExt;
+    let m = fs::metadata(path)?;
+    Ok(crate::inventory::placeholder::classify(
+        m.file_attributes(),
+        None,
+    ))
+}
+
+#[cfg(not(windows))]
+fn placeholder_state_for(_path: &Path) -> Result<crate::inventory::PlaceholderState> {
+    Ok(crate::inventory::PlaceholderState::NotPlaceholder)
+}
+
 /// File extension we append in safe-rename mode. Chosen to be
 /// distinctive enough that an undo walker won't accidentally touch
 /// user files (e.g. `.bak` or `.tmp` would be too generic).
@@ -283,20 +317,30 @@ pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 /// run them directly without round-tripping through a results file.
 /// Each goes through the same Win32 / portable backend the planner
 /// uses, so the safety guarantees are identical.
+///
+/// Every action calls `guard_destructive(path)` first. The planner
+/// already filters placeholders, so this is defense in depth — even
+/// if a caller forgets to filter (e.g. a future code path, or a
+/// future GUI flow), the action layer refuses to delete / replace /
+/// rename a cloud placeholder or reparse-tagged file.
 pub fn action_remove(path: &Path) -> Result<()> {
+    guard_destructive(path)?;
     fs::remove_file(path)?;
     Ok(())
 }
 
 pub fn action_recycle(path: &Path) -> Result<()> {
+    guard_destructive(path)?;
     recycle(path)
 }
 
 pub fn action_hardlink(target: &Path, keeper: &Path) -> Result<()> {
+    guard_destructive(target)?;
     replace_with_hardlink(target, keeper)
 }
 
 pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
+    guard_destructive(target)?;
     replace_with_reflink(target, keeper)
 }
 
@@ -304,6 +348,7 @@ pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
 /// files already ending in the suffix are a no-op. Reversible via
 /// `unsuperdeduper_root`. Never deletes anything.
 pub fn action_safe_rename(target: &Path) -> Result<()> {
+    guard_destructive(target)?;
     let name = target
         .file_name()
         .ok_or_else(|| Error::other(format!("{} has no file name", target.display())))?;
@@ -560,6 +605,25 @@ mod tests {
         assert_eq!(outcome.executed, 1);
         assert!(a.exists());
         assert!(b.exists(), "dry-run must not delete");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn guard_destructive_allows_normal_files() {
+        let d = tmpdir();
+        let f = d.join("regular.bin");
+        write_file(&f, b"normal");
+        assert!(guard_destructive(&f).is_ok());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn action_remove_normal_file_still_works() {
+        let d = tmpdir();
+        let f = d.join("doomed.bin");
+        write_file(&f, b"bye");
+        action_remove(&f).unwrap();
+        assert!(!f.exists());
         fs::remove_dir_all(&d).ok();
     }
 
