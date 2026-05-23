@@ -817,9 +817,33 @@ fn tier_index(tier: Tier) -> u8 {
 
 fn cache_key(f: &LaidOutFile, algo: HashAlgo) -> Option<CacheKey> {
     let guid = f.entry.volume_guid.clone()?;
+    // The cache schema's PRIMARY KEY is (volume_guid, file_ref,
+    // hash_algo). When the walker's fallback path leaves file_ref
+    // at zero (and Stage 2b's `resolve_file_ids` couldn't resolve
+    // it either — e.g., permission-denied parent directory, file
+    // since deleted), every such file collides on the same key.
+    // The `ON CONFLICT UPDATE` clause then clobbers earlier writes
+    // and the secondary (size, mtime, usn) check fails on lookup
+    // for nearly every file. Net effect: cache appears empty even
+    // after a full scan.
+    //
+    // Synthesize a stable file_ref from the path hash when the
+    // real one is missing. Hash space is 63 bits (top bit reserved
+    // to keep i64 positive). NTFS file_refs in practice fit in the
+    // low 48 bits, so collisions with real refs are
+    // astronomically unlikely; collisions between synthetic refs
+    // are bounded by 2^32 paths having birthday-problem-50%-chance.
+    let file_ref = if f.entry.file_ref != 0 {
+        f.entry.file_ref as i64
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        f.entry.path.hash(&mut h);
+        (h.finish() & 0x7fff_ffff_ffff_ffff) as i64
+    };
     Some(CacheKey {
         volume_guid: guid,
-        file_ref: f.entry.file_ref as i64,
+        file_ref,
         size: f.entry.size,
         mtime: f.entry.mtime,
         usn: f.entry.usn,
