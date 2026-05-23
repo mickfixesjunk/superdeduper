@@ -147,13 +147,34 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     };
 
     let t_inventory = std::time::Instant::now();
-    let inventory = inventory::enumerate(&cfg, cache.as_ref()).context("inventory failed")?;
+    let (inventory, skipped) =
+        inventory::enumerate_with_skipped(&cfg, cache.as_ref()).context("inventory failed")?;
     let inventory_ms = t_inventory.elapsed().as_millis();
     tracing::info!(
         count = inventory.len(),
+        skipped = skipped.len(),
         elapsed_ms = inventory_ms as u64,
         "stage 1: inventory complete"
     );
+
+    // T2.1 phase 7: --placeholders-only short-circuits stages 2-4.
+    // User just wants the placeholder inventory; no hashing happens,
+    // groups[] is empty, skipped[] is the payload.
+    if args.placeholders_only {
+        tracing::info!(
+            placeholders = skipped.len(),
+            "stage 2-4 skipped: --placeholders-only set"
+        );
+        let mut writer: Box<dyn Write> = match &cfg.output {
+            Some(p) => Box::new(BufWriter::new(
+                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+            )),
+            None => Box::new(BufWriter::new(io::stdout().lock())),
+        };
+        output::write(writer.as_mut(), cfg.format, &[], &skipped)?;
+        writer.flush()?;
+        return Ok(());
+    }
 
     let t_group = std::time::Instant::now();
     let mut size_groups = pipeline::grouping::group_by_size(inventory);
@@ -308,7 +329,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         )),
         None => Box::new(BufWriter::new(io::stdout().lock())),
     };
-    output::write(writer.as_mut(), cfg.format, &duplicates)?;
+    output::write(writer.as_mut(), cfg.format, &duplicates, &skipped)?;
     writer.flush()?;
 
     Ok(())

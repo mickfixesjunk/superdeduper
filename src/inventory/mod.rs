@@ -89,20 +89,56 @@ pub struct FileEntry {
 /// full cold cost. Pass `None` to disable warm-path entirely (the
 /// `superdeduper scan --no-cache` codepath does this).
 pub fn enumerate(cfg: &ScanConfig, cache: Option<&Arc<Mutex<Cache>>>) -> Result<Vec<FileEntry>> {
-    if !all_roots_are_volume_roots(&cfg.roots) {
+    let (files, _skipped) = enumerate_with_skipped(cfg, cache)?;
+    Ok(files)
+}
+
+/// T2.1 phase 7 surface — same as [`enumerate`] but also returns the
+/// list of placeholders observed (every entry classified as
+/// non-`NotPlaceholder` during inventory). Used by the CLI/GUI to emit
+/// a `skipped[]` array in the JSON scan output separately from the
+/// dup-group set.
+///
+/// All three producers (mft, warm, walk) already call `classify()` and
+/// stamp `PlaceholderState` onto each `FileEntry` (phase 2). We derive
+/// the skipped list from the entry stream rather than threading a
+/// parallel collector through every producer — single read of the
+/// FileEntry vec, no extra allocations during enumeration, no API
+/// churn at the producer level.
+///
+/// `placeholder == ReparseDedup` files appear in BOTH `files` and
+/// `skipped` because they're observed AND hashable; downstream
+/// consumers filter as appropriate.
+pub fn enumerate_with_skipped(
+    cfg: &ScanConfig,
+    cache: Option<&Arc<Mutex<Cache>>>,
+) -> Result<(Vec<FileEntry>, Vec<crate::pipeline::SkippedFile>)> {
+    let files = if !all_roots_are_volume_roots(&cfg.roots) {
         tracing::info!(
             roots = ?cfg.roots,
             "scan root is a subdirectory; using walker (MFT path skipped — see inventory/mod.rs doc)",
         );
-        return walk::enumerate(cfg);
-    }
-    match mft::enumerate(cfg, cache) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            tracing::warn!(error = %e, "MFT enumeration unavailable, falling back to directory walk");
-            walk::enumerate(cfg)
+        walk::enumerate(cfg)?
+    } else {
+        match mft::enumerate(cfg, cache) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "MFT enumeration unavailable, falling back to directory walk");
+                walk::enumerate(cfg)?
+            }
         }
+    };
+    let skipped: Vec<crate::pipeline::SkippedFile> = files
+        .iter()
+        .filter_map(|f| crate::pipeline::SkippedFile::from_state(f.path.clone(), f.placeholder))
+        .collect();
+    if !skipped.is_empty() {
+        tracing::info!(
+            count = skipped.len(),
+            "inventory: placeholder files observed (see skipped[] in scan output)"
+        );
     }
+    Ok((files, skipped))
 }
 
 /// True when every root is the root of its volume (or filesystem on unix),

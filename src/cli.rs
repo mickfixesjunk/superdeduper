@@ -120,6 +120,15 @@ pub struct ScanArgs {
     #[arg(long)]
     pub allow_system_paths: bool,
 
+    /// Skip stages 2-4 (size grouping, layout, hashing) and emit only
+    /// the placeholder inventory. Use when auditing a tree for
+    /// cloud-placeholder presence without paying any tier-1 read cost.
+    /// JSON output's `groups[]` is empty; `skipped[]` carries the
+    /// per-file placeholder records; `summary.placeholder_skipped`
+    /// counts them.
+    #[arg(long)]
+    pub placeholders_only: bool,
+
     /// Allow the hash worker to read cloud-placeholder files
     /// (`RecallOnOpen` / `RecallOnDataAccess`) even though opening them
     /// triggers cloud hydration. Default OFF — the conservative default

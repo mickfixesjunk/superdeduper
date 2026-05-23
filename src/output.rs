@@ -6,13 +6,20 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::cli::OutputFormat;
-use crate::pipeline::DuplicateGroup;
+use crate::pipeline::{DuplicateGroup, SkippedFile};
 use crate::Result;
 
 #[derive(Serialize)]
 struct Report<'a> {
     schema: &'static str,
     groups: &'a [DuplicateGroup],
+    /// T2.1 phase 7 surface (schema v2): one record per placeholder
+    /// observed during inventory (RecallOnOpen, RecallOnDataAccess,
+    /// ReparseDedup, OtherReparse). Empty array when no placeholders
+    /// fired — present-but-empty makes the schema shape stable across
+    /// runs. ReparseDedup files appear here AND in `groups` because
+    /// they're observed AND hashable; downstream filters as needed.
+    skipped: &'a [SkippedFile],
     summary: Summary,
 }
 
@@ -35,16 +42,32 @@ struct Summary {
     /// back?" `0` for groups whose JSON predates the `unique_inodes`
     /// field (it falls back to the path-aware metric in that case).
     reclaimable_inode_bytes: u64,
+    /// T2.1 phase 7: count of placeholder files observed during
+    /// inventory. Equal to `skipped.len()`. Promoted to summary so
+    /// scripts that only consume the summary block (without parsing
+    /// the whole skipped[] array) can still tell at a glance that
+    /// placeholders existed and were handled.
+    placeholder_skipped: usize,
 }
 
-pub fn write(out: &mut dyn Write, format: OutputFormat, groups: &[DuplicateGroup]) -> Result<()> {
-    let summary = summarize(groups);
+pub fn write(
+    out: &mut dyn Write,
+    format: OutputFormat,
+    groups: &[DuplicateGroup],
+    skipped: &[SkippedFile],
+) -> Result<()> {
+    let summary = summarize(groups, skipped);
     match format {
-        OutputFormat::Text => write_text(out, groups, &summary)?,
+        OutputFormat::Text => write_text(out, groups, skipped, &summary)?,
         OutputFormat::Json => {
             let report = Report {
-                schema: "superdeduper.scan.v1",
+                // Schema bumped v1 → v2 for the skipped[] +
+                // placeholder_skipped additions. Consumers reading
+                // older v1 outputs continue to work; v2 adds keys
+                // they can opt into.
+                schema: "superdeduper.scan.v2",
                 groups,
+                skipped,
                 summary,
             };
             serde_json::to_writer_pretty(&mut *out, &report).map_err(io_err)?;
@@ -55,8 +78,13 @@ pub fn write(out: &mut dyn Write, format: OutputFormat, groups: &[DuplicateGroup
     Ok(())
 }
 
-fn write_text(out: &mut dyn Write, groups: &[DuplicateGroup], summary: &Summary) -> Result<()> {
-    if groups.is_empty() {
+fn write_text(
+    out: &mut dyn Write,
+    groups: &[DuplicateGroup],
+    skipped: &[SkippedFile],
+    summary: &Summary,
+) -> Result<()> {
+    if groups.is_empty() && skipped.is_empty() {
         writeln!(out, "No duplicates found.")?;
         return Ok(());
     }
@@ -78,12 +106,29 @@ fn write_text(out: &mut dyn Write, groups: &[DuplicateGroup], summary: &Summary)
         }
         writeln!(out)?;
     }
+    if !skipped.is_empty() {
+        writeln!(out, "# placeholders observed (skipped from hashing where blocking)")?;
+        for s in skipped {
+            match s.reparse_tag {
+                Some(tag) => writeln!(
+                    out,
+                    "  [{}:0x{:08x}] {}",
+                    s.placeholder,
+                    tag,
+                    display_path(&s.path)
+                )?,
+                None => writeln!(out, "  [{}] {}", s.placeholder, display_path(&s.path))?,
+            }
+        }
+        writeln!(out)?;
+    }
     writeln!(
         out,
-        "Summary: {} group(s), {} file(s), {} reclaimable.",
+        "Summary: {} group(s), {} file(s), {} reclaimable, {} placeholder(s) skipped.",
         summary.groups,
         summary.files,
         humansize::format_size(summary.reclaimable_bytes, humansize::BINARY),
+        summary.placeholder_skipped,
     )?;
     Ok(())
 }
@@ -114,7 +159,7 @@ fn write_csv(out: &mut dyn Write, groups: &[DuplicateGroup]) -> Result<()> {
     Ok(())
 }
 
-fn summarize(groups: &[DuplicateGroup]) -> Summary {
+fn summarize(groups: &[DuplicateGroup], skipped: &[SkippedFile]) -> Summary {
     let mut files = 0usize;
     let mut reclaimable_bytes = 0u64;
     let mut reclaimable_inode_bytes = 0u64;
@@ -149,6 +194,7 @@ fn summarize(groups: &[DuplicateGroup]) -> Summary {
         files,
         reclaimable_bytes,
         reclaimable_inode_bytes,
+        placeholder_skipped: skipped.len(),
     }
 }
 
