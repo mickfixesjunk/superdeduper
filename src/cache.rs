@@ -35,10 +35,22 @@ use crate::{Error, Result};
 ///   bumping clears v3-era `"river5"` hash rows in one sweep so
 ///   warm cache lookups can't accidentally pair a v3 hash with a
 ///   v15 hash and silently report a wrong "duplicate".
+/// * v7 adds the `reparse_tag` column to `inventory_records` to
+///   persist the cloud-placeholder / reparse-point identity across
+///   scans. T2.1 phase 4 (tier guards) consults
+///   `PlaceholderState::blocks_content_read()`; that state is
+///   derived from `(attributes, reparse_tag)` via
+///   `inventory::placeholder::classify()`. Today's USN-data path
+///   leaves `reparse_tag = None` (FSCTL_GET_REPARSE_POINT isn't
+///   wired up yet), but the column gives us a place to land the
+///   real tag once it is, without a future schema bump. NULL means
+///   "tag unknown" — `classify(attrs, None)` still produces the
+///   safe-default `OtherReparse(0)` for unknown reparses, so warm
+///   path correctness is preserved.
 ///
 /// Bumping this string causes init_schema to drop and recreate the
 /// tables; any cached data from older versions is discarded.
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "7";
 
 #[derive(Debug, Clone)]
 pub struct CacheKey {
@@ -88,6 +100,13 @@ pub struct InventoryRecord {
     pub name: String,
     pub size: i64,
     pub mtime: u64,
+    /// Reparse tag for files where `attributes & FILE_ATTRIBUTE_REPARSE_POINT`
+    /// is set. `None` means "not a reparse point OR tag not yet fetched."
+    /// Cold-path producers leave this `None` today (FSCTL_GET_REPARSE_POINT
+    /// isn't wired up yet); the warm path passes it through to
+    /// `placeholder::classify()` so the tier guard sees the same state on
+    /// resume that it saw on the original scan once the fetcher lands.
+    pub reparse_tag: Option<u32>,
 }
 
 impl InventoryRecord {
@@ -223,6 +242,11 @@ impl Cache {
             -- Directories carry size = -1 / mtime = 0 since their
             -- only use is the parent-chain lookup that
             -- reconstruct_path() walks.
+            -- v7: reparse_tag column. NULL when the record isn't a
+            -- reparse point or the tag wasn't fetched at scan time;
+            -- the warm-path enumerator passes it through to
+            -- placeholder::classify() so the tier guard sees the
+            -- same state on resume.
             CREATE TABLE IF NOT EXISTS inventory_records (
                 volume_guid TEXT    NOT NULL,
                 file_ref    INTEGER NOT NULL,
@@ -232,6 +256,7 @@ impl Cache {
                 name        TEXT    NOT NULL,
                 size        INTEGER NOT NULL,
                 mtime       INTEGER NOT NULL,
+                reparse_tag INTEGER,
                 PRIMARY KEY (volume_guid, file_ref)
             );
             CREATE INDEX IF NOT EXISTS idx_inventory_records_volume
@@ -411,7 +436,7 @@ impl Cache {
     /// 500k AppData files ≈ 50 MB, well within budget.
     pub fn load_inventory_records(&self, volume_guid: &str) -> Result<Vec<(u64, InventoryRecord)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT file_ref, parent_ref, usn, attributes, name, size, mtime
+            "SELECT file_ref, parent_ref, usn, attributes, name, size, mtime, reparse_tag
              FROM inventory_records WHERE volume_guid = ?1",
         )?;
         let rows = stmt.query_map(params![volume_guid], |r| {
@@ -424,6 +449,7 @@ impl Cache {
                     name: r.get::<_, String>(4)?,
                     size: r.get::<_, i64>(5)?,
                     mtime: r.get::<_, i64>(6)? as u64,
+                    reparse_tag: r.get::<_, Option<i64>>(7)?.map(|v| v as u32),
                 },
             ))
         })?;
@@ -460,8 +486,8 @@ impl Cache {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO inventory_records
-                     (volume_guid, file_ref, parent_ref, usn, attributes, name, size, mtime)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (volume_guid, file_ref, parent_ref, usn, attributes, name, size, mtime, reparse_tag)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for (file_ref, rec) in records {
                 stmt.execute(params![
@@ -473,6 +499,7 @@ impl Cache {
                     rec.name,
                     rec.size,
                     rec.mtime as i64,
+                    rec.reparse_tag.map(|t| t as i64),
                 ])?;
             }
         }
@@ -530,8 +557,8 @@ impl Cache {
         if !upserts.is_empty() {
             let mut up = tx.prepare(
                 "INSERT OR REPLACE INTO inventory_records
-                     (volume_guid, file_ref, parent_ref, usn, attributes, name, size, mtime)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (volume_guid, file_ref, parent_ref, usn, attributes, name, size, mtime, reparse_tag)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for (file_ref, rec) in upserts {
                 up.execute(params![
@@ -543,6 +570,7 @@ impl Cache {
                     rec.name,
                     rec.size,
                     rec.mtime as i64,
+                    rec.reparse_tag.map(|t| t as i64),
                 ])?;
             }
         }
@@ -820,6 +848,84 @@ mod tests {
         assert_eq!(loaded.tier1_hash.as_deref(), Some(b"T1".as_ref()), "tier1");
         assert_eq!(loaded.tier2_hash.as_deref(), Some(b"T2".as_ref()), "tier2");
         assert_eq!(loaded.tier3_hash.as_deref(), Some(b"T3".as_ref()), "tier3");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// v7 schema: reparse_tag persists across save/load so the warm
+    /// path can pass it back to `placeholder::classify()` and get the
+    /// same PlaceholderState the cold path computed at scan time.
+    #[test]
+    fn inventory_snapshot_reparse_tag_roundtrips() {
+        let p = tmp_db();
+        let mut cache = Cache::open(&p).unwrap();
+        let vol = "vol-test";
+        let meta = InventoryMeta {
+            journal_id: 1,
+            last_usn: 100,
+            captured_at_unix: now_unix(),
+        };
+        // Three records covering the cases that matter:
+        // * No reparse point — reparse_tag = None
+        // * Reparse with known dedup tag (0x80000013) — should
+        //   roundtrip exactly
+        // * Reparse with unknown tag — also roundtrips exactly so
+        //   future analyses can audit what was actually seen
+        let records = vec![
+            (
+                10u64,
+                InventoryRecord {
+                    parent_ref: 1,
+                    usn: 10,
+                    attributes: 0x80, // FILE_ATTRIBUTE_NORMAL-ish, no reparse
+                    name: "plain.txt".into(),
+                    size: 100,
+                    mtime: 0,
+                    reparse_tag: None,
+                },
+            ),
+            (
+                20u64,
+                InventoryRecord {
+                    parent_ref: 1,
+                    usn: 20,
+                    attributes: 0x400, // FILE_ATTRIBUTE_REPARSE_POINT
+                    name: "dedup.dat".into(),
+                    size: 1024,
+                    mtime: 0,
+                    reparse_tag: Some(0x8000_0013),
+                },
+            ),
+            (
+                30u64,
+                InventoryRecord {
+                    parent_ref: 1,
+                    usn: 30,
+                    attributes: 0x400,
+                    name: "unknown-reparse".into(),
+                    size: 2048,
+                    mtime: 0,
+                    reparse_tag: Some(0xDEAD_BEEF),
+                },
+            ),
+        ];
+        cache.save_inventory_snapshot(vol, &meta, &records).unwrap();
+
+        let loaded = cache.load_inventory_records(vol).unwrap();
+        assert_eq!(loaded.len(), 3);
+        // Order isn't guaranteed by load_inventory_records — index by file_ref.
+        let by_ref: std::collections::HashMap<u64, &InventoryRecord> =
+            loaded.iter().map(|(r, rec)| (*r, rec)).collect();
+        assert_eq!(by_ref[&10].reparse_tag, None, "plain file");
+        assert_eq!(
+            by_ref[&20].reparse_tag,
+            Some(0x8000_0013),
+            "dedup reparse tag roundtrips"
+        );
+        assert_eq!(
+            by_ref[&30].reparse_tag,
+            Some(0xDEAD_BEEF),
+            "unknown reparse tag roundtrips for future audit"
+        );
         std::fs::remove_file(&p).ok();
     }
 }

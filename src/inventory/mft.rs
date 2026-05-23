@@ -377,6 +377,11 @@ fn persist_cold_snapshot(
                     name: r.name.clone(),
                     size,
                     mtime: r.mtime_filetime as u64,
+                    // FSCTL_GET_REPARSE_POINT not wired up to USN-data
+                    // iteration yet; persist None for now. Warm path
+                    // re-classifies via attrs alone (safe-default for
+                    // unknown reparses).
+                    reparse_tag: None,
                 },
             )
         })

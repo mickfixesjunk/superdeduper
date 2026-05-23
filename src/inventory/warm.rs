@@ -223,6 +223,8 @@ pub fn try_warm(
                 name: r.name.clone(),
                 size: 0,
                 mtime: 0,
+                // Not yet fetched; warm path re-classifies later.
+                reparse_tag: None,
             };
             // Temporarily insert so reconstruct_path can find it.
             by_ref.insert(r.file_ref, provisional_record);
@@ -271,6 +273,10 @@ pub fn try_warm(
             name: r.name.clone(),
             size,
             mtime,
+            // Same as cold-path: tag fetch isn't wired up yet. Once it
+            // is, set this to the real value here so the warm-path
+            // snapshot persists it across scans.
+            reparse_tag: None,
         };
         by_ref.insert(r.file_ref, record.clone());
         delta_upserts.push((r.file_ref, record));
@@ -458,7 +464,10 @@ fn entries_from_records(
             usn: rec.usn,
             attributes: rec.attributes,
             volume_guid: None,
-            placeholder: crate::inventory::placeholder::classify(rec.attributes, None),
+            placeholder: crate::inventory::placeholder::classify(
+                rec.attributes,
+                rec.reparse_tag,
+            ),
         });
     }
     tracing::info!(
