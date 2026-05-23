@@ -734,35 +734,89 @@ pub(crate) fn pathbuf_from_wide(wide: &[u16]) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_wide(&wide[..len]))
 }
 
-/// Send `path` to the Recycle Bin via `SHFileOperationW` with
-/// `FOF_ALLOWUNDO`. Restorable via the standard shell APIs.
+/// Send `path` to the Recycle Bin via the modern `IFileOperation` COM
+/// interface. Restorable via the standard shell APIs.
+///
+/// T2.3 — replaced the legacy `SHFileOperationW` path with
+/// `IFileOperation` for: (a) native long-path support without `\\?\`
+/// wrapping, (b) HRESULT-grade error reporting (instead of opaque
+/// integer rc), (c) future-compat — Microsoft has soft-deprecated
+/// SHFileOperationW since Vista. The user-visible behavior is
+/// unchanged: silent recycle, no UI, no confirmation, no error
+/// dialog.
 pub fn recycle(path: &Path) -> Result<()> {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::S_FALSE;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
     use windows::Win32::UI::Shell::{
-        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE,
-        SHFILEOPSTRUCTW,
+        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, FILEOPERATION_FLAGS,
+        FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
     };
 
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    wide.push(0);
-    wide.push(0);
+    // Build a null-terminated UTF-16 path. IFileOperation handles long
+    // paths natively, so the legacy `\\?\` prefix is not required (but
+    // is tolerated if a caller passed one).
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
-    let mut op = SHFILEOPSTRUCTW {
-        wFunc: FO_DELETE as u32,
-        pFrom: PCWSTR(wide.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0) as u16,
-        ..Default::default()
-    };
-    // SAFETY: SHFileOperationW reads `op` and the buffer it points at
-    // during the call. The buffer is double-null-terminated as the
-    // function requires. We keep `wide` alive past the call.
-    let rc = unsafe { SHFileOperationW(&mut op) };
-    if rc != 0 {
-        return Err(Error::Other(format!(
-            "SHFileOperationW returned {rc} for {}",
-            path.display()
-        )));
+    // COM init dance: try to initialize the apartment for this thread.
+    // S_OK or S_FALSE both mean "init OK and we own a refcount to
+    // release"; any other HRESULT (notably RPC_E_CHANGED_MODE if some
+    // other code already initialised this thread MTA) means we did NOT
+    // take a refcount and must not Uninitialize. Calls beyond the COM
+    // boundary are unsafe regardless of the result.
+    unsafe {
+        let init_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let need_uninit = init_hr == HRESULT(0) || init_hr == S_FALSE;
+
+        let result = (|| -> Result<()> {
+            // CoCreateInstance returns the COM object as the requested
+            // interface; turbofish makes the type binding explicit.
+            let op: IFileOperation =
+                CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER).map_err(|e| {
+                    Error::Other(format!("CoCreateInstance(IFileOperation): {e}"))
+                })?;
+
+            // Flag combination matches the SHFileOperationW call we
+            // replaced: SILENT (no progress UI) + NOCONFIRMATION (no
+            // prompt) + NOERRORUI (no dialog). FOFX_RECYCLEONDELETE
+            // forces recycle-bin semantics even when the shell would
+            // otherwise hard-delete (e.g. files above the Recycle Bin
+            // size cap, or network shares). This is the IFileOperation
+            // equivalent of the FOF_ALLOWUNDO flag.
+            let flags_u32 = (FOF_SILENT.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0) as u32
+                | FOFX_RECYCLEONDELETE.0 as u32;
+            op.SetOperationFlags(FILEOPERATION_FLAGS(flags_u32))
+                .map_err(|e| Error::Other(format!("SetOperationFlags: {e}")))?;
+
+            let shell_item: IShellItem =
+                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(|e| {
+                    Error::Other(format!(
+                        "SHCreateItemFromParsingName({}): {e}",
+                        path.display()
+                    ))
+                })?;
+
+            op.DeleteItem(&shell_item, None)
+                .map_err(|e| Error::Other(format!("DeleteItem({}): {e}", path.display())))?;
+
+            op.PerformOperations()
+                .map_err(|e| Error::Other(format!("PerformOperations({}): {e}", path.display())))?;
+
+            Ok(())
+        })();
+
+        if need_uninit {
+            CoUninitialize();
+        }
+        result
     }
-    Ok(())
 }
 
 /// Replace `target` with a ReFS block-clone of `keeper` using

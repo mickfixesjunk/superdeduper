@@ -89,6 +89,10 @@ features = [
     "Win32_System_WindowsProgramming",
     "Win32_Security",
     "Win32_UI_Shell",
+    # T2.3 — IFileOperation upgrade. The COM-based replacement for
+    # SHFileOperationW needs CoInitializeEx / CoUninitialize plus the
+    # SHCreateItemFromParsingName/IShellItem family.
+    "Win32_System_Com",
 ]
 
 [dev-dependencies]
