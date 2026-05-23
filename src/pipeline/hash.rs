@@ -87,6 +87,13 @@ pub struct HashCounters {
     pub tier_bytes: [AtomicU64; 4],
     /// Number of files whose compute step succeeded at each tier.
     pub tier_count: [AtomicU64; 4],
+    /// T2.1 phase 7 — tier guard skip counters. Surfaces "N files
+    /// skipped because placeholders" so the user understands why the
+    /// dup-group count is lower than expected. Split by state so the
+    /// scan-finish log line can give a per-class breakdown without
+    /// changing wire format.
+    pub placeholders_blocked_recall: AtomicU64,
+    pub placeholders_blocked_other_reparse: AtomicU64,
 }
 
 /// Outcome reported by the per-file [`FileProgress`] callback.
@@ -207,6 +214,13 @@ fn run_with_counters_inner(
             tier_micros: snap_arr(&arc.tier_micros),
             tier_bytes: snap_arr(&arc.tier_bytes),
             tier_count: snap_arr(&arc.tier_count),
+            placeholders_blocked_recall: AtomicU64::new(
+                arc.placeholders_blocked_recall.load(Ordering::Relaxed),
+            ),
+            placeholders_blocked_other_reparse: AtomicU64::new(
+                arc.placeholders_blocked_other_reparse
+                    .load(Ordering::Relaxed),
+            ),
         }
     });
     Ok((confirmed, counters))
@@ -248,7 +262,9 @@ fn apply_tier_guards(
     group: LaidOutGroup,
     on_file: Option<&FileProgress>,
     allow_recall_on_read: bool,
+    counters: &HashCounters,
 ) -> LaidOutGroup {
+    use crate::inventory::PlaceholderState;
     let size = group.size;
     let mut allowed = Vec::with_capacity(group.files.len());
     let mut blocked = 0usize;
@@ -262,6 +278,25 @@ fn apply_tier_guards(
                 placeholder = ?f.entry.placeholder,
                 "tier guard: refusing content read for placeholder file",
             );
+            // Phase 7: bump the per-state counter the GUI / CLI
+            // surface at scan finish. Split by class so we can
+            // give the user a per-bucket breakdown without
+            // expanding the wire schema.
+            match f.entry.placeholder {
+                PlaceholderState::RecallOnOpen | PlaceholderState::RecallOnDataAccess => {
+                    counters
+                        .placeholders_blocked_recall
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                PlaceholderState::OtherReparse(_) => {
+                    counters
+                        .placeholders_blocked_other_reparse
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // NotPlaceholder + ReparseDedup never reach this
+                // branch (they don't trigger blocks_content_read).
+                _ => {}
+            }
             if let Some(cb) = on_file {
                 cb(
                     &f.entry.path,
@@ -316,7 +351,9 @@ fn run_group(
     // their data is local and reading is safe.
     // Phase 6: cfg.allow_recall_on_read lets users opt into accepting
     // forced hydration if that's what they actually want.
-    let group = apply_tier_guards(group, on_file, cfg.allow_recall_on_read);
+    // Phase 7: per-state skip counters land in `counters` for the
+    // scan-finish breakdown line.
+    let group = apply_tier_guards(group, on_file, cfg.allow_recall_on_read, counters);
 
     // Zero-byte short circuit.
     if size == 0 {
@@ -1067,6 +1104,47 @@ mod tests {
             "with --allow-recall-on-read, recall placeholders hash and group"
         );
         assert_eq!(result[0].files.len(), 2);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// Phase 7 counter: blocked placeholders increment the per-state
+    /// counters so the scan-finish log line can give a breakdown.
+    /// Validates both buckets (recall + other-reparse) and confirms
+    /// ReparseDedup does not increment (it's never blocked).
+    #[test]
+    fn tier_guard_counters_split_by_state() {
+        use crate::inventory::PlaceholderState;
+        let d = tmpdir();
+        let body = vec![0x99u8; 8 * 1024];
+        let mk = |i: u8, ph: PlaceholderState| {
+            let p = d.join(format!("f{i}"));
+            fs::write(&p, &body).unwrap();
+            lo_with_placeholder(p, body.len() as u64, ph)
+        };
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                mk(0, PlaceholderState::RecallOnOpen),
+                mk(1, PlaceholderState::RecallOnDataAccess),
+                mk(2, PlaceholderState::RecallOnOpen),
+                mk(3, PlaceholderState::OtherReparse(0xC0DE)),
+                mk(4, PlaceholderState::ReparseDedup), // allowed, doesn't increment
+                mk(5, PlaceholderState::ReparseDedup),
+            ],
+        };
+        let (_dups, counters) = run_with_counters(vec![group], &cfg(), None).unwrap();
+        assert_eq!(
+            counters.placeholders_blocked_recall.load(Ordering::Relaxed),
+            3,
+            "RecallOnOpen + RecallOnDataAccess sum"
+        );
+        assert_eq!(
+            counters
+                .placeholders_blocked_other_reparse
+                .load(Ordering::Relaxed),
+            1,
+            "OtherReparse counted separately"
+        );
         fs::remove_dir_all(&d).ok();
     }
 

@@ -278,6 +278,24 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         scan_started.elapsed().as_millis()
     );
 
+    // T2.1 phase 7: surface placeholder skip counts so a smaller-
+    // than-expected dup-group count has a visible explanation.
+    let placeholders_recall = counters
+        .placeholders_blocked_recall
+        .load(Ordering::Relaxed);
+    let placeholders_other = counters
+        .placeholders_blocked_other_reparse
+        .load(Ordering::Relaxed);
+    let placeholders_total = placeholders_recall.saturating_add(placeholders_other);
+    if placeholders_total > 0 {
+        let _ = writeln!(
+            stderr,
+            "tier guard skipped:    {placeholders_total} placeholder file(s) \
+             ({placeholders_recall} cloud-recall, {placeholders_other} other reparse) \
+             — rerun with --allow-recall-on-read to include cloud stubs"
+        );
+    }
+
     let duplicates = if cfg.paranoid {
         pipeline::confirm::paranoid_verify(duplicates).context("paranoid verification failed")?
     } else {

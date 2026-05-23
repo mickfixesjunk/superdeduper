@@ -526,6 +526,9 @@ fn run(
     let mut tier_micros_total: [u64; 4] = [0; 4];
     let mut tier_bytes_total: [u64; 4] = [0; 4];
     let mut tier_count_total: [u64; 4] = [0; 4];
+    // T2.1 phase 7 — placeholder skip counters, summed across chunks.
+    let mut placeholders_blocked_recall_total: u64 = 0;
+    let mut placeholders_blocked_other_reparse_total: u64 = 0;
     // Per-tier attempt counters (one slot for Tier 0..3). Shared
     // ownership across rayon worker threads via Arc; updated
     // lock-free by the per-file callback.
@@ -742,6 +745,17 @@ fn run(
             tier_count_total[i] =
                 tier_count_total[i].saturating_add(counters.tier_count[i].load(Ordering::Relaxed));
         }
+        placeholders_blocked_recall_total = placeholders_blocked_recall_total.saturating_add(
+            counters
+                .placeholders_blocked_recall
+                .load(Ordering::Relaxed),
+        );
+        placeholders_blocked_other_reparse_total = placeholders_blocked_other_reparse_total
+            .saturating_add(
+                counters
+                    .placeholders_blocked_other_reparse
+                    .load(Ordering::Relaxed),
+            );
 
         for g in dups {
             if already_reported.contains(&g.content_hash) {
@@ -837,6 +851,25 @@ fn run(
             crate::gui::theme::humansize(reclaimable)
         ),
     });
+    // T2.1 phase 7 surface: tell the user how many files the tier
+    // guard skipped, broken out by class. Silent when the corpus
+    // had no placeholders (typical for non-OneDrive / non-WSL roots),
+    // shown prominently otherwise so dropped dup-group counts
+    // make sense at a glance.
+    let placeholders_total = placeholders_blocked_recall_total
+        .saturating_add(placeholders_blocked_other_reparse_total);
+    if placeholders_total > 0 {
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Warn,
+            message: format!(
+                "skipped {} placeholder file(s): {} cloud-recall, {} other reparse \
+                 (rerun with --allow-recall-on-read to include cloud stubs)",
+                placeholders_total,
+                placeholders_blocked_recall_total,
+                placeholders_blocked_other_reparse_total,
+            ),
+        });
+    }
     // Stop the diagnostics sampler and write the final summary.
     sampler_stop.store(true, Ordering::Relaxed);
     if let Some(h) = sampler_handle {
