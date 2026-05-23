@@ -110,6 +110,8 @@ features = [
     "Win32_System_Memory",
     "Win32_System_SystemServices",
     "Win32_System_WindowsProgramming",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_Security",
     "Win32_UI_Shell",
     # T2.3 — IFileOperation upgrade. The COM-based replacement for
