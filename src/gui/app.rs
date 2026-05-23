@@ -123,6 +123,12 @@ pub struct SuperdeduperApp {
     /// returns. `Cancel` resets to `Idle`; `Start` resets to `Idle`
     /// and proceeds to the original `start_live` body.
     preflight: crate::gui::preflight::PreflightState,
+    /// Cache-fast-forward sparkle particle state. Fires during the
+    /// "magical resume catch-up" phase where the engine replays
+    /// cached hashes thousands-per-second; pairs with a synthesized
+    /// computerised chime on entry + ascending-triad chime on
+    /// catch-up.
+    sparkles: crate::gui::particles::Sparkles,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -201,6 +207,7 @@ impl SuperdeduperApp {
             alpha_warning_acked_session: false,
             action_cancel: Arc::new(AtomicBool::new(false)),
             preflight: crate::gui::preflight::PreflightState::Idle,
+            sparkles: Default::default(),
         };
         let mut app = app;
         // Populate cache-banner state on first launch — roots may
@@ -1822,19 +1829,48 @@ impl eframe::App for SuperdeduperApp {
                 });
             });
 
+        let mut stats_rect: Option<egui::Rect> = None;
         TopBottomPanel::top("header")
             .frame(Frame::default().fill(theme::BG).inner_margin(8.0))
             .show(ctx, |ui| {
-                let action = header::show(
+                let out = header::show(
                     ui,
                     &self.state,
                     self.persisted.settings.hash_algo,
                     self.is_scanning,
                 );
-                if action == header::HeaderAction::OpenSettings {
+                if out.action == header::HeaderAction::OpenSettings {
                     want_settings = true;
                 }
+                stats_rect = out.stats_rect;
             });
+        // Tick the cache-fast-forward sparkles. When OverallProgress
+        // is in Hashing AND advancing at >2K files/sec (only cache
+        // hits can do that), we emit a stream of gold/cyan sparkles
+        // anchored to the header stats. Catches up with a 3-note
+        // chime when the rate drops back to real-hashing pace.
+        if matches!(
+            self.state.overall.stage,
+            crate::gui::events::OverallStage::Hashing
+        ) {
+            let signals = self.sparkles.tick(self.state.overall.done, stats_rect);
+            #[cfg(feature = "audio")]
+            {
+                if signals.entered_fast_forward {
+                    crate::gui::sound::play_fastforward_start();
+                }
+                if signals.left_fast_forward {
+                    crate::gui::sound::play_caught_up();
+                }
+            }
+            #[cfg(not(feature = "audio"))]
+            {
+                let _ = signals;
+            }
+            if self.sparkles.active() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
         if want_settings {
             self.settings_open = true;
         }
@@ -2005,6 +2041,25 @@ impl eframe::App for SuperdeduperApp {
         // practice they're mutually exclusive (preflight is pre-scan,
         // action-progress is post-results).
         self.tick_preflight(ctx);
+
+        // Sparkles render LAST in their own foreground layer so they
+        // overlay every other widget. The tick happened earlier when
+        // we had the header's stats_rect in hand; this is just the
+        // paint pass.
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("sd-sparkles-anchor"),
+        ));
+        // egui scope so we have a Ui to pass into paint. Use Area
+        // with TopLeft so the foreground layer covers the whole
+        // window without consuming clicks.
+        egui::Area::new(egui::Id::new("sd-sparkles-overlay"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                self.sparkles.paint(ui);
+            });
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

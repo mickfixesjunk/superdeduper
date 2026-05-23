@@ -12,8 +12,18 @@ pub enum HeaderAction {
     OpenSettings,
 }
 
-pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool) -> HeaderAction {
+/// Output of one header render: action requested + (optionally) the
+/// rectangle where the per-stat row was drawn. The caller anchors
+/// the cache-fast-forward sparkle particles to this rect so they
+/// drift up off the running totals when resume kicks in.
+pub struct HeaderOutput {
+    pub action: HeaderAction,
+    pub stats_rect: Option<egui::Rect>,
+}
+
+pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool) -> HeaderOutput {
     let mut action = HeaderAction::None;
+    let mut stats_rect: Option<egui::Rect> = None;
     ui.horizontal(|ui| {
         ui.add_space(4.0);
         ui.label(RichText::new("superdeduper").color(theme::ACCENT).heading());
@@ -56,35 +66,40 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool
         ui.label(RichText::new(status).color(theme::TEXT_HI));
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            big_stat(
-                ui,
-                "Reclaimable",
-                &theme::humansize(state.totals.reclaimable_bytes),
-                theme::HOT,
-            );
-            big_stat(
-                ui,
-                "Duplicates",
-                &state.totals.duplicates.to_string(),
-                theme::ACCENT,
-            );
-            big_stat(
-                ui,
-                "Read",
-                &theme::humansize(state.totals.bytes_read),
-                theme::COOL,
-            );
-            if let Some(elapsed) = state.scan_elapsed() {
-                big_stat(
-                    ui,
-                    "Elapsed",
-                    &crate::gui::state::fmt_wallclock(elapsed),
-                    theme::TEXT_HI,
-                );
-            }
+            let resp = ui
+                .scope(|ui| {
+                    big_stat(
+                        ui,
+                        "Reclaimable",
+                        &theme::humansize(state.totals.reclaimable_bytes),
+                        theme::HOT,
+                    );
+                    big_stat(
+                        ui,
+                        "Duplicates",
+                        &state.totals.duplicates.to_string(),
+                        theme::ACCENT,
+                    );
+                    big_stat(
+                        ui,
+                        "Read",
+                        &theme::humansize(state.totals.bytes_read),
+                        theme::COOL,
+                    );
+                    if let Some(elapsed) = state.scan_elapsed() {
+                        big_stat(
+                            ui,
+                            "Elapsed",
+                            &crate::gui::state::fmt_wallclock(elapsed),
+                            theme::TEXT_HI,
+                        );
+                    }
+                })
+                .response;
+            stats_rect = Some(resp.rect);
         });
     });
-    action
+    HeaderOutput { action, stats_rect }
 }
 
 fn big_stat(ui: &mut Ui, label: &str, value: &str, color: egui::Color32) {
