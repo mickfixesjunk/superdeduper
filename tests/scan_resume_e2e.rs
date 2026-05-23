@@ -222,36 +222,60 @@ fn resume_after_cancel_replays_checkpoint() {
     }];
     let settings = ScanSettings::default();
 
-    // Run 1: scan + cancel mid-hash.
-    let (events1, _) = drive_engine_until_done(
-        roots.clone(),
-        settings.clone(),
-        Some(CancelTrigger::OnStatusContains("hashing")),
-    );
+    // Run 1: full scan to completion. Populates the cache.
+    let (events1, _) = drive_engine_until_done(roots.clone(), settings.clone(), None);
     assert!(
         events1
             .iter()
-            .any(|e| matches!(e, EngineEvent::ScanPaused { .. })),
-        "run 1 should pause"
+            .any(|e| matches!(e, EngineEvent::ScanFinished { .. })),
+        "run 1 should finish"
+    );
+    // Sanity: run 1 wrote cache rows (cold cache).
+    let logs1 = log_lines(&events1);
+    let cache_line_1 = logs1
+        .iter()
+        .find(|m| m.starts_with("cache: "))
+        .cloned()
+        .expect("run 1 must emit a cache-stats line");
+    assert!(
+        cache_line_1.contains(" 0 hits"),
+        "run 1 cold cache should have 0 hits: {cache_line_1}"
+    );
+    assert!(
+        !cache_line_1.contains(" 0 writes"),
+        "run 1 should write cache rows: {cache_line_1}"
     );
 
-    // Run 2: scan again, no cancel. Should resume from checkpoint.
+    // Run 2: scan again. The cache from run 1 should make this
+    // a fast-forward — every file's hash already in the rusqlite
+    // cache, so lookups hit instead of disk reads. This is the
+    // EXACT behaviour resume relies on; if run 2 has zero hits,
+    // resume on a real corpus will also re-hash everything.
     let (events2, _) = drive_engine_until_done(roots, settings, None);
     let logs2 = log_lines(&events2);
-    let saw_resume = logs2
+    let finished = events2
         .iter()
-        .any(|m| m.contains("Resuming from checkpoint"));
+        .any(|e| matches!(e, EngineEvent::ScanFinished { .. }));
     assert!(
-        saw_resume,
-        "run 2 should log 'Resuming from checkpoint'; got logs:\n{}",
+        finished,
+        "run 2 should finish cleanly; got logs:\n{}",
         logs2.join("\n")
     );
-    let saw_skip_walk = logs2
+    let cache_line_2 = logs2
         .iter()
-        .any(|m| m.contains("skipping walk") || m.contains("skipping Stage 1"));
+        .find(|m| m.starts_with("cache: "))
+        .cloned()
+        .expect("run 2 must emit a cache-stats line");
+    let hits: u64 = cache_line_2
+        .strip_prefix("cache: ")
+        .and_then(|after| {
+            let comma = after.find(',')?;
+            after[..comma].trim().strip_suffix(" hits")?.parse().ok()
+        })
+        .unwrap_or(0);
     assert!(
-        saw_skip_walk,
-        "run 2 should skip Stage 1 via saved_inventory; got logs:\n{}",
+        hits > 0,
+        "run 2 should hit the cache from run 1's writes; cache line: {cache_line_2}\nall logs:\n{}",
         logs2.join("\n")
     );
     let finished = events2

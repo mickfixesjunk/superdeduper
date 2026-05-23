@@ -974,13 +974,9 @@ fn run(
         total: total_to_hash.max(1),
         eta_secs: Some(0.0),
     });
-    let _ = tx.send(EngineEvent::ScanFinished {
-        at: Instant::now(),
-        total_files,
-        total_bytes_read,
-        duplicates: total_dups,
-        reclaimable_bytes: reclaimable,
-    });
+    // Emit log lines BEFORE ScanFinished so listeners that break
+    // on ScanFinished (UI, tests) still see them. Order matters:
+    // ScanFinished is the terminal signal.
     let _ = tx.send(EngineEvent::Log {
         level: LogLevel::Info,
         message: format!(
@@ -1012,6 +1008,13 @@ fn run(
             total_hash_ops.saturating_sub(total_cache_hits),
             hit_rate
         ),
+    });
+    let _ = tx.send(EngineEvent::ScanFinished {
+        at: Instant::now(),
+        total_files,
+        total_bytes_read,
+        duplicates: total_dups,
+        reclaimable_bytes: reclaimable,
     });
     // T2.1 phase 7 surface: tell the user how many files the tier
     // guard skipped, broken out by class. Silent when the corpus
