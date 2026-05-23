@@ -113,25 +113,62 @@ pub fn enumerate_with_skipped(
     cfg: &ScanConfig,
     cache: Option<&Arc<Mutex<Cache>>>,
 ) -> Result<(Vec<FileEntry>, Vec<crate::pipeline::SkippedFile>)> {
+    // Block K: also collect walker-side error skips that don't produce
+    // a FileEntry (the canonical case is `--follow-links` hitting a
+    // cloud-recall symlink target that can't be stat'd on Win11 25H2
+    // without a Cloud Filter sync root). Walker emits these via the
+    // existing `WalkEvent::EntrySkipped` event stream — we just need
+    // to consume it from the inventory side rather than relying on
+    // the post-walk FileEntry-stream derivation alone.
+    //
+    // The closure pushes to a local Vec via FnMut. Reasons that should
+    // surface in JSON `skipped[]` get a corresponding SkippedFile;
+    // others (permission denied, "not a regular file", glob/size
+    // filter rejection) stay as tracing events only — they're not
+    // placeholder-class outcomes.
+    let mut walker_event_skipped: Vec<crate::pipeline::SkippedFile> = Vec::new();
+    let walker_event_callback = |evt: walk::WalkEvent<'_>| {
+        if let walk::WalkEvent::EntrySkipped { path, reason } = evt {
+            // Currently only the symlink-target case is surfaced.
+            // Other EntrySkipped reasons are filter/permission events
+            // that don't correspond to placeholder-class outcomes;
+            // adding them would mix filter-reject with
+            // hydration-class concerns and confuse downstream
+            // consumers. Extend deliberately if needed.
+            if reason == "symlink target unreadable" {
+                walker_event_skipped.push(crate::pipeline::SkippedFile {
+                    path: path.to_path_buf(),
+                    placeholder: "symlink_target_unreadable".to_string(),
+                    reparse_tag: None,
+                });
+            }
+        }
+    };
+
     let files = if !all_roots_are_volume_roots(&cfg.roots) {
         tracing::info!(
             roots = ?cfg.roots,
             "scan root is a subdirectory; using walker (MFT path skipped — see inventory/mod.rs doc)",
         );
-        walk::enumerate(cfg)?
+        walk::enumerate_with_progress(cfg, walker_event_callback)?
     } else {
         match mft::enumerate(cfg, cache) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "MFT enumeration unavailable, falling back to directory walk");
-                walk::enumerate(cfg)?
+                walk::enumerate_with_progress(cfg, walker_event_callback)?
             }
         }
     };
-    let skipped: Vec<crate::pipeline::SkippedFile> = files
+    // FileEntry-derived skips (placeholders the walker successfully
+    // enumerated and stamped) plus walker-event skips (error paths
+    // that didn't produce a FileEntry). Both go into the same vec
+    // so downstream consumers see one unified `skipped[]`.
+    let mut skipped: Vec<crate::pipeline::SkippedFile> = files
         .iter()
         .filter_map(|f| crate::pipeline::SkippedFile::from_state(f.path.clone(), f.placeholder))
         .collect();
+    skipped.extend(walker_event_skipped);
     if !skipped.is_empty() {
         tracing::info!(
             count = skipped.len(),
