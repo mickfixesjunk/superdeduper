@@ -16,7 +16,17 @@ use crate::gui::theme;
 
 const BAR_HEIGHT: f32 = 22.0;
 
-pub fn show(ui: &mut Ui, state: &UiState) {
+/// Output from rendering the overall bar: the full bar rect + the
+/// filled (progress) rect, so a caller (e.g. the resume-sparkle
+/// particle system) can anchor effects to the actively-progressing
+/// portion of the bar.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BarRects {
+    pub full: Option<egui::Rect>,
+    pub fill: Option<egui::Rect>,
+}
+
+pub fn show(ui: &mut Ui, state: &UiState) -> BarRects {
     let avail = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(avail, BAR_HEIGHT), Sense::hover());
     resp.on_hover_text(
@@ -38,11 +48,13 @@ pub fn show(ui: &mut Ui, state: &UiState) {
     let label = stage.label();
     let color = stage_color(stage);
 
+    let mut fill_rect_out: Option<egui::Rect> = None;
     if state.overall.is_determinate() {
         let frac = state.overall.fraction();
         let mut fill_rect = rect;
         fill_rect.set_width(rect.width() * frac);
         painter.rect_filled(fill_rect, Rounding::same(4.0), color);
+        fill_rect_out = Some(fill_rect);
 
         let mid = rect.center();
         let pct = (frac * 100.0).round() as u32;
@@ -84,6 +96,10 @@ pub fn show(ui: &mut Ui, state: &UiState) {
             egui::FontId::proportional(13.0),
             theme::TEXT_HI,
         );
+    }
+    BarRects {
+        full: Some(rect),
+        fill: fill_rect_out,
     }
 }
 

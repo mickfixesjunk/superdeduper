@@ -126,9 +126,19 @@ pub struct SuperdeduperApp {
     /// Cache-fast-forward sparkle particle state. Fires during the
     /// "magical resume catch-up" phase where the engine replays
     /// cached hashes thousands-per-second; pairs with a synthesized
-    /// computerised chime on entry + ascending-triad chime on
-    /// catch-up.
+    /// dystopian synth swell on entry + metallic-hit chime on
+    /// catch-up. STRICTLY resume-only — gated on `resume_effect_active`.
     sparkles: crate::gui::particles::Sparkles,
+    /// `true` when the most recent scan launch was a Resume (set in
+    /// accept_resume → start_live), and the cache has not yet
+    /// caught up. Flips to `false` either when the cache catch-up
+    /// fires once (Sparkles signals `left_fast_forward`) or when
+    /// the scan ends. While `false`, sparkles + sounds are silent
+    /// even if the rate spikes.
+    resume_effect_active: bool,
+    /// Filled progress-bar rect captured from the most recent render
+    /// pass. Particles anchor inside it and are clipped to it.
+    last_bar_fill: Option<egui::Rect>,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -208,6 +218,8 @@ impl SuperdeduperApp {
             action_cancel: Arc::new(AtomicBool::new(false)),
             preflight: crate::gui::preflight::PreflightState::Idle,
             sparkles: Default::default(),
+            resume_effect_active: false,
+            last_bar_fill: None,
         };
         let mut app = app;
         // Populate cache-banner state on first launch — roots may
@@ -312,6 +324,11 @@ impl SuperdeduperApp {
         // Pull the regular results_store path back in too — if its
         // fingerprint also matches it's a freebie.
         self.auto_restore_results_state();
+        // Flag this scan as a resume so the cache-fast-forward
+        // sparkles + dystopian synth effects fire (they're gated on
+        // resume_effect_active so they never appear on fresh scans).
+        self.resume_effect_active = true;
+        self.sparkles.reset();
         // Auto-launch the resumed scan. The user's click on Resume
         // in the modal is consent — making them click "Resume scan"
         // again in the roots panel was a pointless second click.
@@ -808,9 +825,16 @@ impl SuperdeduperApp {
                             self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
                             scan_just_finished = true;
+                            // End-of-scan also clears the resume
+                            // effect so a fresh subsequent scan
+                            // doesn't accidentally inherit it.
+                            self.resume_effect_active = false;
+                            self.sparkles.reset();
                         }
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;
+                            self.resume_effect_active = false;
+                            self.sparkles.reset();
                         }
                         EngineEvent::ActionFinished { .. } => {
                             // Action's done — clear the per-group
@@ -1844,16 +1868,22 @@ impl eframe::App for SuperdeduperApp {
                 }
                 stats_rect = out.stats_rect;
             });
-        // Tick the cache-fast-forward sparkles. When OverallProgress
-        // is in Hashing AND advancing at >2K files/sec (only cache
-        // hits can do that), we emit a stream of gold/cyan sparkles
-        // anchored to the header stats. Catches up with a 3-note
-        // chime when the rate drops back to real-hashing pace.
-        if matches!(
-            self.state.overall.stage,
-            crate::gui::events::OverallStage::Hashing
-        ) {
-            let signals = self.sparkles.tick(self.state.overall.done, stats_rect);
+        let _ = stats_rect; // anchor moved to progress-bar fill_rect
+        // Cache-fast-forward effect: STRICTLY resume-only. Only fires
+        // while resume_effect_active is true, the engine is in
+        // Hashing, and the rate exceeds the fast-forward threshold.
+        // After catch-up (Sparkles emits `left_fast_forward`) we
+        // clear resume_effect_active so the effect ends and the bar
+        // returns to its normal render for the rest of the scan.
+        if self.resume_effect_active
+            && matches!(
+                self.state.overall.stage,
+                crate::gui::events::OverallStage::Hashing
+            )
+        {
+            let signals = self
+                .sparkles
+                .tick(self.state.overall.done, self.last_bar_fill);
             #[cfg(feature = "audio")]
             {
                 if signals.entered_fast_forward {
@@ -1863,9 +1893,8 @@ impl eframe::App for SuperdeduperApp {
                     crate::gui::sound::play_caught_up();
                 }
             }
-            #[cfg(not(feature = "audio"))]
-            {
-                let _ = signals;
+            if signals.left_fast_forward {
+                self.resume_effect_active = false;
             }
             if self.sparkles.active() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -1888,7 +1917,8 @@ impl eframe::App for SuperdeduperApp {
                     .inner_margin(egui::vec2(8.0, 4.0)),
             )
             .show(ctx, |ui| {
-                overall_bar::show(ui, &self.state);
+                let bar_rects = overall_bar::show(ui, &self.state);
+                self.last_bar_fill = bar_rects.fill;
             });
 
         SidePanel::left("sidebar")
@@ -2042,23 +2072,16 @@ impl eframe::App for SuperdeduperApp {
         // action-progress is post-results).
         self.tick_preflight(ctx);
 
-        // Sparkles render LAST in their own foreground layer so they
-        // overlay every other widget. The tick happened earlier when
-        // we had the header's stats_rect in hand; this is just the
-        // paint pass.
-        ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("sd-sparkles-anchor"),
-        ));
-        // egui scope so we have a Ui to pass into paint. Use Area
-        // with TopLeft so the foreground layer covers the whole
-        // window without consuming clicks.
+        // Sparkles render LAST in their own foreground layer +
+        // clipped to the progress-bar fill rect. Anything that
+        // would have drawn outside the bar's bounds is dropped.
+        let fill = self.last_bar_fill;
         egui::Area::new(egui::Id::new("sd-sparkles-overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)
             .fixed_pos(egui::pos2(0.0, 0.0))
             .show(ctx, |ui| {
-                self.sparkles.paint(ui);
+                self.sparkles.paint(ui, fill);
             });
     }
 

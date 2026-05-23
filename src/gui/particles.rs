@@ -1,29 +1,29 @@
-//! Sparkle particle system for the cache-fast-forward "magical"
-//! moment. When the engine is replaying cached hashes on resume,
-//! `OverallProgress.done` jumps hundreds or thousands of files per
-//! frame. We detect that rate and spawn a burst of fading dots that
-//! drift outward — visual confirmation that the cache is doing its
-//! job.
+//! Resume cache-fast-forward visual effect.
+//!
+//! Strictly gated on:
+//! 1. The current scan is a RESUME (set when accept_resume launches the engine).
+//! 2. The OverallProgress rate exceeds the cache-fast-forward threshold.
+//! 3. We have a bar fill rect to anchor to.
+//!
+//! Particles are clipped to the filled portion of the progress bar
+//! and use the app's accent palette (no gold, no rainbow). When
+//! catch-up completes (rate drops below the lower hysteresis bound),
+//! the effect stops entirely and the bar returns to its normal
+//! render until end of scan.
 
 use std::time::Instant;
 
-use egui::{Color32, Pos2, Rect, Stroke, Ui};
+use egui::{Color32, Pos2, Rect, Ui};
 
-/// One animated dot.
+use crate::gui::theme;
+
 #[derive(Clone, Copy)]
 struct Particle {
     pos: Pos2,
     vel: egui::Vec2,
-    /// Seconds since the particle was spawned. Lifetime is implicit
-    /// (drop when alpha hits 0).
     age: f32,
-    /// Total seconds the particle should be visible. Beyond this, it
-    /// gets dropped on the next update.
     lifetime: f32,
-    /// Tint applied to the dot. The alpha channel is multiplied by
-    /// the fade curve every frame.
     color: Color32,
-    /// Pixel radius at age 0. Shrinks linearly to 0 at end-of-life.
     radius: f32,
 }
 
@@ -31,18 +31,10 @@ pub struct Sparkles {
     particles: Vec<Particle>,
     last_files: u64,
     last_frame: Option<Instant>,
-    /// Rolling rate of files-per-frame. Smoothed so a single big tick
-    /// doesn't flicker the sparkles for one frame and stop.
     rate_ewma: f32,
-    /// True while we're in the "cache fast-forward" regime. Used to
-    /// change particle palette + detect the transition out so the
-    /// caller can play the catch-up chime.
     fast_forwarding: bool,
 }
 
-/// Events emitted by Sparkles::tick that the caller may want to act
-/// on — currently only the catch-up transition, which is the cue to
-/// play the "you're synced" chime.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SparkleSignals {
     pub entered_fast_forward: bool,
@@ -52,7 +44,7 @@ pub struct SparkleSignals {
 impl Default for Sparkles {
     fn default() -> Self {
         Self {
-            particles: Vec::with_capacity(256),
+            particles: Vec::with_capacity(128),
             last_files: 0,
             last_frame: None,
             rate_ewma: 0.0,
@@ -62,13 +54,23 @@ impl Default for Sparkles {
 }
 
 impl Sparkles {
-    /// Update on every frame. Feeds the current `files_done` counter
-    /// (engine's `OverallProgress.done` while in Hashing). When the
-    /// per-frame delta crosses the fast-forward threshold, emits a
-    /// burst centred near `anchor`. Returns transition signals so
-    /// the caller can play the catch-up chime exactly once when the
-    /// cache fast-forward resolves.
-    pub fn tick(&mut self, files_done: u64, anchor: Option<Rect>) -> SparkleSignals {
+    /// Reset between scans so the rate counter doesn't carry stale
+    /// state across a launch/cancel/relaunch cycle.
+    pub fn reset(&mut self) {
+        self.particles.clear();
+        self.last_files = 0;
+        self.last_frame = None;
+        self.rate_ewma = 0.0;
+        self.fast_forwarding = false;
+    }
+
+    /// Update once per frame. `fill_rect` is the progress-bar fill
+    /// rectangle (the gauge's coloured portion). Particles spawn
+    /// inside it and are clipped to it on render.
+    ///
+    /// Returns transition signals — caller plays sound effects on
+    /// `entered_fast_forward` / `left_fast_forward`.
+    pub fn tick(&mut self, files_done: u64, fill_rect: Option<Rect>) -> SparkleSignals {
         let now = Instant::now();
         let dt = match self.last_frame {
             Some(prev) => now.saturating_duration_since(prev).as_secs_f32().max(0.001),
@@ -79,14 +81,8 @@ impl Sparkles {
         let delta = files_done.saturating_sub(self.last_files);
         self.last_files = files_done;
         let rate = delta as f32 / dt;
-        // EWMA so the sparkles stay lit across the brief gaps between
-        // file-progress events (events fire every 100 files, not every
-        // frame, so raw rate would flicker at low frame counts).
         self.rate_ewma = 0.6 * self.rate_ewma + 0.4 * rate;
 
-        // Hysteresis: enter fast-forward at 2000 files/sec, exit at
-        // 500. Real hashing rate is tens-to-hundreds of files/sec so
-        // the 500 lower bound stays comfortably above normal scans.
         let was_ff = self.fast_forwarding;
         if !self.fast_forwarding && self.rate_ewma > 2_000.0 {
             self.fast_forwarding = true;
@@ -99,20 +95,40 @@ impl Sparkles {
         };
 
         if self.fast_forwarding {
-            if let Some(rect) = anchor {
-                self.emit_burst(rect, dt);
+            if let Some(rect) = fill_rect {
+                if rect.width() > 4.0 {
+                    self.emit_inside_bar(rect, dt);
+                }
             }
         }
 
-        // Tick existing particles.
+        // Tick particles. No gravity — keep them inside the bar.
         for p in self.particles.iter_mut() {
             p.pos += p.vel * dt;
-            // Slow drift down (gravity-lite) so they fall away from
-            // the stat once they've drifted up.
-            p.vel.y += 20.0 * dt;
             p.age += dt;
+            // Slight velocity damping so particles stall and fade in
+            // place instead of drifting out of bounds.
+            p.vel *= (1.0 - 1.4 * dt).max(0.0);
         }
-        self.particles.retain(|p| p.age < p.lifetime);
+        self.particles.retain(|p| {
+            if p.age >= p.lifetime {
+                return false;
+            }
+            // Drop anything outside the bar fill rect on the most
+            // recent frame. The caller passes the current fill rect
+            // each tick, so this is up-to-date even as the bar
+            // grows during fast-forward.
+            if let Some(rect) = fill_rect {
+                if p.pos.x < rect.min.x - 2.0
+                    || p.pos.x > rect.max.x + 2.0
+                    || p.pos.y < rect.min.y - 2.0
+                    || p.pos.y > rect.max.y + 2.0
+                {
+                    return false;
+                }
+            }
+            true
+        });
 
         signals
     }
@@ -121,13 +137,18 @@ impl Sparkles {
         self.fast_forwarding
     }
 
-    fn emit_burst(&mut self, anchor: Rect, dt: f32) {
-        // Particles-per-second proportional to rate, capped so we
-        // don't drown the screen on a 100K-file cache fast-forward.
-        let pps = (self.rate_ewma / 200.0).clamp(20.0, 240.0);
-        let target_emit = (pps * dt) as u32;
-        // PRNG: cheap xorshift seeded from the running rate +
-        // particle count. Plenty of jitter for this purpose.
+    pub fn active(&self) -> bool {
+        !self.particles.is_empty() || self.fast_forwarding
+    }
+
+    fn emit_inside_bar(&mut self, fill_rect: Rect, dt: f32) {
+        // Modest emission — the effect should read as "the bar is
+        // alive with data flowing inside it" not "a fireworks
+        // display." Cap aggressively so 100K-file fast-forwards
+        // don't carpet the screen.
+        let pps = (self.rate_ewma / 1_500.0).clamp(15.0, 80.0);
+        let target_emit = (pps * dt).ceil() as u32;
+
         let mut seed = (self.rate_ewma as u32)
             .wrapping_add(self.particles.len() as u32)
             .wrapping_mul(0x9E37_79B9)
@@ -138,69 +159,90 @@ impl Sparkles {
             seed ^= seed << 5;
             seed as f32 / u32::MAX as f32
         };
+
+        // Spawn band: the rightmost ~12% of the fill, where the
+        // bar's leading edge is. Visually "data is being processed
+        // here, and trailing through the bar".
+        let lead_x = fill_rect.max.x;
+        let band_w = (fill_rect.width() * 0.12).max(8.0);
+        let band_left = (lead_x - band_w).max(fill_rect.min.x);
+
         for _ in 0..target_emit.max(1) {
-            // Spawn anywhere across the anchor's width, near its top
-            // edge — particles drift up and to the side from there.
-            let x = anchor.min.x + rand() * anchor.width();
-            let y = anchor.min.y + anchor.height() * (0.6 + 0.4 * rand());
-            // Initial velocity: mostly upward, slight horizontal jitter.
-            let vx = (rand() - 0.5) * 80.0;
-            let vy = -40.0 - rand() * 80.0;
-            let lifetime = 0.6 + rand() * 0.7;
-            // Fast-forward palette: gold + cyan + white. Bright,
-            // "data-stream" coded — distinct from the normal scan
-            // colours so the user sees "this is the cache catching
-            // up" instead of just generic activity.
-            let color = match (rand() * 4.0) as u32 {
-                0 => Color32::from_rgb(0xff, 0xd7, 0x3a), // gold
-                1 => Color32::from_rgb(0x4f, 0xd1, 0xc5), // cyan/teal
-                2 => Color32::from_rgb(0x69, 0x9b, 0xff), // electric blue
-                _ => Color32::from_rgb(0xff, 0xfa, 0xe6), // bright white
+            // Bias horizontal spawn toward the leading edge.
+            let r = rand();
+            let bias = r * r; // squared bias = denser near lead_x
+            let x = band_left + (1.0 - bias) * band_w;
+            // Vertical: keep them clearly inside the bar.
+            let y_inset = fill_rect.height() * 0.25;
+            let y = fill_rect.min.y + y_inset + rand() * (fill_rect.height() - 2.0 * y_inset);
+
+            // Small leftward drift + tiny vertical jitter. Damping
+            // in tick() stalls them so they fade in place inside
+            // the bar.
+            let vx = -20.0 - rand() * 40.0;
+            let vy = (rand() - 0.5) * 12.0;
+
+            let lifetime = 0.35 + rand() * 0.45;
+
+            // Theme palette only. Two cyan-family shades + one
+            // electric-blue accent. No gold, no warn-amber, no
+            // hot-pink. Occasional bright off-white for sparkle.
+            let color = match (rand() * 6.0) as u32 {
+                0 => theme::ACCENT,                          // primary teal
+                1 => theme::ACCENT,                          // weighted
+                2 => Color32::from_rgb(0x69, 0x9b, 0xff),    // electric blue
+                3 => Color32::from_rgb(0xa0, 0xc6, 0xff),    // pale blue
+                _ => Color32::from_rgb(0xe8, 0xee, 0xf5),    // text-hi off-white
             };
+
             self.particles.push(Particle {
                 pos: egui::pos2(x, y),
                 vel: egui::vec2(vx, vy),
                 age: 0.0,
                 lifetime,
                 color,
-                radius: 2.5 + rand() * 2.5,
+                radius: 1.3 + rand() * 1.6,
             });
         }
     }
 
-    /// Render every live particle as a fading dot. Call at the end
-    /// of the render pass so sparkles sit on top of the header /
-    /// stats / progress bar.
-    pub fn paint(&self, ui: &Ui) {
+    /// Render every particle. Caller is expected to provide a Ui
+    /// (typically inside an Area on the Foreground layer). Particles
+    /// outside `fill_rect` are skipped — defensive in case the bar
+    /// shrank between tick and paint.
+    pub fn paint(&self, ui: &Ui, fill_rect: Option<Rect>) {
         if self.particles.is_empty() {
             return;
         }
-        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        let mut painter = ui.ctx().layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("sd-sparkles"),
         ));
+        if let Some(rect) = fill_rect {
+            painter.set_clip_rect(rect);
+        }
+        let _ = &mut painter;
         for p in &self.particles {
             let t = (p.age / p.lifetime).clamp(0.0, 1.0);
-            let alpha = ((1.0 - t).powf(1.5) * 220.0) as u8;
-            let radius = p.radius * (1.0 - t).max(0.0);
-            if radius <= 0.0 {
+            // Quick fade-in (first 15% of life) then steady decay.
+            let alpha_curve = if t < 0.15 {
+                t / 0.15
+            } else {
+                ((1.0 - t) / 0.85).powf(1.2)
+            };
+            let alpha = (alpha_curve * 200.0).clamp(0.0, 220.0) as u8;
+            let radius = p.radius * alpha_curve.max(0.2);
+            if radius <= 0.2 {
                 continue;
             }
             let c = Color32::from_rgba_unmultiplied(p.color.r(), p.color.g(), p.color.b(), alpha);
-            // Soft halo + bright core for the "shimmer" feel.
+            // Soft halo (1/3 alpha, larger radius) + crisp core.
             painter.circle_filled(
                 p.pos,
-                radius * 1.7,
-                Color32::from_rgba_unmultiplied(p.color.r(), p.color.g(), p.color.b(), alpha / 3),
+                radius * 1.5,
+                Color32::from_rgba_unmultiplied(p.color.r(), p.color.g(), p.color.b(), alpha / 4),
             );
-            painter.circle(p.pos, radius, c, Stroke::NONE);
+            painter.circle_filled(p.pos, radius, c);
         }
-    }
-
-    /// True while there are particles still on screen — used by the
-    /// caller to schedule a repaint so the animation runs smoothly
-    /// even when no other event is firing.
-    pub fn active(&self) -> bool {
-        !self.particles.is_empty() || self.rate_ewma > 200.0
     }
 }
