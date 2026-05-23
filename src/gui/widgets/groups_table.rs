@@ -57,6 +57,17 @@ pub enum GroupAction {
     /// dropdown above the results table so both bulk actions sit in
     /// the same place.
     ArchiveAllVisible,
+    /// Promote a non-keeper file to the keeper slot for its group.
+    /// The dispatcher swaps `state.duplicates[group_idx].files[0]`
+    /// with `files[member_idx]` so every subsequent destructive
+    /// action treats the promoted file as protected. `group_idx`
+    /// is the index in `UiState::duplicates`; `member_idx` is the
+    /// position within that group's `files` vec (must be > 0; the
+    /// keeper button doesn't appear on the existing keeper).
+    PromoteKeeper {
+        group_idx: usize,
+        member_idx: usize,
+    },
 }
 
 /// The two bulk-action options the dropdown above the results
@@ -470,7 +481,42 @@ pub fn show_filtered(
                                     row.col(|_| {});
                                     row.col(|_| {});
                                     row.col(|_| {});
-                                    row.col(|_| {});
+                                    row.col(|ui| {
+                                        // Per-dupe action column: a
+                                        // "Make keeper" button on
+                                        // non-keeper rows. Lets the
+                                        // user override the smart
+                                        // picker when they know which
+                                        // copy they want to protect.
+                                        // Disabled mid-scan (Settings,
+                                        // Go etc. are too) AND when
+                                        // this group is in the
+                                        // `acted` set (action queued).
+                                        if j > 0 && !acted {
+                                            let btn = egui::Button::new(
+                                                RichText::new("👑")
+                                                    .color(theme::WARN)
+                                                    .small(),
+                                            )
+                                            .frame(false)
+                                            .min_size(egui::vec2(20.0, 16.0));
+                                            let resp = ui
+                                                .add_enabled(!is_scanning, btn)
+                                                .on_hover_text(
+                                                    "Make this the keeper — \
+                                                     promote this file to the \
+                                                     protected slot in the \
+                                                     group. The current keeper \
+                                                     becomes a dupe.",
+                                                );
+                                            if resp.clicked() {
+                                                clicked = Some(GroupAction::PromoteKeeper {
+                                                    group_idx: *orig_idx,
+                                                    member_idx: j,
+                                                });
+                                            }
+                                        }
+                                    });
                                     row.col(|ui| {
                                         let (tag, color) = if j == 0 {
                                             ("keep ", Color32::from_rgb(0x9a, 0xe6, 0xb4))
@@ -484,13 +530,6 @@ pub fn show_filtered(
                                                 .monospace()
                                                 .strong(),
                                         );
-                                        // Hover the keep / dupe tag
-                                        // to see why this file got
-                                        // its label. Useful when the
-                                        // smart picker makes a
-                                        // surprising call — the
-                                        // breakdown shows every
-                                        // signal that fired.
                                         let mtime =
                                             std::fs::metadata(p).and_then(|m| m.modified()).ok();
                                         let s = crate::keep::score_file(p, mtime);

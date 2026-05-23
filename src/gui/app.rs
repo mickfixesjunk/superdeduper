@@ -1106,9 +1106,14 @@ impl SuperdeduperApp {
     fn dispatch_group_action(&mut self, action: GroupAction) {
         // Reveal / Open* touch nothing — bypass the modal
         // unconditionally. They're navigational, not destructive.
+        // PromoteKeeper is also non-destructive (in-memory swap) and
+        // skips the modal.
         if matches!(
             action,
-            GroupAction::Reveal(_) | GroupAction::OpenFile(_) | GroupAction::OpenFolder(_)
+            GroupAction::Reveal(_)
+                | GroupAction::OpenFile(_)
+                | GroupAction::OpenFolder(_)
+                | GroupAction::PromoteKeeper { .. }
         ) {
             return self.dispatch_group_action_unchecked(action);
         }
@@ -1143,6 +1148,21 @@ impl SuperdeduperApp {
                 // archive worker. `pick_archive_dest_and_run` handles
                 // the picker + the threaded run.
                 self.pick_archive_dest_and_run();
+            }
+            GroupAction::PromoteKeeper {
+                group_idx,
+                member_idx,
+            } => {
+                // Swap files[0] with files[member_idx] so the smart-
+                // picked keeper becomes a dupe and the chosen member
+                // becomes the protected keeper. In-memory only —
+                // doesn't touch disk. The user can flip back by
+                // clicking 👑 on the other row.
+                if let Some(g) = self.state.duplicates.get_mut(group_idx) {
+                    if member_idx > 0 && member_idx < g.files.len() {
+                        g.files.swap(0, member_idx);
+                    }
+                }
             }
         }
     }
@@ -2034,6 +2054,9 @@ fn describe_destructive_action(action: &GroupAction) -> String {
         }
         GroupAction::OpenFolder(_) => {
             "(internal: Open-folder reached the destructive modal — this is a bug)".into()
+        }
+        GroupAction::PromoteKeeper { .. } => {
+            "(internal: Promote-keeper reached the destructive modal — this is a bug)".into()
         }
     }
 }
