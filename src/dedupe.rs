@@ -585,11 +585,13 @@ mod tests {
     }
 
     fn group(size: u64, files: Vec<PathBuf>) -> DuplicateGroup {
+        let unique_inodes = files.len() as u64;
         DuplicateGroup {
             size,
             content_hash: "deadbeef".into(),
             files,
             link_equivalent: false,
+            unique_inodes,
         }
     }
 

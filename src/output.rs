@@ -20,8 +20,21 @@ struct Report<'a> {
 struct Summary {
     groups: usize,
     files: usize,
-    /// Bytes that could be reclaimed if every group kept exactly one file.
+    /// Path-aware reclaimable: bytes you'd save by deleting every
+    /// duplicate path, summed across groups. Overstates the actual
+    /// disk free for hardlink-heavy corpora (deleting N-1 hardlink
+    /// aliases of one inode frees zero bytes — the data stays).
+    /// Kept under the old name for backwards-compat with existing
+    /// consumers; semantically equivalent to "duplicate path bytes."
     reclaimable_bytes: u64,
+    /// Inode-aware reclaimable: bytes that ACTUALLY come back after
+    /// dedup, computed as `(distinct inodes - 1) * size` per group.
+    /// On hardlink-heavy corpora (System32 ↔ WinSxS) this is
+    /// substantially smaller than `reclaimable_bytes`. This is the
+    /// number a user wants when answering "how much disk will I get
+    /// back?" `0` for groups whose JSON predates the `unique_inodes`
+    /// field (it falls back to the path-aware metric in that case).
+    reclaimable_inode_bytes: u64,
 }
 
 pub fn write(out: &mut dyn Write, format: OutputFormat, groups: &[DuplicateGroup]) -> Result<()> {
@@ -104,6 +117,7 @@ fn write_csv(out: &mut dyn Write, groups: &[DuplicateGroup]) -> Result<()> {
 fn summarize(groups: &[DuplicateGroup]) -> Summary {
     let mut files = 0usize;
     let mut reclaimable_bytes = 0u64;
+    let mut reclaimable_inode_bytes = 0u64;
     for g in groups {
         files += g.files.len();
         let n = g.files.len() as u64;
@@ -114,11 +128,27 @@ fn summarize(groups: &[DuplicateGroup]) -> Summary {
         if n > 1 && !g.link_equivalent {
             reclaimable_bytes = reclaimable_bytes.saturating_add(g.size.saturating_mul(n - 1));
         }
+        // Inode-aware metric — what disk would ACTUALLY free if we
+        // dedup'd this group: (distinct inodes - 1) * size. Hardlink
+        // aliases collapse to one inode here, so a group with 5 paths
+        // sharing 2 inodes contributes 1*size, not 4*size. `0` in
+        // `unique_inodes` means "unknown" (older JSON), in which case
+        // we fall back to the path-aware metric.
+        let unique = if g.unique_inodes == 0 {
+            n
+        } else {
+            g.unique_inodes
+        };
+        if unique > 1 && !g.link_equivalent {
+            reclaimable_inode_bytes =
+                reclaimable_inode_bytes.saturating_add(g.size.saturating_mul(unique - 1));
+        }
     }
     Summary {
         groups: groups.len(),
         files,
         reclaimable_bytes,
+        reclaimable_inode_bytes,
     }
 }
 

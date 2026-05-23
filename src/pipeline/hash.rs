@@ -361,12 +361,18 @@ fn run_group(
             return Ok(Vec::new());
         }
         let files: Vec<PathBuf> = group.files.into_iter().map(|f| f.entry.path).collect();
+        let unique_inodes = files.len() as u64;
         let empty_hash = algo::hash_oneshot(cfg.hash_algo, &[]);
         return Ok(vec![DuplicateGroup {
             size: 0,
             content_hash: hex(&empty_hash),
             files,
             link_equivalent: false,
+            // 0-byte files all hash to the same value but each is its
+            // own inode (we don't dedupe by inode at inventory time);
+            // treating the count as files.len() gives the "every file
+            // is one inode" interpretation that's correct here.
+            unique_inodes,
         }]);
     }
 
@@ -443,6 +449,30 @@ fn run_group(
                     && first.volume_guid.is_some()
             })
         };
+        // Count distinct (volume, inode) pairs. Lets downstream
+        // consumers compute "actual disk reclaimable" =
+        // (unique_inodes - 1) * size, separate from the path-aware
+        // "duplicate path bytes" = (files.len() - 1) * size. On
+        // hardlink-heavy corpora (System32 ↔ WinSxS) the two differ
+        // substantially. Walker fallback sets volume_guid=None, in
+        // which case file_ref is always 0 and every file looks like
+        // the same inode — `link_equivalent` already requires
+        // volume_guid.is_some(), and unique_inodes follows the same
+        // semantics: if volume_guid is None, treat each file as its
+        // own inode (the conservative "we don't know better").
+        let unique_inodes: u64 = {
+            use std::collections::HashSet;
+            let mut seen: HashSet<(Option<String>, u64)> = HashSet::new();
+            let mut unknowns: u64 = 0;
+            for f in &files {
+                if f.entry.volume_guid.is_some() {
+                    seen.insert((f.entry.volume_guid.clone(), f.entry.file_ref));
+                } else {
+                    unknowns = unknowns.saturating_add(1);
+                }
+            }
+            seen.len() as u64 + unknowns
+        };
         let mut paths: Vec<PathBuf> = files.iter().map(|f| f.entry.path.clone()).collect();
         paths.sort();
         out.push(DuplicateGroup {
@@ -450,6 +480,7 @@ fn run_group(
             content_hash: hex(&hash),
             files: paths,
             link_equivalent,
+            unique_inodes,
         });
     }
     Ok(out)
