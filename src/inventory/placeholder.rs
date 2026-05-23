@@ -86,6 +86,38 @@ impl PlaceholderState {
     pub fn blocks_destructive_action(self) -> bool {
         !matches!(self, Self::NotPlaceholder)
     }
+
+    /// Policy-aware variant of [`blocks_content_read`]. Returns true
+    /// when the tier guard should refuse a content read; when
+    /// `allow_recall_on_read` is true, the user has explicitly opted
+    /// into accepting cloud-hydration for placeholders, so
+    /// `RecallOnOpen` / `RecallOnDataAccess` pass through.
+    /// `OtherReparse` stays blocked under all policies — the safe
+    /// default for unknown reparses is "don't touch."
+    pub fn blocks_content_read_under_policy(self, allow_recall_on_read: bool) -> bool {
+        match self {
+            Self::NotPlaceholder | Self::ReparseDedup => false,
+            Self::RecallOnOpen | Self::RecallOnDataAccess => !allow_recall_on_read,
+            Self::OtherReparse(_) => true,
+        }
+    }
+
+    /// Policy-aware variant of [`blocks_destructive_action`]. When
+    /// `allow_destructive_on_deduped` is true, `ReparseDedup` files
+    /// become eligible targets — NTFS dedup is transparent at the API
+    /// layer, so destructive actions don't risk data loss (though
+    /// reclaimable bytes will be ~0 since the FS already shares the
+    /// extents). All recall/unknown-reparse states stay blocked.
+    pub fn blocks_destructive_action_under_policy(
+        self,
+        allow_destructive_on_deduped: bool,
+    ) -> bool {
+        match self {
+            Self::NotPlaceholder => false,
+            Self::ReparseDedup => !allow_destructive_on_deduped,
+            Self::RecallOnOpen | Self::RecallOnDataAccess | Self::OtherReparse(_) => true,
+        }
+    }
 }
 
 impl Default for PlaceholderState {
@@ -176,6 +208,39 @@ mod tests {
         assert!(PlaceholderState::RecallOnDataAccess.blocks_destructive_action());
         assert!(PlaceholderState::ReparseDedup.blocks_destructive_action());
         assert!(PlaceholderState::OtherReparse(0x1234).blocks_destructive_action());
+    }
+
+    #[test]
+    fn content_read_policy_unblocks_recall_when_opted_in() {
+        // Without opt-in, behaviour matches the default.
+        assert!(!PlaceholderState::NotPlaceholder.blocks_content_read_under_policy(false));
+        assert!(PlaceholderState::RecallOnOpen.blocks_content_read_under_policy(false));
+        assert!(PlaceholderState::OtherReparse(0).blocks_content_read_under_policy(false));
+
+        // With opt-in, recall-class states pass; others unchanged.
+        assert!(!PlaceholderState::RecallOnOpen.blocks_content_read_under_policy(true));
+        assert!(!PlaceholderState::RecallOnDataAccess.blocks_content_read_under_policy(true));
+        // Unknown reparses still blocked under any policy — too risky.
+        assert!(PlaceholderState::OtherReparse(0xDEAD).blocks_content_read_under_policy(true));
+        // ReparseDedup is always allowed regardless of policy.
+        assert!(!PlaceholderState::ReparseDedup.blocks_content_read_under_policy(false));
+        assert!(!PlaceholderState::ReparseDedup.blocks_content_read_under_policy(true));
+    }
+
+    #[test]
+    fn destructive_policy_unblocks_deduped_when_opted_in() {
+        // Default (allow_destructive_on_deduped = false): same as old method.
+        assert!(!PlaceholderState::NotPlaceholder.blocks_destructive_action_under_policy(false));
+        assert!(PlaceholderState::ReparseDedup.blocks_destructive_action_under_policy(false));
+        assert!(PlaceholderState::RecallOnOpen.blocks_destructive_action_under_policy(false));
+
+        // Opted in: only ReparseDedup unblocks.
+        assert!(!PlaceholderState::ReparseDedup.blocks_destructive_action_under_policy(true));
+        // Recall/unknown stay blocked even with the dedup flag — those
+        // are about cloud safety, not FS-dedup transparency.
+        assert!(PlaceholderState::RecallOnOpen.blocks_destructive_action_under_policy(true));
+        assert!(PlaceholderState::RecallOnDataAccess.blocks_destructive_action_under_policy(true));
+        assert!(PlaceholderState::OtherReparse(0xC0DE).blocks_destructive_action_under_policy(true));
     }
 
     #[cfg(windows)]

@@ -1112,6 +1112,11 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         output: None,
         follow_links: settings.follow_links,
         allow_system_paths: settings.allow_system_paths,
+        // GUI settings don't surface the placeholder-policy knob yet;
+        // tier guard defaults to conservative (refuse cloud recalls).
+        // Phase 7 GUI counter exposes the bucket; a future iteration
+        // can add the toggle if user feedback shows it's wanted.
+        allow_recall_on_read: false,
         hash_algo: settings.hash_algo,
     })
 }

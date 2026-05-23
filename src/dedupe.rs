@@ -142,7 +142,7 @@ fn process_group(
             continue;
         }
 
-        match perform_action(args.action, path, keeper) {
+        match perform_action(args.action, path, keeper, args.allow_destructive_on_deduped) {
             Ok(()) => {
                 outcome.executed += 1;
                 outcome.bytes_reclaimed += group.size;
@@ -264,27 +264,44 @@ fn validate_file(path: &Path, expected_size: u64) -> Result<()> {
     Ok(())
 }
 
-fn perform_action(action: DedupeAction, path: &Path, keeper: &Path) -> Result<()> {
+/// Args-driven dispatch. Honours `--allow-destructive-on-deduped` by
+/// running its own policy-aware guard up front, then calling the
+/// OS-level helpers directly (skipping the default-conservative guard
+/// in the pub fn action_*() wrappers, which are kept for GUI callers
+/// that haven't been wired to the policy yet).
+fn perform_action(
+    action: DedupeAction,
+    path: &Path,
+    keeper: &Path,
+    allow_destructive_on_deduped: bool,
+) -> Result<()> {
+    guard_destructive(path, allow_destructive_on_deduped)?;
     match action {
-        DedupeAction::Remove => action_remove(path),
-        DedupeAction::Recycle => action_recycle(path),
-        DedupeAction::Hardlink => action_hardlink(path, keeper),
-        DedupeAction::Reflink => action_reflink(path, keeper),
-        DedupeAction::SafeRename => action_safe_rename(path),
+        DedupeAction::Remove => fs::remove_file(path).map_err(Into::into),
+        DedupeAction::Recycle => recycle(path),
+        DedupeAction::Hardlink => replace_with_hardlink(path, keeper),
+        DedupeAction::Reflink => replace_with_reflink(path, keeper),
+        DedupeAction::SafeRename => safe_rename_unguarded(path),
     }
 }
 
 /// Refuse destructive action against cloud-placeholder and
 /// reparse-tagged files. Stats `path`, classifies via
 /// `inventory::placeholder::classify()`, and returns an error if
-/// the resulting `PlaceholderState` blocks destructive action.
+/// the resulting `PlaceholderState` blocks destructive action under
+/// the supplied policy.
 ///
 /// Cross-platform: on non-Windows, attributes are always 0 →
 /// `NotPlaceholder` → never blocks. The guard is a no-op on those
 /// platforms.
-fn guard_destructive(path: &Path) -> Result<()> {
+///
+/// `allow_destructive_on_deduped` (phase 6) lets the user opt into
+/// destructive actions against `ReparseDedup` files via
+/// `--allow-destructive-on-deduped`. Recall/unknown reparses stay
+/// blocked regardless of this flag.
+fn guard_destructive(path: &Path, allow_destructive_on_deduped: bool) -> Result<()> {
     let state = placeholder_state_for(path)?;
-    if state.blocks_destructive_action() {
+    if state.blocks_destructive_action_under_policy(allow_destructive_on_deduped) {
         return Err(Error::other(format!(
             "refusing destructive action on placeholder/reparse file ({state:?}): {}",
             path.display(),
@@ -324,23 +341,23 @@ pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 /// future GUI flow), the action layer refuses to delete / replace /
 /// rename a cloud placeholder or reparse-tagged file.
 pub fn action_remove(path: &Path) -> Result<()> {
-    guard_destructive(path)?;
+    guard_destructive(path, false)?;
     fs::remove_file(path)?;
     Ok(())
 }
 
 pub fn action_recycle(path: &Path) -> Result<()> {
-    guard_destructive(path)?;
+    guard_destructive(path, false)?;
     recycle(path)
 }
 
 pub fn action_hardlink(target: &Path, keeper: &Path) -> Result<()> {
-    guard_destructive(target)?;
+    guard_destructive(target, false)?;
     replace_with_hardlink(target, keeper)
 }
 
 pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
-    guard_destructive(target)?;
+    guard_destructive(target, false)?;
     replace_with_reflink(target, keeper)
 }
 
@@ -348,7 +365,17 @@ pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
 /// files already ending in the suffix are a no-op. Reversible via
 /// `unsuperdeduper_root`. Never deletes anything.
 pub fn action_safe_rename(target: &Path) -> Result<()> {
-    guard_destructive(target)?;
+    guard_destructive(target, false)?;
+    safe_rename_unguarded(target)
+}
+
+/// The OS-level portion of safe-rename — no placeholder guard, no
+/// policy. Called from `perform_action` (which has already applied a
+/// policy-aware guard) and from `action_safe_rename` (which applies
+/// the conservative default guard up front). Pulled out so the two
+/// callers can share the rename logic without round-tripping through
+/// another guard call.
+fn safe_rename_unguarded(target: &Path) -> Result<()> {
     let name = target
         .file_name()
         .ok_or_else(|| Error::other(format!("{} has no file name", target.display())))?;
@@ -581,6 +608,7 @@ mod tests {
             action,
             dry_run,
             allow_system_paths: false,
+            allow_destructive_on_deduped: false,
         }
     }
 
@@ -613,7 +641,11 @@ mod tests {
         let d = tmpdir();
         let f = d.join("regular.bin");
         write_file(&f, b"normal");
-        assert!(guard_destructive(&f).is_ok());
+        assert!(guard_destructive(&f, false).is_ok());
+        assert!(
+            guard_destructive(&f, true).is_ok(),
+            "policy doesn't change behaviour for NotPlaceholder files"
+        );
         fs::remove_dir_all(&d).ok();
     }
 

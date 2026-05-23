@@ -34,6 +34,10 @@ pub struct ScanConfig {
     pub output: Option<PathBuf>,
     pub follow_links: bool,
     pub allow_system_paths: bool,
+    /// T2.1 phase 6: when true, the hash worker tier guard accepts
+    /// cloud-recall placeholders (forcing hydration on read). Default
+    /// false. Flows from `--allow-recall-on-read`.
+    pub allow_recall_on_read: bool,
     /// Which content-hash algorithm to use for Tier 1/2/3 + format
     /// fingerprints. BLAKE3 is the default; DDH-128 is the
     /// in-development alternative (currently an xxhash3-128 stub).
@@ -77,6 +81,7 @@ impl ScanConfig {
             output: args.output.clone(),
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
+            allow_recall_on_read: args.allow_recall_on_read,
             hash_algo: args.hash_algo.into(),
         })
     }

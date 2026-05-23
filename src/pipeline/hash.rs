@@ -222,7 +222,8 @@ enum Tier {
 }
 
 /// Partition a candidate group into files we'll hash and files we'll
-/// refuse to read. Anything whose `placeholder.blocks_content_read()`
+/// refuse to read. Anything whose
+/// `placeholder.blocks_content_read_under_policy(allow_recall_on_read)`
 /// returns true is dropped from the survivors list and reported as a
 /// failed progress event with a placeholder-specific error string.
 ///
@@ -235,16 +236,27 @@ enum Tier {
 ///   for each blocked file with the error string `"placeholder blocks
 ///   content read: <state>"` so the GUI Log tab can surface them with
 ///   the right reason.
+/// * `allow_recall_on_read` plumbs `--allow-recall-on-read` from
+///   CLI/Config so users can opt into reading cloud-recall placeholders.
+///   Doesn't change behaviour for `OtherReparse` (still blocked under
+///   any policy) or `ReparseDedup` (always allowed).
 ///
 /// Cost: O(N) over the group; no I/O. Safe to call unconditionally on
 /// every group; on non-Windows or for groups with no placeholders, every
 /// file passes through and no events fire.
-fn apply_tier_guards(group: LaidOutGroup, on_file: Option<&FileProgress>) -> LaidOutGroup {
+fn apply_tier_guards(
+    group: LaidOutGroup,
+    on_file: Option<&FileProgress>,
+    allow_recall_on_read: bool,
+) -> LaidOutGroup {
     let size = group.size;
     let mut allowed = Vec::with_capacity(group.files.len());
     let mut blocked = 0usize;
     for f in group.files {
-        if f.entry.placeholder.blocks_content_read() {
+        if f.entry
+            .placeholder
+            .blocks_content_read_under_policy(allow_recall_on_read)
+        {
             tracing::warn!(
                 path = %f.entry.path.display(),
                 placeholder = ?f.entry.placeholder,
@@ -302,7 +314,9 @@ fn run_group(
     // didn't run classify for some reason), the hash worker still refuses
     // before any ReadFile. NotPlaceholder + ReparseDedup pass through —
     // their data is local and reading is safe.
-    let group = apply_tier_guards(group, on_file);
+    // Phase 6: cfg.allow_recall_on_read lets users opt into accepting
+    // forced hydration if that's what they actually want.
+    let group = apply_tier_guards(group, on_file, cfg.allow_recall_on_read);
 
     // Zero-byte short circuit.
     if size == 0 {
@@ -839,9 +853,16 @@ mod tests {
             output: None,
             follow_links: false,
             allow_system_paths: false,
+            allow_recall_on_read: false,
             io_threads: 4,
             hash_algo: HashAlgo::Blake3,
         }
+    }
+
+    fn cfg_with_allow_recall() -> ScanConfig {
+        let mut c = cfg();
+        c.allow_recall_on_read = true;
+        c
     }
 
     /// Tier 1 must release files whose 4 KiB heads differ.
@@ -1014,6 +1035,65 @@ mod tests {
         assert!(
             result.is_empty(),
             "all-placeholder group must collapse to no dup output"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// Phase 6 opt-in: with --allow-recall-on-read, RecallOnOpen and
+    /// RecallOnDataAccess pass the guard and get hashed. Validates that
+    /// the policy bit reaches the guard from ScanConfig (not just that
+    /// the policy method works in isolation, which is covered in
+    /// placeholder.rs).
+    #[test]
+    fn tier_guard_recall_passes_when_opted_in() {
+        use crate::inventory::PlaceholderState;
+        let d = tmpdir();
+        let body = vec![0x42u8; 8 * 1024];
+        let a = d.join("a");
+        let b = d.join("b");
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                lo_with_placeholder(a, body.len() as u64, PlaceholderState::RecallOnOpen),
+                lo_with_placeholder(b, body.len() as u64, PlaceholderState::RecallOnDataAccess),
+            ],
+        };
+        let result = run(vec![group], &cfg_with_allow_recall()).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "with --allow-recall-on-read, recall placeholders hash and group"
+        );
+        assert_eq!(result[0].files.len(), 2);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// Phase 6 opt-in DOES NOT extend to OtherReparse — unknown
+    /// reparses stay blocked regardless of policy. Asymmetric on
+    /// purpose: recall-class is a known cloud-hydration trade-off the
+    /// user can opt into knowing what they get; unknown is unknown.
+    #[test]
+    fn tier_guard_other_reparse_still_blocked_when_opted_in() {
+        use crate::inventory::PlaceholderState;
+        let d = tmpdir();
+        let body = vec![0x55u8; 8 * 1024];
+        let a = d.join("a");
+        let b = d.join("b");
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![
+                lo_with_placeholder(a, body.len() as u64, PlaceholderState::OtherReparse(0x1234)),
+                lo_with_placeholder(b, body.len() as u64, PlaceholderState::OtherReparse(0x1234)),
+            ],
+        };
+        let result = run(vec![group], &cfg_with_allow_recall()).unwrap();
+        assert!(
+            result.is_empty(),
+            "unknown reparses stay blocked even with --allow-recall-on-read"
         );
         fs::remove_dir_all(&d).ok();
     }

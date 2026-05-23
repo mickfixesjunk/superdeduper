@@ -120,6 +120,18 @@ pub struct ScanArgs {
     #[arg(long)]
     pub allow_system_paths: bool,
 
+    /// Allow the hash worker to read cloud-placeholder files
+    /// (`RecallOnOpen` / `RecallOnDataAccess`) even though opening them
+    /// triggers cloud hydration. Default OFF — the conservative default
+    /// is to skip placeholders so a dedup scan doesn't quietly download
+    /// gigabytes from OneDrive/iCloud/SharePoint. Set this when you
+    /// explicitly want those files hashed (e.g. you're auditing a
+    /// fully-cached OneDrive Files-On-Demand root). Unknown reparse
+    /// tags (`OtherReparse`) stay blocked even with this flag — they
+    /// might be HSM / PrjFS / other hydration-class.
+    #[arg(long)]
+    pub allow_recall_on_read: bool,
+
     /// Content-hash algorithm. `river5` (default, 16-byte,
     /// AES-NI hardware-accelerated, ~3× faster than BLAKE3 on
     /// supported CPUs) or `blake3` (32-byte, cryptographic).
@@ -167,6 +179,18 @@ pub struct DedupeArgs {
     /// Permit destructive operations under system-critical paths.
     #[arg(long)]
     pub allow_system_paths: bool,
+
+    /// Allow destructive actions (recycle, hardlink-replace, etc.)
+    /// against files marked with `IO_REPARSE_TAG_DEDUP` (NTFS data
+    /// deduplication). Default OFF — the conservative default refuses
+    /// any reparse-tagged file. Dedup'd files are safe to act on (the
+    /// extents are already FS-shared, so the data is local and intact)
+    /// but reclaim ~0 bytes per action since the FS shares them.
+    /// Cloud-placeholder states (`RecallOnOpen` / `RecallOnDataAccess`
+    /// / `OtherReparse`) remain blocked regardless of this flag — those
+    /// guard against cloud-hydration, not FS-dedup transparency.
+    #[arg(long)]
+    pub allow_destructive_on_deduped: bool,
 }
 
 #[derive(Debug, Subcommand)]
