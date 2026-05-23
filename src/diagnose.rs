@@ -212,17 +212,51 @@ pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
 }
 
 fn ensure_scratch_dir(under: &Path) -> anyhow::Result<PathBuf> {
-    let candidate = if under.is_dir() {
-        under.join(".superdeduper-diagnose-scratch")
+    // Preferred location: a hidden subdir of the user's chosen target.
+    // That gives the disk probes a measurement on the same physical
+    // drive as the scan. Falls back to system temp when the target is
+    // read-only / network share / restricted — common in the GUI
+    // preflight flow where users scan locations they don't own.
+    let candidates: Vec<PathBuf> = if under.is_dir() {
+        vec![
+            under.join(".superdeduper-diagnose-scratch"),
+            std::env::temp_dir().join("superdeduper-diagnose-scratch"),
+        ]
     } else {
-        std::env::temp_dir().join("superdeduper-diagnose-scratch")
+        vec![std::env::temp_dir().join("superdeduper-diagnose-scratch")]
     };
-    if candidate.exists() {
-        std::fs::remove_dir_all(&candidate).ok();
+
+    let mut last_err: Option<std::io::Error> = None;
+    for candidate in candidates {
+        if candidate.exists() {
+            std::fs::remove_dir_all(&candidate).ok();
+        }
+        match std::fs::create_dir_all(&candidate) {
+            Ok(()) => {
+                // Write-probe a small file too — `create_dir_all` can
+                // succeed on a directory we can't actually write to
+                // (some Windows permissions cases).
+                let probe = candidate.join(".write-probe");
+                match std::fs::write(&probe, b"ok") {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&probe);
+                        return Ok(candidate);
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&candidate);
+                        last_err = Some(e);
+                    }
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
     }
-    std::fs::create_dir_all(&candidate)
-        .map_err(|e| anyhow::anyhow!("creating scratch dir {}: {}", candidate.display(), e))?;
-    Ok(candidate)
+    Err(anyhow::anyhow!(
+        "no writable scratch location found (tried target + system temp): {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 struct ScratchGuard {
