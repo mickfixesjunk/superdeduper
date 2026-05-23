@@ -734,6 +734,93 @@ pub(crate) fn pathbuf_from_wide(wide: &[u16]) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_wide(&wide[..len]))
 }
 
+/// Fetch the raw reparse-point tag for `path` via `FSCTL_GET_REPARSE_POINT`.
+/// Returns `None` if the file doesn't carry a reparse point, can't be opened,
+/// or the ioctl fails.
+///
+/// Why this exists: phase-2 classify() takes both `attrs` and an
+/// `Option<u32>` `reparse_tag`, but all three FileEntry producers (mft,
+/// warm, walker) currently pass `None` for the tag because USN data
+/// doesn't include it. That makes classify() return `OtherReparse(0)`
+/// for *every* reparse-tagged file, even IO_REPARSE_TAG_DEDUP (which
+/// should be `ReparseDedup`) and the cloud-provider tags (which should
+/// be `RecallOnOpen` / `RecallOnDataAccess` once classify supports
+/// tag-first cloud detection).
+///
+/// This helper closes the gap. Walker calls it when
+/// `attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0`, passes the result to
+/// classify(). Cost: one CreateFile + one DeviceIoControl + one
+/// CloseHandle per reparse file — typically a handful per scan, so
+/// the cost is negligible against per-file hashing.
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` opens the link itself, not the
+/// target — critical, otherwise symlinks would resolve and we'd never
+/// see the link's own reparse data. `FILE_FLAG_BACKUP_SEMANTICS`
+/// lets us open directories too (some reparse points are dir
+/// junctions). Read-only is sufficient.
+pub fn fetch_reparse_tag(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+        OPEN_EXISTING,
+    };
+    use windows::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+    use windows::Win32::System::IO::DeviceIoControl;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        .ok()?
+    };
+    if handle.is_invalid() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    // REPARSE_DATA_BUFFER (and REPARSE_GUID_DATA_BUFFER) both start with
+    // a `ULONG ReparseTag` at offset 0. We only need the first 4 bytes,
+    // but DeviceIoControl can fail with ERROR_INSUFFICIENT_BUFFER if
+    // the output buffer is smaller than the full reparse payload. Size
+    // to MAXIMUM_REPARSE_DATA_BUFFER_SIZE (16 KB) so any in-spec reparse
+    // tag fits.
+    let mut buf = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
+    let mut bytes_returned: u32 = 0;
+    let result = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_GET_REPARSE_POINT,
+            None,
+            0,
+            Some(buf.as_mut_ptr() as *mut _),
+            buf.len() as u32,
+            Some(&mut bytes_returned),
+            None,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if result.is_err() || bytes_returned < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+}
+
 /// Drop the leading `\\?\` verbatim-path prefix, if present. The walker
 /// (src/inventory/walk.rs::to_verbatim) adds this prefix to every
 /// emitted path so legacy Win32 APIs accept trailing-dot / reserved-DOS

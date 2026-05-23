@@ -74,3 +74,10 @@ pub fn replace_with_reflink(_t: &Path, _k: &Path) -> Result<()> {
         "Windows-only FSCTL_DUPLICATE_EXTENTS_TO_FILE",
     ))
 }
+
+/// Non-Windows: reparse points don't exist in the filesystems we
+/// support, so the tag fetcher returns `None`. classify() handles
+/// `None` correctly (treats the file as `NotPlaceholder`).
+pub fn fetch_reparse_tag(_path: &Path) -> Option<u32> {
+    None
+}

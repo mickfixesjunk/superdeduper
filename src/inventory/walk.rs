@@ -286,6 +286,19 @@ where
         // platforms attributes stays 0 and placeholder.rs's
         // cross-platform stub returns NotPlaceholder.
         let attributes = win_file_attributes(&metadata);
+        // When the file carries a reparse point, fetch its tag via
+        // FSCTL_GET_REPARSE_POINT so classify() can distinguish
+        // IO_REPARSE_TAG_DEDUP (ReparseDedup → hashable) from cloud
+        // tags (RecallOnOpen etc. via tag-first detection) from
+        // arbitrary unknowns. Without this, every reparse file
+        // classifies as `OtherReparse(0)` — conservative-blocked,
+        // but loses information the user needs.
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x400.
+        let reparse_tag = if (attributes & 0x400) != 0 {
+            crate::winapi_wrappers::fetch_reparse_tag(&path)
+        } else {
+            None
+        };
         out.push(FileEntry {
             path,
             size,
@@ -295,7 +308,7 @@ where
             usn: 0,
             attributes,
             volume_guid: None,
-            placeholder: crate::inventory::placeholder::classify(attributes, None),
+            placeholder: crate::inventory::placeholder::classify(attributes, reparse_tag),
         });
     }
     Ok(())

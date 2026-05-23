@@ -160,27 +160,45 @@ pub fn classify(attrs: u32, reparse_tag: Option<u32>) -> PlaceholderState {
     const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
     // From ntifs.h. Values are stable and architecture-agnostic.
     const IO_REPARSE_TAG_DEDUP: u32 = 0x8000_0013;
-    // Cloud-files reparse tags live in the 0x901..0x903 range
-    // (NAME_SURROGATE bits + cloud-provider-specific tail); we
-    // match on the recall attributes rather than the tag value
-    // because providers use different tag values within the family.
+    // Cloud Files API reparse tags — used by OneDrive, iCloud Drive,
+    // SharePoint Files-On-Demand, and other Cloud Filter API clients.
+    // `_RECALL_ON_OPEN` hydrates the full file the moment it's opened;
+    // `_RECALL_ON_DATA_ACCESS` hydrates only the regions actually read
+    // past whatever's locally cached. From `cfapi.h`.
+    const IO_REPARSE_TAG_CLOUD_RECALL_ON_OPEN: u32 = 0x9000_001A;
+    const IO_REPARSE_TAG_CLOUD_RECALL_ON_DATA_ACCESS: u32 = 0x9000_101A;
 
-    // Recall bits take precedence — if a file is a cloud placeholder
-    // AND a reparse point, we treat it as a cloud placeholder.
+    // Attribute-first checks. When a Cloud Filter API sync root is
+    // active, Windows surfaces the recall bits via attributes — that's
+    // the canonical "this file will hydrate on open" signal at the FS
+    // API layer and takes precedence over the tag-based path.
     if attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0 {
         return PlaceholderState::RecallOnOpen;
     }
     if attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0 {
         return PlaceholderState::RecallOnDataAccess;
     }
+
+    // Tag-based classification (Block J). On Win11 25H2 without a
+    // Cloud Filter API sync root — and on synthetic test fixtures
+    // built without going through the Cloud Filter API — the recall
+    // attribute bits aren't set on cloud-tagged files. Falling back
+    // to the raw tag value lets us identify cloud placeholders
+    // anyway, and lets `IO_REPARSE_TAG_DEDUP` correctly become
+    // `ReparseDedup` (hashable) instead of the conservative-blocked
+    // `OtherReparse(_)` fallback.
     if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         if let Some(tag) = reparse_tag {
-            if tag == IO_REPARSE_TAG_DEDUP {
-                return PlaceholderState::ReparseDedup;
-            }
-            return PlaceholderState::OtherReparse(tag);
+            return match tag {
+                IO_REPARSE_TAG_DEDUP => PlaceholderState::ReparseDedup,
+                IO_REPARSE_TAG_CLOUD_RECALL_ON_OPEN => PlaceholderState::RecallOnOpen,
+                IO_REPARSE_TAG_CLOUD_RECALL_ON_DATA_ACCESS => PlaceholderState::RecallOnDataAccess,
+                other => PlaceholderState::OtherReparse(other),
+            };
         }
         // Reparse point with no tag info — treat as Other(0).
+        // Callers should fetch the tag via
+        // `winapi_wrappers::fetch_reparse_tag(&path)` when feasible.
         return PlaceholderState::OtherReparse(0);
     }
     PlaceholderState::NotPlaceholder
@@ -289,6 +307,47 @@ mod tests {
         assert_eq!(
             classify(attrs, Some(unknown)),
             PlaceholderState::OtherReparse(unknown)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_cloud_tag_recall_on_open_tag_first() {
+        // Block J: classify recognizes the OneDrive / Cloud Filter API
+        // RECALL_ON_OPEN tag (0x9000001A) even when the recall
+        // attribute bit isn't set. Win11 25H2 without a Cloud Filter
+        // sync root won't surface the attribute, so tag-first
+        // detection is the only way to identify the file correctly.
+        let attrs_reparse_only = 0x0000_0400; // FILE_ATTRIBUTE_REPARSE_POINT, no recall bit
+        assert_eq!(
+            classify(attrs_reparse_only, Some(0x9000_001A)),
+            PlaceholderState::RecallOnOpen
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_cloud_tag_recall_on_data_access_tag_first() {
+        let attrs_reparse_only = 0x0000_0400;
+        assert_eq!(
+            classify(attrs_reparse_only, Some(0x9000_101A)),
+            PlaceholderState::RecallOnDataAccess
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_unknown_cloud_range_falls_through_to_other() {
+        // A 0x9000xxxx variant we don't have specific handling for
+        // (e.g. a hypothetical IO_REPARSE_TAG_CLOUD_3 at 0x9000301A)
+        // stays as OtherReparse(tag) — the safer default. We log the
+        // exact tag so users can file an issue with a real-world
+        // value and we can add specific handling.
+        let attrs_reparse_only = 0x0000_0400;
+        let exotic = 0x9000_301A;
+        assert_eq!(
+            classify(attrs_reparse_only, Some(exotic)),
+            PlaceholderState::OtherReparse(exotic),
         );
     }
 
