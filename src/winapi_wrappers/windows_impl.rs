@@ -1052,4 +1052,36 @@ mod tests {
         assert_eq!(parsed[1].name, "two");
         assert_eq!(parsed[2].name, "three");
     }
+
+    /// T2.3 fix regression guard: SHCreateItemFromParsingName rejects
+    /// `\\?\` verbatim prefixes with E_INVALIDARG, so recycle() strips
+    /// them before the COM call. Lock that semantic in a test so a
+    /// future helper refactor doesn't quietly reintroduce the bug.
+    #[test]
+    fn strip_verbatim_prefix_drops_extended_path_marker() {
+        // With prefix → dropped.
+        assert_eq!(
+            super::strip_verbatim_prefix(std::path::Path::new(r"\\?\C:\Windows\System32")),
+            std::path::PathBuf::from(r"C:\Windows\System32"),
+        );
+        // Without prefix → unchanged.
+        assert_eq!(
+            super::strip_verbatim_prefix(std::path::Path::new(r"C:\Windows\System32")),
+            std::path::PathBuf::from(r"C:\Windows\System32"),
+        );
+        // UNC path without the verbatim form → unchanged (we only
+        // strip the literal `\\?\` marker, not UNC roots).
+        assert_eq!(
+            super::strip_verbatim_prefix(std::path::Path::new(r"\\server\share\file")),
+            std::path::PathBuf::from(r"\\server\share\file"),
+        );
+        // Verbatim UNC `\\?\UNC\server\share` — we drop the `\\?\` only,
+        // leaving `UNC\server\share`. SHCreateItemFromParsingName doesn't
+        // accept that form either, but it's a known edge case; callers
+        // dealing with verbatim-UNC paths need their own conversion.
+        assert_eq!(
+            super::strip_verbatim_prefix(std::path::Path::new(r"\\?\UNC\server\share")),
+            std::path::PathBuf::from(r"UNC\server\share"),
+        );
+    }
 }

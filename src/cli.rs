@@ -232,7 +232,7 @@ pub enum KeepStrategy {
 pub enum DedupeAction {
     /// Permanently remove the file.
     Remove,
-    /// Send the file to the Recycle Bin (uses SHFileOperationW).
+    /// Send the file to the Recycle Bin (uses IFileOperation).
     Recycle,
     /// Replace the file with a hardlink to the keeper.
     Hardlink,
