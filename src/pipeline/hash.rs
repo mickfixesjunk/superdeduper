@@ -925,27 +925,81 @@ fn tier3_hash_cancellable(
     // pattern. Per Microsoft docs: "Access is intended to be sequential
     // from beginning to end. The system can use this as a hint to
     // optimize file caching." Tier 3 reads the entire file from offset
-    // 0 to EOF in one pass — perfect match. Expected impact: 10-30%
-    // throughput improvement on large files on NVMe, more on slower
-    // disks where readahead matters more.
+    // 0 to EOF in one pass — perfect match.
+    //
+    // Block O++: producer-consumer ping-pong via std::thread::scope +
+    // sync_channel(1). One thread reads chunks from disk; the worker
+    // (this) thread hashes them. The channel's capacity of 1 means
+    // exactly one chunk-in-flight at any time — true ping-pong, not
+    // a queue. Decouples read latency from hash latency: while the
+    // producer reads chunk K+1, the consumer hashes chunk K.
+    //
+    // Why this is worth ~200μs thread-spawn overhead per file: on the
+    // typical large-file workload (2 GiB at ~5 GB/s seq read = 400ms
+    // wall), serial read+hash takes ~580ms; pipelined takes max(read,
+    // hash) ≈ 400ms (disk-bound limit). Per-file save: ~180ms. Spawn
+    // overhead is rounding error against that. On small Tier 3 files
+    // (~10MB), the trade-off thins out but stays positive overall.
     let file = open_sequential(&f.entry.path)?;
-    let mut reader = BufReader::with_capacity(TIER3_BUF, file);
-    let mut hasher = ContentHasher::new(algo);
-    let mut buf = vec![0u8; TIER3_BUF];
-    loop {
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "cancelled",
-            ));
+    let path_display = f.entry.path.display().to_string();
+    use std::sync::mpsc::sync_channel;
+    let (tx, rx) = sync_channel::<Option<Vec<u8>>>(1);
+
+    std::thread::scope(|scope| -> std::io::Result<Vec<u8>> {
+        // Producer: read chunks from disk, ship them through the
+        // channel. On error or EOF, signal completion by sending
+        // `None` and exit.
+        let read_handle = scope.spawn(move || -> std::io::Result<()> {
+            let mut reader = BufReader::with_capacity(TIER3_BUF, file);
+            loop {
+                let mut buf = vec![0u8; TIER3_BUF];
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(None);
+                        return Ok(());
+                    }
+                    Ok(n) => {
+                        buf.truncate(n);
+                        // tx.send blocks if the consumer hasn't pulled
+                        // the previous chunk — that's the ping-pong.
+                        // If the consumer dropped rx (cancellation),
+                        // send fails and we exit cleanly.
+                        if tx.send(Some(buf)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+
+        // Consumer: pull chunks as they arrive, hash them in arrival
+        // order (which equals on-disk order since the producer reads
+        // sequentially).
+        let mut hasher = ContentHasher::new(algo);
+        while let Ok(Some(chunk)) = rx.recv() {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                drop(rx); // closes the channel; producer exits
+                let _ = read_handle.join();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
+                ));
+            }
+            hasher.update(&chunk);
         }
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+
+        // Drain producer result. If the producer errored, surface
+        // that. If it panicked, surface a synthetic IO error.
+        match read_handle.join() {
+            Ok(Ok(())) => Ok(hasher.finalize()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("tier3 read thread panicked: {}", path_display),
+            )),
         }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize())
+    })
 }
 
 /// Open a file with sequential-scan hint. Block O — Tier 3 large-file
@@ -1502,6 +1556,57 @@ mod tests {
             "ReparseDedup files must still group as duplicates"
         );
         assert_eq!(result[0].files.len(), 2);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// Block O++ correctness contract: the streaming Tier-3 path (used
+    /// for files > TIER3_ONESHOT_THRESHOLD = 1 MiB) MUST produce the
+    /// same content_hash as a single-shot hash of the same bytes.
+    /// Without this test, the new producer-consumer ping-pong path is
+    /// unverified — none of the prior Tier-3 tests use files large
+    /// enough to take the streaming branch.
+    #[test]
+    fn tier3_streaming_path_matches_oneshot_hash() {
+        let d = tmpdir();
+        // Make a file just above the oneshot threshold so we know
+        // the streaming branch runs. Use deterministic non-trivial
+        // content (xorshift-stamped 4 MiB).
+        let size = (TIER3_ONESHOT_THRESHOLD + 1024 * 1024) as usize;
+        let mut body = vec![0u8; size];
+        let mut x: u32 = 0xDEAD_BEEF;
+        for chunk in body.chunks_mut(4) {
+            x ^= x.wrapping_shl(13);
+            x ^= x.wrapping_shr(17);
+            x ^= x.wrapping_shl(5);
+            let b = x.to_le_bytes();
+            for (i, byte) in chunk.iter_mut().enumerate() {
+                *byte = b[i.min(3)];
+            }
+        }
+        let a = d.join("streaming-a.bin");
+        let b = d.join("streaming-b.bin");
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+
+        // Compute the oneshot reference hash via algo::hash_oneshot.
+        let reference_hash = algo::hash_oneshot(HashAlgo::Blake3, &body);
+        let reference_hex = hex(&reference_hash);
+
+        // Now run the dup-detection pipeline. Two identical files >
+        // the oneshot threshold MUST trigger the streaming Tier 3
+        // path and produce a dup group whose content_hash equals the
+        // oneshot reference.
+        let group = LaidOutGroup {
+            size: body.len() as u64,
+            files: vec![lo(a, body.len() as u64), lo(b, body.len() as u64)],
+        };
+        let result = run(vec![group], &cfg()).unwrap();
+        assert_eq!(result.len(), 1, "two identical files must group");
+        assert_eq!(
+            result[0].content_hash, reference_hex,
+            "streaming-path content_hash must equal oneshot reference; \
+             producer-consumer ping-pong has a chunk-ordering bug otherwise"
+        );
         fs::remove_dir_all(&d).ok();
     }
 }

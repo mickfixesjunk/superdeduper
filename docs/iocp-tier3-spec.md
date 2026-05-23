@@ -1,8 +1,48 @@
 # Block O+: IOCP integration for Tier 3 hashing
 
-> **Status:** spec + implementation plan.
-> Engine work splits into two chunks. Block V's baseline bench
-> (large-dups-r1) sets the win target.
+> **Status: DEFERRED.** Block V's large-dups-r1 baseline data
+> reframed the problem; the cheaper Block O++ (producer-consumer
+> ping-pong, shipped) addressed most of the available win without
+> the IOCP infrastructure cost. Notes below preserve the analysis
+> for a future session if/when a user surfaces a workload where
+> Block O++ is insufficient.
+
+---
+
+## Why deferred (May 2026)
+
+Block V's large-dups baseline (8 × 2 GiB pairs, pure-Tier-3 corpus)
+measured **71.54 MB/s/thread** ≈ 2.29 GB/s aggregate. Initial read:
+"40% of D:'s 5-6 GB/s seq read ceiling — IOCP can close the gap."
+
+On closer analysis: with **only 8 files spread across 32 rayon
+workers, ~25% of workers had any work at all**. The "40% of ceiling"
+isn't IO inefficiency — it's worker starvation. We're already
+close to disk-optimal given the parallelism we can apply.
+
+For IOCP to actually win on a small-file-count workload like this,
+we'd need **within-file chunk parallelism**: split a 2 GiB file
+into N chunks, submit them concurrently, hash in completion order.
+That requires either:
+* BLAKE3 tree-mode hashing via its low-level `ChunkState` API
+  (river5 doesn't support tree mode — would need a reorder buffer)
+* A reorder buffer that holds out-of-order chunks until the
+  in-order hash consumer is ready (~50 lines, simpler than tree-mode)
+
+Plus: on a single 2 GiB file the disk delivers ~5 GB/s and the
+hasher (river5) does 11+ GB/s on memory-resident data. **The disk
+is the gate even on a single large file. Faster hashing doesn't
+help if the disk delivers slower.**
+
+Updated honest scope: ~5-7h of careful work for a ~30-40% per-file
+win on workloads that have:
+1. File count < worker count (rare in practice)
+2. Files individually > 100 MB (specialised — media, archives)
+
+Block O++ (producer-consumer ping-pong within `tier3_hash_cancellable`)
+captures most of the available win for ~30 min of engineering — the
+read-overlapping-hash pattern works inside a single worker thread,
+no IOCP infrastructure required. Shipped instead.
 
 ---
 
