@@ -24,9 +24,10 @@ use serde::{Deserialize, Serialize};
 /// Anything else gets skipped by the walker (or, for `ReparseDedup`,
 /// hashed but flagged informationally — the file's data IS readable,
 /// it's just stored by NTFS dedup).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlaceholderState {
     /// Default: a regular file. Hashing proceeds as normal.
+    #[default]
     NotPlaceholder,
     /// `FILE_ATTRIBUTE_RECALL_ON_OPEN` — opening the file at all
     /// triggers cloud hydration. Skip content reads.
@@ -117,12 +118,6 @@ impl PlaceholderState {
             Self::ReparseDedup => !allow_destructive_on_deduped,
             Self::RecallOnOpen | Self::RecallOnDataAccess | Self::OtherReparse(_) => true,
         }
-    }
-}
-
-impl Default for PlaceholderState {
-    fn default() -> Self {
-        Self::NotPlaceholder
     }
 }
 
