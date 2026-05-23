@@ -373,6 +373,64 @@ fn run(
             ),
         });
     }
+    // Volume-guid backfill: cache lookups require volume_guid. The
+    // walker's Windows fast path (Block N) populates it via
+    // FileIdBothDirectoryInfo, but the fallback path leaves it None.
+    // Files in saved_inventory inherit whatever the original walk
+    // recorded — None propagates indefinitely across resumes, so
+    // Stage 4 silently re-hashes everything because cache_key()
+    // short-circuits to None when volume_guid is missing.
+    //
+    // Resolve per-root once, stamp every file with None. Cheap: one
+    // GetVolumePathNameW + GetVolumeNameForVolumeMountPointW pair
+    // per unique root.
+    #[cfg(windows)]
+    {
+        let mut root_guid_cache: hashbrown::HashMap<std::path::PathBuf, Option<String>> =
+            hashbrown::HashMap::new();
+        let mut stamped = 0u64;
+        for f in files.iter_mut() {
+            if f.volume_guid.is_some() {
+                continue;
+            }
+            // Find which scan root contains this file. roots is
+            // typically small (1-4 entries), linear scan is fine.
+            let owner = root_paths.iter().find(|r| f.path.starts_with(r));
+            if let Some(root) = owner {
+                let guid = root_guid_cache
+                    .entry(root.clone())
+                    .or_insert_with(|| {
+                        crate::winapi_wrappers::volume_for_path(root).ok()
+                    });
+                if let Some(g) = guid {
+                    f.volume_guid = Some(g.clone());
+                    stamped += 1;
+                }
+            }
+        }
+        if stamped > 0 {
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "post-walk volume_guid backfill: stamped {} file(s) so cache lookups can fire on resume",
+                    stamped
+                ),
+            });
+        }
+    }
+    let with_guid = files.iter().filter(|f| f.volume_guid.is_some()).count();
+    let _ = tx.send(EngineEvent::Log {
+        level: if with_guid == files.len() {
+            LogLevel::Info
+        } else {
+            LogLevel::Warn
+        },
+        message: format!(
+            "inventory volume_guid census: {}/{} files have volume_guid (cache fast-forward needs ALL of them)",
+            with_guid,
+            files.len()
+        ),
+    });
     // Persist the inventory NOW so a subsequent pause during hashing
     // doesn't have to re-walk on the next resume. Cheap: just clones
     // path + size + mtime; serialisation happens inside the next
