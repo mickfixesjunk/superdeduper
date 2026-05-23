@@ -392,29 +392,53 @@ fn run_force_hash_mode(
         .thread_name(|i| format!("superdeduper-force-hash-{i}"))
         .build()
         .map_err(|e| anyhow::anyhow!("io thread pool build: {e}"))?;
+    // Block Q fix (post large-dups-r1-baseline observation): stream
+    // each file through a fixed-size buffer instead of read_to_end.
+    // The previous read_to_end approach grew the Vec to the full file
+    // size, so 8 × 2 GiB files in concurrent workers gave a peak RSS
+    // of 16 GiB — exactly the corpus size, and would OOM on real
+    // workloads. The streaming path is what tier3_hash_cancellable
+    // already uses for files above its 1 MiB oneshot threshold; we
+    // replicate that here so --force-hash is safe at any corpus size.
+    const STREAM_BUF: usize = 1 << 20; // 1 MiB, matches TIER3_BUF
     pool.install(|| {
         candidates.par_iter().for_each(|entry| {
             let path = &entry.path;
+            let mut hasher =
+                superdeduper::pipeline::hash::ContentHasher::new(cfg.hash_algo);
+            let mut buf = vec![0u8; STREAM_BUF];
             match std::fs::File::open(path) {
                 Ok(mut f) => {
-                    let mut buf = Vec::with_capacity(entry.size.min(1 << 26) as usize);
-                    match std::io::Read::read_to_end(&mut f, &mut buf) {
-                        Ok(n) => {
-                            // Hash the bytes — we don't keep the digest,
-                            // we just want the read + compute work to
-                            // happen so the throughput numbers reflect
-                            // both stages.
-                            let _digest = superdeduper::pipeline::hash::algo::hash_oneshot(
-                                cfg.hash_algo,
-                                &buf,
-                            );
-                            bytes_hashed.fetch_add(n as u64, Ordering::Relaxed);
-                            files_hashed.fetch_add(1, Ordering::Relaxed);
+                    let mut total = 0u64;
+                    let mut had_error = false;
+                    loop {
+                        match std::io::Read::read(&mut f, &mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                hasher.update(&buf[..n]);
+                                total += n as u64;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "force-hash read failed"
+                                );
+                                had_error = true;
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "force-hash read failed");
-                            failures.fetch_add(1, Ordering::Relaxed);
-                        }
+                    }
+                    if had_error {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Finalize even if total bytes wasn't exactly
+                        // entry.size — short reads can happen on
+                        // concurrent modification. Counters reflect
+                        // actual bytes hashed.
+                        let _digest = hasher.finalize();
+                        bytes_hashed.fetch_add(total, Ordering::Relaxed);
+                        files_hashed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
