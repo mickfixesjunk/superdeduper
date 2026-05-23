@@ -912,12 +912,23 @@ fn tier3_hash_cancellable(
         ));
     }
     if size <= TIER3_ONESHOT_THRESHOLD {
+        // Small-file path: a single read_to_end is sequential by
+        // nature, and small enough that the SEQUENTIAL_SCAN hint adds
+        // no measurable benefit. Use plain File::open.
         let mut file = File::open(&f.entry.path)?;
         let mut buf = Vec::with_capacity(size as usize);
         file.read_to_end(&mut buf)?;
         return Ok(algo::hash_oneshot(algo, &buf));
     }
-    let file = File::open(&f.entry.path)?;
+    // Block O: large-file streaming path. Open with FILE_FLAG_SEQUENTIAL_SCAN
+    // on Windows so the kernel enables prefetch for the sequential read
+    // pattern. Per Microsoft docs: "Access is intended to be sequential
+    // from beginning to end. The system can use this as a hint to
+    // optimize file caching." Tier 3 reads the entire file from offset
+    // 0 to EOF in one pass — perfect match. Expected impact: 10-30%
+    // throughput improvement on large files on NVMe, more on slower
+    // disks where readahead matters more.
+    let file = open_sequential(&f.entry.path)?;
     let mut reader = BufReader::with_capacity(TIER3_BUF, file);
     let mut hasher = ContentHasher::new(algo);
     let mut buf = vec![0u8; TIER3_BUF];
@@ -935,6 +946,54 @@ fn tier3_hash_cancellable(
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize())
+}
+
+/// Open a file with sequential-scan hint. Block O — Tier 3 large-file
+/// reads tell the OS "I'll read this start-to-end, prefetch
+/// aggressively." Cross-platform shim: on Windows, uses
+/// `CreateFileW` + `FILE_FLAG_SEQUENTIAL_SCAN`. On other platforms,
+/// falls back to plain `File::open` (Linux has `posix_fadvise` but
+/// `std::fs::File` doesn't expose the right hooks cleanly; future
+/// optimization point).
+#[cfg(windows)]
+fn open_sequential(path: &std::path::Path) -> std::io::Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN,
+            None,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
+    };
+    if handle.is_invalid() || handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: We just got the handle from CreateFileW; it's valid and
+    // we own it. Wrapping in File transfers ownership; File's Drop
+    // will CloseHandle on the way out.
+    Ok(unsafe { File::from_raw_handle(handle.0 as *mut _) })
+}
+
+#[cfg(not(windows))]
+fn open_sequential(path: &std::path::Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
