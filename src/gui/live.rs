@@ -859,14 +859,21 @@ fn run(
     let placeholders_total = placeholders_blocked_recall_total
         .saturating_add(placeholders_blocked_other_reparse_total);
     if placeholders_total > 0 {
+        // Only suggest the recall flag when there's actually a recall
+        // placeholder to unlock — otherwise the hint misleads.
+        let hint = if placeholders_blocked_recall_total > 0 {
+            " (rerun with --allow-recall-on-read to include cloud stubs)"
+        } else {
+            ""
+        };
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Warn,
             message: format!(
-                "skipped {} placeholder file(s): {} cloud-recall, {} other reparse \
-                 (rerun with --allow-recall-on-read to include cloud stubs)",
+                "skipped {} placeholder file(s): {} cloud-recall, {} other reparse{}",
                 placeholders_total,
                 placeholders_blocked_recall_total,
                 placeholders_blocked_other_reparse_total,
+                hint,
             ),
         });
     }

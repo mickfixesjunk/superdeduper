@@ -309,11 +309,18 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         .load(Ordering::Relaxed);
     let placeholders_total = placeholders_recall.saturating_add(placeholders_other);
     if placeholders_total > 0 {
+        // Only suggest the recall flag when there's actually a recall
+        // placeholder to unlock — suggesting it when only other-reparse
+        // fired is misleading (the flag wouldn't change behaviour).
+        let hint = if placeholders_recall > 0 {
+            " — rerun with --allow-recall-on-read to include cloud stubs"
+        } else {
+            ""
+        };
         let _ = writeln!(
             stderr,
             "tier guard skipped:    {placeholders_total} placeholder file(s) \
-             ({placeholders_recall} cloud-recall, {placeholders_other} other reparse) \
-             — rerun with --allow-recall-on-read to include cloud stubs"
+             ({placeholders_recall} cloud-recall, {placeholders_other} other reparse){hint}"
         );
     }
 
