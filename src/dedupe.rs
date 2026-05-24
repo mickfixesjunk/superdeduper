@@ -469,11 +469,15 @@ fn recycle(path: &Path) -> Result<()> {
     crate::winapi_wrappers::recycle(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn recycle(path: &Path) -> Result<()> {
-    // No Recycle Bin on non-Windows; fall back to plain remove. This
-    // path exists so cross-platform tests of the dedupe planner work;
-    // production targets are Windows-only.
+    // L0: XDG Trash spec implementation. Lives in src/platform/linux/trash.rs.
+    crate::platform::trash_file(path).map_err(|e| Error::other(format!("trash: {e}")))
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn recycle(path: &Path) -> Result<()> {
+    // Other Unixes (macOS pending L3) — fall back to plain remove for now.
     fs::remove_file(path)?;
     Ok(())
 }
@@ -507,10 +511,25 @@ fn replace_with_reflink(target: &Path, keeper: &Path) -> Result<()> {
     crate::winapi_wrappers::replace_with_reflink(target, keeper)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn replace_with_reflink(target: &Path, keeper: &Path) -> Result<()> {
+    // L0: FICLONE-based clone with atomic-via-tmp-rename. The
+    // `target` argument is the path we're REPLACING; the `keeper` is
+    // the file we want `target` to become a CoW clone of. After this
+    // call, both files share storage on disk.
+    //
+    // platform::clone_file(src, dst) creates `dst` as a clone of
+    // `src`. So here src=keeper, dst=target.
+    crate::platform::clone_file(keeper, target).map_err(|e| match e {
+        crate::platform::PlatformError::Unsupported(msg) => Error::Unsupported(msg),
+        other => Error::other(format!("reflink: {other}")),
+    })
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn replace_with_reflink(_target: &Path, _keeper: &Path) -> Result<()> {
     Err(Error::Unsupported(
-        "reflink (FSCTL_DUPLICATE_EXTENTS_TO_FILE) is Windows-only",
+        "reflink not implemented on this platform yet (L3 roadmap covers macOS)",
     ))
 }
 

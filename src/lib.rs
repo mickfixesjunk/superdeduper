@@ -25,6 +25,7 @@ pub mod inventory;
 pub mod keep;
 pub mod output;
 pub mod pipeline;
+pub mod platform;
 pub mod winapi_wrappers;
 
 #[cfg(feature = "gui")]
