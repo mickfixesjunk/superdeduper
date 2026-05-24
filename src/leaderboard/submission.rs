@@ -815,4 +815,118 @@ mod tests {
         let out = submit(&state, &sample_inputs());
         assert!(matches!(out, SubmitOutcome::Rejected { status: 0, .. }));
     }
+
+    #[test]
+    fn outcome_kind_tag_covers_every_variant() {
+        // If a new SubmitOutcome variant ships without updating the
+        // tag matcher, the archive file's `outcome_kind` field
+        // would collide with the "rejected" default. This test
+        // pins the mapping so any new variant must declare its tag.
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::Accepted {
+                submission_id: "x".into(),
+                ranks: vec![],
+                achievements_unlocked: vec![],
+                profile_url: None,
+            }),
+            "accepted"
+        );
+        assert_eq!(outcome_kind_tag(&SubmitOutcome::DuplicateNoChange), "duplicate");
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::Rejected {
+                status: 400,
+                reason: "x".into(),
+            }),
+            "rejected"
+        );
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::Transient { reason: "x".into() }),
+            "transient"
+        );
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::FlaggedForReview {
+                review_id: None,
+                local_path: "x".into(),
+                original_status: 0,
+                original_reason: "x".into(),
+            }),
+            "flagged-for-review"
+        );
+    }
+
+    #[test]
+    fn serializable_outcome_round_trips_all_variants() {
+        // The archive + review JSON files store outcomes via
+        // SerializableOutcome (tagged enum). If serde derive ever
+        // breaks for one variant, prior archive entries become
+        // unreadable. Round-trip each variant.
+        let variants = vec![
+            SubmitOutcome::Accepted {
+                submission_id: "abc".into(),
+                ranks: vec![RankEntry {
+                    category: "throughput".into(),
+                    bracket: "9950X3D2".into(),
+                    rank: 4,
+                    bucket_size: 412,
+                }],
+                achievements_unlocked: vec!["hoarder".into(), "big-find".into()],
+                profile_url: Some("https://superdeduper.io/profile/abc".into()),
+            },
+            SubmitOutcome::DuplicateNoChange,
+            SubmitOutcome::Rejected {
+                status: 422,
+                reason: "{\"error\":\"schema_invalid\"}".into(),
+            },
+            SubmitOutcome::Transient {
+                reason: "transport: connection refused".into(),
+            },
+            SubmitOutcome::FlaggedForReview {
+                review_id: Some("review-xyz".into()),
+                local_path: "/tmp/x/y.json".into(),
+                original_status: 400,
+                original_reason: "{\"error\":\"install_id_missing\"}".into(),
+            },
+        ];
+        for v in &variants {
+            let s = SerializableOutcome::from(v);
+            let bytes = serde_json::to_vec(&s).expect("serialize");
+            let _: SerializableOutcome =
+                serde_json::from_slice(&bytes).expect("deserialize");
+        }
+    }
+
+    #[test]
+    fn iso8601_handles_epoch_and_modern_dates() {
+        // Defensive — exercise the civil-from-days math at a few
+        // anchors so a future refactor that touches it can't break
+        // silently.
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_from_unix(1_704_067_200), "2024-01-01T00:00:00Z");
+        // Anchor used by the rfc3339 unit test elsewhere.
+        assert_eq!(iso8601_from_unix(1_779_594_153), "2026-05-24T03:42:33Z");
+    }
+
+    #[test]
+    fn now_iso8601_format_is_well_formed() {
+        // Shape: YYYY-MM-DDTHH:MM:SSZ — 20 chars, ends with Z,
+        // contains T as the date/time separator. Catches a future
+        // off-by-one or format-string typo in the rendering.
+        let ts = now_iso8601();
+        assert_eq!(ts.len(), 20);
+        assert!(ts.ends_with('Z'));
+        assert!(ts.chars().nth(10) == Some('T'));
+    }
+
+    #[test]
+    fn build_payload_clamps_install_id_into_output() {
+        // Defensive — the install_id arg is the ONLY way the freshest
+        // post-rotation install_id enters the payload. A future
+        // refactor that drops the threading would silently submit
+        // against a stale id. Pin the wire-format claim.
+        let inputs = sample_inputs();
+        let p1 = build_payload(&inputs, "id-a");
+        let p2 = build_payload(&inputs, "id-b");
+        assert_eq!(p1.get("install_id").and_then(|v| v.as_str()), Some("id-a"));
+        assert_eq!(p2.get("install_id").and_then(|v| v.as_str()), Some("id-b"));
+    }
 }
