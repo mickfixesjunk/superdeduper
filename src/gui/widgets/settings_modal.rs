@@ -787,6 +787,7 @@ fn render_leaderboard(ui: &mut egui::Ui) {
     render_submit_section(ui);
 }
 
+#[cfg(feature = "telemetry")]
 fn render_submit_section(ui: &mut egui::Ui) {
     use crate::leaderboard::{install, submission};
 
@@ -900,6 +901,7 @@ fn render_submit_section(ui: &mut egui::Ui) {
     }
 }
 
+#[cfg(feature = "telemetry")]
 fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::SubmitOutcome) {
     use crate::leaderboard::submission::SubmitOutcome;
     match outcome {

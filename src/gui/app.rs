@@ -139,6 +139,19 @@ pub struct SuperdeduperApp {
     /// Filled progress-bar rect captured from the most recent render
     /// pass. Particles anchor inside it and are clipped to it.
     last_bar_fill: Option<egui::Rect>,
+    /// Post-scan leaderboard modal state. Transitions:
+    /// `Hidden → Ready` on ScanFinished (with AlwaysAsk + a built
+    /// payload); `Ready → Submitting` on Submit click; `Submitting
+    /// → Done` when the worker returns; `Done → Hidden` on Close.
+    /// `AutoOptIn` bypasses Ready and goes straight to Submitting +
+    /// silent toast.
+    #[cfg(feature = "telemetry")]
+    scan_complete_modal: crate::gui::widgets::scan_complete_modal::ScanCompleteState,
+    /// Snapshot of the just-finished scan's headline stats, captured
+    /// once on ScanFinished so the modal renders consistent values
+    /// even if downstream UI state mutates. Cleared on Close.
+    #[cfg(feature = "telemetry")]
+    scan_complete_data: Option<crate::gui::widgets::scan_complete_modal::ScanCompleteData>,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -220,6 +233,10 @@ impl SuperdeduperApp {
             sparkles: Default::default(),
             resume_effect_active: false,
             last_bar_fill: None,
+            #[cfg(feature = "telemetry")]
+            scan_complete_modal: crate::gui::widgets::scan_complete_modal::ScanCompleteState::default(),
+            #[cfg(feature = "telemetry")]
+            scan_complete_data: None,
         };
         let mut app = app;
         // Populate cache-banner state on first launch — roots may
@@ -521,6 +538,221 @@ impl SuperdeduperApp {
             match action {
                 PreflightAction::Start => self.launch_scan(defender_rtp_pre),
                 PreflightAction::Cancel => {}
+            }
+        }
+    }
+
+    /// Called from `drain_events` on `ScanFinished`. Captures the
+    /// run's headline stats, then transitions the post-scan modal
+    /// per the user's share preference:
+    ///
+    /// * `AlwaysAsk` → modal opens in `Ready` state (Submit / Skip
+    ///   / Auto-submit / What gets shared? buttons).
+    /// * `AutoOptIn` → modal opens in `Submitting` state immediately
+    ///   (no user click needed); will fall through to `Done` when
+    ///   the worker returns. User still sees rank + achievements but
+    ///   doesn't have to click Submit each scan.
+    /// * `Never` → no modal; no submission.
+    ///
+    /// Requires the engine to have called `submission::store_pending`,
+    /// which it does unconditionally in `live::run` post-ScanFinished.
+    #[cfg(feature = "telemetry")]
+    fn on_scan_finished_for_leaderboard(
+        &mut self,
+        total_files: u64,
+        total_bytes_read: u64,
+        duplicates: u64,
+        reclaimable_bytes: u64,
+    ) {
+        use crate::gui::widgets::scan_complete_modal::{
+            ScanCompleteData, ScanCompleteState,
+        };
+        use crate::leaderboard::install;
+        use crate::leaderboard::submission;
+
+        // Drop any prior modal's state — a new scan supersedes it.
+        self.scan_complete_modal = ScanCompleteState::Hidden;
+        self.scan_complete_data = None;
+
+        // No pending payload means the engine's telemetry path didn't
+        // build one this run (e.g. cancelled or errored mid-scan).
+        // Don't pop the modal with a stale or zero payload.
+        if submission::peek_pending().is_none() {
+            return;
+        }
+
+        let elapsed_secs = self
+            .state
+            .scan_elapsed()
+            .map(|d| d.as_secs_f32())
+            .unwrap_or(0.0);
+        self.scan_complete_data = Some(ScanCompleteData::from_engine_event(
+            elapsed_secs,
+            reclaimable_bytes,
+            total_files,
+            total_bytes_read,
+            duplicates,
+        ));
+
+        // Decide what to do based on the install's share preference.
+        let share = install::load()
+            .ok()
+            .flatten()
+            .map(|s| s.share_default)
+            .unwrap_or(install::ShareDefault::AlwaysAsk);
+
+        match share {
+            install::ShareDefault::Never => {
+                self.scan_complete_modal = ScanCompleteState::Hidden;
+            }
+            install::ShareDefault::AlwaysAsk => {
+                self.scan_complete_modal = ScanCompleteState::Ready;
+            }
+            install::ShareDefault::AutoOptIn => {
+                self.scan_complete_modal = ScanCompleteState::Submitting;
+                self.spawn_leaderboard_submit_worker();
+            }
+        }
+    }
+
+    /// Spawn the submit worker thread. Reads `take_pending()` (so a
+    /// rapid double-click can't double-submit), POSTs the payload,
+    /// stashes the outcome via `store_last_outcome`. The render
+    /// loop polls `peek_last_outcome` each frame to flip the modal
+    /// from `Submitting` to `Done`.
+    #[cfg(feature = "telemetry")]
+    fn spawn_leaderboard_submit_worker(&self) {
+        std::thread::spawn(|| {
+            use crate::leaderboard::{install, submission};
+            let state = match install::load() {
+                Ok(Some(s)) if s.registered => s,
+                _ => {
+                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                        status: 0,
+                        reason: "install not registered".into(),
+                    });
+                    return;
+                }
+            };
+            let inputs = match submission::take_pending() {
+                Some(i) => i,
+                None => {
+                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                        status: 0,
+                        reason: "no pending submission".into(),
+                    });
+                    return;
+                }
+            };
+            let outcome = submission::submit(&state, &inputs);
+            if let submission::SubmitOutcome::Transient { reason } = &outcome {
+                eprintln!("leaderboard: submit transient ({reason}); enqueueing");
+                let body = crate::leaderboard::hmac_signer::canonical_body(
+                    &submission::build_payload(&inputs),
+                );
+                let signature = state
+                    .install_key()
+                    .map(|k| crate::leaderboard::hmac_signer::sign(&k, &body))
+                    .unwrap_or_default();
+                if let Err(e) = submission::enqueue(&inputs, &signature) {
+                    eprintln!("leaderboard: enqueue failed: {e:?}");
+                }
+            }
+            submission::store_last_outcome(outcome);
+        });
+    }
+
+    /// Render the post-scan leaderboard modal (if active) + dispatch
+    /// its actions. Called once per frame from `update()`.
+    #[cfg(feature = "telemetry")]
+    fn tick_scan_complete_modal(&mut self, ctx: &egui::Context) {
+        use crate::gui::widgets::scan_complete_modal::{
+            self as widget, ScanCompleteAction, ScanCompleteState,
+        };
+        use crate::leaderboard::submission;
+
+        if matches!(self.scan_complete_modal, ScanCompleteState::Hidden) {
+            return;
+        }
+        // Submit worker stashes outcome via store_last_outcome; flip
+        // the state when we observe one in flight from Submitting.
+        if matches!(self.scan_complete_modal, ScanCompleteState::Submitting)
+            && submission::peek_last_outcome().is_some()
+        {
+            self.scan_complete_modal = ScanCompleteState::Done;
+        }
+        let data = match &self.scan_complete_data {
+            Some(d) => d.clone(),
+            None => {
+                self.scan_complete_modal = ScanCompleteState::Hidden;
+                return;
+            }
+        };
+        let outcome = submission::peek_last_outcome();
+        // Re-build the payload preview on demand only when needed.
+        // Cheap (small JSON, no IO); avoids holding state.
+        let payload_preview: Option<String> =
+            if matches!(self.scan_complete_modal, ScanCompleteState::Preview) {
+                submission::peek_pending().map(|inputs| {
+                    let v = submission::build_payload(&inputs);
+                    serde_json::to_string_pretty(&v).unwrap_or_default()
+                })
+            } else {
+                None
+            };
+        let action = widget::show(
+            ctx,
+            self.scan_complete_modal,
+            &data,
+            outcome.as_ref(),
+            payload_preview.as_deref(),
+        );
+        if let Some(a) = action {
+            match a {
+                ScanCompleteAction::Submit => {
+                    self.scan_complete_modal = ScanCompleteState::Submitting;
+                    self.spawn_leaderboard_submit_worker();
+                }
+                ScanCompleteAction::AutoSubmit => {
+                    self.flip_share_to_auto_opt_in();
+                    self.scan_complete_modal = ScanCompleteState::Submitting;
+                    self.spawn_leaderboard_submit_worker();
+                }
+                ScanCompleteAction::Skip => {
+                    self.scan_complete_modal = ScanCompleteState::Hidden;
+                    self.scan_complete_data = None;
+                }
+                ScanCompleteAction::OpenPreview => {
+                    self.scan_complete_modal = ScanCompleteState::Preview;
+                }
+                ScanCompleteAction::ClosePreview => {
+                    // Return to the prior state — Ready unless an
+                    // outcome already landed (then Done).
+                    self.scan_complete_modal =
+                        if submission::peek_last_outcome().is_some() {
+                            ScanCompleteState::Done
+                        } else {
+                            ScanCompleteState::Ready
+                        };
+                }
+                ScanCompleteAction::Close => {
+                    self.scan_complete_modal = ScanCompleteState::Hidden;
+                    self.scan_complete_data = None;
+                }
+            }
+        }
+    }
+
+    /// Persist `ShareDefault::AutoOptIn` on the install. Best-effort:
+    /// a save failure logs to stderr but doesn't stop the in-flight
+    /// submission. Next launch will re-load and pick up the change.
+    #[cfg(feature = "telemetry")]
+    fn flip_share_to_auto_opt_in(&self) {
+        use crate::leaderboard::install;
+        if let Ok(Some(mut s)) = install::load() {
+            s.share_default = install::ShareDefault::AutoOptIn;
+            if let Err(e) = install::save(&s) {
+                eprintln!("leaderboard: failed to persist AutoOptIn: {e:?}");
             }
         }
     }
@@ -834,7 +1066,13 @@ impl SuperdeduperApp {
                 Ok(ev) => {
                     match &ev {
                         EngineEvent::ScanStarted { .. } => self.is_scanning = true,
-                        EngineEvent::ScanFinished { .. } => {
+                        EngineEvent::ScanFinished {
+                            total_files,
+                            total_bytes_read,
+                            duplicates,
+                            reclaimable_bytes,
+                            ..
+                        } => {
                             self.is_scanning = false;
                             self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
@@ -853,6 +1091,13 @@ impl SuperdeduperApp {
                             // Don't reset() here — leave the burst
                             // particles in flight so the user sees
                             // them; they'll age out on their own.
+                            #[cfg(feature = "telemetry")]
+                            self.on_scan_finished_for_leaderboard(
+                                *total_files,
+                                *total_bytes_read,
+                                *duplicates,
+                                *reclaimable_bytes,
+                            );
                         }
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;
@@ -2093,6 +2338,13 @@ impl eframe::App for SuperdeduperApp {
         // practice they're mutually exclusive (preflight is pre-scan,
         // action-progress is post-results).
         self.tick_preflight(ctx);
+
+        // Post-scan leaderboard "dopamine moment" modal. Pops on
+        // ScanFinished with ShareDefault::AlwaysAsk; AutoOptIn
+        // submits silently; Never skips both. Mutually exclusive
+        // with preflight (both are scan-boundary modals).
+        #[cfg(feature = "telemetry")]
+        self.tick_scan_complete_modal(ctx);
 
         // Sparkles render LAST in their own foreground layer +
         // clipped to the progress-bar fill rect. Anything that
