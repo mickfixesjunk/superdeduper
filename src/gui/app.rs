@@ -1407,12 +1407,22 @@ impl SuperdeduperApp {
         // (group_size, content_hash, keeper, dupes-to-move). Keeper
         // is recorded only for the manifest's "what was this a copy
         // of" field; we never move or modify it.
+        let hide_unreclaimable = self.groups_state.hide_unreclaimable;
         let groups: Vec<(u64, String, PathBuf, Vec<PathBuf>)> = self
             .state
             .duplicates
             .iter()
             .filter_map(|g| {
                 if g.files.len() < 2 {
+                    return None;
+                }
+                // Respect the hide-unreclaimable toggle: archiving
+                // 0-byte-reclaimable groups (hardlinks) is at best
+                // pointless + at worst destructive (moving aliases
+                // doesn't free space on the source volume).
+                if hide_unreclaimable
+                    && crate::gui::state::inode_aware_savings(g) == 0
+                {
                     return None;
                 }
                 let keeper = g.files[0].clone();
@@ -1651,12 +1661,22 @@ impl SuperdeduperApp {
             .filter(|r| r.is_reference)
             .map(|r| r.path.clone())
             .collect();
+        let hide_unreclaimable = self.groups_state.hide_unreclaimable;
         let groups: Vec<(PathBuf, Vec<PathBuf>)> = self
             .state
             .duplicates
             .iter()
             .filter_map(|g| {
                 if g.files.len() < 2 {
+                    return None;
+                }
+                // Respect the hide-unreclaimable toggle (same as
+                // Recycle/Nuke): if the user has 0-byte-reclaimable
+                // groups hidden from the table view, the Go button
+                // must not act on them either.
+                if hide_unreclaimable
+                    && crate::gui::state::inode_aware_savings(g) == 0
+                {
                     return None;
                 }
                 let keeper = g.files[0].clone();
@@ -1878,7 +1898,10 @@ impl SuperdeduperApp {
     /// non-keepers. Mirrors the per-group worker but iterates across
     /// all groups, sums up totals, and reports a single summary.
     /// Reference paths are filtered out so a "Nuke all" can never
-    /// touch a source-of-truth root.
+    /// touch a source-of-truth root. Respects the
+    /// hide-unreclaimable toggle so a user who explicitly chose
+    /// "show only reclaimable" doesn't get hardlink-equivalent
+    /// groups blown away.
     fn run_bulk_destructive_threaded(&self, action: DedupeAction, label_emoji: &str) {
         self.action_cancel.store(false, Ordering::Relaxed);
         let cancel = Arc::clone(&self.action_cancel);
@@ -1892,12 +1915,24 @@ impl SuperdeduperApp {
             .filter(|r| r.is_reference)
             .map(|r| r.path.clone())
             .collect();
+        let hide_unreclaimable = self.groups_state.hide_unreclaimable;
         let groups: Vec<Vec<PathBuf>> = self
             .state
             .duplicates
             .iter()
             .filter_map(|g| {
                 if g.files.len() < 2 {
+                    return None;
+                }
+                // SAFETY GATE: when the user has the
+                // "hide unreclaimable" toggle on, skip 0-byte-
+                // reclaimable groups (link_equivalent +
+                // partial-hardlinks with unique_inodes < 2).
+                // Hiding them visually + still acting on them via
+                // Go would be a silent-destruction trap.
+                if hide_unreclaimable
+                    && crate::gui::state::inode_aware_savings(g) == 0
+                {
                     return None;
                 }
                 let dupes: Vec<PathBuf> = g.files[1..]

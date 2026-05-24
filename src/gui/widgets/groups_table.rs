@@ -215,8 +215,16 @@ pub fn show_filtered(
     // Bulk safe-rename header row — one button to safe-rename every
     // non-keeper across every visible group. Reversible via the
     // Unsuperdeduper button in the Roots panel; never deletes anything.
+    //
+    // Visible-dupe-count must respect the hide-unreclaimable toggle
+    // so the Go button label matches what'll actually be acted on
+    // (the app's bulk-action workers apply the same filter).
     let visible_dupe_count: usize = sorted
         .iter()
+        .filter(|(_, g)| {
+            !table_state.hide_unreclaimable
+                || crate::gui::state::inode_aware_savings(g) > 0
+        })
         .map(|(_, g)| g.files.len().saturating_sub(1))
         .sum();
     // Bulk-action row: a dropdown for "what to do across every
