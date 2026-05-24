@@ -8,7 +8,7 @@ Per `~/sd-bench-local/design/gui-test-harness-spec.md`. This file documents the 
 |---|---|---|
 | **Tier 0 — serde layer** | shipped (`ce0ea9f`) | Live backend JSON shape pinned. If `/api/v1/profile/{install_id}` drifts (renames `id`→`achievement_id`, un-nests `lifetime`, etc), the test goes red first. See `src/leaderboard/catalog.rs::profile_deserialises_live_backend_shape`. |
 | **Tier 1 widget-state** | shipped (this commit) | Pure-function grid classification. `classify_grid_entries(state, catalog)` returns tiles in render order; tests assert grant flags + sort order survive the full pipeline. See `src/gui/widgets/badge_wall.rs::badge_wall_classifies_granted_tiles_from_live_server_shape`. |
-| **Tier 1 widget-render** | deferred | True headless egui rendering via `egui_kittest`. Requires egui 0.28 → 0.32+ upgrade (egui_kittest doesn't publish for 0.28). Tracked as separate work in `feat/gui-test-harness`. |
+| **Tier 1 widget-render** | shipped (`03b07a8`) | True headless egui rendering via `egui_kittest`. Renders the badge wall via `Harness::new_ui()` then queries the AccessKit tree for granted-vs-ungranted labels. Also produces PNG side-artifacts (`target/test-artifacts/badge_wall-{empty,granted}.png`) when run, for visual proof without booting an EXE. Sat on top of an egui 0.28 → 0.32 upgrade landed in the same branch. |
 | **Tier 2 integration** | deferred | `mockito` HTTP mock + full-app harness. ~5 eng-days in `feat/gui-test-harness`. |
 | **Tier 3 visual regression** | deferred | sdd-testwin owns; nightly screenshot diffs. ~4 eng-days. |
 
@@ -57,12 +57,8 @@ cargo test --features gui,telemetry --lib              # full lib suite (~235 te
 
 CI gates merges on `cargo test --features gui,telemetry` passing across Linux + Windows.
 
-## Deferred — egui_kittest upgrade path
+## egui upgrade path (history)
 
-`egui_kittest` is the de facto headless-rendering harness for egui. We're on egui `0.28`; egui_kittest first publishes at `0.32`. Upgrading egui to 0.32+ touches:
+`egui_kittest` is the de facto headless-rendering harness for egui. We were on egui `0.28`; egui_kittest first publishes at `0.32`. Upgrade landed as commit `04297a5` on `feat/egui-0.32-upgrade`. Touched 10 widget files (mechanical Margin int conversion + Painter StrokeKind argument additions). ~1-2 hours of work; ~40 deprecation warnings remain that should clean up in a follow-on commit before bumping to 0.33+ (e.g. `Rounding` → `CornerRadius`, `menu::bar` → `MenuBar::new`, `ScrollArea::id_source` → `id_salt`).
 
-- All `egui::*` API call sites (some breaking changes between 0.28 → 0.34, especially around `egui::Frame`, `egui::Window`, `Sense`, etc.)
-- `eframe` upgrade in lockstep
-- `egui_plot` + `egui_extras` upgrades in lockstep
-
-Estimated 1-2 eng-days for the upgrade + call-site fixes. Lands as the first commit on `feat/gui-test-harness`; egui_kittest landings follow.
+If a future egui bump pulls more breaking changes, the same pattern: count errors first, batch the mechanical fixes, run the full suite. The 41-warning cleanup is bookkeeping but worth doing.
