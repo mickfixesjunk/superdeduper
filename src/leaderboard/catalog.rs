@@ -43,19 +43,44 @@ pub struct CatalogEntry {
 /// `GET /api/v1/profile/{install_id}`. Returns the full catalog
 /// with per-entry grant state — one round-trip renders the badge
 /// wall.
+///
+/// Field naming matches the backend's actual wire shape (verified
+/// 2026-05-24 against `api.superdeduper.io`): lifetime stats are
+/// nested under a `lifetime` object, and per-achievement entries
+/// use `id` (not `achievement_id`). Helper methods on `Profile`
+/// preserve the flat accessor names callers expected from the
+/// earlier draft so the rest of the GUI doesn't have to know.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub install_id: String,
     #[serde(default)]
-    pub lifetime_reclaimed_bytes: u64,
-    #[serde(default)]
-    pub lifetime_scans: u64,
+    pub lifetime: Lifetime,
     #[serde(default)]
     pub achievements: Vec<ProfileGrant>,
 }
 
+impl Profile {
+    pub fn lifetime_reclaimed_bytes(&self) -> u64 {
+        self.lifetime.bytes_reclaimed
+    }
+    pub fn lifetime_scans(&self) -> u64 {
+        self.lifetime.total_scans
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Lifetime {
+    #[serde(default)]
+    pub bytes_reclaimed: u64,
+    #[serde(default)]
+    pub total_scans: u64,
+    #[serde(default)]
+    pub total_files_seen: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileGrant {
+    #[serde(rename = "id")]
     pub achievement_id: String,
     /// `true` when the install has earned this achievement.
     #[serde(default)]
@@ -246,7 +271,9 @@ pub fn spawn_profile_refresh(server_url: String, install_id: String) {
                 let total = p.achievements.len();
                 eprintln!(
                     "catalog: profile refresh OK (granted={}, total={}, lifetime_reclaimed={})",
-                    granted, total, p.lifetime_reclaimed_bytes
+                    granted,
+                    total,
+                    p.lifetime_reclaimed_bytes()
                 );
                 set_profile(Ok(p));
             }
@@ -299,7 +326,38 @@ mod tests {
         let json = r#"{"install_id":"abc"}"#;
         let p: Profile = serde_json::from_str(json).unwrap();
         assert_eq!(p.install_id, "abc");
-        assert_eq!(p.lifetime_reclaimed_bytes, 0);
+        assert_eq!(p.lifetime_reclaimed_bytes(), 0);
         assert!(p.achievements.is_empty());
+    }
+
+    #[test]
+    fn profile_deserialises_live_backend_shape() {
+        // Pinning the EXACT shape the backend emits. Drift here is
+        // what caused the badge wall to show 0/N greyed: server uses
+        // `id` per achievement (not `achievement_id`) and nests
+        // lifetime stats under `lifetime`. If either shape changes,
+        // this test fails first and we update the structs deliberately.
+        let json = r#"{
+            "install_id": "abc",
+            "lifetime": { "bytes_reclaimed": 731677101, "total_scans": 3, "total_files_seen": 42 },
+            "achievements": [
+                { "id": "brisk", "name": "Brisk", "tier": "low", "display_order": 200, "granted": true, "granted_at": "2026-05-24T14:22:52Z" },
+                { "id": "founder", "name": "Founder", "tier": "high", "display_order": 550, "granted": true, "granted_at": "2026-05-24T05:20:37Z" },
+                { "id": "pioneer", "name": "Pioneer", "tier": "mid", "display_order": 560, "granted": false, "granted_at": null }
+            ]
+        }"#;
+        let p: Profile = serde_json::from_str(json).expect("live-shape JSON parses");
+        assert_eq!(p.install_id, "abc");
+        assert_eq!(p.lifetime_reclaimed_bytes(), 731_677_101);
+        assert_eq!(p.lifetime_scans(), 3);
+        assert_eq!(p.achievements.len(), 3);
+        assert_eq!(p.achievements[0].achievement_id, "brisk");
+        assert!(p.achievements[0].granted);
+        assert_eq!(p.achievements[1].achievement_id, "founder");
+        assert!(p.achievements[1].granted);
+        assert_eq!(p.achievements[2].achievement_id, "pioneer");
+        assert!(!p.achievements[2].granted);
+        let granted_count = p.achievements.iter().filter(|g| g.granted).count();
+        assert_eq!(granted_count, 2);
     }
 }

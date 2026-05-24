@@ -65,7 +65,7 @@ fn run_achievements(
                 let total = profile.achievements.len();
                 println!(
                     "Refetched: {granted}/{total} granted; lifetime_reclaimed_bytes={}",
-                    profile.lifetime_reclaimed_bytes
+                    profile.lifetime_reclaimed_bytes()
                 );
             }
             Ok(())
@@ -108,7 +108,12 @@ fn print_achievements(
         .collect();
 
     let mut entries: Vec<_> = catalog.achievements.iter().collect();
-    entries.sort_by_key(|e| e.display_order);
+    // Granted entries first (visual-test-friendly), then by
+    // display_order. Matches the badge-wall ordering.
+    entries.sort_by_key(|e| {
+        let granted = grants.get(e.id.as_str()).map(|g| g.granted).unwrap_or(false);
+        (!granted, e.display_order)
+    });
 
     match format {
         OutputFormat::Json => {
@@ -134,8 +139,8 @@ fn print_achievements(
                 .collect();
             let payload = serde_json::json!({
                 "install_id": profile.install_id,
-                "lifetime_reclaimed_bytes": profile.lifetime_reclaimed_bytes,
-                "lifetime_scans": profile.lifetime_scans,
+                "lifetime_reclaimed_bytes": profile.lifetime_reclaimed_bytes(),
+                "lifetime_scans": profile.lifetime_scans(),
                 "achievements": rows,
             });
             println!(
@@ -147,7 +152,7 @@ fn print_achievements(
             println!("install_id: {}", profile.install_id);
             println!(
                 "lifetime: {} bytes reclaimed across {} scans",
-                profile.lifetime_reclaimed_bytes, profile.lifetime_scans
+                profile.lifetime_reclaimed_bytes(), profile.lifetime_scans()
             );
             let granted_count = grants.values().filter(|g| g.granted).count();
             println!(

@@ -170,10 +170,17 @@ fn render_grid(
         _ => HashMap::new(),
     };
 
-    // Sort by display_order. Catalog endpoint already returns sorted
-    // but the .sort_by_key() here makes the contract local.
+    // Sort granted-first (so newly-unlocked tiles pop to the top
+    // of the grid where they're easy to spot for visual smoke
+    // tests), then by display_order within each bucket. The
+    // catalog endpoint returns display_order-sorted; we re-order
+    // here so the badge wall layout reflects grant state, not
+    // backend ordering.
     let mut entries: Vec<&CatalogEntry> = catalog.achievements.iter().collect();
-    entries.sort_by_key(|e| e.display_order);
+    entries.sort_by_key(|e| {
+        let granted = grants.get(e.id.as_str()).copied().unwrap_or(false);
+        (!granted, e.display_order)
+    });
 
     // 3-column grid. With ~35 entries this gives 12 rows. Could go to
     // 4-col on wider windows; sticking with 3 for the bottom-left
@@ -297,7 +304,7 @@ fn lifetime_reclaimed_human(state: &CatalogState) -> String {
         .profile
         .as_ref()
         .and_then(|r| r.as_ref().ok())
-        .map(|p| p.lifetime_reclaimed_bytes)
+        .map(|p| p.lifetime_reclaimed_bytes())
         .unwrap_or(0);
     theme::humansize(bytes)
 }
@@ -349,8 +356,7 @@ mod tests {
             })),
             profile: Some(Ok(Profile {
                 install_id: "x".into(),
-                lifetime_reclaimed_bytes: 0,
-                lifetime_scans: 0,
+                lifetime: Default::default(),
                 achievements: vec![
                     ProfileGrant {
                         achievement_id: "a".into(),
