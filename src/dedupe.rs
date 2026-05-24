@@ -771,4 +771,78 @@ mod tests {
         let _ = inode_b;
         fs::remove_dir_all(&d).ok();
     }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recycle_action_uses_xdg_trash_on_linux() {
+        // L0 deliverable: action_recycle on Linux MUST route through
+        // platform::trash_file (XDG Trash spec) rather than fall back
+        // to plain remove. Builds an isolated fake HOME so the
+        // trashed file lands in a known location we can inspect +
+        // doesn't pollute the dev's real ~/.local/share/Trash.
+        let d = tmpdir();
+        let fake_home = d.join("fake_home");
+        fs::create_dir_all(&fake_home).unwrap();
+        let target = d.join("doomed-recycle.bin");
+        write_file(&target, b"recycle-me");
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("HOME", &fake_home);
+        std::env::remove_var("XDG_DATA_HOME");
+
+        action_recycle(&target).expect("action_recycle on Linux");
+
+        // Original gone.
+        assert!(!target.exists(), "recycled file should not remain at source");
+        // Trash files dir has it.
+        let trashed = fake_home.join(".local/share/Trash/files/doomed-recycle.bin");
+        assert!(
+            trashed.exists(),
+            "file should land in XDG Trash files/ subdir"
+        );
+        // Matching info file.
+        let info = fake_home
+            .join(".local/share/Trash/info/doomed-recycle.bin.trashinfo");
+        assert!(info.exists(), "trashinfo should be written");
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reflink_action_returns_unsupported_on_tmpfs() {
+        // tmpfs (most likely backend for std::env::temp_dir) doesn't
+        // support FICLONE. The platform layer maps EOPNOTSUPP to
+        // PlatformError::Unsupported; dedupe.rs maps that further to
+        // Error::Unsupported. The contract: callers see Unsupported,
+        // NOT a raw IO error, so they can fall back to copy + replace
+        // cleanly (or surface the right user-facing message).
+        let d = tmpdir();
+        let a = d.join("a.bin");
+        let b = d.join("b.bin");
+        write_file(&a, b"reflink-me");
+        write_file(&b, b"reflink-me");
+
+        match action_reflink(&b, &a) {
+            // CoW-capable temp filesystem (Btrfs / XFS-reflink=1)
+            // is allowed — the test should pass on those hosts too.
+            Ok(()) => {
+                assert!(b.exists());
+            }
+            Err(Error::Unsupported(_)) => { /* expected on tmpfs */ }
+            Err(other) => panic!(
+                "expected Ok or Error::Unsupported, got {other:?}"
+            ),
+        }
+        fs::remove_dir_all(&d).ok();
+    }
 }
