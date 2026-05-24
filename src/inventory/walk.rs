@@ -321,19 +321,53 @@ where
         } else {
             None
         };
+        // L0: on Linux/Unix, populate file_ref + volume_guid from
+        // st_ino + st_dev so the engine's T0.5 partition_by_inode
+        // sees real hardlink relationships. Without this, every
+        // path got a synthetic per-file key, hardlinks were never
+        // collapsed, and reclaimable_inode_bytes inflated on
+        // hardlink-heavy corpora (e.g. /usr/lib's uutils multi-
+        // call binary that ships 114 hardlinks to one inode).
+        // Cheap: `metadata` was already fetched for the size +
+        // filetime/win-attributes lines above; no extra syscall.
+        let (file_ref, volume_guid) = inode_identity(&metadata);
         out.push(FileEntry {
             path,
             size,
             mtime: filetime_ticks(&metadata),
-            file_ref: 0,
+            file_ref,
             parent_ref: 0,
             usn: 0,
             attributes,
-            volume_guid: None,
+            volume_guid,
             placeholder: crate::inventory::placeholder::classify(attributes, reparse_tag),
         });
     }
     Ok(())
+}
+
+/// Extract (file_ref, volume_guid) from a Metadata.
+///
+/// On Unix: `(st_ino, Some("linux-dev-{st_dev}"))`. T0.5's
+/// `partition_by_inode` uses `(volume_guid, file_ref)` as the inode
+/// key — populating both fields makes hardlink groups collapse
+/// correctly on Linux.
+///
+/// On Windows: returns `(0, None)`. Windows has its own
+/// `resolve_file_ids` pass that uses `GetFileInformationByHandle` to
+/// populate the canonical NTFS file_ref; we leave the walker's
+/// default here to preserve that flow.
+#[cfg(unix)]
+fn inode_identity(metadata: &std::fs::Metadata) -> (u64, Option<String>) {
+    use std::os::unix::fs::MetadataExt;
+    let file_ref = metadata.ino();
+    let volume_guid = Some(format!("linux-dev-{}", metadata.dev()));
+    (file_ref, volume_guid)
+}
+
+#[cfg(not(unix))]
+fn inode_identity(_metadata: &std::fs::Metadata) -> (u64, Option<String>) {
+    (0, None)
 }
 
 /// Block N — Windows fast path. Iterate `enumeration.entries`, push
