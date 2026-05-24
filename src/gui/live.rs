@@ -1618,6 +1618,7 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         // can add the toggle if user feedback shows it's wanted.
         allow_recall_on_read: false,
         hash_algo: settings.hash_algo,
+        exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
     })
 }
 

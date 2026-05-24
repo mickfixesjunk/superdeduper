@@ -1190,6 +1190,7 @@ mod tests {
             allow_recall_on_read: false,
             io_threads: 4,
             hash_algo: HashAlgo::Blake3,
+            exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
         }
     }
 

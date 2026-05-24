@@ -47,6 +47,14 @@ pub struct ScanConfig {
     /// fingerprints. BLAKE3 is the default; DDH-128 is the
     /// in-development alternative (currently an xxhash3-128 stub).
     pub hash_algo: crate::pipeline::hash::HashAlgo,
+    /// Settings → Exclusions runtime filter (preset packs + custom
+    /// extensions + custom path patterns). Defaults to disabled
+    /// (master toggle OFF); the walker short-circuits to Included
+    /// on every file when this is in the disabled state. Compile
+    /// from [`crate::exclusions::ExclusionConfig`] at scan start
+    /// once the GUI / CLI exposes a way to populate the config
+    /// (Days 3-5 of the scan-options branch).
+    pub exclusion_policy: crate::exclusions::ExclusionPolicy,
 }
 
 impl ScanConfig {
@@ -93,6 +101,11 @@ impl ScanConfig {
             allow_system_paths: args.allow_system_paths,
             allow_recall_on_read: args.allow_recall_on_read,
             hash_algo: args.hash_algo.into(),
+            // Until the CLI's `--exclusions on` / Settings UI wires
+            // up an actual `ExclusionConfig`, the walker runs with
+            // a disabled policy (master toggle off). Behaviour
+            // matches today's "show every duplicate" default.
+            exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
         })
     }
 }

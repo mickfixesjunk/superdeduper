@@ -573,6 +573,15 @@ fn path_passes_globs(path: &Path, cfg: &ScanConfig) -> bool {
             return false;
         }
     }
+    // Settings → Exclusions filter (preset packs + custom). Master
+    // toggle defaults OFF; this short-circuits to Included when
+    // disabled so the per-scan cost is one bool check.
+    if matches!(
+        cfg.exclusion_policy.evaluate(path),
+        crate::exclusions::Decision::Excluded(_)
+    ) {
+        return false;
+    }
     true
 }
 
