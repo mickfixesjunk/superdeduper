@@ -82,6 +82,14 @@ pub struct ScanArgs {
     #[arg(long, value_name = "BYTES", default_value = "4K")]
     pub min_size: String,
 
+    /// Tier 1 head-read size. Accepts suffixes K/M/G. Default 4K.
+    /// Experimental knob — lets bench coord measure whether the
+    /// cz-vs-sd small-file perf gap shrinks when sd's Tier 1 read
+    /// size matches cz's ~2K partial-hash. Files smaller than this
+    /// value short-read to their actual size.
+    #[arg(long, value_name = "BYTES", default_value = "4K")]
+    pub tier1_bytes: String,
+
     /// Skip files larger than this.
     #[arg(long, value_name = "BYTES")]
     pub max_size: Option<String>,

@@ -32,6 +32,7 @@ fn cfg_for(roots: Vec<PathBuf>) -> ScanConfig {
         reference_roots: vec![],
         min_size: 1,
         max_size: None,
+        tier1_bytes: pipeline::hash::TIER1_BYTES,
         include: None,
         exclude: None,
         format: superdeduper::cli::OutputFormat::Text,

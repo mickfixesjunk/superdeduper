@@ -15,6 +15,11 @@ pub struct ScanConfig {
     pub reference_roots: Vec<PathBuf>,
     pub min_size: u64,
     pub max_size: Option<u64>,
+    /// Runtime override for the Tier 1 head-read size.
+    /// Default 4 KiB; CLI `--tier1-bytes` flag lets bench coord
+    /// experiment with smaller (matches cz's partial-hash) or
+    /// larger (saturate IO queue) values.
+    pub tier1_bytes: u64,
     pub include: Option<GlobSet>,
     pub exclude: Option<GlobSet>,
     pub format: OutputFormat,
@@ -52,6 +57,10 @@ impl ScanConfig {
 
         let min_size = cli::parse_size(&args.min_size)?;
         let max_size = args.max_size.as_deref().map(cli::parse_size).transpose()?;
+        let tier1_bytes = cli::parse_size(&args.tier1_bytes)?;
+        if tier1_bytes == 0 {
+            return Err(Error::other("--tier1-bytes must be > 0"));
+        }
         if let (Some(max), min) = (max_size, min_size) {
             if max < min {
                 return Err(Error::other(format!(
@@ -65,6 +74,7 @@ impl ScanConfig {
             reference_roots: args.reference.clone(),
             min_size,
             max_size,
+            tier1_bytes,
             include: build_globset(&args.include)?,
             exclude: build_globset(&args.exclude)?,
             format: args.format,

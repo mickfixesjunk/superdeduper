@@ -1396,6 +1396,9 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
             .collect(),
         min_size: settings.min_size_bytes,
         max_size: settings.max_size_bytes,
+        // GUI scans use the engine default Tier 1 read size; the
+        // experimental --tier1-bytes flag is CLI-only for now.
+        tier1_bytes: crate::pipeline::hash::TIER1_BYTES,
         include,
         exclude,
         format: OutputFormat::Json,

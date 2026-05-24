@@ -67,7 +67,7 @@ fn drive_engine_until_done(
 ) -> (Vec<EngineEvent>, Arc<AtomicBool>) {
     let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(8192);
     let cancel = Arc::new(AtomicBool::new(false));
-    let handle = live::spawn_with_settings(tx.clone(), roots, settings, cancel.clone());
+    let handle = live::spawn_with_settings(tx.clone(), roots, settings, cancel.clone(), None);
 
     let mut events = Vec::new();
     let started = Instant::now();
