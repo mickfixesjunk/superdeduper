@@ -1619,6 +1619,7 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         allow_recall_on_read: false,
         hash_algo: settings.hash_algo,
         exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
+        exclusion_counters: crate::exclusions::ExclusionCounters::new(),
     })
 }
 

@@ -55,6 +55,12 @@ pub struct ScanConfig {
     /// once the GUI / CLI exposes a way to populate the config
     /// (Days 3-5 of the scan-options branch).
     pub exclusion_policy: crate::exclusions::ExclusionPolicy,
+    /// Live counters bumped by the walker each time an exclusion
+    /// fires. Shared via [`std::sync::Arc`] so worker threads
+    /// increment atomically; the scan summary reads via the same
+    /// pointer at scan end. Reset implicitly per scan (a fresh
+    /// `ScanConfig::from_args` makes a fresh counter).
+    pub exclusion_counters: std::sync::Arc<crate::exclusions::ExclusionCounters>,
 }
 
 impl ScanConfig {
@@ -106,6 +112,7 @@ impl ScanConfig {
             // a disabled policy (master toggle off). Behaviour
             // matches today's "show every duplicate" default.
             exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
+            exclusion_counters: crate::exclusions::ExclusionCounters::new(),
         })
     }
 }

@@ -285,6 +285,13 @@ where
             }
         }
 
+        if dropped_by_exclusions(&path, size, cfg) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "Settings → Exclusions",
+            });
+            continue;
+        }
         if !path_passes_globs(&path, cfg) {
             callback(WalkEvent::EntrySkipped {
                 path: &path,
@@ -472,6 +479,13 @@ where
                     continue;
                 }
             }
+            if dropped_by_exclusions(&path, target_size, cfg) {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "Settings → Exclusions",
+                });
+                continue;
+            }
             if !path_passes_globs(&path, cfg) {
                 callback(WalkEvent::EntrySkipped {
                     path: &path,
@@ -535,6 +549,13 @@ where
                 continue;
             }
         }
+        if dropped_by_exclusions(&path, size, cfg) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "Settings → Exclusions",
+            });
+            continue;
+        }
         if !path_passes_globs(&path, cfg) {
             callback(WalkEvent::EntrySkipped {
                 path: &path,
@@ -573,16 +594,25 @@ fn path_passes_globs(path: &Path, cfg: &ScanConfig) -> bool {
             return false;
         }
     }
-    // Settings → Exclusions filter (preset packs + custom). Master
-    // toggle defaults OFF; this short-circuits to Included when
-    // disabled so the per-scan cost is one bool check.
+    true
+}
+
+/// Returns `true` if the file should be dropped per Settings →
+/// Exclusions; bumps the per-scan counter as a side-effect when
+/// it does. Master-toggle-off short-circuits without touching the
+/// counter.
+fn dropped_by_exclusions(path: &Path, size: u64, cfg: &ScanConfig) -> bool {
+    if !cfg.exclusion_policy.is_enabled() {
+        return false;
+    }
     if matches!(
         cfg.exclusion_policy.evaluate(path),
         crate::exclusions::Decision::Excluded(_)
     ) {
-        return false;
+        cfg.exclusion_counters.record(size);
+        return true;
     }
-    true
+    false
 }
 
 #[cfg(windows)]

@@ -1191,6 +1191,7 @@ mod tests {
             io_threads: 4,
             hash_algo: HashAlgo::Blake3,
             exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
+            exclusion_counters: crate::exclusions::ExclusionCounters::new(),
         }
     }
 
