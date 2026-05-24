@@ -169,10 +169,70 @@ fn detect_cpu_model() -> String {
 // ============================================================
 
 fn detect_isa_flags() -> Vec<String> {
-    // TODO(g1-followup): use the `raw-cpuid` crate (small, no_std)
-    // or inline CPUID via core::arch on x86_64 to emit:
-    //   sse4_2, aes, avx, avx2, avx512f, bmi1, bmi2, sha, vaes, ...
+    detect_isa_flags_impl()
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+fn detect_isa_flags_impl() -> Vec<String> {
+    // Inline CPUID — no external crate. Probe leaves 1 + 7 sub-leaf 0
+    // per Intel/AMD vol 2 §3.2 + §3.3. Bit positions are stable.
+    let mut flags: Vec<String> = Vec::new();
+    let max_basic = unsafe { cpuid(0, 0) }.eax;
+
+    if max_basic >= 1 {
+        let r = unsafe { cpuid(1, 0) };
+        // ECX
+        if (r.ecx & (1 << 19)) != 0 { flags.push("sse4_1".into()); }
+        if (r.ecx & (1 << 20)) != 0 { flags.push("sse4_2".into()); }
+        if (r.ecx & (1 << 25)) != 0 { flags.push("aes".into()); }
+        if (r.ecx & (1 << 28)) != 0 { flags.push("avx".into()); }
+        if (r.ecx & (1 << 30)) != 0 { flags.push("rdrand".into()); }
+        // EDX
+        if (r.edx & (1 << 26)) != 0 { flags.push("sse2".into()); }
+    }
+    if max_basic >= 7 {
+        let r = unsafe { cpuid(7, 0) };
+        if (r.ebx & (1 << 3))  != 0 { flags.push("bmi1".into()); }
+        if (r.ebx & (1 << 5))  != 0 { flags.push("avx2".into()); }
+        if (r.ebx & (1 << 8))  != 0 { flags.push("bmi2".into()); }
+        if (r.ebx & (1 << 16)) != 0 { flags.push("avx512f".into()); }
+        if (r.ebx & (1 << 17)) != 0 { flags.push("avx512dq".into()); }
+        if (r.ebx & (1 << 29)) != 0 { flags.push("sha".into()); }
+        if (r.ecx & (1 << 9))  != 0 { flags.push("vaes".into()); }
+    }
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+fn detect_isa_flags_impl() -> Vec<String> {
+    // ARM / RISC-V: empty for now. Future enhancement: inspect
+    // HWCAP (Linux) / sysctl `hw.optional.*` (macOS) for NEON / SVE.
     Vec::new()
+}
+
+#[derive(Clone, Copy)]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+struct CpuidResult {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn cpuid(leaf: u32, sub_leaf: u32) -> CpuidResult {
+    let r = std::arch::x86_64::__cpuid_count(leaf, sub_leaf);
+    CpuidResult { eax: r.eax, ebx: r.ebx, ecx: r.ecx, edx: r.edx }
+}
+
+#[cfg(target_arch = "x86")]
+#[inline]
+unsafe fn cpuid(leaf: u32, sub_leaf: u32) -> CpuidResult {
+    let r = std::arch::x86::__cpuid_count(leaf, sub_leaf);
+    CpuidResult { eax: r.eax, ebx: r.ebx, ecx: r.ecx, edx: r.edx }
 }
 
 // ============================================================
@@ -257,6 +317,30 @@ fn detect_os_edition() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    fn isa_flags_contain_sse2_on_x86() {
+        // Every x86_64 CPU has SSE2 (it's part of the baseline ISA).
+        let h = detect();
+        assert!(
+            h.cpu_isa_flags.iter().any(|f| f == "sse2"),
+            "x86_64 CPU should always report sse2; got {:?}",
+            h.cpu_isa_flags
+        );
+    }
+
+    #[test]
+    fn isa_flags_are_sorted_and_deduped() {
+        let h = detect();
+        let mut sorted = h.cpu_isa_flags.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            h.cpu_isa_flags, sorted,
+            "isa_flags must be pre-sorted + deduped on the wire"
+        );
+    }
 
     #[test]
     fn detect_populates_required_fields() {
