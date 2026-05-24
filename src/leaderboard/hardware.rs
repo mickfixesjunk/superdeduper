@@ -166,7 +166,11 @@ fn detect_isa_flags_impl() -> Vec<String> {
         let r = unsafe { cpuid(1, 0) };
         if (r.ecx & (1 << 19)) != 0 { flags.push("sse4-1".into()); }
         if (r.ecx & (1 << 20)) != 0 { flags.push("sse4-2".into()); }
-        if (r.ecx & (1 << 25)) != 0 { flags.push("aes".into()); }
+        // Backend catalog uses Intel marketing name "aes-ni" (not
+        // the bare CPUID-convention "aes"); without this rename the
+        // server-side hardware-self-consistency check rejects with
+        // "claimed CPU ships with ISA flags not present in payload".
+        if (r.ecx & (1 << 25)) != 0 { flags.push("aes-ni".into()); }
         if (r.ecx & (1 << 28)) != 0 { flags.push("avx".into()); }
         if (r.ecx & (1 << 30)) != 0 { flags.push("rdrand".into()); }
         if (r.edx & (1 << 26)) != 0 { flags.push("sse2".into()); }
