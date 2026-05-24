@@ -1,6 +1,19 @@
 # Leaderboard — design spec
 
-> **Status:** spec for the **superdeduper-backend** and
+> **⚠ SUPERSEDED.** This document is the pre-G-track sketch and is kept
+> for historical reference only. The current canonical specs live in
+> design's workdir:
+>
+> - `~/sd-bench-local/design/gamification-design.md` — vision + UX
+> - `~/sd-bench-local/design/gamification-client-spec.md` — engine contract
+> - `~/sd-bench-local/design/gamification-backend-spec.md` — backend contract
+> - `~/sd-bench-local/design/gamification-threat-model.md` — defences
+>
+> Do not implement against this document.
+
+---
+
+> **Status (original, when first drafted):** spec for the **superdeduper-backend** and
 > **superdeduper-website** agents to implement against.
 > Engine-side stub at `src/telemetry.rs` (when implemented) will
 > have the submission signature ready.
