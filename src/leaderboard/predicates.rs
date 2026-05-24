@@ -50,18 +50,24 @@ pub struct PredicateContext<'a> {
     pub perceptual_mode_active: bool,
 }
 
-/// Install-level state needed by counter-driven predicates. The
-/// fields exist as `u64` counters in the on-disk install state;
-/// loaded once per scan and passed through `PredicateContext`.
-/// Concrete persistence + bumping logic lands in a follow-up
-/// commit alongside the predicate stubs they unblock.
-#[derive(Debug, Clone, Copy, Default)]
+/// Install-level state needed by counter-driven predicates.
+/// Persisted as part of [`crate::leaderboard::install::InstallState`]
+/// (under the `counters` field) so the counts survive across runs.
+/// Loaded once per scan and passed through `PredicateContext`.
+///
+/// Both fields default to 0 + are tagged `#[serde(default)]` so an
+/// older `install.json` lacking the `counters` block loads cleanly.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct InstallCounters {
     /// Lifetime count of times the user has saved a new
     /// exclude-pattern edit via Settings → Exclusions or CLI.
+    /// Drives the `picky-eater` predicate (grants at ≥10).
+    #[serde(default)]
     pub exclude_pattern_edits: u64,
     /// Lifetime count of times the user has invoked
-    /// `superdeduper achievements verify` from the CLI.
+    /// `superdeduper achievements verify` from the CLI. Drives the
+    /// `verify-veteran` predicate (grants at ≥10).
+    #[serde(default)]
     pub achievements_verify_invocations: u64,
 }
 

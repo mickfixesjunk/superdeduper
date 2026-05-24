@@ -16,6 +16,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::leaderboard::predicates::InstallCounters;
+
 /// Bump when adding required fields. Old files with a lower
 /// schema_version get rejected on load → user re-registers.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -46,6 +48,16 @@ pub struct InstallState {
     /// `Never` → no submit attempt, no modal.
     #[serde(default)]
     pub share_default: ShareDefault,
+
+    /// Lifetime counters that drive client-claimed achievement
+    /// predicates (`picky-eater`, `verify-veteran`). `#[serde(default)]`
+    /// so install.json files written before this field existed
+    /// load cleanly with both counters at 0. Bumped via the
+    /// [`bump_exclude_pattern_edits`] / [`bump_achievements_verify_invocations`]
+    /// helpers — never mutated by callers directly so the
+    /// load/mutate/save is always atomic.
+    #[serde(default)]
+    pub counters: InstallCounters,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,7 +227,40 @@ pub fn new_unregistered(server_url: String) -> InstallState {
         server_url,
         client_version_at_register: env!("CARGO_PKG_VERSION").to_string(),
         share_default: ShareDefault::default(),
+        counters: InstallCounters::default(),
     }
+}
+
+/// Increment the `exclude_pattern_edits` counter by 1 + persist.
+/// No-op when install.json doesn't exist (user hasn't registered),
+/// so callers in the Settings → Exclusions edit path can fire-and-
+/// forget without guarding on registration state. Errors only
+/// surface for genuine I/O failures (disk full, permission denied,
+/// schema-version mismatch).
+pub fn bump_exclude_pattern_edits() -> io::Result<()> {
+    bump_counter(|c| {
+        c.exclude_pattern_edits = c.exclude_pattern_edits.saturating_add(1)
+    })
+}
+
+/// Increment the `achievements_verify_invocations` counter by 1 +
+/// persist. Fired from the `superdeduper achievements verify` CLI
+/// path on every invocation. Same no-op-on-missing semantics as
+/// [`bump_exclude_pattern_edits`].
+pub fn bump_achievements_verify_invocations() -> io::Result<()> {
+    bump_counter(|c| {
+        c.achievements_verify_invocations =
+            c.achievements_verify_invocations.saturating_add(1)
+    })
+}
+
+fn bump_counter(mutate: impl FnOnce(&mut InstallCounters)) -> io::Result<()> {
+    let mut state = match load()? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    mutate(&mut state.counters);
+    save(&state)
 }
 
 /// Fill `buf` with cryptographically suitable random bytes.
@@ -310,5 +355,41 @@ mod tests {
         let b = new_unregistered("https://b".into());
         assert_ne!(a.install_id, b.install_id);
         assert_ne!(a.install_key_hex, b.install_key_hex);
+    }
+
+    #[test]
+    fn install_state_round_trips_with_counters() {
+        // Counters get persisted + restored. Round-trip via JSON is
+        // the actual on-disk path; this catches a future serde drift
+        // (e.g. rename, container shape change) before it eats user
+        // counters silently.
+        let mut s = new_unregistered("https://example".into());
+        s.counters.exclude_pattern_edits = 7;
+        s.counters.achievements_verify_invocations = 3;
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let restored: InstallState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.counters.exclude_pattern_edits, 7);
+        assert_eq!(restored.counters.achievements_verify_invocations, 3);
+    }
+
+    #[test]
+    fn legacy_install_json_without_counters_loads_with_defaults() {
+        // Pre-counters install.json (written by v0.1.8 and earlier)
+        // must still load. The `counters` field is absent; serde's
+        // `#[serde(default)]` on the field + on InstallCounters
+        // itself gives us (0, 0) without erroring.
+        let legacy_json = r#"{
+            "schema_version": 1,
+            "install_id": "e1eae1fa-58fb-4f5a-8712-a7480ac5761b",
+            "install_key_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "registered": true,
+            "server_url": "https://api.superdeduper.io",
+            "client_version_at_register": "0.1.8"
+        }"#;
+        let state: InstallState = serde_json::from_str(legacy_json)
+            .expect("legacy install.json must deserialise");
+        assert_eq!(state.counters.exclude_pattern_edits, 0);
+        assert_eq!(state.counters.achievements_verify_invocations, 0);
+        assert_eq!(state.share_default, ShareDefault::AlwaysAsk);
     }
 }

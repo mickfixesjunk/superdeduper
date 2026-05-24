@@ -88,6 +88,50 @@ fn run_achievements(
             print_achievements(&catalog_data, &profile, format, all);
             Ok(())
         }
+        AchievementsCommand::Verify { format, quiet } => {
+            // Verify reads from the local cache + fetches if absent
+            // (mirrors List). Always prints the audit on success
+            // (regardless of `all`-style filter — verify is the
+            // "show me everything" flavour). Then bumps the local
+            // invocation counter; reaching 10 unlocks the
+            // `verify-veteran` predicate on the next scan.
+            let cat_state = catalog::peek_state();
+            let catalog_data = match cat_state.catalog {
+                Some(Ok(c)) => c,
+                _ => catalog::fetch_catalog(&state.server_url)
+                    .map_err(|e| anyhow::anyhow!("catalog fetch failed: {e:?}"))?,
+            };
+            let profile = match cat_state.profile {
+                Some(Ok(p)) => p,
+                _ => catalog::fetch_profile_fresh(&state.server_url, &state.install_id)
+                    .map_err(|e| anyhow::anyhow!("profile fetch failed: {e:?}"))?,
+            };
+            if !quiet {
+                print_achievements(&catalog_data, &profile, format, /* all = */ true);
+            }
+            // Always bump — even in --quiet mode the counter ticks
+            // (per the predicate spec: "Engine increments a local
+            // counter on each `achievements verify` invocation.").
+            install::bump_achievements_verify_invocations()
+                .map_err(|e| anyhow::anyhow!("counter bump failed: {e}"))?;
+            // Re-load to read the post-bump value for the user-
+            // visible "you're at N/10" hint.
+            if !quiet {
+                if let Some(post) = install::load()? {
+                    let n = post.counters.achievements_verify_invocations;
+                    if n < 10 {
+                        println!(
+                            "\n(verify invocation #{n}; verify-veteran unlocks at 10.)"
+                        );
+                    } else {
+                        println!(
+                            "\n(verify invocation #{n}; verify-veteran qualifies — will grant on next scan submit.)"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
 

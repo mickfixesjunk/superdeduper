@@ -358,6 +358,20 @@ pub enum AchievementsCommand {
         #[arg(long)]
         quiet: bool,
     },
+
+    /// Print an audit of the install's granted achievements
+    /// (timestamps + per-row provenance) and bump the local
+    /// invocation counter. Each call adds one toward the
+    /// `verify-veteran` predicate (grants at 10 invocations).
+    Verify {
+        /// Output format. `text` (default, human) or `json` (machine).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        /// Suppress stdout output (still bumps the counter; returns
+        /// exit code 0 / 1 only).
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 /// G-track CLI subcommands for `superdeduper config`.
