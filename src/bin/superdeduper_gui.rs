@@ -32,6 +32,17 @@ struct Args {
 fn main() -> eframe::Result<()> {
     let args = Args::parse();
 
+    // Channel resolution: ENV var > [network] channel in persisted
+    // config > default `prod`. The GUI binary doesn't expose a
+    // --channel flag (the Settings → Network panel handles switching
+    // mid-session); a fresh GUI launch otherwise inherits the same
+    // precedence chain as the CLI per dev-channel-spec.md §3.3.
+    let active = superdeduper::channel::resolve_active_channel(None).unwrap_or_else(|e| {
+        eprintln!("channel resolution failed: {e}; defaulting to prod");
+        superdeduper::channel::Channel::Prod
+    });
+    superdeduper::channel::set_active_channel(active);
+
     // Window title carries version + git SHA so multi-window users
     // can disambiguate which build is which without us shipping
     // uniquely-named EXEs. SD_BUILD_SHA is set at compile-time by
