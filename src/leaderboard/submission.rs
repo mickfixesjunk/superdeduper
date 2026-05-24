@@ -334,16 +334,37 @@ pub fn flag_for_review(
         payload: body.clone(),
     };
     let path = write_review_entry(&entry)?;
-    // Best-effort upload; ignore the response. Endpoint may 404
-    // until backend ships it — that's fine, local copy persists.
-    let _ = try_upload_review(state, &entry);
+    // Best-effort upload. Endpoint went live (web commit c8cceb9),
+    // so a real signed POST should land. Surface the outcome to
+    // stderr so the user (or Mick supporting beta testers) can see
+    // what happened.
+    match try_upload_review(state, &entry) {
+        Ok(review_id) => {
+            eprintln!(
+                "review: uploaded ({}). Backend review_id={review_id}. Local copy at {}",
+                state.server_url,
+                path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "review: upload failed ({e}). Local copy at {}",
+                path.display()
+            );
+        }
+    }
     Ok(path)
 }
 
+/// POST the review entry to the backend review endpoint. On 200,
+/// returns the server-assigned review_id (string) — useful in
+/// stderr so the user or admin can correlate when reading the
+/// review queue. On any non-2xx, returns the body or transport
+/// error as the Err string; caller decides surface treatment.
 fn try_upload_review(
     state: &super::install::InstallState,
     entry: &ReviewSubmission,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let install_key = state.install_key().ok_or("install_key malformed")?;
     let body_value = serde_json::to_value(entry).map_err(|e| format!("{e}"))?;
     let canonical = hmac_signer::canonical_body(&body_value);
@@ -358,8 +379,25 @@ fn try_upload_review(
         .timeout(std::time::Duration::from_secs(15))
         .send_bytes(&canonical);
     match resp {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("{e:?}")),
+        Ok(r) => {
+            // Parse {accepted: true, review_id: "<uuid>"} per web's
+            // contract; fall back to "<unknown>" if the body shape
+            // changes later.
+            let v: serde_json::Value = r
+                .into_json()
+                .unwrap_or(serde_json::Value::Null);
+            let review_id = v
+                .get("review_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>")
+                .to_string();
+            Ok(review_id)
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            Err(format!("HTTP {code}: {body}"))
+        }
+        Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
     }
 }
 
