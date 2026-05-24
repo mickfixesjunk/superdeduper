@@ -44,6 +44,11 @@ bytes = "1.6"
 # TOML serde for sd's persisted config (project bundle, exclusions
 # settings, etc.). `toml` is the de facto Rust TOML crate.
 toml = "0.8"
+# SHA-256 used by `sd debug snapshot` (content/ACL hashes per the
+# containment-test schema) and by the telemetry HMAC signer. Small
+# audited RustCrypto crate; non-optional so the debug helper
+# compiles in `--no-default-features` builds.
+sha2 = "0.10"
 
 # GUI deps — optional, gated behind the `gui` feature.
 eframe = { version = "0.32", optional = true, default-features = false, features = [
@@ -73,7 +78,6 @@ rodio = { version = "0.19", optional = true, default-features = false }
 #   install_id wants a real RFC 4122 v4 UUID per client-spec §4.3.
 ureq = { version = "2.10", optional = true, default-features = false, features = ["json", "tls"] }
 hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
 uuid = { version = "1.10", optional = true, features = ["v4"] }
 # Unicode script detection — used by the `polyglot-paths` predicate
 # (gamification §5) to count distinct scripts in a path. Tiny crate,
@@ -94,7 +98,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:sha2", "dep:uuid", "dep:unicode-script"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script"]
 
 [[bin]]
 name = "superdeduper-gui"

@@ -254,16 +254,18 @@ fn inode_nlink_from_metadata(meta: &std::fs::Metadata) -> (u64, u64) {
 }
 
 #[cfg(windows)]
-fn inode_nlink_from_metadata(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::windows::fs::MetadataExt;
-    // `file_index` is the closest std analogue to the NTFS file_ref;
-    // stable enough for harness use even though it's the "raw"
-    // 64-bit identifier vs the high+low pair NTFS internals expose.
-    // nlink isn't on std's Windows MetadataExt — harness can call
-    // `superdeduper debug snapshot` for the full nlink count, OR
-    // we can extend this later via a CreateFile + GetFileInformationByHandle
-    // call. For now: emit 1 as the harmless default.
-    (meta.file_index().unwrap_or(0), 1)
+fn inode_nlink_from_metadata(_meta: &std::fs::Metadata) -> (u64, u64) {
+    // `std::os::windows::fs::MetadataExt::file_index()` is gated
+    // behind the unstable `windows_by_handle` feature on stable
+    // Rust through 1.87 — cross-builds break with E0658. The
+    // honest fallback for action-receipt purposes is `(0, 1)`:
+    // harness callers that need real inode IDs should invoke
+    // `superdeduper debug snapshot`, which uses CreateFileW +
+    // GetFileInformationByHandle via the windows crate (see
+    // `src/debug/snapshot.rs::win_file_info`). Receipts get inode
+    // for free on Unix; on Windows they degrade to a structural
+    // placeholder until we plumb the same windows-crate call here.
+    (0, 1)
 }
 
 #[cfg(not(any(unix, windows)))]

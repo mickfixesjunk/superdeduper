@@ -50,6 +50,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Cache(cmd) => run_cache(cmd),
         Command::DriveInfo => run_drive_info(),
         Command::Diagnose(args) => superdeduper::diagnose::run(args),
+        Command::Debug(cmd) => run_debug(cmd),
         #[cfg(feature = "telemetry")]
         Command::Register(args) => run_register(args),
         #[cfg(feature = "telemetry")]
@@ -258,6 +259,36 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
                         println!("account_id:   {}", account_id);
                     }
                 },
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `superdeduper debug snapshot` — emit the canonical containment-
+/// test snapshot for `<path>` as JSON. Used by sdd-testwin +
+/// testrunner to capture pre/post state around an action under test.
+fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
+    use superdeduper::cli::{DebugCommand, SnapshotFormat};
+    use superdeduper::debug::snapshot;
+    match cmd {
+        DebugCommand::Snapshot { path, format, out } => {
+            let SnapshotFormat::Json = format;
+            let snap = snapshot::capture(&path)
+                .with_context(|| format!("snapshot {:?} failed", path))?;
+            match out {
+                Some(file) => {
+                    let f = std::fs::File::create(&file)
+                        .with_context(|| format!("create {:?}", file))?;
+                    let mut w = BufWriter::new(f);
+                    snapshot::write_json(&snap, &mut w)?;
+                    w.flush()?;
+                }
+                None => {
+                    let stdout = io::stdout();
+                    let mut handle = stdout.lock();
+                    snapshot::write_json(&snap, &mut handle)?;
+                }
             }
             Ok(())
         }

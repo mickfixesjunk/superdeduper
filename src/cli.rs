@@ -96,6 +96,11 @@ pub enum Command {
     /// requiring filesystem spelunking.
     #[command(subcommand)]
     ScanHistory(ScanHistoryCommand),
+
+    /// Debug helpers — read-only state-dump commands the
+    /// containment-integration test harness shells out to.
+    #[command(subcommand)]
+    Debug(DebugCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,6 +151,34 @@ pub enum AccountCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+}
+
+/// `sd debug …` subcommands. Currently just the snapshot helper;
+/// more debug surface may land here as the containment-integration
+/// spec expands.
+#[derive(Debug, Subcommand)]
+pub enum DebugCommand {
+    /// Walk `<path>` recursively + emit the canonical containment-
+    /// test snapshot (paths + sizes + inodes + content hashes +
+    /// nlinks + ACL hashes + mtimes + reparse-tag metadata). JSON
+    /// output matches the schema in
+    /// `testdesign/specs/containment-fixtures/_snapshot-schema-examples.md`.
+    Snapshot {
+        /// Root path to snapshot. Absolute or relative.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// Output format. Only `json` supported at v1.
+        #[arg(long, value_enum, default_value_t = SnapshotFormat::Json)]
+        format: SnapshotFormat,
+        /// Write to file instead of stdout. Truncates on each call.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+pub enum SnapshotFormat {
+    Json,
 }
 
 #[derive(Debug, Args)]

@@ -20,6 +20,7 @@ pub mod cache;
 pub mod channel;
 pub mod cli;
 pub mod config;
+pub mod debug;
 pub mod dedupe;
 pub mod diagnose;
 pub mod error;
