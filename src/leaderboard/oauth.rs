@@ -996,25 +996,49 @@ fn exchange_code(
     redirect_uri: &str,
     code_verifier: Option<&str>,
 ) -> Result<OauthToken, OauthError> {
+    // Load the install state so we can sign the exchange POST with
+    // the install's HMAC key. The exchange endpoint requires the
+    // `X-Sd-Signature` header (web returns HTTP 401
+    // `missing_signature_header` otherwise — observed in Mick's
+    // 2026-05-24T23:42Z dev log). Same signing the rest of the
+    // leaderboard endpoints use; see `submission.rs` /
+    // `registration.rs::register_cli`.
+    let state = crate::leaderboard::install::load()
+        .map_err(|e| OauthError::BadCallback(format!("load install for signing: {e}")))?
+        .ok_or_else(|| {
+            OauthError::BadCallback(
+                "install state missing — run `superdeduper register --channel <name>` first"
+                    .to_string(),
+            )
+        })?;
+    let key = state.install_key().ok_or_else(|| {
+        OauthError::BadCallback("install_key_hex malformed".to_string())
+    })?;
+
     let url = format!(
         "{}/api/v1/account/oauth/{}",
         server_url.trim_end_matches('/'),
         provider.as_slug(),
     );
     let mut body = serde_json::json!({
+        "install_id": state.install_id,
         "code": code,
         "redirect_uri": redirect_uri,
     });
     if let Some(v) = code_verifier {
         body["code_verifier"] = serde_json::Value::String(v.to_string());
     }
-    let body_str = serde_json::to_string(&body).map_err(|e| {
-        OauthError::BadCallback(format!("encode exchange body: {e}"))
-    })?;
+    // Canonicalise body bytes the same way submission + registration
+    // do, then sign with the install key. Web verifies the signature
+    // against the install_id's stored key.
+    let canonical = crate::leaderboard::hmac_signer::canonical_body(&body);
+    let signature = crate::leaderboard::hmac_signer::sign(&key, &canonical);
+
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
+        .set("X-Sd-Signature", &signature)
         .timeout(Duration::from_secs(15))
-        .send_string(&body_str);
+        .send_bytes(&canonical);
     match resp {
         Ok(r) => {
             let response_body = r
