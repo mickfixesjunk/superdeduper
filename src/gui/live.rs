@@ -520,6 +520,50 @@ fn run(
         return Ok(());
     }
 
+    // G1.x: client-claimed predicate evaluation. Runs at end of
+    // Stage 1 while `files` (the full post-walker inventory) is
+    // still owned by this scope — Stage 2's group_by_size moves
+    // it. Matched predicate IDs are stashed in `easter_egg_hits`
+    // for inclusion in the leaderboard payload at end-of-scan.
+    // Without the `telemetry` feature this is a no-op + the
+    // payload code path is also gated off, so the Vec stays as
+    // a zero-cost empty slot.
+    #[cfg(feature = "telemetry")]
+    let easter_egg_hits: Vec<String> = {
+        use crate::leaderboard::install;
+        use crate::leaderboard::predicates::{evaluate_all, PredicateContext};
+        let all_paths: Vec<&std::path::Path> =
+            files.iter().map(|e| e.path.as_path()).collect();
+        // FILETIME (100ns ticks since 1601-01-01) → Unix seconds.
+        // Inverse of inventory::walk::filetime_ticks. `mtime == 0`
+        // is the walker's "unknown" sentinel; surface as None so
+        // mtime-dependent predicates short-circuit cleanly per-file.
+        const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
+        let mtimes_unix_secs: Vec<Option<i64>> = files
+            .iter()
+            .map(|e| {
+                if e.mtime == 0 {
+                    None
+                } else {
+                    Some((e.mtime - UNIX_EPOCH_AS_FILETIME) / 10_000_000)
+                }
+            })
+            .collect();
+        // Counters: best-effort load. If install.json is missing
+        // or corrupt the counter-driven predicates (picky-eater /
+        // verify-veteran) silently return None — they just won't
+        // grant yet.
+        let install_state = install::load().ok().flatten();
+        let install_counters = install_state.as_ref().map(|s| &s.counters);
+        let pred_ctx = PredicateContext {
+            all_paths: &all_paths,
+            mtimes_unix_secs: Some(&mtimes_unix_secs),
+            install_counters,
+            perceptual_mode_active: false,
+        };
+        evaluate_all(&pred_ctx)
+    };
+
     // ---------------- Stage 2: size grouping ----------------
     let _ = tx.send(EngineEvent::Status("Stage 2 — size grouping".into()));
     let _ = tx.try_send(EngineEvent::OverallProgress {
@@ -627,6 +671,31 @@ fn run(
     let mut reclaimable: u64 = 0;
     let mut reclaimable_inode: u64 = 0;
     let mut largest_group_bytes: u64 = 0;
+    // G1.x esoteric metric: largest dup-group (by member count)
+    // whose content is empty (size == 0). Used by backend to grant
+    // "zero-byte hoarder". Updated on each group emission below.
+    let mut zero_byte_group_max: u64 = 0;
+    // G1.x esoteric metric: highest hardlink count observed in the
+    // scan. Derived from `link_equivalent` groups — every path in
+    // such a group is a confirmed alias of one inode, so the
+    // group's member count is a tight lower bound on that inode's
+    // `nlink`. Honest under-report: singletons + partial-hardlink
+    // groups don't contribute (we don't have per-file nlink at
+    // this layer; walker-side nlink capture is a future follow-up
+    // that would let us cover those too).
+    let mut max_hardlink_count_in_scan: u64 = 0;
+    // G1.x esoteric metric: count of basenames that resolved to
+    // ≥2 distinct content hashes across the scan ("name-twins").
+    // Builds basename → {content_hash} as groups stream in; the
+    // final count of entries with set size ≥ 2 is the metric.
+    // Only sees basenames that appear in ≥1 dup group (singletons
+    // bypass hashing entirely + we don't have hashes for them), so
+    // the worst missed case is "same name in one dup group + one
+    // singleton of different size" — fine for an esoteric metric.
+    let mut basename_to_hashes: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -967,6 +1036,35 @@ fn run(
             if group_reclaim > largest_group_bytes {
                 largest_group_bytes = group_reclaim;
             }
+            if g.size == 0 {
+                // g.files was moved into filter_reference_only
+                // above; use visible_files which carries the same
+                // (or fewer) members.
+                let members = visible_files.len() as u64;
+                if members > zero_byte_group_max {
+                    zero_byte_group_max = members;
+                }
+            }
+            if g.link_equivalent {
+                // Every visible path in a link-equivalent group
+                // refers to one inode → the member count is a
+                // confirmed lower bound on that inode's nlink.
+                let aliases = visible_files.len() as u64;
+                if aliases > max_hardlink_count_in_scan {
+                    max_hardlink_count_in_scan = aliases;
+                }
+            }
+            // Track basenames → content-hashes for the name-twins
+            // metric. A path may have a non-unicode basename — skip
+            // those (rare; just narrows what counts as a collision).
+            for path in visible_files.iter() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    basename_to_hashes
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(g.content_hash.clone());
+                }
+            }
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
             // sampler thread sees fresh values without us holding
@@ -1138,6 +1236,7 @@ fn run(
         } else {
             None
         };
+
         let inputs = SubmissionInputs {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             run_uuid: uuid::Uuid::new_v4().to_string(),
@@ -1152,7 +1251,30 @@ fn run(
                 features_used_bitmap: features_bits,
                 corpus_kind,
                 cache_hit_ratio,
-                easter_egg_hits: Vec::new(),
+                easter_egg_hits,
+                // Computed during dup-group emission above.
+                zero_byte_group_max: if zero_byte_group_max > 0 {
+                    Some(zero_byte_group_max)
+                } else {
+                    None
+                },
+                // Computed from `link_equivalent` group sizes during
+                // dup-group emission above. Conservative lower bound
+                // — see the comment on the declaration.
+                max_hardlink_count_in_scan: if max_hardlink_count_in_scan > 0 {
+                    Some(max_hardlink_count_in_scan)
+                } else {
+                    None
+                },
+                // Tally basenames whose path-resolution disagreed on
+                // content (≥2 distinct hashes for the same name).
+                name_collision_count: {
+                    let n = basename_to_hashes
+                        .values()
+                        .filter(|hs| hs.len() >= 2)
+                        .count() as u64;
+                    if n > 0 { Some(n) } else { None }
+                },
             },
             result_summary: ResultSummary {
                 duplicate_groups: total_dups,

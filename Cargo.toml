@@ -75,6 +75,10 @@ ureq = { version = "2.10", optional = true, default-features = false, features =
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 uuid = { version = "1.10", optional = true, features = ["v4"] }
+# Unicode script detection — used by the `polyglot-paths` predicate
+# (gamification §5) to count distinct scripts in a path. Tiny crate,
+# data-table only, no other deps.
+unicode-script = { version = "0.5", optional = true }
 
 [features]
 default = []
@@ -90,7 +94,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:sha2", "dep:uuid"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:sha2", "dep:uuid", "dep:unicode-script"]
 
 [[bin]]
 name = "superdeduper-gui"
