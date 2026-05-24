@@ -290,12 +290,12 @@ impl SuperdeduperApp {
         if let Some(saved) = saved_results {
             let dup_count = saved.duplicates.len();
             for g in saved.duplicates {
-                let savings = g
-                    .size
-                    .saturating_mul(g.files.len().saturating_sub(1) as u64);
                 self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
-                self.state.totals.reclaimable_bytes =
-                    self.state.totals.reclaimable_bytes.saturating_add(savings);
+                self.state.totals.reclaimable_bytes = self
+                    .state
+                    .totals
+                    .reclaimable_bytes
+                    .saturating_add(crate::gui::state::inode_aware_savings(&g));
                 self.state.duplicates.push(g);
             }
             self.state.push_log(
@@ -331,12 +331,12 @@ impl SuperdeduperApp {
         // come back populated.
         let dup_count = cp.previous_duplicates.len();
         for g in &cp.previous_duplicates {
-            let savings = g
-                .size
-                .saturating_mul(g.files.len().saturating_sub(1) as u64);
             self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
-            self.state.totals.reclaimable_bytes =
-                self.state.totals.reclaimable_bytes.saturating_add(savings);
+            self.state.totals.reclaimable_bytes = self
+                .state
+                .totals
+                .reclaimable_bytes
+                .saturating_add(crate::gui::state::inode_aware_savings(g));
             self.state.duplicates.push(g.clone());
         }
         self.state.push_log(
@@ -929,12 +929,12 @@ impl SuperdeduperApp {
                 self.can_resume = false;
                 let n = duplicates.len();
                 for g in duplicates {
-                    let savings = g
-                        .size
-                        .saturating_mul(g.files.len().saturating_sub(1) as u64);
                     self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
-                    self.state.totals.reclaimable_bytes =
-                        self.state.totals.reclaimable_bytes.saturating_add(savings);
+                    self.state.totals.reclaimable_bytes = self
+                        .state
+                        .totals
+                        .reclaimable_bytes
+                        .saturating_add(crate::gui::state::inode_aware_savings(&g));
                     self.state.duplicates.push(g);
                 }
                 self.current_project_path = Some(dir.to_path_buf());

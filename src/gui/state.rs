@@ -381,20 +381,9 @@ impl UiState {
             }
             EngineEvent::DuplicateFound(g) => {
                 self.totals.duplicates = self.totals.duplicates.saturating_add(1);
-                // Hardlinked groups already share storage on disk —
-                // the (n-1) × size figure overcounts the actual
-                // reclaimable space (it's zero, the data is shared).
-                // Exclude them from the header Reclaimable stat so
-                // the user isn't told they can recover space that's
-                // already been recovered. The groups still show in
-                // the table (badged distinctly via the GUI).
-                if !g.link_equivalent {
-                    let savings = g
-                        .size
-                        .saturating_mul(g.files.len().saturating_sub(1) as u64);
-                    self.totals.reclaimable_bytes =
-                        self.totals.reclaimable_bytes.saturating_add(savings);
-                }
+                let savings = inode_aware_savings(&g);
+                self.totals.reclaimable_bytes =
+                    self.totals.reclaimable_bytes.saturating_add(savings);
                 self.duplicates.push(g);
             }
             EngineEvent::ScanFinished {
@@ -495,6 +484,27 @@ impl UiState {
         let end = self.scan_finished_at.unwrap_or_else(Instant::now);
         Some(end.saturating_duration_since(start))
     }
+}
+
+/// True reclaimable bytes for a duplicate group. Returns 0 when the
+/// group is purely hardlinked (data already shared on disk; nothing
+/// to free). Uses `unique_inodes` for the partial-hardlink case so
+/// a group with 8 path-aliases sharing 3 inodes credits `2 * size`,
+/// not `7 * size`. Falls back to `files.len()` when `unique_inodes`
+/// is 0 (older checkpoint formats that pre-date the field).
+pub fn inode_aware_savings(g: &DuplicateGroupSummary) -> u64 {
+    if g.link_equivalent {
+        return 0;
+    }
+    let unique = if g.unique_inodes == 0 {
+        g.files.len() as u64
+    } else {
+        g.unique_inodes
+    };
+    if unique < 2 {
+        return 0;
+    }
+    g.size.saturating_mul(unique - 1)
 }
 
 /// Human-readable wallclock formatter shared by the header tile and

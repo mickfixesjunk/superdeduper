@@ -983,6 +983,7 @@ fn run(
                 content_hash: g.content_hash,
                 files: visible_files,
                 link_equivalent: g.link_equivalent,
+                unique_inodes: g.unique_inodes,
             };
             checkpoint_state.record(&summary);
             let _ = tx.send(EngineEvent::DuplicateFound(summary));

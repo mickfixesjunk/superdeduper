@@ -111,6 +111,16 @@ pub struct DuplicateGroupSummary {
     /// checkpoints (without this field) still load.
     #[serde(default)]
     pub link_equivalent: bool,
+    /// Count of distinct inodes in this group. Most groups have
+    /// `unique_inodes == files.len()` (every file is its own inode),
+    /// but on hardlink-heavy corpora (C:\Windows / WinSxS) a group
+    /// can have many path-aliases sharing few inodes. The true
+    /// reclaimable bytes for a group is `(unique_inodes - 1) *
+    /// size`, NOT `(files.len() - 1) * size`. `0` means "unknown"
+    /// (older checkpoint format) — callers fall back to
+    /// `files.len()` in that case.
+    #[serde(default)]
+    pub unique_inodes: u64,
 }
 
 /// Severity tag for [`EngineEvent::Log`] entries.

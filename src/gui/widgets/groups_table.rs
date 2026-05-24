@@ -122,6 +122,12 @@ pub struct GroupsTableState {
     /// Sticky selection for the bulk-action dropdown; persists across
     /// re-renders so the user doesn't have to re-pick on every scan.
     pub bulk_action: BulkAction,
+    /// "Hide unreclaimable (0 bytes)" filter toggle. When true,
+    /// hardlinked groups (link_equivalent + partial-hardlink groups
+    /// where unique_inodes < 2) drop out of the visible table. The
+    /// per-row "0 B reclaimable" rows still exist in the data model;
+    /// only their rendering is hidden.
+    pub hide_unreclaimable: bool,
 }
 
 /// Render the unfiltered table. Kept for callers that don't need a
@@ -318,6 +324,31 @@ pub fn show_filtered(
         );
     });
     ui.add_space(4.0);
+    // "Hide unreclaimable (0 bytes)" filter — drops hardlinked groups
+    // (link_equivalent + partial-hardlink with unique_inodes < 2) from
+    // the table view. The data is still in state.duplicates; only the
+    // table rendering is affected. Total reclaimable in the header
+    // already excludes these via inode_aware_savings, so the filter is
+    // purely cosmetic.
+    ui.horizontal(|ui| {
+        let hidden_count = sorted
+            .iter()
+            .filter(|(_, g)| crate::gui::state::inode_aware_savings(g) == 0)
+            .count();
+        let label = if hidden_count > 0 {
+            format!("Hide unreclaimable (0 bytes) — {hidden_count} group(s)")
+        } else {
+            "Hide unreclaimable (0 bytes)".to_string()
+        };
+        ui.checkbox(&mut table_state.hide_unreclaimable, label)
+            .on_hover_text(
+                "Filter out groups whose files are already hardlinked / \
+                 share storage on disk (nothing to free). Groups stay in \
+                 the data model; only the table view hides them. Doesn't \
+                 affect the Reclaimable total in the header.",
+            );
+    });
+    ui.add_space(4.0);
 
     ScrollArea::vertical()
         .id_source("groups-table")
@@ -361,6 +392,16 @@ pub fn show_filtered(
                 })
                 .body(|mut body| {
                     for (i, (orig_idx, g)) in sorted.iter().enumerate() {
+                        // "Hide unreclaimable" toggle: skip groups
+                        // whose inode-aware savings is 0
+                        // (link_equivalent or partial-hardlink with
+                        // unique_inodes < 2). Data still in
+                        // state.duplicates; only this view skips.
+                        if table_state.hide_unreclaimable
+                            && crate::gui::state::inode_aware_savings(g) == 0
+                        {
+                            continue;
+                        }
                         // Reclaimable bytes is the (n-1) × size that
                         // WOULD be freed if you collapsed the group
                         // — unless the group is already a hardlink
