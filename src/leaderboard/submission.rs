@@ -69,6 +69,28 @@ pub struct RunShape {
     /// when the predicate is `unlock_kind: client-claimed`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub easter_egg_hits: Vec<String>,
+    /// G1.x server-side esoteric metrics. All optional / additive
+    /// per the schema; older engines that don't compute these
+    /// just omit the field. The backend uses them to grant
+    /// catalog entries like "zero-byte hoarder", "hardlink
+    /// archaeologist", "name-collider".
+
+    /// Largest dup-group (by member count) whose content is zero
+    /// bytes — i.e. the count of empty-file "dups" in the largest
+    /// such group. Used by backend to grant "zero-byte hoarder"
+    /// when this exceeds the threshold.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub zero_byte_group_max: Option<u64>,
+    /// Highest hardlink count observed on any inode during this
+    /// scan. Backend uses this to grant "hardlink archaeologist".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_hardlink_count_in_scan: Option<u64>,
+    /// Count of distinct (filename) values that appeared at least
+    /// twice but with different content hashes — i.e. identical
+    /// filenames at different paths whose CONTENT differs. Used
+    /// by backend to grant "name-collider".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name_collision_count: Option<u64>,
 }
 
 /// `result_summary` block per backend schema.
@@ -747,6 +769,9 @@ mod tests {
                 corpus_kind: "user-data".into(),
                 cache_hit_ratio: None,
                 easter_egg_hits: Vec::new(),
+                zero_byte_group_max: None,
+                max_hardlink_count_in_scan: None,
+                name_collision_count: None,
             },
             result_summary: ResultSummary {
                 duplicate_groups: 42,

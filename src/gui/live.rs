@@ -627,6 +627,10 @@ fn run(
     let mut reclaimable: u64 = 0;
     let mut reclaimable_inode: u64 = 0;
     let mut largest_group_bytes: u64 = 0;
+    // G1.x esoteric metric: largest dup-group (by member count)
+    // whose content is empty (size == 0). Used by backend to grant
+    // "zero-byte hoarder". Updated on each group emission below.
+    let mut zero_byte_group_max: u64 = 0;
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -967,6 +971,15 @@ fn run(
             if group_reclaim > largest_group_bytes {
                 largest_group_bytes = group_reclaim;
             }
+            if g.size == 0 {
+                // g.files was moved into filter_reference_only
+                // above; use visible_files which carries the same
+                // (or fewer) members.
+                let members = visible_files.len() as u64;
+                if members > zero_byte_group_max {
+                    zero_byte_group_max = members;
+                }
+            }
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
             // sampler thread sees fresh values without us holding
@@ -1153,6 +1166,19 @@ fn run(
                 corpus_kind,
                 cache_hit_ratio,
                 easter_egg_hits: Vec::new(),
+                // Computed during dup-group emission above.
+                zero_byte_group_max: if zero_byte_group_max > 0 {
+                    Some(zero_byte_group_max)
+                } else {
+                    None
+                },
+                // TODO(G1.x follow-up): wire walker hardlink-count
+                // tracking into max_hardlink_count_in_scan.
+                max_hardlink_count_in_scan: None,
+                // TODO(G1.x follow-up): track (basename → hash)
+                // collisions across all scanned files for
+                // name_collision_count.
+                name_collision_count: None,
             },
             result_summary: ResultSummary {
                 duplicate_groups: total_dups,

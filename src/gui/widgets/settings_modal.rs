@@ -1278,6 +1278,9 @@ fn build_sample_payload_json() -> String {
             corpus_kind: "user-data".into(),
             cache_hit_ratio: Some(0.42),
             easter_egg_hits: Vec::new(),
+            zero_byte_group_max: None,
+            max_hardlink_count_in_scan: None,
+            name_collision_count: None,
         },
         result_summary: submission::ResultSummary {
             duplicate_groups: 18_204,
