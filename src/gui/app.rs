@@ -1566,6 +1566,18 @@ impl SuperdeduperApp {
                 // the picker + the threaded run.
                 self.pick_archive_dest_and_run();
             }
+            GroupAction::RecycleAllVisible => {
+                self.run_bulk_destructive_threaded(
+                    DedupeAction::Recycle,
+                    "♻ Recycle",
+                );
+            }
+            GroupAction::NukeAllVisible => {
+                self.run_bulk_destructive_threaded(
+                    DedupeAction::Remove,
+                    "💀 Nuke",
+                );
+            }
             GroupAction::PromoteKeeper {
                 group_idx,
                 member_idx,
@@ -1822,6 +1834,105 @@ impl SuperdeduperApp {
                 });
             })
             .expect("spawn unsuperdeduper thread");
+    }
+
+    /// Bulk Recycle / Nuke across every visible duplicate group's
+    /// non-keepers. Mirrors the per-group worker but iterates across
+    /// all groups, sums up totals, and reports a single summary.
+    /// Reference paths are filtered out so a "Nuke all" can never
+    /// touch a source-of-truth root.
+    fn run_bulk_destructive_threaded(&self, action: DedupeAction, label_emoji: &str) {
+        self.action_cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.action_cancel);
+        let tx = self.tx.clone();
+        // Own the label so the spawned thread can outlive the &str.
+        let label_emoji: String = label_emoji.to_string();
+        let reference_roots: Vec<PathBuf> = self
+            .persisted
+            .roots
+            .iter()
+            .filter(|r| r.is_reference)
+            .map(|r| r.path.clone())
+            .collect();
+        let groups: Vec<Vec<PathBuf>> = self
+            .state
+            .duplicates
+            .iter()
+            .filter_map(|g| {
+                if g.files.len() < 2 {
+                    return None;
+                }
+                let dupes: Vec<PathBuf> = g.files[1..]
+                    .iter()
+                    .filter(|p| !reference_roots.iter().any(|r| p.starts_with(r)))
+                    .cloned()
+                    .collect();
+                if dupes.is_empty() {
+                    None
+                } else {
+                    Some(dupes)
+                }
+            })
+            .collect();
+        let total: u64 = groups.iter().map(|d| d.len() as u64).sum();
+        let action_label = format!("{label_emoji} · {total} file(s) across {} group(s)", groups.len());
+        std::thread::Builder::new()
+            .name("superdeduper-bulk-destructive".into())
+            .spawn(move || {
+                let _ = tx.send(EngineEvent::ActionStarted {
+                    name: action_label,
+                    total: Some(total),
+                });
+                let mut done = 0u64;
+                let mut failed = 0u64;
+                let mut processed = 0u64;
+                let mut user_stopped = false;
+                'outer: for dupes in &groups {
+                    for d in dupes {
+                        if cancel.load(Ordering::Relaxed) {
+                            user_stopped = true;
+                            break 'outer;
+                        }
+                        let _ = tx.send(EngineEvent::ActionProgress {
+                            done: processed,
+                            current: Some(d.display().to_string()),
+                        });
+                        let r = match action {
+                            DedupeAction::Recycle => crate::dedupe::action_recycle(d),
+                            DedupeAction::Remove => crate::dedupe::action_remove(d),
+                            // Other variants aren't valid for bulk-
+                            // destructive here; treat as a no-op +
+                            // failure so the caller sees an
+                            // explicit error rather than a silent
+                            // success.
+                            _ => Err(crate::Error::other(format!(
+                                "bulk-destructive: unsupported action {action:?}",
+                            ))),
+                        };
+                        match r {
+                            Ok(()) => done += 1,
+                            Err(e) => {
+                                failed += 1;
+                                let _ = tx.send(EngineEvent::Log {
+                                    level: crate::gui::events::LogLevel::Warn,
+                                    message: format!(
+                                        "{label_emoji} failed · {} · {e}",
+                                        d.display()
+                                    ),
+                                });
+                            }
+                        }
+                        processed += 1;
+                    }
+                }
+                let label = if user_stopped { "stopped" } else { "complete" };
+                let _ = tx.send(EngineEvent::ActionFinished {
+                    summary: format!(
+                        "{label_emoji} {label} · {done} done, {failed} failed.",
+                    ),
+                });
+            })
+            .expect("spawn bulk-destructive thread");
     }
 
     fn run_action_threaded(&self, action: DedupeAction, keeper: PathBuf, dupes: Vec<PathBuf>) {
@@ -2535,6 +2646,18 @@ fn describe_destructive_action(action: &GroupAction) -> String {
             "Move EVERY non-keeper across EVERY currently visible duplicate group into the chosen \
              archive folder. Original directory tree is preserved under the destination; a manifest \
              JSON is written so the move can be restored later. Reference paths are never touched."
+                .to_string()
+        }
+        GroupAction::RecycleAllVisible => {
+            "Send EVERY non-keeper across EVERY currently visible duplicate group to the OS Recycle \
+             Bin. Recoverable from the recycle bin until you empty it. Reference paths are never \
+             touched."
+                .to_string()
+        }
+        GroupAction::NukeAllVisible => {
+            "PERMANENTLY DELETE every non-keeper across every currently visible duplicate group. \
+             No recycle bin, no .superdeduper rename, no undo. Reference paths are never touched. \
+             Only use when you're certain you don't need any of these files."
                 .to_string()
         }
         // Reveal / Open* should never reach this code path — they

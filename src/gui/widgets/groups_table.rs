@@ -57,6 +57,15 @@ pub enum GroupAction {
     /// dropdown above the results table so both bulk actions sit in
     /// the same place.
     ArchiveAllVisible,
+    /// Recycle (send to Recycle Bin) every dupe across every visible
+    /// group. Reversible from the OS recycle bin until emptied;
+    /// reference paths are never touched. Same destructive-confirm
+    /// gate as per-group Recycle.
+    RecycleAllVisible,
+    /// Permanently delete every dupe across every visible group —
+    /// no recycle bin, no undo. Highest-friction destructive action;
+    /// requires the standard "type DELETE" confirmation.
+    NukeAllVisible,
     /// Promote a non-keeper file to the keeper slot for its group.
     /// The dispatcher swaps `state.duplicates[group_idx].files[0]`
     /// with `files[member_idx]` so every subsequent destructive
@@ -78,6 +87,8 @@ pub enum BulkAction {
     #[default]
     SafeRenameDupes,
     ArchiveDupes,
+    RecycleDupes,
+    NukeDupes,
 }
 
 impl BulkAction {
@@ -85,7 +96,19 @@ impl BulkAction {
         match self {
             BulkAction::SafeRenameDupes => "🛡 Safe-rename dupes",
             BulkAction::ArchiveDupes => "📦 Archive dupes",
+            BulkAction::RecycleDupes => "♻ Recycle dupes",
+            BulkAction::NukeDupes => "💀 Nuke dupes (permanent)",
         }
+    }
+
+    /// `true` for actions that permanently destroy files (no recycle
+    /// bin, no .superdeduper rename). The destructive-confirm modal
+    /// uses this to decide whether to show the "type DELETE" gate.
+    pub fn is_destructive(self) -> bool {
+        matches!(
+            self,
+            BulkAction::RecycleDupes | BulkAction::NukeDupes,
+        )
     }
 }
 
@@ -199,7 +222,7 @@ pub fn show_filtered(
         let action_selected = table_state.bulk_action;
         egui::ComboBox::from_id_source("bulk-action-combo")
             .selected_text(action_selected.label())
-            .width(220.0)
+            .width(240.0)
             .show_ui(ui, |ui| {
                 ui.selectable_value(
                     &mut table_state.bulk_action,
@@ -210,6 +233,16 @@ pub fn show_filtered(
                     &mut table_state.bulk_action,
                     BulkAction::ArchiveDupes,
                     BulkAction::ArchiveDupes.label(),
+                );
+                ui.selectable_value(
+                    &mut table_state.bulk_action,
+                    BulkAction::RecycleDupes,
+                    BulkAction::RecycleDupes.label(),
+                );
+                ui.selectable_value(
+                    &mut table_state.bulk_action,
+                    BulkAction::NukeDupes,
+                    BulkAction::NukeDupes.label(),
                 );
             });
 
@@ -234,6 +267,18 @@ pub fn show_filtered(
                  directory tree under the destination so a future restore \
                  can put files back. Writes a manifest JSON alongside."
             }
+            BulkAction::RecycleDupes => {
+                "Send every non-keeper across every visible group to the \
+                 OS Recycle Bin. Reference paths never touched. Recoverable \
+                 from the recycle bin until you empty it. Requires \
+                 confirmation."
+            }
+            BulkAction::NukeDupes => {
+                "PERMANENTLY delete every non-keeper across every visible \
+                 group — no recycle bin, no undo. Reference paths never \
+                 touched. Requires typing DELETE to confirm. Only use when \
+                 you're certain."
+            }
         };
         // Gate Go on (a) something to act on AND (b) the scan having
         // finished. Mid-scan, the visible dupe set is still growing
@@ -254,12 +299,16 @@ pub fn show_filtered(
             clicked = Some(match table_state.bulk_action {
                 BulkAction::SafeRenameDupes => GroupAction::SafeRenameAllVisible,
                 BulkAction::ArchiveDupes => GroupAction::ArchiveAllVisible,
+                BulkAction::RecycleDupes => GroupAction::RecycleAllVisible,
+                BulkAction::NukeDupes => GroupAction::NukeAllVisible,
             });
         }
 
         let trailer = match table_state.bulk_action {
             BulkAction::SafeRenameDupes => "safe-mode (no files deleted)",
             BulkAction::ArchiveDupes => "moves dupes, writes manifest",
+            BulkAction::RecycleDupes => "recoverable from recycle bin",
+            BulkAction::NukeDupes => "PERMANENT delete — no undo",
         };
         ui.label(
             RichText::new(trailer)
