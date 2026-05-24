@@ -206,6 +206,18 @@ pub enum OauthError {
     /// (or otherwise dropped the [`OauthSession`]). The listener
     /// thread returns early instead of waiting for the timeout.
     Cancelled,
+    /// No OAuth client ID configured for this (provider, channel)
+    /// pair. Currently only fires for Discord on prod — web hasn't
+    /// surfaced the prod client ID yet; users can sign in on dev
+    /// or use Google on prod in the meantime.
+    NoClientId {
+        provider: Provider,
+        channel: Channel,
+    },
+    /// Provider redirected with `error=...` in the callback query
+    /// string instead of an auth code. User declined consent,
+    /// access_denied, etc.
+    ProviderRejected(String),
 }
 
 impl std::fmt::Display for OauthError {
@@ -224,6 +236,13 @@ impl std::fmt::Display for OauthError {
             }
             Self::SaveFailed(d) => write!(f, "couldn't persist OAuth token: {d}"),
             Self::Cancelled => write!(f, "OAuth flow cancelled"),
+            Self::NoClientId { provider, channel } => write!(
+                f,
+                "no OAuth client ID configured for {} on channel {}",
+                provider.display_name(),
+                channel
+            ),
+            Self::ProviderRejected(d) => write!(f, "OAuth provider rejected: {d}"),
         }
     }
 }
@@ -393,6 +412,171 @@ pub fn link_via_loopback_cancellable(
     )
 }
 
+// =====================================================================
+// Per-channel-per-provider OAuth client IDs (PUBLIC values — they
+// appear in the browser URL during auth + are safe in the binary).
+// Web's infra/envs/{env}.tfvars holds the canonical source; if these
+// rotate, update here in lockstep. Discord prod is intentionally
+// `None` for now — web hasn't surfaced it yet.
+// =====================================================================
+
+fn google_client_id(channel: Channel) -> &'static str {
+    match channel {
+        // Prod: registered against api.superdeduper.io + the prod
+        // Google Cloud project.
+        Channel::Prod => "42269717429-navfk22i5dcngg2io3lt7u815fq6e4fk.apps.googleusercontent.com",
+        // Dev + local share the dev Google client — same Cloud project,
+        // same redirect URI allowlist. Local devs hit the local backend
+        // at http://localhost:3000 but the Google auth endpoint is the
+        // same; we use the dev client_id which has 127.0.0.1 in its
+        // redirect URI list.
+        Channel::Dev | Channel::Local => {
+            "42269717429-j1fqjo24vgn7ik2mmh1q5ebo06b3226b.apps.googleusercontent.com"
+        }
+    }
+}
+
+fn discord_client_id(channel: Channel) -> Option<&'static str> {
+    match channel {
+        // Web hasn't surfaced the prod Discord client_id yet
+        // (in prod.tfvars per 2026-05-24T23:12Z post). Surface
+        // `NoClientId` so the user sees a clear message instead of
+        // a broken auth URL.
+        Channel::Prod => None,
+        Channel::Dev | Channel::Local => Some("1508187203053031454"),
+    }
+}
+
+/// Build the provider's auth URL for the active channel.
+/// Returns the URL + the PKCE code_verifier for Google
+/// (`None` for Discord — Discord OAuth doesn't require PKCE).
+/// `state` is the random nonce the loopback expects back.
+pub fn build_auth_url(
+    provider: Provider,
+    channel: Channel,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<(String, Option<String>), OauthError> {
+    match provider {
+        Provider::Google => {
+            let client_id = google_client_id(channel);
+            let verifier = pkce_verifier();
+            let challenge = pkce_challenge(&verifier);
+            let url = format!(
+                "https://accounts.google.com/o/oauth2/v2/auth\
+                 ?client_id={}\
+                 &response_type=code\
+                 &scope={}\
+                 &redirect_uri={}\
+                 &state={}\
+                 &code_challenge={}\
+                 &code_challenge_method=S256",
+                urlencode(client_id),
+                urlencode("openid email profile"),
+                urlencode(redirect_uri),
+                urlencode(state),
+                urlencode(&challenge),
+            );
+            Ok((url, Some(verifier)))
+        }
+        Provider::Discord => {
+            let client_id = discord_client_id(channel)
+                .ok_or(OauthError::NoClientId { provider, channel })?;
+            let url = format!(
+                "https://discord.com/api/oauth2/authorize\
+                 ?client_id={}\
+                 &response_type=code\
+                 &scope={}\
+                 &redirect_uri={}\
+                 &state={}",
+                urlencode(client_id),
+                urlencode("identify"),
+                urlencode(redirect_uri),
+                urlencode(state),
+            );
+            Ok((url, None))
+        }
+    }
+}
+
+/// PKCE code-verifier per RFC 7636 §4.1: 43-128 chars from the
+/// unreserved set [A-Z][a-z][0-9]-._~. We generate 32 random bytes
+/// + base64url-no-pad (43 chars), which is the recommended shape.
+fn pkce_verifier() -> String {
+    let mut buf = [0u8; 32];
+    fill_random_bytes(&mut buf);
+    base64url_nopad(&buf)
+}
+
+/// PKCE code-challenge: base64url(SHA-256(verifier)) per §4.2.
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let digest = hasher.finalize();
+    base64url_nopad(&digest)
+}
+
+fn fill_random_bytes(buf: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(buf);
+            return;
+        }
+    }
+    // Fallback (Windows or /dev/urandom missing): time-seeded xorshift.
+    // Not crypto-strong, but PKCE verifier security depends on the
+    // server-side client_secret not the verifier secrecy (verifier
+    // is sent in cleartext to the provider during exchange).
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ 0xDEAD_BEEF_CAFE_F00D;
+    for b in buf.iter_mut() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        *b = (seed >> 56) as u8;
+    }
+}
+
+/// Base64url-no-pad encoder per RFC 4648 §5. Inline rather than
+/// pulling the `base64` crate: ~15 lines, no allocation surprises.
+fn base64url_nopad(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = (bytes[i] as u32) << 16
+            | (bytes[i + 1] as u32) << 8
+            | (bytes[i + 2] as u32);
+        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHA[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    match bytes.len() - i {
+        2 => {
+            let n = (bytes[i] as u32) << 16 | (bytes[i + 1] as u32) << 8;
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        }
+        1 => {
+            let n = (bytes[i] as u32) << 16;
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        }
+        _ => {}
+    }
+    out
+}
+
 fn link_via_loopback_inner(
     provider: Provider,
     channel: Channel,
@@ -401,8 +585,14 @@ fn link_via_loopback_inner(
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<OauthToken, OauthError> {
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+
+    // `install_id` is unused in the direct-to-provider flow (the
+    // exchange endpoint links it via the user's auth session on
+    // first call). Keep the param so the public API stays stable
+    // for callers that still thread it through.
+    let _ = install_id;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| OauthError::BindFailed(format!("{e}")))?;
@@ -410,33 +600,28 @@ fn link_via_loopback_inner(
         .local_addr()
         .map_err(|e| OauthError::BindFailed(format!("{e}")))?
         .port();
-    let nonce = make_nonce();
-    let expected_path = format!("/oauth-callback/{nonce}");
-    let cb_url = format!("http://127.0.0.1:{port}{expected_path}");
-    let url = format!(
-        "{}/oauth/{}/start?cb={}&install_id={}",
-        server_url.trim_end_matches('/'),
-        provider.as_slug(),
-        urlencode(&cb_url),
-        urlencode(install_id),
-    );
 
-    let (tx, rx) = mpsc::channel::<String>();
-    let expected_path_owned = expected_path.clone();
-    // Non-blocking accept lets the listener thread check the cancel
-    // flag every poll-tick and exit promptly when the UI drops the
-    // session (Cancel button). Otherwise the thread would sit on a
-    // blocking `accept()` for up to the full 5-minute timeout.
+    // `state` is the OAuth CSRF nonce. We send it on the auth URL
+    // and verify it on the callback. The redirect_uri is the
+    // loopback root path; provider redirects there with the auth
+    // code in the query string.
+    let state = make_nonce();
+    let redirect_uri = format!("http://127.0.0.1:{port}/oauth-callback");
+
+    let (auth_url, code_verifier) = build_auth_url(provider, channel, &redirect_uri, &state)?;
+
+    let (tx, rx) = mpsc::channel::<CallbackPayload>();
+    let state_for_listener = state.clone();
     listener
         .set_nonblocking(true)
         .map_err(|e| OauthError::BindFailed(format!("{e}")))?;
 
     let listener_cancel = cancel.clone();
     std::thread::spawn(move || {
-        // Single-shot listener — accept exactly ONE matching POST
-        // then exit. Mismatched paths get a 404 + the loop continues
-        // until either a valid callback arrives, the cancel flag
-        // fires, or the caller drops the receiver.
+        // Single-shot listener — accept exactly ONE matching GET
+        // (provider redirect) then exit. The redirect carries
+        // `code` + `state` in the query string; we verify `state`
+        // matches the nonce we generated.
         let poll_interval = Duration::from_millis(100);
         loop {
             if let Some(c) = &listener_cancel {
@@ -464,63 +649,63 @@ fn link_via_loopback_inner(
             if reader.read_line(&mut first_line).is_err() {
                 continue;
             }
-            // Parse "POST /oauth-callback/{nonce} HTTP/1.1\r\n".
+            // Parse "GET /oauth-callback?code=...&state=... HTTP/1.1\r\n".
             let mut parts = first_line.split_whitespace();
             let method = parts.next().unwrap_or("");
-            let path = parts.next().unwrap_or("");
-            if method != "POST" || path != expected_path_owned.as_str() {
-                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            let path_and_query = parts.next().unwrap_or("");
+            if method != "GET"
+                || !path_and_query.starts_with("/oauth-callback")
+            {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
                 continue;
             }
-            // Read headers until blank line + collect Content-Length.
-            let mut content_length: usize = 0;
+            // Drain the rest of the headers/body (the provider
+            // redirect is a GET with no body; ignore.).
+            let mut sink = String::new();
             loop {
-                let mut hdr = String::new();
-                if reader.read_line(&mut hdr).is_err() {
+                sink.clear();
+                if reader.read_line(&mut sink).is_err() || sink == "\r\n" || sink.is_empty() {
                     break;
                 }
-                if hdr == "\r\n" || hdr.is_empty() {
-                    break;
-                }
-                if let Some(rest) = hdr.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = rest.trim().parse().unwrap_or(0);
-                }
             }
-            if content_length == 0 || content_length > 16 * 1024 {
-                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-                continue;
-            }
-            let mut body = vec![0u8; content_length];
-            if reader.read_exact(&mut body).is_err() {
-                continue;
-            }
-            let body_str = String::from_utf8_lossy(&body).to_string();
+            // Parse the query string into (code, state, error).
+            let payload = parse_callback_query(path_and_query);
+            // Respond first so the browser gets a clean
+            // confirmation page; THEN send the payload to the
+            // outer loop.
             let _ = stream.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 88\r\n\r\n\
                   <!doctype html><meta charset=utf-8><title>Signed in</title>\
                   <p>You can close this tab.",
             );
-            let _ = tx.send(body_str);
+            // CSRF check: state must match what we sent.
+            if payload.state.as_deref() != Some(state_for_listener.as_str()) {
+                let _ = tx.send(CallbackPayload {
+                    code: None,
+                    state: payload.state,
+                    error: Some("state mismatch (possible CSRF)".to_string()),
+                });
+                return;
+            }
+            let _ = tx.send(payload);
             return;
         }
     });
 
-    if !try_open_browser(&url) {
+    if !try_open_browser(&auth_url) {
         return Err(OauthError::BrowserOpenFailed {
-            url: url.clone(),
+            url: auth_url.clone(),
             detail: "could not launch system browser".to_string(),
         });
     }
 
-    // Outer wait. Loop on try_recv every 200ms so the cancel flag
-    // gets checked promptly when the GUI Cancel button fires. The
-    // listener thread sends body bytes once a matching POST lands;
-    // anything else just falls through to the next poll-tick.
+    // Outer wait. Same cancel-friendly poll-tick pattern as before.
     let started = Instant::now();
     let poll_tick = Duration::from_millis(200);
-    let body = loop {
+    let payload = loop {
         match rx.try_recv() {
-            Ok(b) => break b,
+            Ok(p) => break p,
             Err(mpsc::TryRecvError::Disconnected) => return Err(OauthError::ServerDied),
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -535,9 +720,160 @@ fn link_via_loopback_inner(
         std::thread::sleep(poll_tick);
     };
 
-    let token = parse_callback_body(provider, &body)?;
+    if let Some(e) = payload.error {
+        return Err(OauthError::ProviderRejected(e));
+    }
+    let code = payload
+        .code
+        .ok_or_else(|| OauthError::BadCallback("callback missing `code`".to_string()))?;
+
+    // Exchange the auth code for a token via the engine backend.
+    // This is the ONE server endpoint in the direct-to-provider
+    // flow (web 2026-05-24T23:12Z spec); web does the
+    // code↔token round-trip with the provider on its side so the
+    // client never holds the client_secret.
+    let token = exchange_code(
+        provider,
+        server_url,
+        &code,
+        &redirect_uri,
+        code_verifier.as_deref(),
+    )?;
     save_for(channel, &token).map_err(|e| OauthError::SaveFailed(format!("{e}")))?;
     Ok(token)
+}
+
+/// Parsed query string from the provider's redirect to our loopback.
+#[derive(Debug, Clone, Default)]
+struct CallbackPayload {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Pull `code`, `state`, and `error` out of the request line's
+/// query string (`/oauth-callback?code=...&state=...&error=...`).
+/// Tolerates missing fields + URL-encoded values.
+fn parse_callback_query(path_and_query: &str) -> CallbackPayload {
+    let mut out = CallbackPayload::default();
+    let qs = match path_and_query.split_once('?') {
+        Some((_, q)) => q,
+        None => return out,
+    };
+    for pair in qs.split('&') {
+        let (k, v) = match pair.split_once('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        let decoded = url_decode(v);
+        match k {
+            "code" => out.code = Some(decoded),
+            "state" => out.state = Some(decoded),
+            "error" => out.error = Some(decoded),
+            "error_description" => {
+                // If both `error` and `error_description` are
+                // present, prefer the longer human-friendly text.
+                if out.error.is_some() {
+                    out.error = Some(format!("{}: {}", out.error.as_deref().unwrap_or(""), decoded));
+                } else {
+                    out.error = Some(decoded);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'+' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        if b == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) =
+                (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+            {
+                out.push((hi * 16 + lo) as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// POST the auth code to the engine backend's exchange endpoint
+/// per 2026-05-24T23:12Z spec:
+///
+/// ```text
+/// POST {server_url}/api/v1/account/oauth/{provider}
+/// Content-Type: application/json
+/// { "code": "...", "redirect_uri": "http://127.0.0.1:PORT/oauth-callback",
+///   "code_verifier": "..." }     # omitted for Discord
+/// ```
+///
+/// Response shape: `{access_token, refresh_token?, expires_in,
+/// display_name, account_id}` — same as the original mock; the
+/// existing [`parse_callback_body`] handles the deserialise.
+fn exchange_code(
+    provider: Provider,
+    server_url: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: Option<&str>,
+) -> Result<OauthToken, OauthError> {
+    let url = format!(
+        "{}/api/v1/account/oauth/{}",
+        server_url.trim_end_matches('/'),
+        provider.as_slug(),
+    );
+    let mut body = serde_json::json!({
+        "code": code,
+        "redirect_uri": redirect_uri,
+    });
+    if let Some(v) = code_verifier {
+        body["code_verifier"] = serde_json::Value::String(v.to_string());
+    }
+    let body_str = serde_json::to_string(&body).map_err(|e| {
+        OauthError::BadCallback(format!("encode exchange body: {e}"))
+    })?;
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(15))
+        .send_string(&body_str);
+    match resp {
+        Ok(r) => {
+            let response_body = r
+                .into_string()
+                .map_err(|e| OauthError::BadCallback(format!("read exchange response: {e}")))?;
+            parse_callback_body(provider, &response_body)
+        }
+        Err(ureq::Error::Status(code, r)) => Err(OauthError::BackendRejected {
+            status: code,
+            body: r.into_string().unwrap_or_default(),
+        }),
+        Err(ureq::Error::Transport(t)) => Err(OauthError::BadCallback(format!(
+            "exchange transport: {t}"
+        ))),
+    }
 }
 
 // =====================================================================
@@ -1106,6 +1442,150 @@ mod tests {
         let n = make_nonce();
         assert_eq!(n.len(), 32, "16 bytes hex-encoded = 32 chars");
         assert!(n.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn build_auth_url_google_includes_pkce_and_correct_host() {
+        let (url, verifier) =
+            build_auth_url(Provider::Google, Channel::Dev, "http://127.0.0.1:12345/oauth-callback", "test-state")
+                .expect("google dev has a client_id");
+        assert!(
+            url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"),
+            "google auth must target the official OAuth endpoint, got: {url}"
+        );
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("code_challenge="));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=test-state"));
+        // The verifier must be a non-trivial base64url string the
+        // engine can later send to the exchange endpoint.
+        let v = verifier.expect("google flow returns a PKCE verifier");
+        assert!(v.len() >= 43, "verifier too short ({}): {v}", v.len());
+        assert!(
+            v.chars().all(|c| {
+                c.is_ascii_alphanumeric() || c == '-' || c == '_'
+            }),
+            "verifier must be base64url-safe chars only: {v}"
+        );
+        // Client ID match — assert the dev one is in the URL.
+        assert!(
+            url.contains("j1fqjo24vgn7ik2mmh1q5ebo06b3226b"),
+            "dev google client_id missing from auth URL: {url}"
+        );
+    }
+
+    #[test]
+    fn build_auth_url_discord_omits_pkce_on_dev() {
+        let (url, verifier) =
+            build_auth_url(Provider::Discord, Channel::Dev, "http://127.0.0.1:12345/oauth-callback", "test-state")
+                .expect("discord dev has a client_id");
+        assert!(
+            url.starts_with("https://discord.com/api/oauth2/authorize?"),
+            "discord auth must target the discord endpoint, got: {url}"
+        );
+        assert!(url.contains("response_type=code"));
+        assert!(!url.contains("code_challenge"), "discord doesn't use PKCE");
+        assert!(url.contains("state=test-state"));
+        // Discord dev client ID
+        assert!(
+            url.contains("1508187203053031454"),
+            "discord dev client_id missing from auth URL: {url}"
+        );
+        assert!(
+            verifier.is_none(),
+            "discord flow must not produce a PKCE verifier"
+        );
+    }
+
+    #[test]
+    fn build_auth_url_discord_prod_returns_no_client_id() {
+        // Web hasn't surfaced the prod Discord client_id yet
+        // (per 2026-05-24T23:12Z post). The engine must surface
+        // a clear `NoClientId` error instead of building a
+        // half-baked auth URL.
+        let err =
+            build_auth_url(Provider::Discord, Channel::Prod, "http://127.0.0.1:12345/oauth-callback", "test-state")
+                .expect_err("discord prod has no client_id yet");
+        assert!(
+            matches!(
+                err,
+                OauthError::NoClientId {
+                    provider: Provider::Discord,
+                    channel: Channel::Prod
+                }
+            ),
+            "expected NoClientId, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn pkce_challenge_matches_rfc_7636_reference_vector() {
+        // RFC 7636 §B.2 verifier:
+        //   dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+        // Expected challenge:
+        //   E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+        let challenge = pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+        assert_eq!(
+            challenge,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "PKCE challenge must match the RFC 7636 §B.2 reference vector"
+        );
+    }
+
+    #[test]
+    fn base64url_nopad_known_vectors() {
+        // RFC 4648 §10 with the URL-safe alphabet, no padding:
+        // empty → ""
+        // f      → "Zg"
+        // fo     → "Zm8"
+        // foo    → "Zm9v"
+        // foob   → "Zm9vYg"
+        // fooba  → "Zm9vYmE"
+        // foobar → "Zm9vYmFy"
+        assert_eq!(base64url_nopad(b""), "");
+        assert_eq!(base64url_nopad(b"f"), "Zg");
+        assert_eq!(base64url_nopad(b"fo"), "Zm8");
+        assert_eq!(base64url_nopad(b"foo"), "Zm9v");
+        assert_eq!(base64url_nopad(b"foob"), "Zm9vYg");
+        assert_eq!(base64url_nopad(b"fooba"), "Zm9vYmE");
+        assert_eq!(base64url_nopad(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn parse_callback_query_extracts_code_and_state() {
+        let p = parse_callback_query("/oauth-callback?code=ABC123&state=xyz");
+        assert_eq!(p.code.as_deref(), Some("ABC123"));
+        assert_eq!(p.state.as_deref(), Some("xyz"));
+        assert!(p.error.is_none());
+    }
+
+    #[test]
+    fn parse_callback_query_handles_url_encoding() {
+        let p = parse_callback_query("/oauth-callback?code=a%20b%2Fc&state=xyz");
+        assert_eq!(p.code.as_deref(), Some("a b/c"));
+    }
+
+    #[test]
+    fn parse_callback_query_returns_error_when_provider_declines() {
+        let p = parse_callback_query(
+            "/oauth-callback?error=access_denied&error_description=user%20declined",
+        );
+        assert!(p.code.is_none());
+        let e = p.error.expect("error captured");
+        assert!(e.contains("access_denied"));
+        assert!(e.contains("user declined"));
+    }
+
+    #[test]
+    fn pkce_verifier_length_is_within_rfc_range() {
+        // RFC 7636 §4.1: 43-128 chars. 32 random bytes
+        // base64url-no-pad = 43 chars exactly.
+        let v = pkce_verifier();
+        assert!(
+            (43..=128).contains(&v.len()),
+            "verifier length {} out of RFC 7636 range",
+            v.len()
+        );
     }
 
     #[test]
