@@ -31,6 +31,16 @@ pub const STAGE_COLORS: [Color32; 8] = [
 ];
 
 pub fn install(ctx: &egui::Context) {
+    // Lock the theme preference to Dark BEFORE writing visuals.
+    // egui 0.32+ defaults `ThemePreference::System`, which lets the
+    // OS's light/dark setting flip the active style per-frame. On a
+    // Windows-Light machine that bypasses every override below
+    // because egui silently routes `set_style` writes to the
+    // *current-theme* style — which is the Light one we never
+    // touched. Setting the preference explicitly to Dark makes our
+    // overrides land in the only style ever consulted.
+    ctx.set_theme(egui::ThemePreference::Dark);
+
     let mut style = Style::default();
     let mut v = Visuals::dark();
     v.panel_fill = PANEL;
@@ -41,10 +51,23 @@ pub fn install(ctx: &egui::Context) {
     v.hyperlink_color = ACCENT;
     v.selection.bg_fill = ACCENT_DIM;
     v.window_stroke.color = Color32::from_rgb(0x1f, 0x28, 0x36);
+    // bg_fill drives stroke / checkbox / non-button surfaces.
+    // weak_bg_fill drives the button background since egui 0.32
+    // (the field that was at fault for the 2026-05-24T21:45Z
+    // regression — egui's default dark `weak_bg_fill` is gray(60),
+    // ok-ish, but goes very light if system-theme detection flips
+    // to Light mode mid-frame). Set both so every code path lands
+    // on the engine palette.
     v.widgets.noninteractive.bg_fill = PANEL;
+    v.widgets.noninteractive.weak_bg_fill = PANEL;
     v.widgets.inactive.bg_fill = Color32::from_rgb(0x18, 0x20, 0x2c);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x18, 0x20, 0x2c);
     v.widgets.hovered.bg_fill = Color32::from_rgb(0x24, 0x2f, 0x40);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x24, 0x2f, 0x40);
     v.widgets.active.bg_fill = ACCENT_DIM;
+    v.widgets.active.weak_bg_fill = ACCENT_DIM;
+    v.widgets.open.bg_fill = Color32::from_rgb(0x18, 0x20, 0x2c);
+    v.widgets.open.weak_bg_fill = Color32::from_rgb(0x18, 0x20, 0x2c);
     style.visuals = v;
 
     style.text_styles = [

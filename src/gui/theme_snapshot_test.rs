@@ -60,6 +60,44 @@ fn build_themed_harness(
     harness
 }
 
+/// Multi-frame stability test. Renders the SAME button-row scene
+/// for 30 frames and asserts the panel-fill pixel is dark at every
+/// frame. The 2026-05-24T21:45Z regression decayed *over time*:
+/// frame 1 was correct (theme::install just ran); a later frame's
+/// system-theme detection flipped Visuals to Light. A single-frame
+/// PNG snapshot can't see that decay. This one can.
+#[test]
+fn theme_remains_dark_across_multiple_frames() {
+    let mut harness = build_themed_harness(
+        egui::vec2(200.0, 80.0),
+        |ui| {
+            let _ = ui.button("Sentinel button");
+            let _ = ui.button("Second sentinel");
+        },
+    );
+    // Mid-test, simulate the system telling egui "you should switch
+    // to Light mode." Without theme::install locking the preference
+    // to Dark, this would propagate and the next frame's render
+    // would be light. With the fix, the preference stays Dark.
+    harness.ctx.set_theme(egui::ThemePreference::Light);
+
+    for frame in 0..30 {
+        harness.run();
+        let img = harness.render().expect("render PNG per frame");
+        let buf = img.as_raw();
+        let (r, g, b) = (buf[0], buf[1], buf[2]);
+        let luma = (30 * r as u32 + 59 * g as u32 + 11 * b as u32) / 100;
+        assert!(
+            luma < 128,
+            "frame {frame}: panel pixel #{r:02x}{g:02x}{b:02x} \
+             (luma {luma}) is bright. theme::install's dark theme \
+             leaked between frames — system-theme detection or \
+             stray visuals mutation. Regression class from \
+             2026-05-24T21:45Z.",
+        );
+    }
+}
+
 /// Render a panel of representative button states (idle / hover /
 /// active / disabled) to PNG. If theme.rs's Visuals::dark()
 /// overrides are intact, every button fill should be dark
@@ -188,6 +226,52 @@ fn visuals_panel_fill_matches_engine_theme() {
         v.override_text_color,
         Some(theme::TEXT_HI),
         "override_text_color mismatch"
+    );
+}
+
+/// **Critical regression sentinel.** Asserts `theme::install` locks
+/// the egui theme preference to Dark. Without that lock,
+/// egui 0.32's system-theme detection (read from winit per-frame)
+/// can flip the active theme to Light AFTER startup — and since
+/// `install` only writes to the *currently-active* style,
+/// theme overrides never reach the Light style, leaving every
+/// widget at egui's default light grays. Exactly the
+/// 2026-05-24T21:45Z regression.
+///
+/// The check is direct: after install, `ctx.theme()` MUST be
+/// `Dark` and `ctx.style()` MUST carry our overrides. If a future
+/// install forgets the `set_theme` call, this goes red.
+#[test]
+fn theme_install_locks_preference_to_dark() {
+    let ctx = egui::Context::default();
+    // First, prove the test is meaningful: a fresh context with
+    // a Light preference would normally hand back a Light style.
+    ctx.set_theme(egui::ThemePreference::Light);
+    assert_eq!(ctx.theme(), egui::Theme::Light, "precondition: Light");
+
+    // Now install. The fix forces preference back to Dark.
+    theme::install(&ctx);
+    assert_eq!(
+        ctx.theme(),
+        egui::Theme::Dark,
+        "theme::install must lock preference to Dark — see comment in \
+         theme.rs install() for why (the 2026-05-24T21:45Z regression)."
+    );
+
+    let style = ctx.style();
+    fn luma(c: Color32) -> u32 {
+        (30 * c.r() as u32 + 59 * c.g() as u32 + 11 * c.b() as u32) / 100
+    }
+    let bg = style.visuals.widgets.inactive.bg_fill;
+    let weak = style.visuals.widgets.inactive.weak_bg_fill;
+    let panel = style.visuals.panel_fill;
+    assert!(
+        luma(bg) < 128 && luma(weak) < 128 && luma(panel) < 128,
+        "post-install palette must be dark: bg #{:02x}{:02x}{:02x}, \
+         weak #{:02x}{:02x}{:02x}, panel #{:02x}{:02x}{:02x}",
+        bg.r(), bg.g(), bg.b(),
+        weak.r(), weak.g(), weak.b(),
+        panel.r(), panel.g(), panel.b(),
     );
 }
 
