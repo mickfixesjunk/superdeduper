@@ -27,12 +27,12 @@ pub mod hardware;
 pub mod install;
 pub mod hmac_signer;
 pub mod predicates;
+pub mod oauth;
 pub mod ranks_poll;
 pub mod registration;
 pub mod submission;
 
 // G2-G4 modules slot in here as the phases land:
 // pub mod achievements;  // G2
-// pub mod oauth;         // G3
 // pub mod corpus;        // G4
 // pub mod merkle;        // G4

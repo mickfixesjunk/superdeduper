@@ -56,6 +56,149 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Config(cmd) => run_config(cmd),
         #[cfg(feature = "telemetry")]
         Command::Achievements(cmd) => run_achievements(cmd),
+        #[cfg(feature = "telemetry")]
+        Command::Account(cmd) => run_account(cmd),
+    }
+}
+
+/// G3: `superdeduper account link <provider>` / `account unlink` /
+/// `account status`. Per `gamification-client-spec.md` §10.3 +
+/// Mick's 2026-05-24T22:14:51Z directive.
+#[cfg(feature = "telemetry")]
+fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
+    use std::str::FromStr;
+    use superdeduper::channel;
+    use superdeduper::cli::{AccountCommand, OutputFormat};
+    use superdeduper::leaderboard::{install, oauth};
+
+    let active = channel::active_channel();
+    match cmd {
+        AccountCommand::Link {
+            provider,
+            timeout_secs,
+        } => {
+            let provider = oauth::Provider::from_str(&provider)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let install_state = install::load()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "not registered on channel `{}` — run `superdeduper register --channel {}` first",
+                    active,
+                    active,
+                )
+            })?;
+            let server_url = channel::server_url_for(active);
+            println!(
+                "Opening browser to link {} (channel: {}). \
+                 Complete the OAuth flow in your browser; this CLI \
+                 will exit once the callback arrives or after \
+                 {timeout_secs}s.",
+                provider.display_name(),
+                active,
+            );
+            let token = oauth::link_via_loopback(
+                provider,
+                active,
+                server_url,
+                &install_state.install_id,
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "Linked: {} ({}) on channel `{}`. Token stored at {}.",
+                token.display_name,
+                token.provider.display_name(),
+                active,
+                oauth::oauth_path()?.display(),
+            );
+            Ok(())
+        }
+        AccountCommand::Unlink => {
+            let prior = oauth::status()?;
+            oauth::unlink_for(active)?;
+            match prior {
+                oauth::AccountStatus::Anonymous => {
+                    println!("No account was linked on channel `{}`.", active);
+                }
+                oauth::AccountStatus::Linked {
+                    provider,
+                    display_name,
+                    ..
+                } => {
+                    println!(
+                        "Unlinked {} ({}) from channel `{}`. Token file removed.",
+                        display_name,
+                        provider.display_name(),
+                        active,
+                    );
+                }
+            }
+            Ok(())
+        }
+        AccountCommand::Status { format } => {
+            let s = oauth::status()?;
+            let install_state = install::load()?;
+            let install_id = install_state
+                .as_ref()
+                .map(|s| s.install_id.as_str())
+                .unwrap_or("<not registered>");
+            match format {
+                OutputFormat::Json => {
+                    let payload = match &s {
+                        oauth::AccountStatus::Anonymous => serde_json::json!({
+                            "channel": active.to_string(),
+                            "install_id": install_id,
+                            "linked": false,
+                        }),
+                        oauth::AccountStatus::Linked {
+                            provider,
+                            display_name,
+                            account_id,
+                            expired,
+                        } => serde_json::json!({
+                            "channel": active.to_string(),
+                            "install_id": install_id,
+                            "linked": true,
+                            "provider": provider.as_slug(),
+                            "display_name": display_name,
+                            "account_id": account_id,
+                            "expired": expired,
+                        }),
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                }
+                OutputFormat::Text | OutputFormat::Csv => match s {
+                    oauth::AccountStatus::Anonymous => {
+                        println!("channel:    {}", active);
+                        println!("install_id: {}", install_id);
+                        println!("account:    Anonymous (use `superdeduper account link google` or `… link discord` to claim achievements across machines)");
+                    }
+                    oauth::AccountStatus::Linked {
+                        provider,
+                        display_name,
+                        account_id,
+                        expired,
+                    } => {
+                        println!("channel:      {}", active);
+                        println!("install_id:   {}", install_id);
+                        println!(
+                            "account:      Linked — {} ({})",
+                            display_name,
+                            provider.display_name()
+                        );
+                        println!("account_id:   {}", account_id);
+                        if expired {
+                            println!("token:        EXPIRED (next API call will trigger refresh)");
+                        } else {
+                            println!("token:        ok");
+                        }
+                    }
+                },
+            }
+            Ok(())
+        }
     }
 }
 
