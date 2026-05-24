@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// G-track: `sd achievements` — list / refetch the install's
+/// G-track: `superdeduper achievements` — list / refetch the install's
 /// achievement state. Triage tool: pair with the GUI when the badge
 /// wall looks wrong.
 #[cfg(feature = "telemetry")]
@@ -45,12 +45,12 @@ fn run_achievements(
         Some(s) if s.registered => s,
         Some(_) => {
             anyhow::bail!(
-                "not registered yet — run `sd register` first to enable achievement tracking"
+                "not registered yet — run `superdeduper register` first to enable achievement tracking"
             );
         }
         None => {
             anyhow::bail!(
-                "no install.json found — run `sd register` to create one"
+                "no install.json found — run `superdeduper register` to create one"
             );
         }
     };
@@ -182,7 +182,7 @@ fn print_achievements(
     }
 }
 
-/// G-track: `sd register` — register this install with the
+/// G-track: `superdeduper register` — register this install with the
 /// leaderboard backend. Idempotent.
 #[cfg(feature = "telemetry")]
 fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
@@ -226,7 +226,7 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
     match registration::register_cli(&mut state) {
         Ok(()) => {
             println!(
-                "Registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}\nUse `sd config show` to see current share preference.",
+                "Registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}\nUse `superdeduper config show` to see current share preference.",
                 state.install_id, state.install_id
             );
             Ok(())
@@ -235,7 +235,7 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
     }
 }
 
-/// G-track: `sd config show` / `sd config set-share`.
+/// G-track: `superdeduper config show` / `superdeduper config set-share`.
 #[cfg(feature = "telemetry")]
 fn run_config(cmd: superdeduper::cli::ConfigCommand) -> anyhow::Result<()> {
     use superdeduper::cli::{ConfigCommand, ShareValue};
@@ -259,7 +259,7 @@ fn run_config(cmd: superdeduper::cli::ConfigCommand) -> anyhow::Result<()> {
                 None => {
                     println!("install.json:    {} (not yet created)", path.display());
                     println!("status:          unregistered");
-                    println!("Run `sd register` to enroll this install.");
+                    println!("Run `superdeduper register` to enroll this install.");
                 }
             }
             Ok(())
@@ -269,7 +269,7 @@ fn run_config(cmd: superdeduper::cli::ConfigCommand) -> anyhow::Result<()> {
                 Some(s) => s,
                 None => {
                     return Err(anyhow::anyhow!(
-                        "install.json not found — run `sd register` first"
+                        "install.json not found — run `superdeduper register` first"
                     ))
                 }
             };

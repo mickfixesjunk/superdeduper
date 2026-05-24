@@ -142,7 +142,7 @@ pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), Registe
         }
         super::captcha::CaptchaError::BrowserOpenFailed(msg) => {
             RegisterError::Network(format!(
-                "could not launch browser ({msg}) — use `sd register` from a terminal instead"
+                "could not launch browser ({msg}) — use `superdeduper register` from a terminal instead"
             ))
         }
         super::captcha::CaptchaError::BindFailed(msg) => {

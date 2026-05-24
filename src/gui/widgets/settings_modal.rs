@@ -889,7 +889,7 @@ fn render_leaderboard(ui: &mut egui::Ui) {
             );
             ui.label(
                 RichText::new(
-                    "Run `sd register --reset` from a CLI to start fresh (rotates your install_id).",
+                    "Run `superdeduper register --reset` from a CLI to start fresh (rotates your install_id).",
                 )
                 .color(theme::TEXT_LO)
                 .small(),
@@ -1060,7 +1060,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
             )
             .on_hover_text(
                 "Rotate install_id + install_key. Equivalent to \
-                 `sd register --reset` from the CLI. Backend treats \
+                 `superdeduper register --reset` from the CLI. Backend treats \
                  the new id as a fresh user; rank + achievements reset.",
             )
             .clicked()

@@ -6,7 +6,7 @@
 //!
 //! Schema per client-spec §4.3. Failure modes per §4.5: corrupted or
 //! partially-written files fail closed; the user must explicitly opt
-//! in to a fresh registration via `sd register --reset` rather than
+//! in to a fresh registration via `superdeduper register --reset` rather than
 //! silently rotating their identity (which would let an attacker
 //! bypass shadowbans).
 
@@ -80,7 +80,7 @@ impl InstallState {
 }
 
 /// Canonical path for the install.json file. Public so tests + CLI
-/// `sd register --show-path` can hit the same location the engine
+/// `superdeduper register --show-path` can hit the same location the engine
 /// reads/writes.
 pub fn install_path() -> io::Result<PathBuf> {
     let mut p = data_dir()?;

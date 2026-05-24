@@ -41,6 +41,9 @@ globset = "0.4"
 humansize = "2"
 csv = "1.3"
 bytes = "1.6"
+# TOML serde for sd's persisted config (project bundle, exclusions
+# settings, etc.). `toml` is the de facto Rust TOML crate.
+toml = "0.8"
 
 # GUI deps — optional, gated behind the `gui` feature.
 eframe = { version = "0.32", optional = true, default-features = false, features = [
