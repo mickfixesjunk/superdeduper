@@ -1,14 +1,25 @@
-//! Per-install state persisted at:
+//! Per-channel install state persisted at:
 //!
-//! * Windows: `%LOCALAPPDATA%\superdeduper\install.json`
-//! * macOS:   `~/Library/Application Support/superdeduper/install.json`
-//! * Linux:   `$XDG_DATA_HOME/superdeduper/install.json` (or `~/.local/share`)
+//! * Windows: `%LOCALAPPDATA%\superdeduper\install\install.{channel}.json`
+//! * macOS:   `~/Library/Application Support/superdeduper/install/install.{channel}.json`
+//! * Linux:   `$XDG_DATA_HOME/superdeduper/install/install.{channel}.json` (or `~/.local/share`)
+//!
+//! Channel determines which install identity is loaded — `prod`,
+//! `dev`, `local` per [`crate::channel`] + dev-channel-spec.md §3.2.
+//! Channels are independent: switching from prod to dev loads a
+//! fresh identity (or triggers first-run registration on dev) and
+//! the prod identity stays untouched.
 //!
 //! Schema per client-spec §4.3. Failure modes per §4.5: corrupted or
 //! partially-written files fail closed; the user must explicitly opt
 //! in to a fresh registration via `superdeduper register --reset` rather than
 //! silently rotating their identity (which would let an attacker
 //! bypass shadowbans).
+//!
+//! Pre-channel-aware sd installs wrote a flat `install.json` directly
+//! under the data dir. The first channel-aware load that sees no
+//! `install.prod.json` but finds the legacy flat file migrates it
+//! transparently — see [`migrate_legacy_install_json`].
 
 use std::fs;
 use std::io;
@@ -16,6 +27,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::channel::{self, Channel};
 use crate::leaderboard::predicates::InstallCounters;
 
 /// Bump when adding required fields. Old files with a lower
@@ -91,13 +103,56 @@ impl InstallState {
     }
 }
 
-/// Canonical path for the install.json file. Public so tests + CLI
-/// `superdeduper register --show-path` can hit the same location the engine
-/// reads/writes.
+/// Canonical install.json path for the **active** channel (per
+/// [`crate::channel::active_channel`]). Public so tests + CLI
+/// `superdeduper register --show-path` can hit the same location
+/// the engine reads/writes.
 pub fn install_path() -> io::Result<PathBuf> {
+    install_path_for(channel::active_channel())
+}
+
+/// Canonical install.json path for a specific channel. Used by the
+/// GUI Settings → Network panel (which peeks at all three channels
+/// to show registration status per channel) and by the migration
+/// helper in [`migrate_legacy_install_json`]. The path is
+/// `<data_dir>/install/install.{channel}.json` — separate
+/// subdirectory so the per-channel files cluster, and the legacy
+/// flat `install.json` (pre-channel) can coexist during migration.
+pub fn install_path_for(channel: Channel) -> io::Result<PathBuf> {
+    let mut p = data_dir()?;
+    p.push("install");
+    p.push(format!("install.{}.json", channel.as_slug()));
+    Ok(p)
+}
+
+/// Pre-channel flat install.json path. Only used during the
+/// migration check; new code should never read or write this path.
+fn legacy_install_path() -> io::Result<PathBuf> {
     let mut p = data_dir()?;
     p.push("install.json");
     Ok(p)
+}
+
+/// If a legacy flat `install.json` exists AND the channel-aware
+/// `install.prod.json` does NOT yet exist, rename the legacy file
+/// to the prod location. Called automatically by [`load_for`] when
+/// loading the prod channel finds no file; safe to call repeatedly.
+///
+/// Returns `Ok(true)` if a migration happened, `Ok(false)` if no
+/// action was needed, `Err` if the rename failed (the user will see
+/// a clear "couldn't migrate" message rather than silently losing
+/// their identity).
+pub fn migrate_legacy_install_json() -> io::Result<bool> {
+    let legacy = legacy_install_path()?;
+    let new = install_path_for(Channel::Prod)?;
+    if !legacy.exists() || new.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = new.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&legacy, &new)?;
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -136,17 +191,44 @@ fn data_dir() -> io::Result<PathBuf> {
     Ok(p)
 }
 
-/// Load the install state. Returns:
+/// Load the install state for the **active** channel. See
+/// [`load_for`] for the per-channel-explicit variant.
+pub fn load() -> io::Result<Option<InstallState>> {
+    load_for(channel::active_channel())
+}
+
+/// Load the install state for a specific channel.
+///
+/// Returns:
 /// * `Ok(Some(state))` — valid file, ready to use
 /// * `Ok(None)` — file doesn't exist; caller may call `register`
 /// * `Err(_)` — file exists but failed to parse / failed schema check.
 ///   Caller MUST NOT silently re-create (would let an attacker rotate
 ///   identities to escape shadowban). User opts in via `--reset`.
-pub fn load() -> io::Result<Option<InstallState>> {
-    let path = install_path()?;
-    let bytes = match fs::read(&path) {
+///
+/// Side effect: when called for `Channel::Prod` and no file is
+/// found, runs [`migrate_legacy_install_json`] before giving up.
+/// This lets pre-channel-aware install.json files transparently
+/// move into the new channel-aware layout on first use.
+pub fn load_for(channel: Channel) -> io::Result<Option<InstallState>> {
+    let mut path = install_path_for(channel)?;
+    let read_result = fs::read(&path);
+    let bytes = match read_result {
         Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Only try the legacy migration for prod — dev/local
+            // never had a flat install.json layout.
+            if matches!(channel, Channel::Prod) && migrate_legacy_install_json()? {
+                path = install_path_for(channel)?;
+                match fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            } else {
+                return Ok(None);
+            }
+        }
         Err(e) => return Err(e),
     };
     let state: InstallState = serde_json::from_slice(&bytes)
@@ -175,11 +257,18 @@ pub fn load() -> io::Result<Option<InstallState>> {
     Ok(Some(state))
 }
 
-/// Atomic write: serialize to `install.json.tmp` then rename. On
-/// Windows the LOCALAPPDATA permissions already restrict to the
-/// current user; on Unix we set 0600 explicitly.
+/// Atomic write of the install state to the **active** channel's
+/// path. See [`save_for`] for the per-channel-explicit variant.
 pub fn save(state: &InstallState) -> io::Result<()> {
-    let path = install_path()?;
+    save_for(channel::active_channel(), state)
+}
+
+/// Atomic write to a specific channel's install.json. Serialise to
+/// `install.{channel}.json.tmp` then rename. On Windows the
+/// LOCALAPPDATA permissions already restrict to the current user;
+/// on Unix we set 0600 explicitly.
+pub fn save_for(channel: Channel, state: &InstallState) -> io::Result<()> {
+    let path = install_path_for(channel)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -370,6 +459,30 @@ mod tests {
         let restored: InstallState = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored.counters.exclude_pattern_edits, 7);
         assert_eq!(restored.counters.achievements_verify_invocations, 3);
+    }
+
+    #[test]
+    fn install_paths_per_channel_are_distinct() {
+        // The three channel-specific paths must all differ from
+        // each other AND from the legacy flat path. Otherwise
+        // switching channels would write over a different channel's
+        // identity file (data loss).
+        let prod = install_path_for(Channel::Prod).expect("prod path");
+        let dev = install_path_for(Channel::Dev).expect("dev path");
+        let local = install_path_for(Channel::Local).expect("local path");
+        let legacy = legacy_install_path().expect("legacy path");
+        assert_ne!(prod, dev);
+        assert_ne!(prod, local);
+        assert_ne!(dev, local);
+        assert_ne!(prod, legacy);
+        // All channel paths share the same parent dir `<data>/install`.
+        assert_eq!(prod.parent(), dev.parent());
+        assert_eq!(dev.parent(), local.parent());
+        // Channel slug appears verbatim in the filename for visual
+        // greppability + filesystem-tool friendliness.
+        assert!(prod.file_name().unwrap().to_string_lossy().contains("prod"));
+        assert!(dev.file_name().unwrap().to_string_lossy().contains("dev"));
+        assert!(local.file_name().unwrap().to_string_lossy().contains("local"));
     }
 
     #[test]

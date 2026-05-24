@@ -16,7 +16,35 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose, cli.quiet);
 
-    match cli.command {
+    // Channel resolution: --channel flag > SUPERDEDUPER_CHANNEL env var
+    // > [network] channel in persisted config > default `prod`. Set
+    // once at startup so every downstream consumer (install path,
+    // submit URL, GUI banner, CLI footer) reads a consistent value
+    // for the duration of this invocation.
+    let active = superdeduper::channel::resolve_active_channel(cli.channel.as_deref())
+        .map_err(|e| anyhow::anyhow!("--channel / SUPERDEDUPER_CHANNEL / config.toml: {e}"))?;
+    superdeduper::channel::set_active_channel(active);
+
+    let result = dispatch(cli.command);
+
+    // Per dev-channel-spec.md §5.5: every CLI command on non-prod
+    // prints a footer line so the user is reminded which environment
+    // their action just hit. Goes to stderr so it doesn't corrupt
+    // stdout-piped JSON/CSV. Suppressed when --quiet (we suppress
+    // every non-error stream in that mode).
+    if active.is_non_prod() && !cli.quiet && result.is_ok() {
+        eprintln!(
+            "(channel: {} — submissions go to {})",
+            active,
+            superdeduper::channel::server_url_for(active)
+        );
+    }
+
+    result
+}
+
+fn dispatch(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Scan(args) => run_scan(args),
         Command::Dedupe(args) => run_dedupe(args),
         Command::Cache(cmd) => run_cache(cmd),
@@ -30,6 +58,8 @@ fn main() -> anyhow::Result<()> {
         Command::Achievements(cmd) => run_achievements(cmd),
     }
 }
+
+
 
 /// G-track: `superdeduper achievements` — list / refetch the install's
 /// achievement state. Triage tool: pair with the GUI when the badge
@@ -232,9 +262,16 @@ fn print_achievements(
 fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
     use superdeduper::leaderboard::{install, registration};
 
-    let server_url = args
-        .server_url
-        .unwrap_or_else(|| "https://api.superdeduper.io".to_string());
+    // server_url derives from the active channel by default. The
+    // legacy --server-url arg still works as an explicit override
+    // (useful for testing against an ad-hoc backend), but the
+    // common path is now `superdeduper register --channel dev` →
+    // server_url resolves to https://dev-api.superdeduper.io
+    // automatically. Per dev-channel-spec.md §5.1.
+    let server_url = args.server_url.unwrap_or_else(|| {
+        superdeduper::channel::server_url_for(superdeduper::channel::active_channel())
+            .to_string()
+    });
 
     // --reset rotates the install_id. Refuse without explicit opt-in
     // confirmation: prints what's about to happen + requires the

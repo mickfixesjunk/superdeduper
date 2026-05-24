@@ -25,6 +25,7 @@ pub enum SettingsTab {
     KeepStrategy,
     Safety,
     Preflight,
+    Network,
     #[cfg(feature = "telemetry")]
     Leaderboard,
 }
@@ -37,6 +38,7 @@ impl SettingsTab {
             SettingsTab::KeepStrategy => "Keep strategy",
             SettingsTab::Safety => "Safety",
             SettingsTab::Preflight => "Pre-flight",
+            SettingsTab::Network => "Network",
             #[cfg(feature = "telemetry")]
             SettingsTab::Leaderboard => "Leaderboard",
         }
@@ -48,6 +50,7 @@ impl SettingsTab {
             SettingsTab::KeepStrategy,
             SettingsTab::Safety,
             SettingsTab::Preflight,
+            SettingsTab::Network,
         ];
         #[cfg(feature = "telemetry")]
         v.push(SettingsTab::Leaderboard);
@@ -60,6 +63,16 @@ impl SettingsTab {
 #[derive(Default)]
 pub struct SettingsModalState {
     pub tab: SettingsTab,
+    /// Channel the user has currently selected in the Network tab's
+    /// dropdown. `None` means "no change pending — match the active
+    /// channel." When `Some(c)` and `c != channel::active_channel()`,
+    /// the Save button appears and clicking it shows the inline
+    /// confirm row.
+    pub pending_channel: Option<crate::channel::Channel>,
+    /// Set to `Some(channel)` when the user clicked Save and the
+    /// inline confirm row is showing. `None` = no confirmation in
+    /// flight. Cleared after either Confirm or Cancel.
+    pub channel_switch_confirm: Option<crate::channel::Channel>,
 }
 
 /// Process-wide slot for the "Preview a sample submission" modal's
@@ -263,6 +276,7 @@ fn render_modal_body(
                             SettingsTab::KeepStrategy => render_keep_strategy(ui, settings),
                             SettingsTab::Safety => render_safety(ui, settings),
                             SettingsTab::Preflight => render_preflight(ui, settings),
+                            SettingsTab::Network => render_network(ui, state),
                             #[cfg(feature = "telemetry")]
                             SettingsTab::Leaderboard => render_leaderboard(ui),
                         }
@@ -694,6 +708,161 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Settings → Network tab — channel selection.
+///
+/// Per `dev-channel-spec.md` §5.4. Shows the currently active channel,
+/// an explainer for what each channel is for, and a dropdown +
+/// Save flow that lets the user switch mid-session. The actual
+/// channel-switch (which load `install.{channel}.json` becomes
+/// "active") happens via [`crate::channel::set_active_channel`] +
+/// [`crate::channel::write_persisted_channel`] after the user
+/// confirms via the inline Confirm row.
+fn render_network(ui: &mut egui::Ui, state: &mut SettingsModalState) {
+    use crate::channel::{self, Channel};
+
+    let current = channel::active_channel();
+    let selected = state.pending_channel.unwrap_or(current);
+
+    ui.heading("Channel");
+    ui.label(
+        RichText::new(
+            "Server environment this client talks to. Identity, \
+             achievements, and submissions live per channel — \
+             switching to dev or local won't pollute or read from \
+             your prod data.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+    ui.add_space(8.0);
+
+    // Dropdown
+    let mut pick = selected;
+    let prior_pick = pick;
+    egui::ComboBox::from_id_source("sd_network_channel_dropdown")
+        .selected_text(pick.as_slug())
+        .show_ui(ui, |ui| {
+            for &c in Channel::all() {
+                ui.selectable_value(&mut pick, c, c.as_slug());
+            }
+        });
+    if pick != prior_pick {
+        state.pending_channel = Some(pick);
+        // Selecting a different option clears any in-flight confirm
+        // so the user re-confirms against the new selection.
+        state.channel_switch_confirm = None;
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(pick.description())
+            .color(theme::TEXT_HI)
+            .small(),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!("Endpoint: {}", channel::server_url_for(pick)))
+            .color(theme::TEXT_LO)
+            .small()
+            .italics(),
+    );
+    ui.add_space(4.0);
+    // Registration status for the SELECTED channel — answers the
+    // "if I switch here, am I already registered?" question before
+    // the user clicks Save. Best-effort read; an I/O error reads
+    // as "unknown" rather than crashing the panel.
+    #[cfg(feature = "telemetry")]
+    {
+        let registered = crate::leaderboard::install::install_path_for(pick)
+            .ok()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        let line = if registered {
+            format!("Registered on {}.", pick.as_slug())
+        } else {
+            format!(
+                "Not yet registered on {}. Run `superdeduper register --channel {}` first.",
+                pick.as_slug(),
+                pick.as_slug(),
+            )
+        };
+        let color = if registered { theme::TEXT_LO } else { theme::HOT };
+        ui.label(RichText::new(line).color(color).small());
+    }
+
+    ui.add_space(12.0);
+
+    // Save + confirm flow. The Save button is only visible when the
+    // pending channel differs from the active channel. Clicking
+    // Save arms an inline confirm row (per spec §5.4: "Switch
+    // channel to {channel}?"); the confirm row stays until the
+    // user clicks Confirm or Cancel. Switching to the same channel
+    // is a no-op (no Save button).
+    if pick != current {
+        if state.channel_switch_confirm == Some(pick) {
+            ui.label(
+                RichText::new(format!("Switch channel to {}?", pick.as_slug()))
+                    .strong()
+                    .color(theme::TEXT_HI),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Switching to {} channel. You'll be a fresh install on {} \
+                     (or load the existing one if you've registered there before). \
+                     Your {} grants stay safe but won't transfer between channels.",
+                    pick.as_slug(),
+                    pick.as_slug(),
+                    current.as_slug(),
+                ))
+                .color(theme::TEXT_LO)
+                .small(),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    state.channel_switch_confirm = None;
+                    state.pending_channel = None;
+                }
+                let confirm_label = format!("Switch to {}", pick.as_slug());
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(confirm_label)
+                                .color(theme::PANEL_DEEP)
+                                .strong(),
+                        )
+                        .fill(theme::ACCENT),
+                    )
+                    .clicked()
+                {
+                    // Persist + activate. Best-effort write; the
+                    // active-channel set still happens even if the
+                    // disk write fails (the user gets the switch
+                    // for this session at least).
+                    if let Err(e) = channel::write_persisted_channel(pick) {
+                        eprintln!("channel: write_persisted_channel failed: {e}");
+                    }
+                    channel::set_active_channel(pick);
+                    state.channel_switch_confirm = None;
+                    state.pending_channel = None;
+                }
+            });
+        } else if ui
+            .button(format!("Save (switch to {})", pick.as_slug()))
+            .clicked()
+        {
+            state.channel_switch_confirm = Some(pick);
+        }
+    } else {
+        ui.label(
+            RichText::new(format!("Active channel: {}", current.as_slug()))
+                .color(theme::TEXT_LO)
+                .small()
+                .italics(),
+        );
+    }
 }
 
 #[cfg(feature = "telemetry")]

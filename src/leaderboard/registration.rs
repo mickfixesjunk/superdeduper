@@ -51,6 +51,14 @@ pub const DEFAULT_POW_DIFFICULTY: u8 = 22;
 
 /// CLI registration flow. Mutates `state` to set `registered = true`
 /// + persists, on a successful round-trip.
+/// **Note on the register response body:** the server's `/register`
+/// response MAY include a `submit_url` hint (see web's
+/// `register.ts:140`). Engine deliberately IGNORES it — per
+/// dev-channel-spec.md post-#7 add-on (design 20:09Z, option 2),
+/// client-side URL resolution via [`crate::channel::server_url_for`]
+/// is the single source of truth. This guarantees a stale hardcoded
+/// URL on the server can never leak a dev install onto prod
+/// telemetry. Same rule applies to [`register_gui_via_loopback`].
 pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     if state.registered {
         return Err(RegisterError::AlreadyRegistered);

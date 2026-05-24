@@ -2347,6 +2347,17 @@ impl eframe::App for SuperdeduperApp {
             }
         }
 
+        // Channel banner — always-on 32px coloured strip when the
+        // active channel is not prod (per dev-channel-spec.md §3.4).
+        // Rendered as the FIRST top panel so it sits at the very top
+        // of the window, above the menubar. Reads the active channel
+        // from the channel module's process-global cell — set once
+        // at GUI startup via channel::set_active_channel.
+        crate::gui::widgets::channel_banner::show(
+            ctx,
+            crate::channel::active_channel(),
+        );
+
         // File menubar — owns project lifecycle (New / Open / Save /
         // Save As / Open Archive Manifest). Rendered as a thin strip
         // above the header so it doesn't intrude on the always-visible
