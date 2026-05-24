@@ -209,3 +209,134 @@ fn io_err(e: impl std::error::Error) -> crate::Error {
 fn csv_err(e: csv::Error) -> crate::Error {
     crate::Error::other(e.to_string())
 }
+
+#[cfg(test)]
+mod summarize_tests {
+    //! Coverage for `summarize` — the engine's external contract
+    //! for `summary.reclaimable_bytes` + `summary.reclaimable_inode_bytes`
+    //! in the JSON output. Backend leaderboard payload + GUI header
+    //! tile + the dual-reclaim narrative all depend on these being
+    //! correctly computed.
+
+    use super::summarize;
+    use crate::pipeline::DuplicateGroup;
+    use std::path::PathBuf;
+
+    fn group(
+        size: u64,
+        files: usize,
+        link_equivalent: bool,
+        unique_inodes: u64,
+    ) -> DuplicateGroup {
+        DuplicateGroup {
+            size,
+            content_hash: "h".into(),
+            files: (0..files).map(|i| PathBuf::from(format!("/p/{i}"))).collect(),
+            link_equivalent,
+            unique_inodes,
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_zero_summary() {
+        let s = summarize(&[], &[]);
+        assert_eq!(s.groups, 0);
+        assert_eq!(s.files, 0);
+        assert_eq!(s.reclaimable_bytes, 0);
+        assert_eq!(s.reclaimable_inode_bytes, 0);
+    }
+
+    #[test]
+    fn single_alias_group_credits_both_metrics_equally() {
+        // 3 files, each a separate inode → (3-1)*size for both
+        // path-aware and inode-aware.
+        let g = group(1000, 3, false, 3);
+        let s = summarize(&[g], &[]);
+        assert_eq!(s.reclaimable_bytes, 2000);
+        assert_eq!(s.reclaimable_inode_bytes, 2000);
+        assert_eq!(s.groups, 1);
+        assert_eq!(s.files, 3);
+    }
+
+    #[test]
+    fn link_equivalent_group_credits_zero_to_both() {
+        // 8 hardlinks of one inode → 0 reclaim from either metric.
+        // Crucial invariant: a fully-hardlinked group's bytes are
+        // ALREADY shared on disk; counting them as "freeable" is
+        // the inflation bug Mick hit on C:\\Windows.
+        let g = group(4096, 8, true, 1);
+        let s = summarize(&[g], &[]);
+        assert_eq!(s.reclaimable_bytes, 0);
+        assert_eq!(s.reclaimable_inode_bytes, 0);
+        assert_eq!(s.groups, 1);
+        assert_eq!(s.files, 8);
+    }
+
+    #[test]
+    fn partial_hardlink_group_diverges_between_metrics() {
+        // 8 paths sharing 3 inodes — the dual-reclaim story. Each
+        // metric is `(count - 1) * size` for its respective count.
+        // path-aware (count=8): 7000
+        // inode-aware (count=3): 2000
+        let g = group(1000, 8, false, 3);
+        let s = summarize(&[g], &[]);
+        assert_eq!(s.reclaimable_bytes, 7000);
+        assert_eq!(s.reclaimable_inode_bytes, 2000);
+        assert_ne!(s.reclaimable_bytes, s.reclaimable_inode_bytes);
+    }
+
+    #[test]
+    fn unique_inodes_zero_falls_back_to_files_len_for_inode_metric() {
+        // Older checkpoint formats persisted unique_inodes=0 (the
+        // field didn't exist). When loaded, summarize must NOT
+        // crash + fall back to path-aware for the inode metric.
+        let g = group(500, 4, false, 0);
+        let s = summarize(&[g], &[]);
+        assert_eq!(s.reclaimable_bytes, 1500);
+        // Fallback equals path-aware figure in this case.
+        assert_eq!(s.reclaimable_inode_bytes, 1500);
+    }
+
+    #[test]
+    fn mixed_groups_sum_correctly() {
+        // Realistic /usr/lib-shaped mix: a hardlink group, a
+        // single-alias dup group, a partial-hardlink group.
+        let g_hardlink = group(11_000_000, 114, true, 1);   // 0 reclaim
+        let g_dup     = group(1_000_000,    3, false, 3);  // 2_000_000 / 2_000_000
+        let g_mixed   = group(500_000,      6, false, 2);  // 2_500_000 / 500_000
+        let s = summarize(&[g_hardlink, g_dup, g_mixed], &[]);
+        assert_eq!(s.reclaimable_bytes, 4_500_000);
+        assert_eq!(s.reclaimable_inode_bytes, 2_500_000);
+        assert_eq!(s.groups, 3);
+        assert_eq!(s.files, 114 + 3 + 6);
+    }
+
+    #[test]
+    fn singleton_groups_credit_nothing() {
+        // A group with only 1 file has n-1 = 0 reclaim.
+        // Engine shouldn't emit these but the function must handle
+        // them sanely. files counter still includes the file.
+        let g = group(1000, 1, false, 1);
+        let s = summarize(&[g], &[]);
+        assert_eq!(s.reclaimable_bytes, 0);
+        assert_eq!(s.reclaimable_inode_bytes, 0);
+        assert_eq!(s.files, 1);
+    }
+
+    #[test]
+    fn largest_per_group_reclaim_invariant() {
+        // Backend sanity check requires
+        // `largest_single_group_bytes <= duplicate_bytes_reclaimable`.
+        // Verify it holds across the realistic mix.
+        let g_a = group(2_000_000, 3, false, 3);  // 4_000_000
+        let g_b = group(800_000,   5, false, 5);  // 3_200_000
+        let g_c = group(10_000,    2, false, 2);  // 10_000
+        let s = summarize(&[g_a, g_b, g_c], &[]);
+        let largest_inode = 4_000_000u64;
+        assert!(
+            largest_inode <= s.reclaimable_inode_bytes,
+            "max per-group reclaim ({largest_inode}) must be <= total ({})",
+            s.reclaimable_inode_bytes
+        );
+    }
+}
