@@ -1,0 +1,948 @@
+//! Submit a completed scan's results to the leaderboard backend.
+//!
+//! Flow per client-spec §6:
+//! 1. Build the payload from scan results + hardware fingerprint
+//! 2. Canonicalize to JSON (sorted keys via [`hmac_signer::canonical_body`])
+//! 3. HMAC-sign with the install_key
+//! 4. POST to `/api/v1/submit` with `X-Sd-Signature` header
+//! 5. On 5xx / network failure: enqueue to disk for next-launch retry
+//!    (50-submission cap per spec §6.5)
+//! 6. On 200: surface rank + achievements to the caller
+//! 7. On 409 (`duplicate_submission`): treat as neutral "no change"
+//!
+//! The wire payload shape is not yet locked against the live JSON
+//! schema at `https://api.superdeduper.io/api/v1/submit/schema.json` —
+//! follow-up commit will regenerate the struct via `typify`. For now
+//! the body is built as a `serde_json::Value` so field additions
+//! don't churn a Rust type.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use super::hardware::HardwareFingerprint;
+use super::hmac_signer;
+use super::install::InstallState;
+
+/// Inputs to the submission builder. Caller provides everything the
+/// engine knows about this scan; this module wraps it into the wire
+/// payload + signs + posts.
+///
+/// Mirrors the backend schema's required top-level keys (less
+/// `install_id` + `timestamp` which `build_payload` synthesises from
+/// freshest sources): `client_version`, `hardware`, `run_shape`,
+/// `result_summary`.
+#[derive(Debug, Clone)]
+pub struct SubmissionInputs {
+    pub client_version: String,
+    pub hardware: HardwareFingerprint,
+    pub run_shape: RunShape,
+    pub result_summary: ResultSummary,
+    /// Local copy of the run UUID — useful for engine-side
+    /// diagnostic logging (e.g. "payload built for run X"). NOT on
+    /// the wire; backend assigns its own submission_id.
+    pub run_uuid: String,
+}
+
+/// `run_shape` block per backend schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunShape {
+    pub wall_clock_seconds: f64,
+    pub bytes_scanned: u64,
+    pub files_scanned: u64,
+    /// Enum: `"river5-aes-ni" | "river5-96" | "blake3" | "sha256"
+    /// | "other"`.
+    pub hash_algorithm: String,
+    /// Enum: `"mft" | "walker" | "hybrid"`.
+    pub walker_variant: String,
+    /// Enum: `"whole-volume" | "subdirectory" | "selection" |
+    /// "canonical-bench"`.
+    pub scope: String,
+    /// Bitmap of which engine features were active during the scan.
+    /// See [`FEATURE_BIT_*`] constants.
+    pub features_used_bitmap: u64,
+    /// Enum: `"user-data" | "system" | "canonical-bench"`.
+    pub corpus_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_ratio: Option<f64>,
+    /// G2 client-claimed achievement IDs. Backend grants these
+    /// when the predicate is `unlock_kind: client-claimed`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub easter_egg_hits: Vec<String>,
+}
+
+/// `result_summary` block per backend schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultSummary {
+    pub duplicate_groups: u64,
+    pub duplicate_bytes_reclaimable: u64,
+    pub largest_single_group_bytes: u64,
+    /// Per-action counts, e.g. `{"recycle": 12, "hardlink": 0}`.
+    /// Empty `{}` is valid + the natural state at scan-end (actions
+    /// happen post-scan).
+    pub actions_taken_summary: std::collections::BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder_skip_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder_skip_bytes: Option<u64>,
+}
+
+// `features_used_bitmap` bit assignments. Stable; new features
+// append. Reserved bits stay 0 until claimed.
+pub const FEATURE_BIT_CACHE: u64 = 1 << 0;
+pub const FEATURE_BIT_FORMAT_AWARE: u64 = 1 << 1;
+pub const FEATURE_BIT_PARANOID: u64 = 1 << 2;
+pub const FEATURE_BIT_FOLLOW_LINKS: u64 = 1 << 3;
+pub const FEATURE_BIT_ALLOW_SYSTEM_PATHS: u64 = 1 << 4;
+pub const FEATURE_BIT_ALLOW_RECALL_ON_READ: u64 = 1 << 5;
+pub const FEATURE_BIT_REFERENCE_ROOTS: u64 = 1 << 6;
+pub const FEATURE_BIT_INCLUDE_GLOB: u64 = 1 << 7;
+pub const FEATURE_BIT_EXCLUDE_GLOB: u64 = 1 << 8;
+
+#[derive(Debug, Clone)]
+pub enum SubmitOutcome {
+    /// 200 OK — backend accepted and ranked.
+    Accepted {
+        submission_id: String,
+        ranks: Vec<RankEntry>,
+        achievements_unlocked: Vec<String>,
+        profile_url: Option<String>,
+    },
+    /// 409 — same payload hash already on file. Neutral status.
+    DuplicateNoChange,
+    /// 4xx (other than 409). Caller should surface the reason; don't
+    /// retry (the payload is wrong, not the network).
+    Rejected { status: u16, reason: String },
+    /// 5xx / network. Caller should enqueue to disk for next launch.
+    /// (Persisting is done by `submit_with_queue` — see below.)
+    Transient { reason: String },
+    /// User clicked "Submit for review" on a Rejected outcome. We
+    /// saved a copy to the local review queue and (best-effort)
+    /// uploaded to /api/v1/submit/review. `review_id` is the
+    /// server-assigned id on success; `None` if the upload didn't
+    /// land but the local save did. `original_status` /
+    /// `original_reason` carry the rejection that triggered this
+    /// review — surfaced in the GUI confirmation card so the user
+    /// sees both "we sent it" + "here's what was wrong" in the
+    /// same view. Rendered with a green ✓.
+    FlaggedForReview {
+        review_id: Option<String>,
+        local_path: String,
+        original_status: u16,
+        original_reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankEntry {
+    pub category: String,
+    pub bracket: String,
+    pub rank: u64,
+    pub bucket_size: u64,
+}
+
+/// Build the canonical JSON request body. Pure function so tests can
+/// snapshot the exact wire bytes without spinning a server.
+///
+/// `install_id` is threaded as a separate param (rather than baked
+/// into `SubmissionInputs`) so the most up-to-date value from the
+/// current install state is always used — guards against a stale
+/// pending payload outliving a "Reset install" rotation.
+pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "v1",
+        "client_version": inputs.client_version,
+        "install_id": install_id,
+        "timestamp": now_iso8601(),
+        "hardware": inputs.hardware,
+        "run_shape": inputs.run_shape,
+        "result_summary": inputs.result_summary,
+    })
+}
+
+/// Build + sign + POST a submission. Network errors surface as
+/// `Transient`; the caller decides whether to enqueue for retry.
+/// This function never panics on network failure; it returns an
+/// outcome.
+pub fn submit(state: &InstallState, inputs: &SubmissionInputs) -> SubmitOutcome {
+    if !state.registered {
+        return SubmitOutcome::Rejected {
+            status: 0,
+            reason: "install not registered — call `sd register` first".to_string(),
+        };
+    }
+    let install_key = match state.install_key() {
+        Some(k) => k,
+        None => {
+            return SubmitOutcome::Rejected {
+                status: 0,
+                reason: "install_key_hex malformed".to_string(),
+            };
+        }
+    };
+    let payload = build_payload(inputs, &state.install_id);
+    let body = hmac_signer::canonical_body(&payload);
+    let signature = hmac_signer::sign(&install_key, &body);
+
+    let url = format!("{}/api/v1/submit", state.server_url.trim_end_matches('/'));
+    let response = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("X-Sd-Signature", &signature)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_bytes(&body);
+
+    match response {
+        Ok(resp) => parse_ok(resp),
+        Err(ureq::Error::Status(code, resp)) => parse_error(code, resp),
+        Err(ureq::Error::Transport(t)) => SubmitOutcome::Transient {
+            reason: format!("transport: {t}"),
+        },
+    }
+}
+
+fn parse_ok(resp: ureq::Response) -> SubmitOutcome {
+    let body: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            return SubmitOutcome::Transient {
+                reason: format!("200 OK but body parse failed: {e}"),
+            };
+        }
+    };
+    let submission_id = body
+        .get("submission_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ranks = body
+        .get("current_ranks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| serde_json::from_value::<RankEntry>(r.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let achievements_unlocked = body
+        .get("achievements_unlocked")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let profile_url = body
+        .get("profile_url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    SubmitOutcome::Accepted {
+        submission_id,
+        ranks,
+        achievements_unlocked,
+        profile_url,
+    }
+}
+
+fn parse_error(code: u16, resp: ureq::Response) -> SubmitOutcome {
+    let body_text = resp.into_string().unwrap_or_default();
+    if code == 409 {
+        return SubmitOutcome::DuplicateNoChange;
+    }
+    if (500..600).contains(&code) {
+        return SubmitOutcome::Transient {
+            reason: format!("{code}: {body_text}"),
+        };
+    }
+    let reason = serde_json::from_str::<serde_json::Value>(&body_text)
+        .ok()
+        .and_then(|v| {
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .map(String::from)
+        })
+        .unwrap_or(body_text);
+    SubmitOutcome::Rejected { status: code, reason }
+}
+
+// ============================================================
+// Offline queue: 50-submission cap, drain-on-startup per §6.5.
+// ============================================================
+
+/// Directory under the install data dir where transient-failed
+/// submissions are persisted.
+pub fn queue_dir() -> std::io::Result<PathBuf> {
+    let mut p = super::install::install_path()?;
+    p.set_file_name("submission-queue");
+    Ok(p)
+}
+
+/// Directory under the install data dir where EVERY submission
+/// (successful, rejected, transient-failed) is archived. Gives the
+/// user a permanent local record of what's been sent + how the
+/// server responded — useful for diagnosis, audit, or restoring
+/// runs that need re-submission after a backend fix.
+pub fn archive_dir() -> std::io::Result<PathBuf> {
+    let mut p = super::install::install_path()?;
+    p.set_file_name("submission-archive");
+    Ok(p)
+}
+
+/// Directory under the install data dir where the user has
+/// explicitly flagged failed submissions for admin review. The
+/// engine also tries to POST these to a backend review endpoint
+/// (TBD; falls back to local-only when the endpoint isn't live).
+pub fn review_dir() -> std::io::Result<PathBuf> {
+    let mut p = super::install::install_path()?;
+    p.set_file_name("submission-review");
+    Ok(p)
+}
+
+/// Archive a submission attempt — body + outcome + timestamp — to
+/// the local archive directory. Called from every submit code path
+/// regardless of outcome. Best-effort: failure is logged + swallowed
+/// so a write error on the archive can't suppress the actual
+/// submission outcome from the UI.
+pub fn archive_attempt(
+    inputs: &SubmissionInputs,
+    install_id: &str,
+    outcome: &SubmitOutcome,
+) {
+    let body = build_payload(inputs, install_id);
+    let entry = ArchivedSubmission {
+        archived_at_unix: now_unix(),
+        archived_at_iso: now_iso8601(),
+        run_uuid: inputs.run_uuid.clone(),
+        install_id: install_id.to_string(),
+        outcome_kind: outcome_kind_tag(outcome).to_string(),
+        outcome_detail: serde_json::to_value(SerializableOutcome::from(outcome))
+            .unwrap_or(serde_json::Value::Null),
+        payload: body,
+    };
+    if let Err(e) = write_archive_entry(&entry) {
+        eprintln!("leaderboard: archive write failed: {e:?}");
+    }
+}
+
+/// Save a rejected submission to the review-queue directory AND
+/// attempt to POST it to the backend review endpoint. The local
+/// save always happens (zero-dependency MVP); the POST is
+/// best-effort — when the endpoint isn't live yet, the local copy
+/// is the source of truth and Mick collects them manually from
+/// beta testers.
+///
+/// Returns `(local_path, upload_review_id)`. `upload_review_id` is
+/// `Some` only when the upload landed 200; `None` for any failure
+/// (which still leaves the local save intact).
+pub fn flag_for_review(
+    state: &super::install::InstallState,
+    inputs: &SubmissionInputs,
+    rejection: &SubmitOutcome,
+    user_note: Option<&str>,
+) -> std::io::Result<(PathBuf, Option<String>)> {
+    let body = build_payload(inputs, &state.install_id);
+    let entry = ReviewSubmission {
+        flagged_at_unix: now_unix(),
+        flagged_at_iso: now_iso8601(),
+        run_uuid: inputs.run_uuid.clone(),
+        install_id: state.install_id.clone(),
+        client_version: inputs.client_version.clone(),
+        rejection: serde_json::to_value(SerializableOutcome::from(rejection))
+            .unwrap_or(serde_json::Value::Null),
+        user_note: user_note.map(String::from),
+        payload: body.clone(),
+    };
+    let path = write_review_entry(&entry)?;
+    // Best-effort upload. Endpoint went live (web commit c8cceb9),
+    // so a real signed POST should land. Stderr line is kept as a
+    // diagnostic trail; the structured review_id is what the GUI
+    // surfaces to the user.
+    let review_id = match try_upload_review(state, &entry) {
+        Ok(review_id) => {
+            eprintln!(
+                "review: uploaded ({}). Backend review_id={review_id}. Local copy at {}",
+                state.server_url,
+                path.display()
+            );
+            Some(review_id)
+        }
+        Err(e) => {
+            eprintln!(
+                "review: upload failed ({e}). Local copy at {}",
+                path.display()
+            );
+            None
+        }
+    };
+    Ok((path, review_id))
+}
+
+/// POST the review entry to the backend review endpoint. On 200,
+/// returns the server-assigned review_id (string) — useful in
+/// stderr so the user or admin can correlate when reading the
+/// review queue. On any non-2xx, returns the body or transport
+/// error as the Err string; caller decides surface treatment.
+fn try_upload_review(
+    state: &super::install::InstallState,
+    entry: &ReviewSubmission,
+) -> Result<String, String> {
+    let install_key = state.install_key().ok_or("install_key malformed")?;
+    let body_value = serde_json::to_value(entry).map_err(|e| format!("{e}"))?;
+    let canonical = hmac_signer::canonical_body(&body_value);
+    let signature = hmac_signer::sign(&install_key, &canonical);
+    let url = format!(
+        "{}/api/v1/submit/review",
+        state.server_url.trim_end_matches('/')
+    );
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("X-Sd-Signature", &signature)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_bytes(&canonical);
+    match resp {
+        Ok(r) => {
+            // Parse {accepted: true, review_id: "<uuid>"} per web's
+            // contract; fall back to "<unknown>" if the body shape
+            // changes later.
+            let v: serde_json::Value = r
+                .into_json()
+                .unwrap_or(serde_json::Value::Null);
+            let review_id = v
+                .get("review_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>")
+                .to_string();
+            Ok(review_id)
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            Err(format!("HTTP {code}: {body}"))
+        }
+        Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+    }
+}
+
+fn write_archive_entry(entry: &ArchivedSubmission) -> std::io::Result<PathBuf> {
+    let dir = archive_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    // Archive grows forever (intentional — user wants a permanent
+    // record of every submission). Could revisit a cap if it ever
+    // grows large enough to matter; today each entry is < 4 KB.
+    let filename = format!(
+        "{}-{}-{}.json",
+        entry.archived_at_unix,
+        entry.outcome_kind,
+        short_uuid(&entry.run_uuid),
+    );
+    let path = dir.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(entry)?)?;
+    Ok(path)
+}
+
+fn write_review_entry(entry: &ReviewSubmission) -> std::io::Result<PathBuf> {
+    let dir = review_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let filename = format!(
+        "{}-{}.json",
+        entry.flagged_at_unix,
+        short_uuid(&entry.run_uuid),
+    );
+    let path = dir.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(entry)?)?;
+    Ok(path)
+}
+
+fn short_uuid(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
+fn outcome_kind_tag(o: &SubmitOutcome) -> &'static str {
+    match o {
+        SubmitOutcome::Accepted { .. } => "accepted",
+        SubmitOutcome::DuplicateNoChange => "duplicate",
+        SubmitOutcome::Rejected { .. } => "rejected",
+        SubmitOutcome::Transient { .. } => "transient",
+        SubmitOutcome::FlaggedForReview { .. } => "flagged-for-review",
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArchivedSubmission {
+    archived_at_unix: i64,
+    archived_at_iso: String,
+    run_uuid: String,
+    install_id: String,
+    outcome_kind: String,
+    outcome_detail: serde_json::Value,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReviewSubmission {
+    flagged_at_unix: i64,
+    flagged_at_iso: String,
+    run_uuid: String,
+    install_id: String,
+    client_version: String,
+    rejection: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_note: Option<String>,
+    payload: serde_json::Value,
+}
+
+/// Mirror of `SubmitOutcome` that derives Serialize via tagged-union
+/// JSON. Used so the archive + review files include the full
+/// structured outcome (ranks, achievements, rejection reason)
+/// without losing variant info.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SerializableOutcome {
+    Accepted {
+        submission_id: String,
+        ranks: Vec<RankEntry>,
+        achievements_unlocked: Vec<String>,
+        profile_url: Option<String>,
+    },
+    DuplicateNoChange,
+    Rejected {
+        status: u16,
+        reason: String,
+    },
+    Transient {
+        reason: String,
+    },
+    FlaggedForReview {
+        review_id: Option<String>,
+        local_path: String,
+        original_status: u16,
+        original_reason: String,
+    },
+}
+
+impl From<&SubmitOutcome> for SerializableOutcome {
+    fn from(o: &SubmitOutcome) -> Self {
+        match o {
+            SubmitOutcome::Accepted {
+                submission_id,
+                ranks,
+                achievements_unlocked,
+                profile_url,
+            } => SerializableOutcome::Accepted {
+                submission_id: submission_id.clone(),
+                ranks: ranks.clone(),
+                achievements_unlocked: achievements_unlocked.clone(),
+                profile_url: profile_url.clone(),
+            },
+            SubmitOutcome::DuplicateNoChange => SerializableOutcome::DuplicateNoChange,
+            SubmitOutcome::Rejected { status, reason } => SerializableOutcome::Rejected {
+                status: *status,
+                reason: reason.clone(),
+            },
+            SubmitOutcome::Transient { reason } => SerializableOutcome::Transient {
+                reason: reason.clone(),
+            },
+            SubmitOutcome::FlaggedForReview {
+                review_id,
+                local_path,
+                original_status,
+                original_reason,
+            } => SerializableOutcome::FlaggedForReview {
+                review_id: review_id.clone(),
+                local_path: local_path.clone(),
+                original_status: *original_status,
+                original_reason: original_reason.clone(),
+            },
+        }
+    }
+}
+
+/// Persist a payload + signature pair so the next launch can retry.
+/// Filename includes a timestamp + the first 8 hex chars of the
+/// payload hash for de-dup.
+pub fn enqueue(
+    inputs: &SubmissionInputs,
+    install_id: &str,
+    signature: &str,
+) -> std::io::Result<PathBuf> {
+    let dir = queue_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    // Cap at 50 entries — oldest gets evicted first.
+    prune_queue(&dir, 50)?;
+    let payload = build_payload(inputs, install_id);
+    let body = hmac_signer::canonical_body(&payload);
+    let body_hash_prefix = blake3::hash(&body).to_hex();
+    let filename = format!(
+        "{}-{}.json",
+        now_unix(),
+        &body_hash_prefix.as_str()[..8]
+    );
+    let path = dir.join(filename);
+    let stored = QueuedSubmission {
+        body: String::from_utf8_lossy(&body).into_owned(),
+        signature: signature.to_string(),
+        enqueued_at_unix: now_unix(),
+    };
+    std::fs::write(&path, serde_json::to_vec_pretty(&stored)?)?;
+    Ok(path)
+}
+
+/// Keep the queue at most `cap` entries by deleting the oldest.
+fn prune_queue(dir: &std::path::Path, cap: usize) -> std::io::Result<()> {
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let p = e.path();
+            let m = e.metadata().ok()?.modified().ok()?;
+            Some((m, p))
+        })
+        .collect();
+    if entries.len() <= cap {
+        return Ok(());
+    }
+    entries.sort_by_key(|(t, _)| *t);
+    let drop_count = entries.len() - cap;
+    for (_, p) in entries.into_iter().take(drop_count) {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QueuedSubmission {
+    body: String,
+    signature: String,
+    enqueued_at_unix: i64,
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// RFC 3339 / ISO 8601 UTC timestamp of "now" with seconds
+/// precision, e.g. `"2026-05-24T05:42:33Z"`. Backend schema requires
+/// `timestamp` in this format (string with format: date-time).
+fn now_iso8601() -> String {
+    iso8601_from_unix(now_unix())
+}
+
+/// Render a unix timestamp (seconds since epoch) as RFC 3339 UTC.
+/// Hand-rolled (no chrono dep) using the same Howard Hinnant
+/// civil-from-days algorithm we already use in gui::app for the
+/// project-bundle stamp.
+fn iso8601_from_unix(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let h = (secs / 3_600) as u32;
+    let m = ((secs % 3_600) / 60) as u32;
+    let s = (secs % 60) as u32;
+    // Civil-from-days (days since 1970-01-01) — Howard Hinnant.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    format!("{year:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+// ============================================================
+// Engine→GUI handoff for the most-recent scan's submission inputs.
+//
+// The engine builds [`SubmissionInputs`] at scan-end (see
+// `gui::live::run`) and stashes them here. The GUI's "Submit run"
+// button reads them on click. A single global slot is sufficient:
+// only one scan runs at a time, and only the *most recent* scan
+// is submittable from the UI. Older payloads either succeeded
+// (and the slot was cleared) or sit in the offline queue.
+//
+// Last-outcome cell follows the same pattern so the UI can render
+// "rank #4 in Win11 9950X3D / +2 achievements" inline after the
+// worker thread returns from submit().
+// ============================================================
+
+use parking_lot::Mutex;
+use std::sync::OnceLock;
+
+static PENDING: OnceLock<Mutex<Option<SubmissionInputs>>> = OnceLock::new();
+static LAST_OUTCOME: OnceLock<Mutex<Option<SubmitOutcome>>> = OnceLock::new();
+
+/// Store the freshest scan's submission inputs. Overwrites any
+/// previous value — scan-end semantics: the user can only submit
+/// the latest run.
+pub fn store_pending(inputs: SubmissionInputs) {
+    let m = PENDING.get_or_init(|| Mutex::new(None));
+    *m.lock() = Some(inputs);
+}
+
+/// Snapshot the pending inputs without removing them. Used by the
+/// GUI to decide whether to enable the Submit button + to display
+/// the run's stats next to it.
+pub fn peek_pending() -> Option<SubmissionInputs> {
+    PENDING.get().and_then(|m| m.lock().clone())
+}
+
+/// Remove + return the pending inputs. Called by the Submit worker
+/// thread; ensures the same payload can't be double-submitted by
+/// rapid clicks.
+pub fn take_pending() -> Option<SubmissionInputs> {
+    PENDING.get().and_then(|m| m.lock().take())
+}
+
+pub fn store_last_outcome(o: SubmitOutcome) {
+    let m = LAST_OUTCOME.get_or_init(|| Mutex::new(None));
+    *m.lock() = Some(o);
+}
+
+pub fn peek_last_outcome() -> Option<SubmitOutcome> {
+    LAST_OUTCOME.get().and_then(|m| m.lock().clone())
+}
+
+pub fn clear_last_outcome() {
+    if let Some(m) = LAST_OUTCOME.get() {
+        *m.lock() = None;
+    }
+}
+
+/// Merge fresh ranks into the stored Accepted outcome. Called by the
+/// ranks-poll worker once the backend's async compute completes.
+/// No-op if the stored outcome isn't Accepted — by then the modal
+/// has either moved on or the submission failed; either way the
+/// ranks are stale.
+pub fn update_last_outcome_ranks(fresh: Vec<RankEntry>) {
+    let m = match LAST_OUTCOME.get() {
+        Some(m) => m,
+        None => return,
+    };
+    let mut guard = m.lock();
+    if let Some(SubmitOutcome::Accepted { ranks, .. }) = guard.as_mut() {
+        *ranks = fresh;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::leaderboard::hardware::HardwareFingerprint;
+
+    fn sample_inputs() -> SubmissionInputs {
+        SubmissionInputs {
+            client_version: "0.1.0".into(),
+            run_uuid: "9d4a0000-0000-0000-0000-000000000001".into(),
+            hardware: crate::leaderboard::hardware::detect(),
+            run_shape: RunShape {
+                wall_clock_seconds: 5.678,
+                bytes_scanned: 9_876_543,
+                files_scanned: 1234,
+                hash_algorithm: "river5-aes-ni".into(),
+                walker_variant: "hybrid".into(),
+                scope: "subdirectory".into(),
+                features_used_bitmap: FEATURE_BIT_CACHE | FEATURE_BIT_FORMAT_AWARE,
+                corpus_kind: "user-data".into(),
+                cache_hit_ratio: None,
+                easter_egg_hits: Vec::new(),
+            },
+            result_summary: ResultSummary {
+                duplicate_groups: 42,
+                duplicate_bytes_reclaimable: 12345,
+                largest_single_group_bytes: 1000,
+                actions_taken_summary: std::collections::BTreeMap::new(),
+                placeholder_skip_count: None,
+                placeholder_skip_bytes: None,
+            },
+        }
+    }
+
+    #[test]
+    fn build_payload_has_all_required_top_level_keys() {
+        let p = build_payload(&sample_inputs(), "test-install-id");
+        // Backend schema's `required` set.
+        for key in [
+            "schema_version",
+            "client_version",
+            "install_id",
+            "timestamp",
+            "hardware",
+            "run_shape",
+            "result_summary",
+        ] {
+            assert!(p.get(key).is_some(), "missing required key '{key}'");
+        }
+        assert_eq!(p.get("install_id").and_then(|v| v.as_str()), Some("test-install-id"));
+        assert_eq!(p.get("schema_version").and_then(|v| v.as_str()), Some("v1"));
+    }
+
+    #[test]
+    fn build_payload_does_not_emit_disallowed_top_level_keys() {
+        // Backend schema is additionalProperties:false at the top
+        // level. The pre-rewrite payload had `run_uuid`,
+        // `sd_version`, `scan`, `submitted_at_unix` — all gone.
+        let p = build_payload(&sample_inputs(), "x");
+        for key in ["run_uuid", "sd_version", "scan", "submitted_at_unix"] {
+            assert!(
+                p.get(key).is_none(),
+                "unexpected key '{key}' on payload — backend rejects with schema_invalid",
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_is_rfc3339_seconds_zulu() {
+        let p = build_payload(&sample_inputs(), "x");
+        let ts = p.get("timestamp").and_then(|v| v.as_str()).unwrap();
+        // Shape: YYYY-MM-DDTHH:MM:SSZ — 20 chars.
+        assert_eq!(ts.len(), 20, "timestamp wrong length: {ts}");
+        assert!(ts.ends_with('Z'), "timestamp must end with Z (UTC): {ts}");
+        assert!(ts.contains('T'), "timestamp must have T separator: {ts}");
+    }
+
+    #[test]
+    fn iso8601_matches_known_unix_anchors() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        assert_eq!(iso8601_from_unix(1_704_067_200), "2024-01-01T00:00:00Z");
+        // 2026-05-24T03:42:33Z = 1779594153
+        assert_eq!(iso8601_from_unix(1_779_594_153), "2026-05-24T03:42:33Z");
+        // Epoch
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn canonical_body_is_deterministic_across_inputs() {
+        // Hardware uses detect() which queries the live machine — so
+        // back-to-back calls return the same bytes, but a snapshot
+        // test would break across machines. Just check shape.
+        let p1 = build_payload(&sample_inputs(), "test-id");
+        let p2 = build_payload(&sample_inputs(), "test-id");
+        let b1 = hmac_signer::canonical_body(&p1);
+        let b2 = hmac_signer::canonical_body(&p2);
+        assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn submit_rejects_when_not_registered() {
+        let state = super::super::install::new_unregistered("https://example".into());
+        // registered defaults to false; submit should refuse.
+        let out = submit(&state, &sample_inputs());
+        assert!(matches!(out, SubmitOutcome::Rejected { status: 0, .. }));
+    }
+
+    #[test]
+    fn outcome_kind_tag_covers_every_variant() {
+        // If a new SubmitOutcome variant ships without updating the
+        // tag matcher, the archive file's `outcome_kind` field
+        // would collide with the "rejected" default. This test
+        // pins the mapping so any new variant must declare its tag.
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::Accepted {
+                submission_id: "x".into(),
+                ranks: vec![],
+                achievements_unlocked: vec![],
+                profile_url: None,
+            }),
+            "accepted"
+        );
+        assert_eq!(outcome_kind_tag(&SubmitOutcome::DuplicateNoChange), "duplicate");
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::Rejected {
+                status: 400,
+                reason: "x".into(),
+            }),
+            "rejected"
+        );
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::Transient { reason: "x".into() }),
+            "transient"
+        );
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::FlaggedForReview {
+                review_id: None,
+                local_path: "x".into(),
+                original_status: 0,
+                original_reason: "x".into(),
+            }),
+            "flagged-for-review"
+        );
+    }
+
+    #[test]
+    fn serializable_outcome_round_trips_all_variants() {
+        // The archive + review JSON files store outcomes via
+        // SerializableOutcome (tagged enum). If serde derive ever
+        // breaks for one variant, prior archive entries become
+        // unreadable. Round-trip each variant.
+        let variants = vec![
+            SubmitOutcome::Accepted {
+                submission_id: "abc".into(),
+                ranks: vec![RankEntry {
+                    category: "throughput".into(),
+                    bracket: "9950X3D2".into(),
+                    rank: 4,
+                    bucket_size: 412,
+                }],
+                achievements_unlocked: vec!["hoarder".into(), "big-find".into()],
+                profile_url: Some("https://superdeduper.io/profile/abc".into()),
+            },
+            SubmitOutcome::DuplicateNoChange,
+            SubmitOutcome::Rejected {
+                status: 422,
+                reason: "{\"error\":\"schema_invalid\"}".into(),
+            },
+            SubmitOutcome::Transient {
+                reason: "transport: connection refused".into(),
+            },
+            SubmitOutcome::FlaggedForReview {
+                review_id: Some("review-xyz".into()),
+                local_path: "/tmp/x/y.json".into(),
+                original_status: 400,
+                original_reason: "{\"error\":\"install_id_missing\"}".into(),
+            },
+        ];
+        for v in &variants {
+            let s = SerializableOutcome::from(v);
+            let bytes = serde_json::to_vec(&s).expect("serialize");
+            let _: SerializableOutcome =
+                serde_json::from_slice(&bytes).expect("deserialize");
+        }
+    }
+
+    #[test]
+    fn iso8601_handles_epoch_and_modern_dates() {
+        // Defensive — exercise the civil-from-days math at a few
+        // anchors so a future refactor that touches it can't break
+        // silently.
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_from_unix(1_704_067_200), "2024-01-01T00:00:00Z");
+        // Anchor used by the rfc3339 unit test elsewhere.
+        assert_eq!(iso8601_from_unix(1_779_594_153), "2026-05-24T03:42:33Z");
+    }
+
+    #[test]
+    fn now_iso8601_format_is_well_formed() {
+        // Shape: YYYY-MM-DDTHH:MM:SSZ — 20 chars, ends with Z,
+        // contains T as the date/time separator. Catches a future
+        // off-by-one or format-string typo in the rendering.
+        let ts = now_iso8601();
+        assert_eq!(ts.len(), 20);
+        assert!(ts.ends_with('Z'));
+        assert!(ts.chars().nth(10) == Some('T'));
+    }
+
+    #[test]
+    fn build_payload_clamps_install_id_into_output() {
+        // Defensive — the install_id arg is the ONLY way the freshest
+        // post-rotation install_id enters the payload. A future
+        // refactor that drops the threading would silently submit
+        // against a stale id. Pin the wire-format claim.
+        let inputs = sample_inputs();
+        let p1 = build_payload(&inputs, "id-a");
+        let p2 = build_payload(&inputs, "id-b");
+        assert_eq!(p1.get("install_id").and_then(|v| v.as_str()), Some("id-a"));
+        assert_eq!(p2.get("install_id").and_then(|v| v.as_str()), Some("id-b"));
+    }
+}

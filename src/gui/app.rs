@@ -139,6 +139,19 @@ pub struct SuperdeduperApp {
     /// Filled progress-bar rect captured from the most recent render
     /// pass. Particles anchor inside it and are clipped to it.
     last_bar_fill: Option<egui::Rect>,
+    /// Post-scan leaderboard modal state. Transitions:
+    /// `Hidden → Ready` on ScanFinished (with AlwaysAsk + a built
+    /// payload); `Ready → Submitting` on Submit click; `Submitting
+    /// → Done` when the worker returns; `Done → Hidden` on Close.
+    /// `AutoOptIn` bypasses Ready and goes straight to Submitting +
+    /// silent toast.
+    #[cfg(feature = "telemetry")]
+    scan_complete_modal: crate::gui::widgets::scan_complete_modal::ScanCompleteState,
+    /// Snapshot of the just-finished scan's headline stats, captured
+    /// once on ScanFinished so the modal renders consistent values
+    /// even if downstream UI state mutates. Cleared on Close.
+    #[cfg(feature = "telemetry")]
+    scan_complete_data: Option<crate::gui::widgets::scan_complete_modal::ScanCompleteData>,
 }
 
 /// Top-level File-menu actions the menubar can request. Dispatched
@@ -220,11 +233,30 @@ impl SuperdeduperApp {
             sparkles: Default::default(),
             resume_effect_active: false,
             last_bar_fill: None,
+            #[cfg(feature = "telemetry")]
+            scan_complete_modal: crate::gui::widgets::scan_complete_modal::ScanCompleteState::default(),
+            #[cfg(feature = "telemetry")]
+            scan_complete_data: None,
         };
         let mut app = app;
         // Populate cache-banner state on first launch — roots may
         // have been seeded from persistence or a CLI argument.
         app.refresh_cache_banner();
+
+        // Spawn the badge-wall data fetch in the background. Catalog
+        // is public + cached on a CDN; profile fetch only fires if the
+        // install is registered (otherwise the wall renders the
+        // greyed-out catalog with the empty-grant overlay). Best-effort:
+        // failure is surfaced inline in the widget, doesn't block UI.
+        #[cfg(feature = "telemetry")]
+        {
+            use crate::leaderboard::{catalog, install};
+            let (server_url, install_id) = match install::load() {
+                Ok(Some(s)) => (s.server_url, Some(s.install_id)),
+                _ => ("https://api.superdeduper.io".to_string(), None),
+            };
+            catalog::spawn_initial_fetch(server_url, install_id);
+        }
 
         // Intentionally NO auto-load of prior scan results on launch.
         // Projects are now explicit — File → Open Project loads one;
@@ -258,12 +290,12 @@ impl SuperdeduperApp {
         if let Some(saved) = saved_results {
             let dup_count = saved.duplicates.len();
             for g in saved.duplicates {
-                let savings = g
-                    .size
-                    .saturating_mul(g.files.len().saturating_sub(1) as u64);
                 self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
-                self.state.totals.reclaimable_bytes =
-                    self.state.totals.reclaimable_bytes.saturating_add(savings);
+                self.state.totals.reclaimable_bytes = self
+                    .state
+                    .totals
+                    .reclaimable_bytes
+                    .saturating_add(crate::gui::state::inode_aware_savings(&g));
                 self.state.duplicates.push(g);
             }
             self.state.push_log(
@@ -299,12 +331,12 @@ impl SuperdeduperApp {
         // come back populated.
         let dup_count = cp.previous_duplicates.len();
         for g in &cp.previous_duplicates {
-            let savings = g
-                .size
-                .saturating_mul(g.files.len().saturating_sub(1) as u64);
             self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
-            self.state.totals.reclaimable_bytes =
-                self.state.totals.reclaimable_bytes.saturating_add(savings);
+            self.state.totals.reclaimable_bytes = self
+                .state
+                .totals
+                .reclaimable_bytes
+                .saturating_add(crate::gui::state::inode_aware_savings(g));
             self.state.duplicates.push(g.clone());
         }
         self.state.push_log(
@@ -442,7 +474,7 @@ impl SuperdeduperApp {
         // * this is a Resume (checkpoint already adopted; user already chose
         //   to continue — the score is the same machine we're already on)
         if self.persisted.settings.skip_preflight || self.can_resume {
-            self.launch_scan();
+            self.launch_scan(None);
             return;
         }
         let roots: Vec<PathBuf> = self
@@ -457,7 +489,11 @@ impl SuperdeduperApp {
     /// Spawn the actual scan worker. Called by `start_live` only
     /// AFTER preflight has been dismissed (Cancel branches out, Start
     /// proceeds here). The body is what `start_live` used to do.
-    fn launch_scan(&mut self) {
+    ///
+    /// `defender_rtp_pre` is `Some(_)` only when this launch came
+    /// through the preflight modal (the Defender probe ran there);
+    /// resume / skip-preflight paths pass `None`.
+    fn launch_scan(&mut self, defender_rtp_pre: Option<bool>) {
         self.is_scanning = true;
         self.cancel.store(false, Ordering::Relaxed);
         self.can_resume = false;
@@ -473,6 +509,7 @@ impl SuperdeduperApp {
             self.persisted.roots.clone(),
             effective_settings,
             self.cancel.clone(),
+            defender_rtp_pre,
         );
     }
 
@@ -503,10 +540,398 @@ impl SuperdeduperApp {
         if let Some(action) =
             crate::gui::widgets::preflight_modal::show(ctx, &self.preflight)
         {
+            // Snapshot the Defender RTP probe result *before* we drop
+            // the report — G1 wants pre-scan defender state in the
+            // leaderboard payload, and this is the only place the
+            // probe runs in the GUI happy path.
+            let defender_rtp_pre = if let PreflightState::Showing { report, .. } = &self.preflight {
+                report.defender.rtp_enabled
+            } else {
+                None
+            };
             self.preflight = PreflightState::Idle;
             match action {
-                PreflightAction::Start => self.launch_scan(),
+                PreflightAction::Start => self.launch_scan(defender_rtp_pre),
                 PreflightAction::Cancel => {}
+            }
+        }
+    }
+
+    /// Called from `drain_events` on `ScanFinished`. Captures the
+    /// run's headline stats, then transitions the post-scan modal
+    /// per the user's share preference:
+    ///
+    /// * `AlwaysAsk` → modal opens in `Ready` state (Submit / Skip
+    ///   / Auto-submit / What gets shared? buttons).
+    /// * `AutoOptIn` → modal opens in `Submitting` state immediately
+    ///   (no user click needed); will fall through to `Done` when
+    ///   the worker returns. User still sees rank + achievements but
+    ///   doesn't have to click Submit each scan.
+    /// * `Never` → no modal; no submission.
+    ///
+    /// Requires the engine to have called `submission::store_pending`,
+    /// which it does unconditionally in `live::run` post-ScanFinished.
+    #[cfg(feature = "telemetry")]
+    fn on_scan_finished_for_leaderboard(
+        &mut self,
+        total_files: u64,
+        total_bytes_read: u64,
+        duplicates: u64,
+        reclaimable_bytes: u64,
+    ) {
+        use crate::gui::widgets::scan_complete_modal::{
+            ScanCompleteData, ScanCompleteState,
+        };
+        use crate::leaderboard::install;
+        use crate::leaderboard::submission;
+
+        // Drop any prior modal's state — a new scan supersedes it.
+        self.scan_complete_modal = ScanCompleteState::Hidden;
+        self.scan_complete_data = None;
+
+        // No pending payload means the engine's telemetry path didn't
+        // build one this run (e.g. cancelled or errored mid-scan).
+        // Don't pop the modal with a stale or zero payload.
+        if submission::peek_pending().is_none() {
+            return;
+        }
+
+        let elapsed_secs = self
+            .state
+            .scan_elapsed()
+            .map(|d| d.as_secs_f32())
+            .unwrap_or(0.0);
+        self.scan_complete_data = Some(ScanCompleteData::from_engine_event(
+            elapsed_secs,
+            reclaimable_bytes,
+            total_files,
+            total_bytes_read,
+            duplicates,
+        ));
+
+        // Decide what to do based on the install's share preference.
+        let share = install::load()
+            .ok()
+            .flatten()
+            .map(|s| s.share_default)
+            .unwrap_or(install::ShareDefault::AlwaysAsk);
+
+        match share {
+            install::ShareDefault::Never => {
+                self.scan_complete_modal = ScanCompleteState::Hidden;
+            }
+            install::ShareDefault::AlwaysAsk => {
+                self.scan_complete_modal = ScanCompleteState::Ready;
+            }
+            install::ShareDefault::AutoOptIn => {
+                self.scan_complete_modal = ScanCompleteState::Submitting;
+                self.spawn_leaderboard_submit_worker();
+            }
+        }
+    }
+
+    /// Spawn the submit worker thread. Reads `take_pending()` (so a
+    /// rapid double-click can't double-submit), POSTs the payload,
+    /// stashes the outcome via `store_last_outcome`. The render
+    /// loop polls `peek_last_outcome` each frame to flip the modal
+    /// from `Submitting` to `Done`.
+    #[cfg(feature = "telemetry")]
+    fn spawn_leaderboard_submit_worker(&self) {
+        std::thread::spawn(|| {
+            use crate::leaderboard::{install, submission};
+            let state = match install::load() {
+                Ok(Some(s)) if s.registered => s,
+                _ => {
+                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                        status: 0,
+                        reason: "install not registered".into(),
+                    });
+                    return;
+                }
+            };
+            // PEEK (not take) so the pending payload survives a
+            // failed submit — lets the "Submit for review" fallback
+            // path on the modal still find inputs to flag. Only
+            // clear the slot on Accepted (or DuplicateNoChange, where
+            // the server already has it).
+            let inputs = match submission::peek_pending() {
+                Some(i) => i,
+                None => {
+                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                        status: 0,
+                        reason: "no pending submission".into(),
+                    });
+                    return;
+                }
+            };
+            let outcome = submission::submit(&state, &inputs);
+            // Archive every attempt — success, duplicate, rejected,
+            // or transient — to the local archive dir so the user
+            // has a permanent record they can come back to.
+            submission::archive_attempt(&inputs, &state.install_id, &outcome);
+            // On Accepted, kick off the ranks poller. Web computes
+            // ranks async-but-immediate (~200ms typical); the poller
+            // surfaces them via toast + modal-update once the
+            // backend's worker lands them.
+            //
+            // Also refresh the cached profile so any achievements
+            // unlocked by THIS submission flip greyed → coloured in
+            // the badge wall. Without this, badge tiles only update
+            // on app restart.
+            if let submission::SubmitOutcome::Accepted { submission_id, .. } = &outcome {
+                eprintln!(
+                    "submit: Accepted (submission_id={}); spawning ranks-poll + profile-refresh",
+                    submission_id
+                );
+                crate::leaderboard::ranks_poll::spawn_ranks_poll_worker(submission_id.clone());
+                crate::leaderboard::catalog::spawn_profile_refresh(
+                    state.server_url.clone(),
+                    state.install_id.clone(),
+                );
+            }
+            // Clear the pending slot only when the server accepted
+            // the payload (or has it on file via 409). Rejected /
+            // Transient stay pending so a follow-up Submit-for-
+            // review (or retry) has data to work with.
+            if matches!(
+                &outcome,
+                submission::SubmitOutcome::Accepted { .. }
+                    | submission::SubmitOutcome::DuplicateNoChange
+            ) {
+                let _ = submission::take_pending();
+            }
+            if let submission::SubmitOutcome::Transient { reason } = &outcome {
+                eprintln!("leaderboard: submit transient ({reason}); enqueueing");
+                let body = crate::leaderboard::hmac_signer::canonical_body(
+                    &submission::build_payload(&inputs, &state.install_id),
+                );
+                let signature = state
+                    .install_key()
+                    .map(|k| crate::leaderboard::hmac_signer::sign(&k, &body))
+                    .unwrap_or_default();
+                if let Err(e) = submission::enqueue(&inputs, &state.install_id, &signature) {
+                    eprintln!("leaderboard: enqueue failed: {e:?}");
+                }
+            }
+            submission::store_last_outcome(outcome);
+        });
+    }
+
+    /// Render the post-scan leaderboard modal (if active) + dispatch
+    /// its actions. Called once per frame from `update()`.
+    #[cfg(feature = "telemetry")]
+    fn tick_scan_complete_modal(&mut self, ctx: &egui::Context) {
+        use crate::gui::widgets::scan_complete_modal::{
+            self as widget, ScanCompleteAction, ScanCompleteState,
+        };
+        use crate::leaderboard::submission;
+
+        if matches!(self.scan_complete_modal, ScanCompleteState::Hidden) {
+            return;
+        }
+        // While the post-scan modal is up, keep the GUI repainting at
+        // 5 Hz so background workers (submit → profile-refresh → ranks-
+        // poll) can publish results into static slots and have the
+        // badge wall + modal pick them up without waiting for user
+        // input. Without this, egui idle-throttles after the modal
+        // transitions stop generating events and stale grants linger
+        // on the badge wall until a mouse-move wakes the frame loop.
+        if matches!(
+            self.scan_complete_modal,
+            ScanCompleteState::Submitting | ScanCompleteState::Done
+        ) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        // Submit worker stashes outcome via store_last_outcome; flip
+        // the state when we observe one in flight from Submitting.
+        if matches!(self.scan_complete_modal, ScanCompleteState::Submitting)
+            && submission::peek_last_outcome().is_some()
+        {
+            self.scan_complete_modal = ScanCompleteState::Done;
+        }
+        let data = match &self.scan_complete_data {
+            Some(d) => d.clone(),
+            None => {
+                self.scan_complete_modal = ScanCompleteState::Hidden;
+                return;
+            }
+        };
+        let outcome = submission::peek_last_outcome();
+        // Re-build the payload preview on demand only when needed.
+        // Cheap (small JSON, no IO); avoids holding state.
+        let payload_preview: Option<String> =
+            if matches!(self.scan_complete_modal, ScanCompleteState::Preview) {
+                let install_id = crate::leaderboard::install::load()
+                    .ok()
+                    .flatten()
+                    .map(|s| s.install_id)
+                    .unwrap_or_else(|| "<not-registered>".to_string());
+                submission::peek_pending().map(|inputs| {
+                    let v = submission::build_payload(&inputs, &install_id);
+                    serde_json::to_string_pretty(&v).unwrap_or_default()
+                })
+            } else {
+                None
+            };
+        let action = widget::show(
+            ctx,
+            self.scan_complete_modal,
+            &data,
+            outcome.as_ref(),
+            payload_preview.as_deref(),
+        );
+        if let Some(a) = action {
+            match a {
+                ScanCompleteAction::Submit => {
+                    self.scan_complete_modal = ScanCompleteState::Submitting;
+                    self.spawn_leaderboard_submit_worker();
+                }
+                ScanCompleteAction::AutoSubmit => {
+                    self.flip_share_to_auto_opt_in();
+                    self.scan_complete_modal = ScanCompleteState::Submitting;
+                    self.spawn_leaderboard_submit_worker();
+                }
+                ScanCompleteAction::Skip => {
+                    self.scan_complete_modal = ScanCompleteState::Hidden;
+                    self.scan_complete_data = None;
+                }
+                ScanCompleteAction::OpenPreview => {
+                    self.scan_complete_modal = ScanCompleteState::Preview;
+                }
+                ScanCompleteAction::ClosePreview => {
+                    // Return to the prior state — Ready unless an
+                    // outcome already landed (then Done).
+                    self.scan_complete_modal =
+                        if submission::peek_last_outcome().is_some() {
+                            ScanCompleteState::Done
+                        } else {
+                            ScanCompleteState::Ready
+                        };
+                }
+                ScanCompleteAction::SubmitForReview => {
+                    self.flag_pending_for_review();
+                }
+                ScanCompleteAction::Close => {
+                    self.scan_complete_modal = ScanCompleteState::Hidden;
+                    self.scan_complete_data = None;
+                }
+            }
+        }
+    }
+
+    /// Flag the current pending submission + its rejection for admin
+    /// review. Writes a local copy to the review-queue dir + best-
+    /// effort POST to the backend review endpoint. Spawns off-thread
+    /// so the UI doesn't block on the upload. Stashes a synthetic
+    /// outcome in the last-outcome slot so the modal updates to
+    /// confirm the action.
+    #[cfg(feature = "telemetry")]
+    fn flag_pending_for_review(&self) {
+        std::thread::spawn(|| {
+            use crate::leaderboard::{install, submission};
+            let state = match install::load() {
+                Ok(Some(s)) => s,
+                _ => {
+                    eprintln!("review: install not loaded; skipping");
+                    return;
+                }
+            };
+            let inputs = match submission::peek_pending() {
+                Some(i) => i,
+                None => {
+                    eprintln!("review: no pending payload to flag");
+                    return;
+                }
+            };
+            let rejection = submission::peek_last_outcome().unwrap_or(
+                submission::SubmitOutcome::Rejected {
+                    status: 0,
+                    reason: "unknown".into(),
+                },
+            );
+            // Capture the original rejection's status + reason so
+            // the confirmation card can surface both "we flagged
+            // this for review" AND the error that triggered it,
+            // side by side, in the same view.
+            let (original_status, original_reason) = match &rejection {
+                submission::SubmitOutcome::Rejected { status, reason } => {
+                    (*status, reason.clone())
+                }
+                submission::SubmitOutcome::Transient { reason } => {
+                    (0, reason.clone())
+                }
+                _ => (0, "unknown".to_string()),
+            };
+            match submission::flag_for_review(&state, &inputs, &rejection, None) {
+                Ok((path, review_id)) => {
+                    eprintln!(
+                        "review: saved to {} (review_id={:?})",
+                        path.display(),
+                        review_id
+                    );
+                    submission::store_last_outcome(
+                        submission::SubmitOutcome::FlaggedForReview {
+                            review_id,
+                            local_path: path.display().to_string(),
+                            original_status,
+                            original_reason,
+                        },
+                    );
+                }
+                Err(e) => {
+                    eprintln!("review: local save failed: {e:?}");
+                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                        status: 0,
+                        reason: format!("Review-save failed: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Route a click from the badge-wall panel. Tile clicks log to
+    /// stderr for now (proper tile-detail modal is a follow-up);
+    /// header link opens the live profile URL; register CTA pops
+    /// the Settings modal at the Leaderboard tab.
+    #[cfg(feature = "telemetry")]
+    fn dispatch_badge_wall_action(
+        &mut self,
+        action: crate::gui::widgets::badge_wall::BadgeWallAction,
+    ) {
+        use crate::gui::widgets::badge_wall::BadgeWallAction;
+        use crate::leaderboard::install;
+        match action {
+            BadgeWallAction::TileClicked(id) => {
+                eprintln!("badge-wall: tile clicked: {id}");
+            }
+            BadgeWallAction::OpenProfile => {
+                let url = match install::load() {
+                    Ok(Some(s)) => format!(
+                        "https://superdeduper.io/profile/{}",
+                        s.install_id
+                    ),
+                    _ => "https://superdeduper.io/".to_string(),
+                };
+                open_url_in_browser(&url);
+            }
+            BadgeWallAction::OpenRegister => {
+                self.settings_open = true;
+                self.settings_modal_state.tab =
+                    crate::gui::widgets::settings_modal::SettingsTab::Leaderboard;
+            }
+        }
+    }
+
+    /// Persist `ShareDefault::AutoOptIn` on the install. Best-effort:
+    /// a save failure logs to stderr but doesn't stop the in-flight
+    /// submission. Next launch will re-load and pick up the change.
+    #[cfg(feature = "telemetry")]
+    fn flip_share_to_auto_opt_in(&self) {
+        use crate::leaderboard::install;
+        if let Ok(Some(mut s)) = install::load() {
+            s.share_default = install::ShareDefault::AutoOptIn;
+            if let Err(e) = install::save(&s) {
+                eprintln!("leaderboard: failed to persist AutoOptIn: {e:?}");
             }
         }
     }
@@ -575,12 +1000,12 @@ impl SuperdeduperApp {
                 self.can_resume = false;
                 let n = duplicates.len();
                 for g in duplicates {
-                    let savings = g
-                        .size
-                        .saturating_mul(g.files.len().saturating_sub(1) as u64);
                     self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
-                    self.state.totals.reclaimable_bytes =
-                        self.state.totals.reclaimable_bytes.saturating_add(savings);
+                    self.state.totals.reclaimable_bytes = self
+                        .state
+                        .totals
+                        .reclaimable_bytes
+                        .saturating_add(crate::gui::state::inode_aware_savings(&g));
                     self.state.duplicates.push(g);
                 }
                 self.current_project_path = Some(dir.to_path_buf());
@@ -820,7 +1245,13 @@ impl SuperdeduperApp {
                 Ok(ev) => {
                     match &ev {
                         EngineEvent::ScanStarted { .. } => self.is_scanning = true,
-                        EngineEvent::ScanFinished { .. } => {
+                        EngineEvent::ScanFinished {
+                            total_files,
+                            total_bytes_read,
+                            duplicates,
+                            reclaimable_bytes,
+                            ..
+                        } => {
                             self.is_scanning = false;
                             self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
@@ -839,6 +1270,13 @@ impl SuperdeduperApp {
                             // Don't reset() here — leave the burst
                             // particles in flight so the user sees
                             // them; they'll age out on their own.
+                            #[cfg(feature = "telemetry")]
+                            self.on_scan_finished_for_leaderboard(
+                                *total_files,
+                                *total_bytes_read,
+                                *duplicates,
+                                *reclaimable_bytes,
+                            );
                         }
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;
@@ -1002,12 +1440,22 @@ impl SuperdeduperApp {
         // (group_size, content_hash, keeper, dupes-to-move). Keeper
         // is recorded only for the manifest's "what was this a copy
         // of" field; we never move or modify it.
+        let hide_unreclaimable = self.groups_state.hide_unreclaimable;
         let groups: Vec<(u64, String, PathBuf, Vec<PathBuf>)> = self
             .state
             .duplicates
             .iter()
             .filter_map(|g| {
                 if g.files.len() < 2 {
+                    return None;
+                }
+                // Respect the hide-unreclaimable toggle: archiving
+                // 0-byte-reclaimable groups (hardlinks) is at best
+                // pointless + at worst destructive (moving aliases
+                // doesn't free space on the source volume).
+                if hide_unreclaimable
+                    && crate::gui::state::inode_aware_savings(g) == 0
+                {
                     return None;
                 }
                 let keeper = g.files[0].clone();
@@ -1199,6 +1647,18 @@ impl SuperdeduperApp {
                 // the picker + the threaded run.
                 self.pick_archive_dest_and_run();
             }
+            GroupAction::RecycleAllVisible => {
+                self.run_bulk_destructive_threaded(
+                    DedupeAction::Recycle,
+                    "♻ Recycle",
+                );
+            }
+            GroupAction::NukeAllVisible => {
+                self.run_bulk_destructive_threaded(
+                    DedupeAction::Remove,
+                    "💀 Nuke",
+                );
+            }
             GroupAction::PromoteKeeper {
                 group_idx,
                 member_idx,
@@ -1234,12 +1694,22 @@ impl SuperdeduperApp {
             .filter(|r| r.is_reference)
             .map(|r| r.path.clone())
             .collect();
+        let hide_unreclaimable = self.groups_state.hide_unreclaimable;
         let groups: Vec<(PathBuf, Vec<PathBuf>)> = self
             .state
             .duplicates
             .iter()
             .filter_map(|g| {
                 if g.files.len() < 2 {
+                    return None;
+                }
+                // Respect the hide-unreclaimable toggle (same as
+                // Recycle/Nuke): if the user has 0-byte-reclaimable
+                // groups hidden from the table view, the Go button
+                // must not act on them either.
+                if hide_unreclaimable
+                    && crate::gui::state::inode_aware_savings(g) == 0
+                {
                     return None;
                 }
                 let keeper = g.files[0].clone();
@@ -1455,6 +1925,120 @@ impl SuperdeduperApp {
                 });
             })
             .expect("spawn unsuperdeduper thread");
+    }
+
+    /// Bulk Recycle / Nuke across every visible duplicate group's
+    /// non-keepers. Mirrors the per-group worker but iterates across
+    /// all groups, sums up totals, and reports a single summary.
+    /// Reference paths are filtered out so a "Nuke all" can never
+    /// touch a source-of-truth root. Respects the
+    /// hide-unreclaimable toggle so a user who explicitly chose
+    /// "show only reclaimable" doesn't get hardlink-equivalent
+    /// groups blown away.
+    fn run_bulk_destructive_threaded(&self, action: DedupeAction, label_emoji: &str) {
+        self.action_cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.action_cancel);
+        let tx = self.tx.clone();
+        // Own the label so the spawned thread can outlive the &str.
+        let label_emoji: String = label_emoji.to_string();
+        let reference_roots: Vec<PathBuf> = self
+            .persisted
+            .roots
+            .iter()
+            .filter(|r| r.is_reference)
+            .map(|r| r.path.clone())
+            .collect();
+        let hide_unreclaimable = self.groups_state.hide_unreclaimable;
+        let groups: Vec<Vec<PathBuf>> = self
+            .state
+            .duplicates
+            .iter()
+            .filter_map(|g| {
+                if g.files.len() < 2 {
+                    return None;
+                }
+                // SAFETY GATE: when the user has the
+                // "hide unreclaimable" toggle on, skip 0-byte-
+                // reclaimable groups (link_equivalent +
+                // partial-hardlinks with unique_inodes < 2).
+                // Hiding them visually + still acting on them via
+                // Go would be a silent-destruction trap.
+                if hide_unreclaimable
+                    && crate::gui::state::inode_aware_savings(g) == 0
+                {
+                    return None;
+                }
+                let dupes: Vec<PathBuf> = g.files[1..]
+                    .iter()
+                    .filter(|p| !reference_roots.iter().any(|r| p.starts_with(r)))
+                    .cloned()
+                    .collect();
+                if dupes.is_empty() {
+                    None
+                } else {
+                    Some(dupes)
+                }
+            })
+            .collect();
+        let total: u64 = groups.iter().map(|d| d.len() as u64).sum();
+        let action_label = format!("{label_emoji} · {total} file(s) across {} group(s)", groups.len());
+        std::thread::Builder::new()
+            .name("superdeduper-bulk-destructive".into())
+            .spawn(move || {
+                let _ = tx.send(EngineEvent::ActionStarted {
+                    name: action_label,
+                    total: Some(total),
+                });
+                let mut done = 0u64;
+                let mut failed = 0u64;
+                let mut processed = 0u64;
+                let mut user_stopped = false;
+                'outer: for dupes in &groups {
+                    for d in dupes {
+                        if cancel.load(Ordering::Relaxed) {
+                            user_stopped = true;
+                            break 'outer;
+                        }
+                        let _ = tx.send(EngineEvent::ActionProgress {
+                            done: processed,
+                            current: Some(d.display().to_string()),
+                        });
+                        let r = match action {
+                            DedupeAction::Recycle => crate::dedupe::action_recycle(d),
+                            DedupeAction::Remove => crate::dedupe::action_remove(d),
+                            // Other variants aren't valid for bulk-
+                            // destructive here; treat as a no-op +
+                            // failure so the caller sees an
+                            // explicit error rather than a silent
+                            // success.
+                            _ => Err(crate::Error::other(format!(
+                                "bulk-destructive: unsupported action {action:?}",
+                            ))),
+                        };
+                        match r {
+                            Ok(()) => done += 1,
+                            Err(e) => {
+                                failed += 1;
+                                let _ = tx.send(EngineEvent::Log {
+                                    level: crate::gui::events::LogLevel::Warn,
+                                    message: format!(
+                                        "{label_emoji} failed · {} · {e}",
+                                        d.display()
+                                    ),
+                                });
+                            }
+                        }
+                        processed += 1;
+                    }
+                }
+                let label = if user_stopped { "stopped" } else { "complete" };
+                let _ = tx.send(EngineEvent::ActionFinished {
+                    summary: format!(
+                        "{label_emoji} {label} · {done} done, {failed} failed.",
+                    ),
+                });
+            })
+            .expect("spawn bulk-destructive thread");
     }
 
     fn run_action_threaded(&self, action: DedupeAction, keeper: PathBuf, dupes: Vec<PathBuf>) {
@@ -1954,6 +2538,26 @@ impl eframe::App for SuperdeduperApp {
                 ui.separator();
                 ui.add_space(6.0);
                 funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
+
+                // §10.4 badge-wall: bottom-left always-visible
+                // achievements grid. Auto-degrades to §10.5 mini-
+                // widget when the sidebar is narrower than ~280 px
+                // (3 tile-columns won't fit).
+                #[cfg(feature = "telemetry")]
+                {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    let state = crate::leaderboard::catalog::peek_state();
+                    let action = if ui.available_width() < 280.0 {
+                        crate::gui::widgets::badge_wall::show_mini(ui, &state)
+                    } else {
+                        crate::gui::widgets::badge_wall::show(ui, &state)
+                    };
+                    if let Some(a) = action {
+                        self.dispatch_badge_wall_action(a);
+                    }
+                }
             });
 
         CentralPanel::default()
@@ -2080,6 +2684,18 @@ impl eframe::App for SuperdeduperApp {
         // action-progress is post-results).
         self.tick_preflight(ctx);
 
+        // Post-scan leaderboard "dopamine moment" modal. Pops on
+        // ScanFinished with ShareDefault::AlwaysAsk; AutoOptIn
+        // submits silently; Never skips both. Mutually exclusive
+        // with preflight (both are scan-boundary modals).
+        #[cfg(feature = "telemetry")]
+        self.tick_scan_complete_modal(ctx);
+
+        // Corner toasts (rank-ready, etc). Renders in the foreground
+        // layer over everything; auto-expires + fades. Pushed from
+        // background workers via gui::widgets::toast::push().
+        crate::gui::widgets::toast::show(ctx);
+
         // Sparkles render LAST in their own foreground layer +
         // clipped to the progress-bar fill rect. Anything that
         // would have drawn outside the bar's bounds is dropped.
@@ -2141,6 +2757,18 @@ fn describe_destructive_action(action: &GroupAction) -> String {
             "Move EVERY non-keeper across EVERY currently visible duplicate group into the chosen \
              archive folder. Original directory tree is preserved under the destination; a manifest \
              JSON is written so the move can be restored later. Reference paths are never touched."
+                .to_string()
+        }
+        GroupAction::RecycleAllVisible => {
+            "Send EVERY non-keeper across EVERY currently visible duplicate group to the OS Recycle \
+             Bin. Recoverable from the recycle bin until you empty it. Reference paths are never \
+             touched."
+                .to_string()
+        }
+        GroupAction::NukeAllVisible => {
+            "PERMANENTLY DELETE every non-keeper across every currently visible duplicate group. \
+             No recycle bin, no .superdeduper rename, no undo. Reference paths are never touched. \
+             Only use when you're certain you don't need any of these files."
                 .to_string()
         }
         // Reveal / Open* should never reach this code path — they
@@ -2270,4 +2898,24 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Open a URL in the user's default browser. Per-OS shell-out;
+/// non-blocking. Failure logs to stderr and is otherwise silent —
+/// this is invoked from UI button clicks, no good way to surface
+/// "browser refused to launch" inline.
+#[cfg(feature = "telemetry")]
+fn open_url_in_browser(url: &str) {
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if let Err(e) = result {
+        eprintln!("failed to open browser to {url}: {e}");
+    }
 }

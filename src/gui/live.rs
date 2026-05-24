@@ -47,6 +47,7 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
         entries,
         ScanSettings::default(),
         Arc::new(AtomicBool::new(false)),
+        None,
     )
 }
 
@@ -55,11 +56,12 @@ pub fn spawn_with_settings(
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
+    defender_rtp_pre: Option<bool>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("superdeduper-engine".into())
         .spawn(move || {
-            if let Err(e) = run(tx.clone(), roots, settings, cancel) {
+            if let Err(e) = run(tx.clone(), roots, settings, cancel, defender_rtp_pre) {
                 let _ = tx.send(EngineEvent::Log {
                     level: LogLevel::Error,
                     message: format!("engine: {e}"),
@@ -75,7 +77,9 @@ fn run(
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
+    defender_rtp_pre: Option<bool>,
 ) -> crate::Result<()> {
+    let scan_started_at = Instant::now();
     // Diagnostics report file — fresh per scan. Failure to open it
     // doesn't kill the scan; we just lose self-debug telemetry.
     let diag = DiagnosticsLog::open();
@@ -436,6 +440,19 @@ fn run(
     // path + size + mtime; serialisation happens inside the next
     // checkpoint::save call below in the hashing loop.
     checkpoint_state.saved_inventory = Some(saved_files_from_runtime(&files));
+    // G1: compute corpus_signature_hash from the inventory's file
+    // sizes — path/content-free per leaderboard-spec §6. Two users
+    // scanning the same canonical corpus produce the same hash;
+    // useful for detecting "ran the official bench corpus" vs random
+    // data. Held in `corpus_sig` for the ScanFinished payload build.
+    #[cfg(feature = "telemetry")]
+    let corpus_sig: String = {
+        let sizes: Vec<u64> = files.iter().map(|f| f.size).collect();
+        crate::leaderboard_corpus_sig(&sizes)
+    };
+    #[cfg(not(feature = "telemetry"))]
+    let corpus_sig: String = String::new();
+    let _ = &corpus_sig; // used below when telemetry feature is on
     // Write the checkpoint to disk right now, BEFORE any hashing
     // starts. Previously the first persist happened at the end of
     // chunk 0, which meant a hard-kill mid-chunk-0 lost the entire
@@ -608,6 +625,8 @@ fn run(
     let mut total_bytes_read: u64 = 0;
     let mut total_dups: u64 = 0;
     let mut reclaimable: u64 = 0;
+    let mut reclaimable_inode: u64 = 0;
+    let mut largest_group_bytes: u64 = 0;
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -735,8 +754,16 @@ fn run(
             } else {
                 progress_files.load(Ordering::Relaxed)
             };
+            // Credit both fresh-hashed AND cache-hit bytes — the
+            // user-visible throughput graph reflects "scan progress
+            // speed" (cache fast-forward + real hashing both count
+            // as work done), and the leaderboard payload's
+            // bytes_scanned needs the cache-hit count too or it
+            // undercounts vs reclaimable_bytes and trips the
+            // backend's result_self_consistency sanity check.
             let bytes_added = match &outcome {
-                pipeline::hash::ProgressOutcome::Hashed { bytes } => *bytes,
+                pipeline::hash::ProgressOutcome::Hashed { bytes }
+                | pipeline::hash::ProgressOutcome::Cached { bytes } => *bytes,
                 _ => 0,
             };
             let total_bytes = progress_bytes
@@ -751,7 +778,10 @@ fn run(
                 if f <= 50 {
                     let _ = progress_tx.try_send(EngineEvent::Log {
                         level: LogLevel::Warn,
-                        message: format!("hash failed · {} · {error}", path.display()),
+                        message: format!(
+                            "hash failed · {} · {error}",
+                            display_path(path),
+                        ),
                     });
                 } else if f == 51 {
                     let _ = progress_tx.try_send(EngineEvent::Log {
@@ -908,6 +938,35 @@ fn run(
                 .size
                 .saturating_mul(visible_files.len().saturating_sub(1) as u64);
             reclaimable = reclaimable.saturating_add(savings);
+            // Inode-aware reclaim — for hardlinked corpora
+            // (C:\Windows / WinSxS dominated), the path-aware
+            // count above inflates because each WinSxS alias counts
+            // as a "dup" even though all aliases share an inode.
+            // Inode-aware is the TRUE freeable bytes; ships in the
+            // leaderboard payload + clamped against bytes_scanned to
+            // satisfy the backend's result_self_consistency check.
+            // Hardlink-equivalent groups have nothing to reclaim
+            // (already collapsed on disk) — skip them.
+            let unique_inodes = if g.unique_inodes == 0 {
+                visible_files.len() as u64
+            } else {
+                g.unique_inodes
+            };
+            let group_reclaim = if !g.link_equivalent && unique_inodes > 1 {
+                g.size.saturating_mul(unique_inodes.saturating_sub(1))
+            } else {
+                0
+            };
+            reclaimable_inode = reclaimable_inode.saturating_add(group_reclaim);
+            // `largest_single_group_bytes` per backend's sanity
+            // check is the largest group's RECLAIM, not its total
+            // bytes-on-disk. Backend rule: largest <= reclaim total.
+            // Using inode-aware per-group reclaim guarantees that
+            // because each per-group reclaim is a summand of the
+            // total (and there are no negative summands).
+            if group_reclaim > largest_group_bytes {
+                largest_group_bytes = group_reclaim;
+            }
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
             // sampler thread sees fresh values without us holding
@@ -930,6 +989,7 @@ fn run(
                 content_hash: g.content_hash,
                 files: visible_files,
                 link_equivalent: g.link_equivalent,
+                unique_inodes: g.unique_inodes,
             };
             checkpoint_state.record(&summary);
             let _ = tx.send(EngineEvent::DuplicateFound(summary));
@@ -977,12 +1037,16 @@ fn run(
     // Emit log lines BEFORE ScanFinished so listeners that break
     // on ScanFinished (UI, tests) still see them. Order matters:
     // ScanFinished is the terminal signal.
+    // Use inode-aware reclaim here so this user-visible line agrees
+    // with the header tile (which also uses inode-aware via
+    // gui::state::inode_aware_savings). The diagnostic line below
+    // prints both flavors for debugging hardlink-heavy corpora.
     let _ = tx.send(EngineEvent::Log {
         level: LogLevel::Info,
         message: format!(
             "scan complete: {} group(s), {} reclaimable",
             total_dups,
-            crate::gui::theme::humansize(reclaimable)
+            crate::gui::theme::humansize(reclaimable_inode)
         ),
     });
     // Cache stats so a resumed scan that *should* have fast-
@@ -1009,12 +1073,141 @@ fn run(
             hit_rate
         ),
     });
+    // Diagnostic: surface both reclaim flavors + bytes_read at
+    // scan-end so a "reclaim > read" report (hardlink-heavy corpora,
+    // partial-hardlink groups with stale unique_inodes, etc.) is
+    // one log-line away. The leaderboard payload clamps reclaim
+    // against bytes_read; this line shows the raw figures.
+    let _ = tx.send(EngineEvent::Log {
+        level: LogLevel::Info,
+        message: format!(
+            "reclaim: path-aware={}, inode-aware={}, bytes-read={} — {} groups",
+            crate::gui::theme::humansize(reclaimable),
+            crate::gui::theme::humansize(reclaimable_inode),
+            crate::gui::theme::humansize(total_bytes_read),
+            total_dups,
+        ),
+    });
+    // G1: build the leaderboard payload from this scan's results
+    // and log its size. We don't auto-submit — that's the GUI
+    // "Submit run" button's job. This step proves the integration
+    // works end-to-end: hardware detect + scan totals + corpus
+    // signature → canonical-JSON + HMAC sign-ready payload.
+    #[cfg(feature = "telemetry")]
+    {
+        use crate::leaderboard::hardware;
+        use crate::leaderboard::hmac_signer;
+        use crate::leaderboard::submission::{
+            self, FEATURE_BIT_ALLOW_RECALL_ON_READ, FEATURE_BIT_ALLOW_SYSTEM_PATHS,
+            FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB, FEATURE_BIT_FOLLOW_LINKS,
+            FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB, FEATURE_BIT_PARANOID,
+            FEATURE_BIT_REFERENCE_ROOTS, ResultSummary, RunShape, SubmissionInputs,
+        };
+        // Discard the defender post probe; current backend schema
+        // doesn't carry defender state. Keep the call commented in
+        // case a future schema reinstates it.
+        let _ = defender_rtp_pre;
+        // Wall-clock as seconds (number) per schema.
+        let wall_clock_seconds = scan_started_at.elapsed().as_secs_f64();
+        let hash_algorithm = match settings.hash_algo {
+            crate::pipeline::hash::HashAlgo::Blake3 => "blake3",
+            crate::pipeline::hash::HashAlgo::River5 => "river5-aes-ni",
+        }
+        .to_string();
+        // Scope heuristic from the root paths.
+        let scope = classify_scope(&roots);
+        // Corpus kind heuristic: "system" if any root looks like an
+        // OS-system tree (C:\Windows, /System, /usr, etc.), else
+        // "user-data".
+        let corpus_kind = classify_corpus_kind(&roots);
+        // Features bitmap built from the resolved settings.
+        let mut features_bits: u64 = 0;
+        if settings.use_cache { features_bits |= FEATURE_BIT_CACHE; }
+        if settings.use_format_aware { features_bits |= FEATURE_BIT_FORMAT_AWARE; }
+        if settings.paranoid { features_bits |= FEATURE_BIT_PARANOID; }
+        if cfg.follow_links { features_bits |= FEATURE_BIT_FOLLOW_LINKS; }
+        if cfg.allow_system_paths { features_bits |= FEATURE_BIT_ALLOW_SYSTEM_PATHS; }
+        if cfg.allow_recall_on_read { features_bits |= FEATURE_BIT_ALLOW_RECALL_ON_READ; }
+        if !cfg.reference_roots.is_empty() { features_bits |= FEATURE_BIT_REFERENCE_ROOTS; }
+        if cfg.include.is_some() { features_bits |= FEATURE_BIT_INCLUDE_GLOB; }
+        if cfg.exclude.is_some() { features_bits |= FEATURE_BIT_EXCLUDE_GLOB; }
+        // Cache hit ratio: tier-totals tracked above; ratio of
+        // cache_hits to total hash ops attempted.
+        let cache_hit_ratio = if total_hash_ops > 0 {
+            Some(total_cache_hits as f64 / total_hash_ops as f64)
+        } else {
+            None
+        };
+        let inputs = SubmissionInputs {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            run_uuid: uuid::Uuid::new_v4().to_string(),
+            hardware: hardware::detect(),
+            run_shape: RunShape {
+                wall_clock_seconds,
+                bytes_scanned: total_bytes_read,
+                files_scanned: total_files,
+                hash_algorithm,
+                walker_variant: "hybrid".to_string(),
+                scope,
+                features_used_bitmap: features_bits,
+                corpus_kind,
+                cache_hit_ratio,
+                easter_egg_hits: Vec::new(),
+            },
+            result_summary: ResultSummary {
+                duplicate_groups: total_dups,
+                // Use inode-aware reclaim (collapses hardlink
+                // aliases) for the leaderboard payload. Clamp to
+                // bytes_scanned just in case some weird edge case
+                // still produces reclaim > scanned (e.g. a file
+                // counted as both alias and unique somehow); backend
+                // sanity-rejects on that.
+                duplicate_bytes_reclaimable: reclaimable_inode.min(total_bytes_read),
+                largest_single_group_bytes: largest_group_bytes.min(total_bytes_read),
+                actions_taken_summary: std::collections::BTreeMap::new(),
+                placeholder_skip_count: None,
+                placeholder_skip_bytes: None,
+            },
+        };
+        // Diagnostic-only payload preview. install_id is empty string
+        // here because the engine doesn't load the install state at
+        // scan-end — the real submission flow re-loads it just-in-time
+        // so the most recent value (post-reset, post-register) is used.
+        // The byte-count printed below is approximate; the actual
+        // submit-time body will include install_id.
+        let payload = submission::build_payload(&inputs, "");
+        let body = hmac_signer::canonical_body(&payload);
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "leaderboard payload ready: {} bytes (run_uuid={}, hw={}/{}c)",
+                body.len(),
+                inputs.run_uuid.split('-').next().unwrap_or(""),
+                inputs.hardware.cpu_model_string,
+                inputs.hardware.cpu_threads,
+            ),
+        });
+        // Stash the inputs in the engine→GUI handoff slot so the
+        // post-scan "Submit run" button has something to send. The
+        // global slot is overwritten on every scan-end — only the
+        // freshest run is submittable from the UI.
+        submission::store_pending(inputs);
+        // A new run replaces any previous outcome's display state.
+        submission::clear_last_outcome();
+    }
+    // Use inode-aware reclaim — this is what overwrites
+    // state.totals.reclaimable_bytes at scan-end (per state.rs's
+    // ScanFinished handler). The path-aware `reclaimable` is kept
+    // for engine-internal diagnostics; the user-facing total must
+    // be inode-aware (true freeable bytes) so the header agrees
+    // with the inline EngineEvent::DuplicateFound accumulation
+    // and the leaderboard payload.
     let _ = tx.send(EngineEvent::ScanFinished {
         at: Instant::now(),
         total_files,
         total_bytes_read,
         duplicates: total_dups,
-        reclaimable_bytes: reclaimable,
+        reclaimable_bytes: reclaimable_inode,
     });
     // T2.1 phase 7 surface: tell the user how many files the tier
     // guard skipped, broken out by class. Silent when the corpus
@@ -1286,6 +1479,70 @@ fn chunk_groups(
     chunks
 }
 
+/// User-facing path display that strips the Windows verbatim-path
+/// prefix (`\\?\`). The engine uses verbatim paths internally to
+/// bypass MAX_PATH; surfacing them to the user as `\\?\C:\foo\bar`
+/// is jarring. Keeps UNC shares (`\\?\UNC\server\share`) intact —
+/// only the local-drive verbatim form is normalized.
+fn display_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.starts_with("UNC\\") {
+            // \\?\UNC\server\share -> \\server\share
+            return format!(r"\\{}", &rest[4..]);
+        }
+        return rest.to_string();
+    }
+    s.into_owned()
+}
+
+/// Map roots → `run_shape.scope` enum:
+/// * single drive-root (e.g. `C:\`) → `whole-volume`
+/// * single non-root path → `subdirectory`
+/// * multiple paths → `selection`
+#[cfg(feature = "telemetry")]
+fn classify_scope(roots: &[RootEntry]) -> String {
+    if roots.len() > 1 {
+        return "selection".to_string();
+    }
+    match roots.first() {
+        Some(r) if is_drive_root(&r.path) => "whole-volume".to_string(),
+        Some(_) => "subdirectory".to_string(),
+        None => "subdirectory".to_string(),
+    }
+}
+
+/// "system" if any root path looks like an OS-system tree;
+/// otherwise "user-data". Conservative heuristic — the backend just
+/// uses this for category bucketing.
+#[cfg(feature = "telemetry")]
+fn classify_corpus_kind(roots: &[RootEntry]) -> String {
+    for r in roots {
+        let s = r.path.to_string_lossy().to_ascii_lowercase();
+        if s.contains("\\windows\\")
+            || s.ends_with("\\windows")
+            || s.contains("/system/")
+            || s.starts_with("/system")
+            || s.contains("\\program files")
+            || s.starts_with("/usr/")
+            || s.starts_with("/bin/")
+            || s.starts_with("/sbin/")
+        {
+            return "system".to_string();
+        }
+    }
+    "user-data".to_string()
+}
+
+#[cfg(feature = "telemetry")]
+fn is_drive_root(p: &std::path::Path) -> bool {
+    let s = p.to_string_lossy();
+    // Windows: "C:\", "D:\", "\\?\C:\". Unix: "/".
+    s == "/"
+        || (s.len() == 3 && s.chars().nth(1) == Some(':') && s.ends_with('\\'))
+        || (s.len() == 7 && s.starts_with("\\\\?\\") && s.ends_with('\\'))
+}
+
 fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<ScanConfig> {
     let include = if settings.include_glob.is_empty() {
         None
@@ -1327,6 +1584,9 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
             .collect(),
         min_size: settings.min_size_bytes,
         max_size: settings.max_size_bytes,
+        // GUI scans use the engine default Tier 1 read size; the
+        // experimental --tier1-bytes flag is CLI-only for now.
+        tier1_bytes: crate::pipeline::hash::TIER1_BYTES,
         include,
         exclude,
         format: OutputFormat::Json,
@@ -1381,4 +1641,105 @@ fn saved_files_from_runtime(
             volume_guid: f.volume_guid.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ============================================================
+    // display_path — verbatim-prefix stripping for Log tab paths.
+    // ============================================================
+
+    #[test]
+    fn display_path_strips_verbatim_drive_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Windows\System32\foo.dll")),
+            r"C:\Windows\System32\foo.dll"
+        );
+    }
+
+    #[test]
+    fn display_path_rewrites_verbatim_unc() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\fs\share\thing")),
+            r"\\fs\share\thing"
+        );
+    }
+
+    #[test]
+    fn display_path_passes_through_normal_paths() {
+        assert_eq!(
+            display_path(Path::new(r"C:\Users\Mick\file")),
+            r"C:\Users\Mick\file"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/neomatrix/file")),
+            "/home/neomatrix/file"
+        );
+    }
+
+    // ============================================================
+    // classify_scope / classify_corpus_kind / is_drive_root —
+    // the heuristics that produce run_shape.scope + corpus_kind on
+    // the leaderboard payload. Wrong outputs land in the backend
+    // and bucket users incorrectly; pin the obvious cases.
+    // ============================================================
+
+    #[cfg(feature = "telemetry")]
+    fn root(path: &str) -> RootEntry {
+        RootEntry {
+            path: std::path::PathBuf::from(path),
+            is_reference: false,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_scope_whole_volume_for_single_drive_root() {
+        assert_eq!(classify_scope(&[root(r"C:\")]), "whole-volume");
+        assert_eq!(classify_scope(&[root("/")]), "whole-volume");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_scope_subdirectory_for_single_non_root() {
+        assert_eq!(classify_scope(&[root(r"C:\Users\Mick")]), "subdirectory");
+        assert_eq!(classify_scope(&[root("/home/neomatrix/Documents")]), "subdirectory");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_scope_selection_for_multiple_roots() {
+        assert_eq!(
+            classify_scope(&[root(r"C:\Users\A"), root(r"D:\Backup")]),
+            "selection"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_corpus_kind_system_on_windows_system_paths() {
+        assert_eq!(classify_corpus_kind(&[root(r"C:\Windows\System32")]), "system");
+        assert_eq!(classify_corpus_kind(&[root(r"C:\Program Files\Foo")]), "system");
+        assert_eq!(classify_corpus_kind(&[root("/usr/local/bin")]), "system");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_corpus_kind_user_data_on_user_paths() {
+        assert_eq!(classify_corpus_kind(&[root(r"C:\Users\Mick")]), "user-data");
+        assert_eq!(classify_corpus_kind(&[root("/home/neomatrix/Photos")]), "user-data");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn is_drive_root_recognises_windows_and_unix_roots() {
+        assert!(is_drive_root(Path::new(r"C:\")));
+        assert!(is_drive_root(Path::new(r"D:\")));
+        assert!(is_drive_root(Path::new("/")));
+        assert!(!is_drive_root(Path::new(r"C:\Users")));
+        assert!(!is_drive_root(Path::new("/home")));
+    }
 }

@@ -103,12 +103,15 @@ pub fn save(
     let stats = ProjectStats {
         duplicate_groups: duplicates.len() as u64,
         duplicate_files: duplicates.iter().map(|g| g.files.len() as u64).sum(),
+        // Inode-aware reclaim — skips fully-hardlinked groups and
+        // uses unique_inodes for partial-hardlink groups. Matches
+        // what the header tile + leaderboard payload report.
+        // Without this, a project saved during a C:\Windows-heavy
+        // run would persist an inflated reclaim figure that re-
+        // hydrated wrong on next launch.
         reclaimable_bytes: duplicates
             .iter()
-            .map(|g| {
-                g.size
-                    .saturating_mul(g.files.len().saturating_sub(1) as u64)
-            })
+            .map(crate::gui::state::inode_aware_savings)
             .sum(),
     };
 

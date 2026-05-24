@@ -27,7 +27,21 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool
     ui.horizontal(|ui| {
         ui.add_space(4.0);
         ui.label(RichText::new("superdeduper").color(theme::ACCENT).heading());
-        ui.label(RichText::new(env!("CARGO_PKG_VERSION")).color(theme::TEXT_LO));
+        // Version + git SHA: makes "which build am I running?"
+        // visually answerable without uniquely-named EXEs. SHA comes
+        // from build.rs at compile-time; falls back to "dev" if the
+        // build host has no git checkout (e.g. tarball install).
+        let build_tag = format!(
+            "v{} · {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("SD_BUILD_SHA"),
+        );
+        ui.label(RichText::new(build_tag).color(theme::TEXT_LO).monospace())
+            .on_hover_text(
+                "Cargo version (Cargo.toml) and git short-SHA of the commit \
+                 this binary was built from. Click-paste me into any bug \
+                 report so we know exactly which build is producing the issue.",
+            );
         ui.add_space(8.0);
 
         // Hash-algo pill — shows the active content-hash algo and
@@ -134,9 +148,9 @@ fn hash_algo_pill(ui: &mut Ui, algo: HashAlgo) -> bool {
     let bg = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 32);
     let frame = Frame::none()
         .fill(bg)
-        .rounding(Rounding::same(10.0))
+        .rounding(Rounding::same(10))
         .stroke(Stroke::new(1.0, fill))
-        .inner_margin(egui::Margin::symmetric(10.0, 4.0));
+        .inner_margin(egui::Margin::symmetric(10, 4));
     let resp = frame
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -173,9 +187,9 @@ fn hash_algo_pill_disabled(ui: &mut Ui, algo: HashAlgo) {
     let bg = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 32);
     let frame = Frame::none()
         .fill(bg)
-        .rounding(Rounding::same(10.0))
+        .rounding(Rounding::same(10))
         .stroke(Stroke::new(1.0, fill))
-        .inner_margin(egui::Margin::symmetric(10.0, 4.0));
+        .inner_margin(egui::Margin::symmetric(10, 4));
     frame
         .show(ui, |ui| {
             ui.horizontal(|ui| {

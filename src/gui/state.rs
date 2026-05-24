@@ -381,20 +381,9 @@ impl UiState {
             }
             EngineEvent::DuplicateFound(g) => {
                 self.totals.duplicates = self.totals.duplicates.saturating_add(1);
-                // Hardlinked groups already share storage on disk —
-                // the (n-1) × size figure overcounts the actual
-                // reclaimable space (it's zero, the data is shared).
-                // Exclude them from the header Reclaimable stat so
-                // the user isn't told they can recover space that's
-                // already been recovered. The groups still show in
-                // the table (badged distinctly via the GUI).
-                if !g.link_equivalent {
-                    let savings = g
-                        .size
-                        .saturating_mul(g.files.len().saturating_sub(1) as u64);
-                    self.totals.reclaimable_bytes =
-                        self.totals.reclaimable_bytes.saturating_add(savings);
-                }
+                let savings = inode_aware_savings(&g);
+                self.totals.reclaimable_bytes =
+                    self.totals.reclaimable_bytes.saturating_add(savings);
                 self.duplicates.push(g);
             }
             EngineEvent::ScanFinished {
@@ -497,6 +486,27 @@ impl UiState {
     }
 }
 
+/// True reclaimable bytes for a duplicate group. Returns 0 when the
+/// group is purely hardlinked (data already shared on disk; nothing
+/// to free). Uses `unique_inodes` for the partial-hardlink case so
+/// a group with 8 path-aliases sharing 3 inodes credits `2 * size`,
+/// not `7 * size`. Falls back to `files.len()` when `unique_inodes`
+/// is 0 (older checkpoint formats that pre-date the field).
+pub fn inode_aware_savings(g: &DuplicateGroupSummary) -> u64 {
+    if g.link_equivalent {
+        return 0;
+    }
+    let unique = if g.unique_inodes == 0 {
+        g.files.len() as u64
+    } else {
+        g.unique_inodes
+    };
+    if unique < 2 {
+        return 0;
+    }
+    g.size.saturating_mul(unique - 1)
+}
+
 /// Human-readable wallclock formatter shared by the header tile and
 /// the "Done — Xm Ys" status line. Picks the right unit so a 4-second
 /// scan reads `4.2s` while a 6-minute scan reads `6m 12s` and a
@@ -513,5 +523,165 @@ pub fn fmt_wallclock(d: Duration) -> String {
         let hours = (total / 3600.0) as u64;
         let mins = ((total - (hours as f64) * 3600.0) / 60.0) as u64;
         format!("{}h {:02}m", hours, mins)
+    }
+}
+
+#[cfg(test)]
+mod inode_aware_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn mk_group(
+        size: u64,
+        n_files: usize,
+        link_equivalent: bool,
+        unique_inodes: u64,
+    ) -> DuplicateGroupSummary {
+        DuplicateGroupSummary {
+            size,
+            content_hash: "h".into(),
+            files: (0..n_files).map(|i| PathBuf::from(format!("/p/{i}"))).collect(),
+            link_equivalent,
+            unique_inodes,
+        }
+    }
+
+    #[test]
+    fn link_equivalent_group_returns_zero() {
+        // Stream A — every file shares one inode, nothing to reclaim.
+        let g = mk_group(4096, 8, true, 1);
+        assert_eq!(inode_aware_savings(&g), 0);
+    }
+
+    #[test]
+    fn single_alias_group_uses_files_count() {
+        // Stream B — N distinct inodes, N-1 are reclaimable.
+        let g = mk_group(1000, 5, false, 5);
+        assert_eq!(inode_aware_savings(&g), 4000);
+    }
+
+    #[test]
+    fn unique_inodes_zero_falls_back_to_files_len() {
+        // Older checkpoint format — `unique_inodes` was missing.
+        // Fall back to path-aware count for backwards compat.
+        let g = mk_group(100, 3, false, 0);
+        assert_eq!(inode_aware_savings(&g), 200);
+    }
+
+    #[test]
+    fn partial_hardlink_uses_unique_inodes_not_files_count() {
+        // 8 path-aliases sharing 3 inodes → (3-1)*size, not (8-1)*size.
+        // This is the C:\Windows / WinSxS shape that was inflating
+        // header reclaim 4x on Mick's scans before the fix.
+        let g = mk_group(1000, 8, false, 3);
+        assert_eq!(inode_aware_savings(&g), 2000);
+        // The path-aware figure for the same group would be 7000.
+        // Verify they actually diverge (the test is meaningful).
+        assert_ne!(inode_aware_savings(&g), 7000);
+    }
+
+    #[test]
+    fn unique_inodes_one_returns_zero() {
+        // Edge case: link_equivalent flag missed but inode count
+        // says single inode → still 0 reclaimable. Defends against
+        // a future bug where Stream A is mis-tagged.
+        let g = mk_group(4096, 5, false, 1);
+        assert_eq!(inode_aware_savings(&g), 0);
+    }
+
+    #[test]
+    fn zero_size_group_returns_zero() {
+        // Empty files: every file is its own inode, but (count-1) *
+        // 0 is still 0. Don't crash on 0-byte content.
+        let g = mk_group(0, 4, false, 4);
+        assert_eq!(inode_aware_savings(&g), 0);
+    }
+
+    #[test]
+    fn saturating_mul_does_not_overflow_at_u64_max() {
+        // Defense against a corrupted profile claiming a huge group.
+        // saturating_mul caps at u64::MAX instead of panicking.
+        let g = mk_group(u64::MAX, 3, false, 3);
+        // (3-1)*u64::MAX saturates to u64::MAX.
+        assert_eq!(inode_aware_savings(&g), u64::MAX);
+    }
+
+    #[test]
+    fn ui_state_totals_match_inode_aware_after_full_event_stream() {
+        // Walk a UiState through the same event sequence the engine
+        // emits at scan-end: a mix of DuplicateFound (link-eq +
+        // single-alias) → ScanFinished. The header's reclaimable
+        // tile reads `self.totals.reclaimable_bytes` which gets
+        // overwritten by ScanFinished, so this test pins both
+        // the accumulator path AND the wholesale overwrite path.
+        use crate::gui::events::{EngineEvent, DuplicateGroupSummary, OverallStage};
+        let mut state = UiState::default();
+
+        // Three groups: one hardlinked (link_equivalent), two
+        // single-alias. Path-aware would sum to a different total
+        // than inode-aware on hardlinked groups.
+        let g_hardlink = mk_group(1_000_000_000, 8, true, 1); // 0 reclaim
+        let g_normal_a = mk_group(50_000_000, 3, false, 3); // 100M reclaim
+        let g_normal_b = mk_group(20_000_000, 2, false, 2); // 20M reclaim
+
+        state.apply(EngineEvent::DuplicateFound(g_hardlink.clone()));
+        state.apply(EngineEvent::DuplicateFound(g_normal_a.clone()));
+        state.apply(EngineEvent::DuplicateFound(g_normal_b.clone()));
+
+        // Pre-ScanFinished, the accumulator should equal the
+        // sum of inode-aware savings across all three groups.
+        let expected = inode_aware_savings(&g_hardlink)
+            + inode_aware_savings(&g_normal_a)
+            + inode_aware_savings(&g_normal_b);
+        assert_eq!(state.totals.reclaimable_bytes, expected);
+        assert_eq!(state.totals.reclaimable_bytes, 120_000_000);
+        assert_eq!(state.totals.duplicates, 3);
+
+        // Now fire ScanFinished — this OVERWRITES self.totals
+        // wholesale. The reclaimable_bytes carried on the event
+        // must already be inode-aware (engine's responsibility),
+        // and after the overwrite the header tile must still
+        // show the inode-aware figure.
+        state.apply(EngineEvent::ScanFinished {
+            at: std::time::Instant::now(),
+            total_files: 100,
+            total_bytes_read: 5_000_000_000,
+            duplicates: 3,
+            reclaimable_bytes: expected, // mirroring what live.rs sends
+        });
+        assert_eq!(state.totals.reclaimable_bytes, expected);
+        assert_eq!(state.totals.reclaimable_bytes, 120_000_000);
+        // bytes_read must always be >= reclaimable_bytes — the
+        // backend's result_self_consistency sanity check requires
+        // it, and this is the user-visible header pair.
+        assert!(
+            state.totals.bytes_read >= state.totals.reclaimable_bytes,
+            "bytes_read ({}) must be >= reclaimable_bytes ({})",
+            state.totals.bytes_read,
+            state.totals.reclaimable_bytes,
+        );
+        let _ = OverallStage::Idle; // just confirm enum is in scope
+    }
+
+    #[test]
+    fn largest_per_group_reclaim_is_at_most_total() {
+        // The invariant the backend's sanity check enforces:
+        // for any set of non-link-equivalent groups, the max of
+        // (per-group reclaim) <= sum of (per-group reclaim).
+        let groups = vec![
+            mk_group(100, 4, false, 4),  // (4-1)*100 = 300
+            mk_group(1000, 3, false, 2), // (2-1)*1000 = 1000  <- biggest
+            mk_group(500, 2, false, 2),  // (2-1)*500 = 500
+            mk_group(50, 8, true, 1),    // 0 (link_equivalent)
+        ];
+        let per_group: Vec<u64> = groups.iter().map(inode_aware_savings).collect();
+        let total: u64 = per_group.iter().sum();
+        let largest = *per_group.iter().max().unwrap();
+        assert!(
+            largest <= total,
+            "largest {largest} must be <= total {total}",
+        );
+        assert_eq!(total, 1800);
+        assert_eq!(largest, 1000);
     }
 }

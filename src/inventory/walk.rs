@@ -321,19 +321,53 @@ where
         } else {
             None
         };
+        // L0: on Linux/Unix, populate file_ref + volume_guid from
+        // st_ino + st_dev so the engine's T0.5 partition_by_inode
+        // sees real hardlink relationships. Without this, every
+        // path got a synthetic per-file key, hardlinks were never
+        // collapsed, and reclaimable_inode_bytes inflated on
+        // hardlink-heavy corpora (e.g. /usr/lib's uutils multi-
+        // call binary that ships 114 hardlinks to one inode).
+        // Cheap: `metadata` was already fetched for the size +
+        // filetime/win-attributes lines above; no extra syscall.
+        let (file_ref, volume_guid) = inode_identity(&metadata);
         out.push(FileEntry {
             path,
             size,
             mtime: filetime_ticks(&metadata),
-            file_ref: 0,
+            file_ref,
             parent_ref: 0,
             usn: 0,
             attributes,
-            volume_guid: None,
+            volume_guid,
             placeholder: crate::inventory::placeholder::classify(attributes, reparse_tag),
         });
     }
     Ok(())
+}
+
+/// Extract (file_ref, volume_guid) from a Metadata.
+///
+/// On Unix: `(st_ino, Some("linux-dev-{st_dev}"))`. T0.5's
+/// `partition_by_inode` uses `(volume_guid, file_ref)` as the inode
+/// key — populating both fields makes hardlink groups collapse
+/// correctly on Linux.
+///
+/// On Windows: returns `(0, None)`. Windows has its own
+/// `resolve_file_ids` pass that uses `GetFileInformationByHandle` to
+/// populate the canonical NTFS file_ref; we leave the walker's
+/// default here to preserve that flow.
+#[cfg(unix)]
+fn inode_identity(metadata: &std::fs::Metadata) -> (u64, Option<String>) {
+    use std::os::unix::fs::MetadataExt;
+    let file_ref = metadata.ino();
+    let volume_guid = Some(format!("linux-dev-{}", metadata.dev()));
+    (file_ref, volume_guid)
+}
+
+#[cfg(not(unix))]
+fn inode_identity(_metadata: &std::fs::Metadata) -> (u64, Option<String>) {
+    (0, None)
 }
 
 /// Block N — Windows fast path. Iterate `enumeration.entries`, push
@@ -625,4 +659,106 @@ pub(crate) fn file_id_for(path: &Path) -> Option<(u64, Option<String>)> {
     // same string; on different volumes they differ.
     let vol = Some(format!("vol-serial:0x{:08x}", info.dwVolumeSerialNumber));
     Some((file_ref, vol))
+}
+
+#[cfg(test)]
+mod inode_identity_tests {
+    //! Unit tests for the inode-identity walker helper. The
+    //! integration check (whole-engine scan of a directory with
+    //! hardlinks) lives in tests/walker_fast_path.rs and the
+    //! verify-scan in the dev iteration; these tests pin the
+    //! helper's contract directly.
+
+    use super::inode_identity;
+    use std::fs;
+    use std::io::Write;
+
+    #[test]
+    #[cfg(unix)]
+    fn extracts_ino_and_dev_on_unix() {
+        // Write a file, fetch its metadata, assert inode_identity
+        // returns non-zero file_ref + a volume_guid that matches
+        // the `linux-dev-{dev}` format. We can't assert specific
+        // numbers (vary per host), only the shape.
+        let tmp = std::env::temp_dir().join(format!(
+            "sd-inode-identity-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut f = fs::File::create(&tmp).unwrap();
+        f.write_all(b"hi").unwrap();
+        drop(f);
+        let meta = fs::metadata(&tmp).unwrap();
+
+        let (file_ref, volume_guid) = inode_identity(&meta);
+        assert_ne!(file_ref, 0, "file_ref must be the real st_ino");
+        let vol = volume_guid.expect("volume_guid populated on Unix");
+        assert!(
+            vol.starts_with("linux-dev-"),
+            "volume_guid format mismatch: {vol}"
+        );
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hardlinks_share_file_ref_and_volume_guid() {
+        // Two hardlinks of the same inode MUST produce the same
+        // (file_ref, volume_guid) — that's the invariant T0.5's
+        // partition_by_inode relies on to collapse them into one
+        // link_equivalent group.
+        let dir = std::env::temp_dir().join(format!(
+            "sd-inode-identity-hl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("a.bin");
+        let link = dir.join("b.bin");
+        let mut f = fs::File::create(&original).unwrap();
+        f.write_all(b"shared").unwrap();
+        drop(f);
+        fs::hard_link(&original, &link).unwrap();
+
+        let m_a = fs::metadata(&original).unwrap();
+        let m_b = fs::metadata(&link).unwrap();
+        let (ino_a, vol_a) = inode_identity(&m_a);
+        let (ino_b, vol_b) = inode_identity(&m_b);
+        assert_eq!(ino_a, ino_b, "hardlinked files must share file_ref");
+        assert_eq!(vol_a, vol_b, "hardlinked files on same fs must share volume_guid");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn distinct_files_have_distinct_file_refs() {
+        // Two genuinely separate files (cp, not ln) must have
+        // different st_ino values. If this ever fails on a real
+        // filesystem, it's a fs/kernel bug, not ours — but pin
+        // the assumption.
+        let dir = std::env::temp_dir().join(format!(
+            "sd-inode-identity-distinct-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let (ino_a, _) = inode_identity(&fs::metadata(&a).unwrap());
+        let (ino_b, _) = inode_identity(&fs::metadata(&b).unwrap());
+        assert_ne!(ino_a, ino_b, "distinct files must have distinct file_refs");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

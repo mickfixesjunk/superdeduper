@@ -1,0 +1,314 @@
+//! Per-install state persisted at:
+//!
+//! * Windows: `%LOCALAPPDATA%\superdeduper\install.json`
+//! * macOS:   `~/Library/Application Support/superdeduper/install.json`
+//! * Linux:   `$XDG_DATA_HOME/superdeduper/install.json` (or `~/.local/share`)
+//!
+//! Schema per client-spec §4.3. Failure modes per §4.5: corrupted or
+//! partially-written files fail closed; the user must explicitly opt
+//! in to a fresh registration via `sd register --reset` rather than
+//! silently rotating their identity (which would let an attacker
+//! bypass shadowbans).
+
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+/// Bump when adding required fields. Old files with a lower
+/// schema_version get rejected on load → user re-registers.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// 256-bit HMAC key as raw bytes. Persisted as hex in install.json.
+pub type InstallKey = [u8; 32];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallState {
+    pub schema_version: u32,
+    /// RFC 4122 v4 UUID. Identity is opaque to the backend; user can
+    /// optionally link a Google/Discord identity to this install at G3.
+    pub install_id: String,
+    /// 32 random bytes, hex-encoded. NEVER transmitted; used only as
+    /// the HMAC-SHA256 key for the `X-Sd-Signature` header.
+    pub install_key_hex: String,
+    /// True once `POST /api/v1/register` returned 200. While false,
+    /// the engine refuses to submit (no point — server would reject).
+    pub registered: bool,
+    /// Backend URL the install_id is registered against. Bumping the
+    /// server_url invalidates registration; user must re-register.
+    pub server_url: String,
+    /// `sd_version` at the moment of registration. Diagnostic only.
+    pub client_version_at_register: String,
+    /// Three-state opt-in for "should this scan attempt a submit?":
+    /// `AlwaysAsk` (default) → GUI shows the post-scan modal,
+    /// `AutoOptIn` → silent submit + summary toast,
+    /// `Never` → no submit attempt, no modal.
+    #[serde(default)]
+    pub share_default: ShareDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareDefault {
+    AlwaysAsk,
+    AutoOptIn,
+    Never,
+}
+
+impl Default for ShareDefault {
+    fn default() -> Self {
+        Self::AlwaysAsk
+    }
+}
+
+impl InstallState {
+    /// Decode `install_key_hex` into the raw 32-byte key. Returns
+    /// `None` if the hex is malformed or wrong length — caller treats
+    /// that as a corrupted-install failure per spec §4.5.
+    pub fn install_key(&self) -> Option<InstallKey> {
+        if self.install_key_hex.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            let byte = u8::from_str_radix(&self.install_key_hex[i * 2..i * 2 + 2], 16).ok()?;
+            out[i] = byte;
+        }
+        Some(out)
+    }
+}
+
+/// Canonical path for the install.json file. Public so tests + CLI
+/// `sd register --show-path` can hit the same location the engine
+/// reads/writes.
+pub fn install_path() -> io::Result<PathBuf> {
+    let mut p = data_dir()?;
+    p.push("install.json");
+    Ok(p)
+}
+
+#[cfg(windows)]
+fn data_dir() -> io::Result<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA not set"))?;
+    let mut p = PathBuf::from(local);
+    p.push("superdeduper");
+    Ok(p)
+}
+
+#[cfg(target_os = "macos")]
+fn data_dir() -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+    let mut p = PathBuf::from(home);
+    p.push("Library");
+    p.push("Application Support");
+    p.push("superdeduper");
+    Ok(p)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn data_dir() -> io::Result<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        let mut p = PathBuf::from(xdg);
+        p.push("superdeduper");
+        return Ok(p);
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+    let mut p = PathBuf::from(home);
+    p.push(".local");
+    p.push("share");
+    p.push("superdeduper");
+    Ok(p)
+}
+
+/// Load the install state. Returns:
+/// * `Ok(Some(state))` — valid file, ready to use
+/// * `Ok(None)` — file doesn't exist; caller may call `register`
+/// * `Err(_)` — file exists but failed to parse / failed schema check.
+///   Caller MUST NOT silently re-create (would let an attacker rotate
+///   identities to escape shadowban). User opts in via `--reset`.
+pub fn load() -> io::Result<Option<InstallState>> {
+    let path = install_path()?;
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let state: InstallState = serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("install.json parse: {e}")))?;
+    if state.schema_version > CURRENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "install.json schema_version {} > {} — newer client wrote this file",
+                state.schema_version, CURRENT_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if state.install_key().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "install_key_hex malformed",
+        ));
+    }
+    if state.install_id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "install_id missing",
+        ));
+    }
+    Ok(Some(state))
+}
+
+/// Atomic write: serialize to `install.json.tmp` then rename. On
+/// Windows the LOCALAPPDATA permissions already restrict to the
+/// current user; on Unix we set 0600 explicitly.
+pub fn save(state: &InstallState) -> io::Result<()> {
+    let path = install_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("install.json encode: {e}")))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &bytes)?;
+    set_owner_only_perms(&tmp)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_perms(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_perms(_path: &std::path::Path) -> io::Result<()> {
+    // Windows: LOCALAPPDATA is already user-scoped; default file
+    // perms inherit "Administrators + SYSTEM + current user". A
+    // future hardening pass can use SetFileSecurityW to strip
+    // Administrators + remove inheritance. Threat model treats
+    // signing as a speed bump anyway, so default ACL is acceptable
+    // for v1.
+    Ok(())
+}
+
+/// Build a fresh InstallState with a new UUID + random HMAC key.
+/// Does NOT persist; caller calls `save(&state)` after a successful
+/// registration response.
+pub fn new_unregistered(server_url: String) -> InstallState {
+    let install_id = uuid::Uuid::new_v4().to_string();
+    let mut key = [0u8; 32];
+    fill_random(&mut key);
+    let install_key_hex = hex_encode(&key);
+    InstallState {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        install_id,
+        install_key_hex,
+        registered: false,
+        server_url,
+        client_version_at_register: env!("CARGO_PKG_VERSION").to_string(),
+        share_default: ShareDefault::default(),
+    }
+}
+
+/// Fill `buf` with cryptographically suitable random bytes.
+///
+/// Strategy: read from `/dev/urandom` on Unix, `BCryptGenRandom` on
+/// Windows. We avoid pulling `getrandom` directly to keep the dep
+/// list small — `uuid::Uuid::new_v4()` already pulls a CSPRNG in
+/// transitively, but we use it directly here for clarity.
+fn fill_random(buf: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            if f.read_exact(buf).is_ok() {
+                return;
+            }
+        }
+        // Fallback: time-seeded xorshift. Not crypto-grade, but the
+        // install_key on a system without /dev/urandom is the least
+        // of that system's problems.
+        seeded_fill(buf);
+    }
+    #[cfg(windows)]
+    {
+        // BCryptGenRandom via the windows crate. We don't have the
+        // BCrypt features enabled in Cargo.toml's windows {} block
+        // yet; for now use the same /dev/urandom-ish fallback. Real
+        // BCrypt wiring is a quick follow-up.
+        seeded_fill(buf);
+    }
+}
+
+fn seeded_fill(buf: &mut [u8]) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ 0xDEAD_BEEF_CAFE_F00D;
+    for b in buf.iter_mut() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        *b = (seed >> 56) as u8;
+    }
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for &byte in b {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_unregistered_has_v4_uuid_and_64_hex_key() {
+        let s = new_unregistered("https://api.superdeduper.io".into());
+        assert_eq!(s.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(s.install_id.len(), 36, "UUID should be 36 chars");
+        assert_eq!(s.install_id.chars().filter(|&c| c == '-').count(), 4);
+        assert_eq!(s.install_key_hex.len(), 64, "32 bytes = 64 hex chars");
+        assert!(!s.registered);
+        assert_eq!(s.share_default, ShareDefault::AlwaysAsk);
+    }
+
+    #[test]
+    fn install_key_decodes_round_trip() {
+        let s = new_unregistered("https://example".into());
+        let key = s.install_key().expect("valid hex");
+        assert_eq!(key.len(), 32);
+        let re_encoded = hex_encode(&key);
+        assert_eq!(re_encoded, s.install_key_hex);
+    }
+
+    #[test]
+    fn malformed_install_key_returns_none() {
+        let mut s = new_unregistered("https://example".into());
+        s.install_key_hex = "not hex".into();
+        assert!(s.install_key().is_none());
+        s.install_key_hex = "abcd".into(); // too short
+        assert!(s.install_key().is_none());
+    }
+
+    #[test]
+    fn two_calls_produce_distinct_ids_and_keys() {
+        let a = new_unregistered("https://a".into());
+        let b = new_unregistered("https://b".into());
+        assert_ne!(a.install_id, b.install_id);
+        assert_ne!(a.install_key_hex, b.install_key_hex);
+    }
+}

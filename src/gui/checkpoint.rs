@@ -245,6 +245,7 @@ mod tests {
             content_hash: "deadbeef".into(),
             files: vec![PathBuf::from("/tmp/x/a"), PathBuf::from("/tmp/x/b")],
             link_equivalent: false,
+            unique_inodes: 2,
         });
         save(&path, &cp).unwrap();
 

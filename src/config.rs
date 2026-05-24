@@ -15,6 +15,11 @@ pub struct ScanConfig {
     pub reference_roots: Vec<PathBuf>,
     pub min_size: u64,
     pub max_size: Option<u64>,
+    /// Runtime override for the Tier 1 head-read size.
+    /// Default 4 KiB; CLI `--tier1-bytes` flag lets bench coord
+    /// experiment with smaller (matches cz's partial-hash) or
+    /// larger (saturate IO queue) values.
+    pub tier1_bytes: u64,
     pub include: Option<GlobSet>,
     pub exclude: Option<GlobSet>,
     pub format: OutputFormat,
@@ -52,6 +57,10 @@ impl ScanConfig {
 
         let min_size = cli::parse_size(&args.min_size)?;
         let max_size = args.max_size.as_deref().map(cli::parse_size).transpose()?;
+        let tier1_bytes = cli::parse_size(&args.tier1_bytes)?;
+        if tier1_bytes == 0 {
+            return Err(Error::other("--tier1-bytes must be > 0"));
+        }
         if let (Some(max), min) = (max_size, min_size) {
             if max < min {
                 return Err(Error::other(format!(
@@ -65,6 +74,7 @@ impl ScanConfig {
             reference_roots: args.reference.clone(),
             min_size,
             max_size,
+            tier1_bytes,
             include: build_globset(&args.include)?,
             exclude: build_globset(&args.exclude)?,
             format: args.format,
@@ -109,4 +119,138 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for `ScanConfig::from_args` validation rules + the
+    //! default-derivation logic. This is the CLI's contract — a
+    //! regression here breaks every command-line invocation.
+
+    use super::*;
+    use crate::cli::{HashAlgoArg, OutputFormat, ScanArgs};
+    use std::path::PathBuf;
+
+    fn args_with_paths(paths: Vec<PathBuf>) -> ScanArgs {
+        ScanArgs {
+            paths,
+            reference: vec![],
+            min_size: "4K".into(),
+            max_size: None,
+            tier1_bytes: "4K".into(),
+            include: vec![],
+            exclude: vec![],
+            format: OutputFormat::Text,
+            paranoid: false,
+            no_cache: false,
+            no_format_aware: false,
+            threads: None,
+            io_threads: None,
+            queue_depth: None,
+            output: None,
+            follow_links: false,
+            allow_system_paths: false,
+            placeholders_only: false,
+            force_hash: false,
+            allow_recall_on_read: false,
+            hash_algo: HashAlgoArg::River5,
+        }
+    }
+
+    #[test]
+    fn empty_paths_rejected() {
+        let a = args_with_paths(vec![]);
+        let r = ScanConfig::from_args(&a);
+        assert!(r.is_err(), "empty paths must reject");
+    }
+
+    #[test]
+    fn min_size_parses_suffixes() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.min_size = "1K".into();
+        let cfg = ScanConfig::from_args(&a).unwrap();
+        assert_eq!(cfg.min_size, 1024);
+
+        a.min_size = "5M".into();
+        let cfg = ScanConfig::from_args(&a).unwrap();
+        assert_eq!(cfg.min_size, 5 * 1024 * 1024);
+
+        a.min_size = "2G".into();
+        let cfg = ScanConfig::from_args(&a).unwrap();
+        assert_eq!(cfg.min_size, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_below_min_rejected() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.min_size = "10M".into();
+        a.max_size = Some("1M".into());
+        let r = ScanConfig::from_args(&a);
+        assert!(
+            r.is_err(),
+            "max-size below min-size must reject (--max < --min is incoherent)"
+        );
+    }
+
+    #[test]
+    fn tier1_bytes_zero_rejected() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.tier1_bytes = "0".into();
+        let r = ScanConfig::from_args(&a);
+        assert!(r.is_err(), "--tier1-bytes 0 must reject");
+    }
+
+    #[test]
+    fn tier1_bytes_default_4k() {
+        let a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        let cfg = ScanConfig::from_args(&a).unwrap();
+        assert_eq!(cfg.tier1_bytes, 4096, "default --tier1-bytes is 4K");
+    }
+
+    #[test]
+    fn io_threads_defaults_to_3x_threads() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.threads = Some(8);
+        a.io_threads = None;
+        let cfg = ScanConfig::from_args(&a).unwrap();
+        assert_eq!(
+            cfg.io_threads, 24,
+            "io_threads defaults to threads*3 (sd oversubscribes IO)"
+        );
+    }
+
+    #[test]
+    fn io_threads_explicit_override_respected() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.threads = Some(4);
+        a.io_threads = Some(99);
+        let cfg = ScanConfig::from_args(&a).unwrap();
+        assert_eq!(cfg.io_threads, 99);
+    }
+
+    #[test]
+    fn use_cache_flag_inverts_no_cache() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.no_cache = false;
+        assert!(ScanConfig::from_args(&a).unwrap().use_cache);
+        a.no_cache = true;
+        assert!(!ScanConfig::from_args(&a).unwrap().use_cache);
+    }
+
+    #[test]
+    fn use_format_aware_flag_inverts_no_format_aware() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.no_format_aware = false;
+        assert!(ScanConfig::from_args(&a).unwrap().use_format_aware);
+        a.no_format_aware = true;
+        assert!(!ScanConfig::from_args(&a).unwrap().use_format_aware);
+    }
+
+    #[test]
+    fn invalid_glob_pattern_propagates_error() {
+        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
+        a.include = vec!["[invalid".into()];
+        let r = ScanConfig::from_args(&a);
+        assert!(r.is_err(), "malformed glob must surface as BadGlob");
+    }
 }

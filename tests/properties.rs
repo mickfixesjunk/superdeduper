@@ -56,6 +56,7 @@ fn run_scan(root: &Path, threads: usize, min_size: u64) -> Vec<pipeline::Duplica
         reference_roots: vec![],
         min_size,
         max_size: None,
+        tier1_bytes: superdeduper::pipeline::hash::TIER1_BYTES,
         include: None,
         exclude: None,
         format: OutputFormat::Text,

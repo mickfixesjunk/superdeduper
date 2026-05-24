@@ -305,6 +305,7 @@ fn draw_grade_chip(ui: &mut egui::Ui, grade: &Grade) {
         12.0,
         theme::PANEL_DEEP,
         Stroke::new(2.5, bg),
+        egui::StrokeKind::Outside,
     );
     painter.text(
         rect.center(),

@@ -17,3 +17,11 @@ Cargo.lock.bak
 # config.
 /.cargo/config.toml
 $V/
+
+# Agent / giga-harness session state. These files exist locally so
+# every Claude session has the project context + cross-session
+# pickup notes, but they are NEVER part of the repo.
+/CLAUDE.md
+/HANDOVER.md
+/giga-harness.toml
+/sd-bench-local/

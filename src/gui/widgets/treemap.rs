@@ -48,11 +48,15 @@ pub fn show_filtered(
         .enumerate()
         .filter(|(_, g)| group_passes_filter(g, drive_root, reference_roots))
         .filter_map(|(idx, g)| {
-            let dup_count = g.files.len().saturating_sub(1) as u64;
-            if dup_count == 0 {
+            // Treemap tile sizes must reflect inode-aware reclaim —
+            // path-aware would size hardlinked-group tiles
+            // proportionally to their alias count, visually
+            // dominating the treemap with non-reclaimable space on
+            // hardlink-heavy corpora (C:\\Windows / WinSxS).
+            let savings = crate::gui::state::inode_aware_savings(g);
+            if savings == 0 {
                 return None;
             }
-            let savings = g.size.saturating_mul(dup_count);
             Some(Tile {
                 group_index: idx + 1,
                 savings,
@@ -312,7 +316,7 @@ fn draw_tile(painter: &egui::Painter, placement: &Placement<'_>) {
     let inset = placement.rect.shrink(1.0);
     let color = color_for_size(placement.tile.size_each);
     painter.rect_filled(inset, 2.0, color);
-    painter.rect_stroke(inset, 2.0, Stroke::new(0.5, theme::BG));
+    painter.rect_stroke(inset, 2.0, Stroke::new(0.5, theme::BG), egui::StrokeKind::Outside);
 
     if inset.width() < 40.0 || inset.height() < 18.0 {
         return;

@@ -44,8 +44,12 @@ pub mod format;
 
 pub use algo::{ContentHasher, HashAlgo};
 
-/// Tier 1 sample size — first 4 KiB of the file.
-const TIER1_BYTES: u64 = 4 * 1024;
+/// Default Tier 1 sample size — first 4 KiB of the file. Runtime
+/// overridable via `ScanConfig::tier1_bytes` (CLI `--tier1-bytes`).
+/// Kept as a fallback for callers that don't have a `ScanConfig`
+/// in scope (cache key calculations, the standalone hash_repro
+/// benchmark binary).
+pub const TIER1_BYTES: u64 = 4 * 1024;
 /// Files at or below this size go through Tier 3 as a single
 /// `hash_oneshot` call (read whole file → one FFI crossing) instead
 /// of the streaming `new/update/finalize` triple. Targets the
@@ -104,7 +108,15 @@ pub struct HashCounters {
 #[derive(Debug, Clone)]
 pub enum ProgressOutcome {
     Hashed { bytes: u64 },
-    Cached,
+    /// Cache hit; the engine didn't physically read the file but
+    /// processed its full size's worth of "scan work." `bytes` is the
+    /// logical file size, so callers tracking inventory/scan-progress
+    /// throughput (the GUI's MB/s graph, the submission payload's
+    /// `bytes_scanned`) can credit cache hits properly. Without this,
+    /// cache-fast-forwarded scans showed 0 MB/s + the submission
+    /// payload's `bytes_scanned` undercount tripped the backend's
+    /// `result_self_consistency` sanity check (reclaim > scanned).
+    Cached { bytes: u64 },
     Failed { error: String },
 }
 
@@ -532,7 +544,7 @@ fn run_group(
     }
     survivors = split_by(&survivors, |f| {
         tiered(f, Tier::One, algo, cache, counters, on_file, || {
-            tier1_hash(f, size, algo)
+            tier1_hash(f, size, algo, cfg.tier1_bytes)
         })
     })?;
     if survivors.len() < 2 {
@@ -693,7 +705,11 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(&f.entry.path, tier_index(tier), ProgressOutcome::Cached);
+                        cb(
+                            &f.entry.path,
+                            tier_index(tier),
+                            ProgressOutcome::Cached { bytes: f.entry.size },
+                        );
                     }
                     return Ok(h);
                 }
@@ -761,7 +777,11 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(&f.entry.path, tier_index(tier), ProgressOutcome::Cached);
+                        cb(
+                            &f.entry.path,
+                            tier_index(tier),
+                            ProgressOutcome::Cached { bytes: f.entry.size },
+                        );
                     }
                     return Some(h);
                 }
@@ -882,8 +902,13 @@ fn tier_byte_estimate(tier: Tier, size: u64) -> u64 {
     }
 }
 
-fn tier1_hash(f: &LaidOutFile, size: u64, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
-    let to_read = size.min(TIER1_BYTES) as usize;
+fn tier1_hash(
+    f: &LaidOutFile,
+    size: u64,
+    algo: HashAlgo,
+    tier1_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let to_read = size.min(tier1_bytes) as usize;
     let mut buf = vec![0u8; to_read];
     let mut file = File::open(&f.entry.path)?;
     read_exact_or_eof(&mut file, &mut buf)?;
@@ -1150,6 +1175,7 @@ mod tests {
             reference_roots: vec![],
             min_size: 0,
             max_size: None,
+            tier1_bytes: TIER1_BYTES,
             include: None,
             exclude: None,
             format: OutputFormat::Text,

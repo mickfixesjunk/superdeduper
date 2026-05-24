@@ -57,6 +57,15 @@ pub enum GroupAction {
     /// dropdown above the results table so both bulk actions sit in
     /// the same place.
     ArchiveAllVisible,
+    /// Recycle (send to Recycle Bin) every dupe across every visible
+    /// group. Reversible from the OS recycle bin until emptied;
+    /// reference paths are never touched. Same destructive-confirm
+    /// gate as per-group Recycle.
+    RecycleAllVisible,
+    /// Permanently delete every dupe across every visible group —
+    /// no recycle bin, no undo. Highest-friction destructive action;
+    /// requires the standard "type DELETE" confirmation.
+    NukeAllVisible,
     /// Promote a non-keeper file to the keeper slot for its group.
     /// The dispatcher swaps `state.duplicates[group_idx].files[0]`
     /// with `files[member_idx]` so every subsequent destructive
@@ -78,6 +87,8 @@ pub enum BulkAction {
     #[default]
     SafeRenameDupes,
     ArchiveDupes,
+    RecycleDupes,
+    NukeDupes,
 }
 
 impl BulkAction {
@@ -85,7 +96,19 @@ impl BulkAction {
         match self {
             BulkAction::SafeRenameDupes => "🛡 Safe-rename dupes",
             BulkAction::ArchiveDupes => "📦 Archive dupes",
+            BulkAction::RecycleDupes => "♻ Recycle dupes",
+            BulkAction::NukeDupes => "💀 Nuke dupes (permanent)",
         }
+    }
+
+    /// `true` for actions that permanently destroy files (no recycle
+    /// bin, no .superdeduper rename). The destructive-confirm modal
+    /// uses this to decide whether to show the "type DELETE" gate.
+    pub fn is_destructive(self) -> bool {
+        matches!(
+            self,
+            BulkAction::RecycleDupes | BulkAction::NukeDupes,
+        )
     }
 }
 
@@ -99,6 +122,12 @@ pub struct GroupsTableState {
     /// Sticky selection for the bulk-action dropdown; persists across
     /// re-renders so the user doesn't have to re-pick on every scan.
     pub bulk_action: BulkAction,
+    /// "Hide unreclaimable (0 bytes)" filter toggle. When true,
+    /// hardlinked groups (link_equivalent + partial-hardlink groups
+    /// where unique_inodes < 2) drop out of the visible table. The
+    /// per-row "0 B reclaimable" rows still exist in the data model;
+    /// only their rendering is hidden.
+    pub hide_unreclaimable: bool,
 }
 
 /// Render the unfiltered table. Kept for callers that don't need a
@@ -164,13 +193,14 @@ pub fn show_filtered(
         .enumerate()
         .filter(|(_, g)| group_passes_filter(g, drive_root, reference_roots))
         .collect();
+    // Sort by inode-aware reclaim (biggest actual freeable space
+    // first). Path-aware would float hardlink-equivalent groups to
+    // the top on hardlink-heavy corpora even though they have 0 B
+    // to reclaim — bad UX (the most-clickable row is the least
+    // useful one).
     sorted.sort_by(|a, b| {
-        let sa =
-            a.1.size
-                .saturating_mul(a.1.files.len().saturating_sub(1) as u64);
-        let sb =
-            b.1.size
-                .saturating_mul(b.1.files.len().saturating_sub(1) as u64);
+        let sa = crate::gui::state::inode_aware_savings(a.1);
+        let sb = crate::gui::state::inode_aware_savings(b.1);
         sb.cmp(&sa)
     });
 
@@ -186,8 +216,16 @@ pub fn show_filtered(
     // Bulk safe-rename header row — one button to safe-rename every
     // non-keeper across every visible group. Reversible via the
     // Unsuperdeduper button in the Roots panel; never deletes anything.
+    //
+    // Visible-dupe-count must respect the hide-unreclaimable toggle
+    // so the Go button label matches what'll actually be acted on
+    // (the app's bulk-action workers apply the same filter).
     let visible_dupe_count: usize = sorted
         .iter()
+        .filter(|(_, g)| {
+            !table_state.hide_unreclaimable
+                || crate::gui::state::inode_aware_savings(g) > 0
+        })
         .map(|(_, g)| g.files.len().saturating_sub(1))
         .sum();
     // Bulk-action row: a dropdown for "what to do across every
@@ -199,7 +237,7 @@ pub fn show_filtered(
         let action_selected = table_state.bulk_action;
         egui::ComboBox::from_id_source("bulk-action-combo")
             .selected_text(action_selected.label())
-            .width(220.0)
+            .width(240.0)
             .show_ui(ui, |ui| {
                 ui.selectable_value(
                     &mut table_state.bulk_action,
@@ -210,6 +248,16 @@ pub fn show_filtered(
                     &mut table_state.bulk_action,
                     BulkAction::ArchiveDupes,
                     BulkAction::ArchiveDupes.label(),
+                );
+                ui.selectable_value(
+                    &mut table_state.bulk_action,
+                    BulkAction::RecycleDupes,
+                    BulkAction::RecycleDupes.label(),
+                );
+                ui.selectable_value(
+                    &mut table_state.bulk_action,
+                    BulkAction::NukeDupes,
+                    BulkAction::NukeDupes.label(),
                 );
             });
 
@@ -234,6 +282,18 @@ pub fn show_filtered(
                  directory tree under the destination so a future restore \
                  can put files back. Writes a manifest JSON alongside."
             }
+            BulkAction::RecycleDupes => {
+                "Send every non-keeper across every visible group to the \
+                 OS Recycle Bin. Reference paths never touched. Recoverable \
+                 from the recycle bin until you empty it. Requires \
+                 confirmation."
+            }
+            BulkAction::NukeDupes => {
+                "PERMANENTLY delete every non-keeper across every visible \
+                 group — no recycle bin, no undo. Reference paths never \
+                 touched. Requires typing DELETE to confirm. Only use when \
+                 you're certain."
+            }
         };
         // Gate Go on (a) something to act on AND (b) the scan having
         // finished. Mid-scan, the visible dupe set is still growing
@@ -254,18 +314,54 @@ pub fn show_filtered(
             clicked = Some(match table_state.bulk_action {
                 BulkAction::SafeRenameDupes => GroupAction::SafeRenameAllVisible,
                 BulkAction::ArchiveDupes => GroupAction::ArchiveAllVisible,
+                BulkAction::RecycleDupes => GroupAction::RecycleAllVisible,
+                BulkAction::NukeDupes => GroupAction::NukeAllVisible,
             });
         }
 
         let trailer = match table_state.bulk_action {
             BulkAction::SafeRenameDupes => "safe-mode (no files deleted)",
             BulkAction::ArchiveDupes => "moves dupes, writes manifest",
+            BulkAction::RecycleDupes => "recoverable from recycle bin",
+            BulkAction::NukeDupes => "PERMANENT delete — no undo",
         };
         ui.label(
             RichText::new(trailer)
                 .color(theme::TEXT_LO)
                 .small()
                 .italics(),
+        );
+
+        // "Hide unreclaimable" toggle on the SAME row as the bulk-
+        // action toolbar so it's visually unmissable. Renders as a
+        // toggle-button (pressed when active, like a switch) rather
+        // than a checkbox so it reads as a filter control.
+        let hidden_count = sorted
+            .iter()
+            .filter(|(_, g)| crate::gui::state::inode_aware_savings(g) == 0)
+            .count();
+        ui.add_space(12.0);
+        let toggle_text = if table_state.hide_unreclaimable {
+            format!("🚫 Showing reclaimable only ({hidden_count} hidden)")
+        } else if hidden_count > 0 {
+            format!("👁 Showing all · {hidden_count} are 0 B")
+        } else {
+            "👁 Showing all".to_string()
+        };
+        let toggle_color = if table_state.hide_unreclaimable {
+            theme::ACCENT
+        } else {
+            theme::TEXT_HI
+        };
+        ui.toggle_value(
+            &mut table_state.hide_unreclaimable,
+            RichText::new(toggle_text).color(toggle_color).strong(),
+        )
+        .on_hover_text(
+            "Toggle: hide groups whose files are already hardlinked / \
+             share storage on disk (nothing to free). Groups stay in \
+             the data model; only the table view hides them. Doesn't \
+             affect the Reclaimable total in the header.",
         );
     });
     ui.add_space(4.0);
@@ -312,17 +408,24 @@ pub fn show_filtered(
                 })
                 .body(|mut body| {
                     for (i, (orig_idx, g)) in sorted.iter().enumerate() {
-                        // Reclaimable bytes is the (n-1) × size that
-                        // WOULD be freed if you collapsed the group
-                        // — unless the group is already a hardlink
-                        // set, in which case the data is shared and
-                        // there's nothing to reclaim.
-                        let savings = if g.link_equivalent {
-                            0
-                        } else {
-                            g.size
-                                .saturating_mul(g.files.len().saturating_sub(1) as u64)
-                        };
+                        // "Hide unreclaimable" toggle: skip groups
+                        // whose inode-aware savings is 0
+                        // (link_equivalent or partial-hardlink with
+                        // unique_inodes < 2). Data still in
+                        // state.duplicates; only this view skips.
+                        if table_state.hide_unreclaimable
+                            && crate::gui::state::inode_aware_savings(g) == 0
+                        {
+                            continue;
+                        }
+                        // Inode-aware reclaim per row — for partial-
+                        // hardlink groups (some aliases of inode A +
+                        // some genuine copies), counts (unique_inodes
+                        // - 1) * size rather than (path_count - 1) *
+                        // size. Falls back to path-aware when
+                        // unique_inodes==0 (older checkpoint format).
+                        // link_equivalent groups read 0 by definition.
+                        let savings = crate::gui::state::inode_aware_savings(g);
                         let is_open = table_state.expanded.contains(orig_idx);
                         let acted = table_state.acted.contains(orig_idx);
                         let keeper = g.files.first().cloned();
@@ -567,8 +670,19 @@ pub fn show_filtered(
     clicked
 }
 
+/// User-facing path display. Strips Windows verbatim-path prefix
+/// (`\\?\`) so dup-table rows + tooltips show `C:\Foo\bar` instead of
+/// `\\?\C:\Foo\bar`. UNC verbatim form (`\\?\UNC\srv\share`) is
+/// rewritten back to `\\srv\share`.
 fn format_path(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.starts_with("UNC\\") {
+            return format!(r"\\{}", &rest[4..]);
+        }
+        return rest.to_string();
+    }
+    s.into_owned()
 }
 
 fn group_passes_filter(
@@ -581,4 +695,66 @@ fn group_passes_filter(
     g.files
         .iter()
         .any(|p| p.starts_with(root) || reference_roots.iter().any(|r| p.starts_with(r)))
+}
+
+#[cfg(test)]
+mod path_display_tests {
+    use super::*;
+
+    #[test]
+    fn drops_verbatim_drive_prefix() {
+        let p = Path::new(r"\\?\C:\Windows\System32\notepad.exe");
+        assert_eq!(format_path(p), r"C:\Windows\System32\notepad.exe");
+    }
+
+    #[test]
+    fn drops_verbatim_drive_prefix_with_lowercase_drive() {
+        // Some Windows APIs return lowercase drive letters in the
+        // verbatim form. Stripping the prefix must not change the
+        // case of what's underneath.
+        let p = Path::new(r"\\?\c:\foo\bar.txt");
+        assert_eq!(format_path(p), r"c:\foo\bar.txt");
+    }
+
+    #[test]
+    fn rewrites_verbatim_unc_form() {
+        // \\?\UNC\server\share\file -> \\server\share\file
+        let p = Path::new(r"\\?\UNC\fileserver\public\report.pdf");
+        assert_eq!(format_path(p), r"\\fileserver\public\report.pdf");
+    }
+
+    #[test]
+    fn passes_through_normal_windows_path() {
+        let p = Path::new(r"C:\Users\Mick\Documents\thing.txt");
+        assert_eq!(format_path(p), r"C:\Users\Mick\Documents\thing.txt");
+    }
+
+    #[test]
+    fn passes_through_normal_unc_path() {
+        // Already-displayable UNC (no \\?\ prefix) stays put.
+        let p = Path::new(r"\\fileserver\share\thing");
+        assert_eq!(format_path(p), r"\\fileserver\share\thing");
+    }
+
+    #[test]
+    fn passes_through_unix_paths() {
+        // Non-Windows paths trip neither branch — engine uses
+        // format_path on the Log tab for cross-platform display.
+        let p = Path::new("/home/neomatrix/file.bin");
+        assert_eq!(format_path(p), "/home/neomatrix/file.bin");
+    }
+
+    #[test]
+    fn handles_root_verbatim_path() {
+        // Edge case: just the prefix + drive root. Should produce
+        // just the drive root, not crash.
+        let p = Path::new(r"\\?\D:\");
+        assert_eq!(format_path(p), r"D:\");
+    }
+
+    #[test]
+    fn empty_path_passes_through() {
+        let p = Path::new("");
+        assert_eq!(format_path(p), "");
+    }
 }
