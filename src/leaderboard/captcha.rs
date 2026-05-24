@@ -60,11 +60,20 @@ pub fn await_captcha_token(
     let nonce = make_nonce();
     let expected_path = format!("/captcha-callback/{nonce}");
 
+    // The /setup page lives on the bare web origin
+    // (https://superdeduper.io/setup/), not the api subdomain.
+    // Derive it by stripping the `api.` prefix from the server_url
+    // if present; falls through to whatever the caller passed if it
+    // doesn't match the convention.
+    let setup_origin = web_origin_from_api(server_url);
+    // Both `cb` and `install_id` need url-encoding — `cb` because it
+    // contains slashes and a port (otherwise the second `&` would
+    // confuse the query parser), `install_id` for general safety.
+    let cb_url = format!("http://127.0.0.1:{port}{expected_path}");
     let url = format!(
-        "{}/setup?cb=http://127.0.0.1:{}{}&install_id={}",
-        server_url.trim_end_matches('/'),
-        port,
-        expected_path,
+        "{}/setup/?cb={}&install_id={}",
+        setup_origin.trim_end_matches('/'),
+        urlencode(&cb_url),
         urlencode(install_id),
     );
 
@@ -209,6 +218,22 @@ fn handle_request(stream: &mut std::net::TcpStream, expected_path: &str) -> Requ
     }
 }
 
+/// Derive the web origin (`https://superdeduper.io`) from the api
+/// origin (`https://api.superdeduper.io`). The `/setup` page lives
+/// on the bare domain per web's deploy. Falls back to the input if
+/// no `api.` prefix is found — useful for staging / dev where the
+/// api server might be at `http://localhost:8080` and the same
+/// host serves /setup.
+fn web_origin_from_api(api_url: &str) -> String {
+    // Split into scheme://rest so we can rewrite only the host.
+    if let Some((scheme, rest)) = api_url.split_once("://") {
+        if let Some(stripped) = rest.strip_prefix("api.") {
+            return format!("{scheme}://{stripped}");
+        }
+    }
+    api_url.to_string()
+}
+
 fn make_nonce() -> String {
     // uuid is already a project dep (run_uuid generation). v4 is
     // 122 bits of CSPRNG entropy — overkill for a one-shot session
@@ -265,6 +290,30 @@ mod tests {
     fn urlencode_percent_encodes_specials() {
         assert_eq!(urlencode("a b"), "a%20b");
         assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn web_origin_strips_api_prefix() {
+        assert_eq!(
+            web_origin_from_api("https://api.superdeduper.io"),
+            "https://superdeduper.io"
+        );
+        assert_eq!(
+            web_origin_from_api("https://api.superdeduper.io/"),
+            "https://superdeduper.io/"
+        );
+    }
+
+    #[test]
+    fn web_origin_passes_through_non_api_origins() {
+        assert_eq!(
+            web_origin_from_api("http://localhost:8080"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            web_origin_from_api("https://superdeduper.io"),
+            "https://superdeduper.io"
+        );
     }
 
     #[test]
