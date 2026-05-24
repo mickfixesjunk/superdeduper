@@ -46,9 +46,139 @@ pub fn show(ui: &mut egui::Ui, state: &CatalogState) -> Option<BadgeWallAction> 
     ui.vertical(|ui| {
         render_header(ui, state, &mut action);
         ui.add_space(6.0);
+        // Above-grid "Login & Claim" CTA per spec §10.5 +
+        // Mick's 2026-05-24T22:18Z direction. Only renders for
+        // anonymous installs; the post-claim state hides it.
+        render_login_cta(ui);
         render_grid(ui, state, &mut action);
     });
     action
+}
+
+/// Process-wide flag for the "Login & Claim" provider chooser
+/// popup. `true` once the user clicks the CTA — next frame
+/// re-renders the chooser row instead of the CTA button. Cleared
+/// when the user picks a provider OR clicks Cancel OR the OAuth
+/// flow returns (success or failure).
+///
+/// Same Mutex-static pattern the settings modal uses for its
+/// sample-preview popup — keeps the widget signature stable
+/// without threading a new state struct through every caller.
+static LOGIN_CTA_CHOOSER_OPEN: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
+
+/// Render the "Login & Claim" CTA + provider chooser, when the
+/// active channel's install is anonymous. No-op when linked.
+/// `link_via_loopback` blocks the UI thread for up to 5 minutes
+/// (same single-thread approach the Settings → Account tab
+/// uses); v1.1 will move to a background thread + progress
+/// spinner.
+fn render_login_cta(ui: &mut egui::Ui) {
+    // Read link status best-effort. Any I/O error reads as
+    // "anonymous" so the CTA still shows — never hide the CTA
+    // because of a transient filesystem hiccup.
+    let active = crate::channel::active_channel();
+    let is_anon = match crate::leaderboard::oauth::status_for(active) {
+        Ok(crate::leaderboard::oauth::AccountStatus::Anonymous) | Err(_) => true,
+        Ok(crate::leaderboard::oauth::AccountStatus::Linked { .. }) => false,
+    };
+    if !is_anon {
+        return;
+    }
+
+    let mut open = LOGIN_CTA_CHOOSER_OPEN.lock();
+    if *open {
+        // Provider chooser row.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Sign in with:")
+                    .color(theme::TEXT_HI)
+                    .small(),
+            );
+            let pick_google = ui
+                .add(
+                    egui::Button::new(RichText::new("Google").color(theme::TEXT_HI))
+                        .min_size(egui::vec2(80.0, 24.0)),
+                )
+                .clicked();
+            let pick_discord = ui
+                .add(
+                    egui::Button::new(RichText::new("Discord").color(theme::TEXT_HI))
+                        .min_size(egui::vec2(80.0, 24.0)),
+                )
+                .clicked();
+            let cancel = ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel").color(theme::TEXT_LO))
+                        .min_size(egui::vec2(60.0, 24.0)),
+                )
+                .clicked();
+            if pick_google {
+                *open = false;
+                drop(open);
+                trigger_link(crate::leaderboard::oauth::Provider::Google, active);
+            } else if pick_discord {
+                *open = false;
+                drop(open);
+                trigger_link(crate::leaderboard::oauth::Provider::Discord, active);
+            } else if cancel {
+                *open = false;
+            }
+        });
+    } else {
+        let resp = ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Login & Claim")
+                        .color(theme::PANEL_DEEP)
+                        .strong(),
+                )
+                .fill(theme::ACCENT)
+                .min_size(egui::vec2(140.0, 28.0)),
+            )
+            .on_hover_text("Claim your achievements for this machine");
+        if resp.clicked() {
+            *open = true;
+        }
+    }
+    ui.add_space(6.0);
+}
+
+fn trigger_link(
+    provider: crate::leaderboard::oauth::Provider,
+    channel: crate::channel::Channel,
+) {
+    use crate::leaderboard::{install, oauth};
+    let install_id = match install::load().ok().flatten() {
+        Some(s) => s.install_id,
+        None => {
+            eprintln!(
+                "login-cta: not registered on channel {channel} — \
+                 run `superdeduper register --channel {channel}` first"
+            );
+            return;
+        }
+    };
+    let server_url = crate::channel::server_url_for(channel);
+    // Blocking call; same constraint the Account tab already
+    // accepts. v1.1 moves to background thread.
+    match oauth::link_via_loopback(
+        provider,
+        channel,
+        server_url,
+        &install_id,
+        oauth::DEFAULT_OAUTH_TIMEOUT,
+    ) {
+        Ok(token) => {
+            eprintln!(
+                "login-cta: linked {} as {} on channel {channel}",
+                token.provider.display_name(),
+                token.display_name,
+            );
+        }
+        Err(e) => {
+            eprintln!("login-cta: link failed: {e}");
+        }
+    }
 }
 
 /// Compact alternative for narrow windows (per §10.5). Same
