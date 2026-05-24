@@ -462,6 +462,30 @@ mod tests {
     }
 
     #[test]
+    fn install_paths_per_channel_are_distinct() {
+        // The three channel-specific paths must all differ from
+        // each other AND from the legacy flat path. Otherwise
+        // switching channels would write over a different channel's
+        // identity file (data loss).
+        let prod = install_path_for(Channel::Prod).expect("prod path");
+        let dev = install_path_for(Channel::Dev).expect("dev path");
+        let local = install_path_for(Channel::Local).expect("local path");
+        let legacy = legacy_install_path().expect("legacy path");
+        assert_ne!(prod, dev);
+        assert_ne!(prod, local);
+        assert_ne!(dev, local);
+        assert_ne!(prod, legacy);
+        // All channel paths share the same parent dir `<data>/install`.
+        assert_eq!(prod.parent(), dev.parent());
+        assert_eq!(dev.parent(), local.parent());
+        // Channel slug appears verbatim in the filename for visual
+        // greppability + filesystem-tool friendliness.
+        assert!(prod.file_name().unwrap().to_string_lossy().contains("prod"));
+        assert!(dev.file_name().unwrap().to_string_lossy().contains("dev"));
+        assert!(local.file_name().unwrap().to_string_lossy().contains("local"));
+    }
+
+    #[test]
     fn legacy_install_json_without_counters_loads_with_defaults() {
         // Pre-counters install.json (written by v0.1.8 and earlier)
         // must still load. The `counters` field is absent; serde's

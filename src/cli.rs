@@ -23,6 +23,14 @@ pub struct Cli {
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 
+    /// Override the server channel for this invocation. One of:
+    /// `prod` (default), `dev`, `local`. Higher-precedence than
+    /// `SUPERDEDUPER_CHANNEL` ENV var and the persisted config
+    /// `[network] channel` setting. Useful for one-off test runs:
+    /// `superdeduper dedupe --channel dev …`.
+    #[arg(long, value_name = "NAME", global = true)]
+    pub channel: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
