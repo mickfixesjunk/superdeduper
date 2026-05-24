@@ -36,4 +36,35 @@ pub mod gui;
 #[cfg(feature = "telemetry")]
 pub mod leaderboard;
 
+/// Crate-internal helper so feature-gated callers (gui::live) can
+/// compute the corpus signature hash without taking a direct dep on
+/// the leaderboard module's path. Mirrors the implementation in
+/// `leaderboard::submission`'s payload-build flow but lives at the
+/// crate root so engine-side code can reach it without the
+/// `leaderboard::` prefix.
+#[cfg(feature = "telemetry")]
+#[doc(hidden)]
+pub fn leaderboard_corpus_sig(sizes: &[u64]) -> String {
+    let mut counts: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+    for &s in sizes {
+        let bucket = match s / 1024 {
+            0..=9 => "<10KB",
+            10..=99 => "10-100KB",
+            100..=999 => "100KB-1MB",
+            1_000..=9_999 => "1MB-10MB",
+            10_000..=99_999 => "10MB-100MB",
+            _ => ">100MB",
+        };
+        *counts.entry(bucket).or_insert(0) += 1;
+    }
+    let mut hasher = blake3::Hasher::new();
+    for (bucket, count) in counts {
+        hasher.update(bucket.as_bytes());
+        hasher.update(b":");
+        hasher.update(&count.to_le_bytes());
+        hasher.update(b"\n");
+    }
+    format!("sha256:{}", hasher.finalize().to_hex())
+}
+
 pub use error::{Error, Result};

@@ -76,6 +76,7 @@ fn run(
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
 ) -> crate::Result<()> {
+    let scan_started_at = Instant::now();
     // Diagnostics report file — fresh per scan. Failure to open it
     // doesn't kill the scan; we just lose self-debug telemetry.
     let diag = DiagnosticsLog::open();
@@ -436,6 +437,19 @@ fn run(
     // path + size + mtime; serialisation happens inside the next
     // checkpoint::save call below in the hashing loop.
     checkpoint_state.saved_inventory = Some(saved_files_from_runtime(&files));
+    // G1: compute corpus_signature_hash from the inventory's file
+    // sizes — path/content-free per leaderboard-spec §6. Two users
+    // scanning the same canonical corpus produce the same hash;
+    // useful for detecting "ran the official bench corpus" vs random
+    // data. Held in `corpus_sig` for the ScanFinished payload build.
+    #[cfg(feature = "telemetry")]
+    let corpus_sig: String = {
+        let sizes: Vec<u64> = files.iter().map(|f| f.size).collect();
+        crate::leaderboard_corpus_sig(&sizes)
+    };
+    #[cfg(not(feature = "telemetry"))]
+    let corpus_sig: String = String::new();
+    let _ = &corpus_sig; // used below when telemetry feature is on
     // Write the checkpoint to disk right now, BEFORE any hashing
     // starts. Previously the first persist happened at the end of
     // chunk 0, which meant a hard-kill mid-chunk-0 lost the entire
@@ -1009,6 +1023,50 @@ fn run(
             hit_rate
         ),
     });
+    // G1: build the leaderboard payload from this scan's results
+    // and log its size. We don't auto-submit — that's the GUI
+    // "Submit run" button's job. This step proves the integration
+    // works end-to-end: hardware detect + scan totals + corpus
+    // signature → canonical-JSON + HMAC sign-ready payload.
+    #[cfg(feature = "telemetry")]
+    {
+        use crate::leaderboard::hardware;
+        use crate::leaderboard::hmac_signer;
+        use crate::leaderboard::submission;
+        let wall_ms = scan_started_at
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let inputs = submission::SubmissionInputs {
+            run_uuid: uuid::Uuid::new_v4().to_string(),
+            sd_version: env!("CARGO_PKG_VERSION").to_string(),
+            hardware: hardware::detect(),
+            scan: submission::ScanResults {
+                files_scanned: total_files,
+                bytes_scanned: total_bytes_read,
+                wall_clock_ms: wall_ms,
+                duplicate_groups: total_dups,
+                reclaimable_inode_bytes: reclaimable,
+                hash_algo: settings.hash_algo.tag().to_string(),
+                defender_rtp_state_pre: None,
+                defender_rtp_state_post: None,
+                corpus_signature_hash: corpus_sig.clone(),
+            },
+        };
+        let payload = submission::build_payload(&inputs);
+        let body = hmac_signer::canonical_body(&payload);
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "leaderboard payload ready: {} bytes (run_uuid={}, hw={}/{}c, corpus_sig={})",
+                body.len(),
+                inputs.run_uuid.split('-').next().unwrap_or(""),
+                inputs.hardware.cpu_model_string,
+                inputs.hardware.cpu_threads,
+                corpus_sig.split(':').nth(1).map(|h| &h[..8]).unwrap_or(""),
+            ),
+        });
+    }
     let _ = tx.send(EngineEvent::ScanFinished {
         at: Instant::now(),
         total_files,
