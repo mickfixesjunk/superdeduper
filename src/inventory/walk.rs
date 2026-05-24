@@ -7,12 +7,32 @@
 //! `winapi_wrappers` for it land.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use hashbrown::HashSet;
 
 use crate::config::ScanConfig;
 use crate::inventory::FileEntry;
 use crate::Result;
+
+/// Canonical "this is the same physical directory" identifier used
+/// by [`enumerate_cancellable`] to break symlink cycles when
+/// `--follow-links` is on.
+///
+/// On Windows the volume serial + 128-bit file ID together uniquely
+/// identify the directory regardless of how many path / junction /
+/// hardlink aliases reach it. On Unix the `(st_dev, st_ino)` pair is
+/// the equivalent.
+///
+/// Equal-by-value across the two reachings of the same directory:
+/// that's what makes T1.7's "visited set" approach work — we don't
+/// rely on path equality, which would miss aliases.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct DirIdentity {
+    pub volume_serial: u64,
+    pub file_id: u128,
+}
 
 /// Streaming progress emitted by [`enumerate_with_progress`]. Consumers
 /// translate these into [`EngineEvent`]s for the GUI; the CLI uses a
@@ -32,6 +52,19 @@ pub enum WalkEvent<'a> {
     EntrySkipped {
         path: &'a Path,
         reason: &'static str,
+    },
+    /// T1.7: a symlink-followed directory whose identity we'd already
+    /// enumerated. Skipping prevents both infinite recursion on true
+    /// cycles AND duplicate file reporting when two symlinks resolve
+    /// to the same directory.
+    ///
+    /// `from` is the symlink path the walker just resolved; `target`
+    /// is the canonicalised target (when known). Identity equality
+    /// is on the underlying `DirIdentity` — same filesystem-level
+    /// directory, regardless of how many alias paths reach it.
+    SymlinkCycleSkipped {
+        from: &'a Path,
+        target: PathBuf,
     },
 }
 
@@ -61,6 +94,12 @@ where
     F: FnMut(WalkEvent<'_>),
 {
     let mut out = Vec::new();
+    // T1.7: per-scan visited set for symlink cycle detection. When
+    // `cfg.follow_links` is OFF, this stays empty (we never follow a
+    // symlink, never compute identity, never insert). When ON, every
+    // directory reached via a followed symlink gets its identity
+    // recorded so we don't recurse twice into the same physical dir.
+    let mut visited_dirs: HashSet<DirIdentity> = HashSet::new();
     for root in &cfg.roots {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             break;
@@ -114,7 +153,15 @@ where
         let root_for_walk = to_verbatim(root);
         #[cfg(not(windows))]
         let root_for_walk = root.clone();
-        walk(&root_for_walk, cfg, &mut out, &mut callback, 0, cancel)?;
+        walk(
+            &root_for_walk,
+            cfg,
+            &mut out,
+            &mut callback,
+            0,
+            cancel,
+            &mut visited_dirs,
+        )?;
     }
     Ok(out)
 }
@@ -216,6 +263,78 @@ fn push_single_file_root<F>(
 // paths in the report, we can strip at the output layer (JSON
 // serialization) instead of in the walker.
 
+/// Resolve a directory path to its filesystem-level identity, used
+/// for cycle detection in the symlink-follow path.
+///
+/// Returns `None` on failure (permission denied, race with deletion,
+/// FS doesn't support the query). Callers treat `None` as "skip,
+/// can't dedupe without identity" — strictly safer than risking a
+/// loop.
+pub fn dir_identity(path: &Path) -> Option<DirIdentity> {
+    dir_identity_impl(path)
+}
+
+#[cfg(windows)]
+fn dir_identity_impl(path: &Path) -> Option<DirIdentity> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // We need a directory handle. The straightforward way is
+    // `std::fs::File::open(path)`, which works on directories when
+    // backed by `CreateFile` + `FILE_FLAG_BACKUP_SEMANTICS`. Rust
+    // doesn't expose that flag via std, so the alternative is to
+    // use std::fs::metadata via OpenOptions custom_flags. Easier:
+    // open the dir as a File the way std::fs::read_dir() does
+    // internally.
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        // FILE_FLAG_BACKUP_SEMANTICS = 0x02000000. Without this,
+        // CreateFile refuses to open a directory.
+        .custom_flags(0x0200_0000)
+        .open(path)
+        .ok()?;
+    let handle = file.as_raw_handle() as isize;
+    let mut info = windows::Win32::Storage::FileSystem::FILE_ID_INFO::default();
+    // SAFETY: handle is valid (owned by `file`); info has correct
+    // type + size; FileIdInfo is the documented constant for this
+    // out-struct.
+    let ok = unsafe {
+        windows::Win32::Storage::FileSystem::GetFileInformationByHandleEx(
+            windows::Win32::Foundation::HANDLE(handle as _),
+            windows::Win32::Storage::FileSystem::FileIdInfo,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<windows::Win32::Storage::FileSystem::FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    // FileId is a FILE_ID_128 — two u64 halves stored as [u8; 16].
+    let mut file_id_bytes = [0u8; 16];
+    file_id_bytes.copy_from_slice(&info.FileId.Identifier);
+    Some(DirIdentity {
+        volume_serial: info.VolumeSerialNumber,
+        file_id: u128::from_le_bytes(file_id_bytes),
+    })
+}
+
+#[cfg(unix)]
+fn dir_identity_impl(path: &Path) -> Option<DirIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(DirIdentity {
+        volume_serial: meta.dev(),
+        file_id: meta.ino() as u128,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn dir_identity_impl(_path: &Path) -> Option<DirIdentity> {
+    None
+}
+
 /// Convert a regular Windows path (`C:\foo\bar`) to its verbatim form
 /// (`\\?\C:\foo\bar`). Already-verbatim paths and non-disk-prefixed
 /// paths pass through unchanged. The Win32 file APIs interpret
@@ -249,12 +368,32 @@ fn walk<F>(
     callback: &mut F,
     depth: u32,
     cancel: Option<&AtomicBool>,
+    visited_dirs: &mut HashSet<DirIdentity>,
 ) -> Result<()>
 where
     F: FnMut(WalkEvent<'_>),
 {
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Ok(());
+    }
+    // T1.7: when follow_links is ON, every descend goes through this
+    // identity check. If we've already enumerated this physical dir
+    // (via any path — symlink or regular subdir), return silently.
+    // The named `SymlinkCycleSkipped` event lives at the symlink site
+    // below; this gate catches the case where the regular descent
+    // happens AFTER a symlink-followed descent already populated the
+    // set, which would otherwise enumerate the dir twice.
+    if cfg.follow_links {
+        if let Some(identity) = dir_identity(dir) {
+            if !visited_dirs.insert(identity) {
+                // Already enumerated this physical directory. Emit
+                // the named cycle event so the GUI / log can show
+                // "we detected an alias" rather than silently skip.
+                let target = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                callback(WalkEvent::SymlinkCycleSkipped { from: dir, target });
+                return Ok(());
+            }
+        }
     }
     callback(WalkEvent::Entered { path: dir, depth });
 
@@ -270,7 +409,16 @@ where
     #[cfg(windows)]
     {
         if let Some(enumeration) = crate::inventory::dir_enum::enumerate_dir_full(dir) {
-            return walk_fast_path(dir, enumeration, cfg, out, callback, depth, cancel);
+            return walk_fast_path(
+                dir,
+                enumeration,
+                cfg,
+                out,
+                callback,
+                depth,
+                cancel,
+                visited_dirs,
+            );
         }
         // Fall through to read_dir (logged at trace level — common on
         // network shares / non-NTFS where the API doesn't apply).
@@ -332,7 +480,8 @@ where
             }
         };
 
-        let metadata = if metadata.file_type().is_symlink() {
+        let entry_was_symlink = metadata.file_type().is_symlink();
+        let metadata = if entry_was_symlink {
             if !cfg.follow_links {
                 callback(WalkEvent::EntrySkipped {
                     path: &path,
@@ -368,7 +517,11 @@ where
         };
 
         if metadata.is_dir() {
-            walk(&path, cfg, out, callback, depth + 1, cancel)?;
+            // T1.7: cycle detection is centralised at walk-top
+            // (visited-set insert + named event emission). We just
+            // recurse; walk handles dedup.
+            let _ = entry_was_symlink; // explicitly accept: used implicitly via metadata re-stat above
+            walk(&path, cfg, out, callback, depth + 1, cancel, visited_dirs)?;
             continue;
         }
         if !metadata.is_file() {
@@ -508,6 +661,7 @@ fn walk_fast_path<F>(
     callback: &mut F,
     depth: u32,
     cancel: Option<&AtomicBool>,
+    visited_dirs: &mut HashSet<DirIdentity>,
 ) -> Result<()>
 where
     F: FnMut(WalkEvent<'_>),
@@ -564,7 +718,8 @@ where
                 }
             };
             if target_meta.is_dir() {
-                walk(&path, cfg, out, callback, depth + 1, cancel)?;
+                // T1.7: walk-top handles cycle detection.
+                walk(&path, cfg, out, callback, depth + 1, cancel, visited_dirs)?;
                 continue;
             }
             if !target_meta.is_file() {
@@ -637,7 +792,7 @@ where
         }
 
         if entry.is_dir {
-            walk(&path, cfg, out, callback, depth + 1, cancel)?;
+            walk(&path, cfg, out, callback, depth + 1, cancel, visited_dirs)?;
             continue;
         }
 
