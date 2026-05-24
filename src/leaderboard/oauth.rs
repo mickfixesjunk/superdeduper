@@ -1257,18 +1257,56 @@ fn try_open_browser(url: &str) -> bool {
     }
     #[cfg(windows)]
     {
-        // `cmd /c start` opens the user's default browser. The
-        // empty title arg + URL is the documented incantation.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
-            .is_ok()
+        open_browser_windows(url)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = url;
         false
     }
+}
+
+/// Open `url` via `ShellExecuteW` instead of `cmd /c start "" url`.
+///
+/// **Why this matters:** `cmd /c start` treats `&` as a command
+/// separator unless the URL is quoted, and Rust's
+/// `std::process::Command` doesn't add quotes around args without
+/// spaces. Result: a URL like
+/// `https://accounts.google.com/o/oauth2/v2/auth?client_id=…&response_type=code&…`
+/// gets split at the first `&`, the browser opens just the prefix
+/// (no `response_type`, no `scope`, no `redirect_uri`), and Google
+/// rejects with `Error 400: invalid_request — Required parameter
+/// is missing: response_type`. Exact regression Mick hit
+/// 2026-05-24T23:15Z.
+///
+/// `ShellExecuteW` is the canonical Win32 "open a URL with the
+/// user's default handler" call. Takes the URL as a single wide
+/// string parameter; no cmd parsing involved. Same path the
+/// captcha module's `open_browser_windows` uses for the same
+/// reason (per `captcha.rs::open_browser_windows`).
+#[cfg(windows)]
+fn open_browser_windows(url: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let op_w: Vec<u16> = "open\0".encode_utf16().collect();
+    let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both wide strings are null-terminated; HWND::default()
+    // is a valid (null) owner; SW_SHOWNORMAL is a documented
+    // constant. ShellExecuteW returns an HINSTANCE > 32 on success.
+    let h = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            PCWSTR(op_w.as_ptr()),
+            PCWSTR(url_w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    h.0 as usize > 32
 }
 
 #[cfg(test)]
