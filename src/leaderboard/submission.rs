@@ -77,9 +77,15 @@ pub struct RankEntry {
 
 /// Build the canonical JSON request body. Pure function so tests can
 /// snapshot the exact wire bytes without spinning a server.
-pub fn build_payload(inputs: &SubmissionInputs) -> serde_json::Value {
+///
+/// `install_id` is threaded as a separate param (rather than baked
+/// into `SubmissionInputs`) so the most up-to-date value from the
+/// current install state is always used — guards against a stale
+/// pending payload outliving a "Reset install" rotation.
+pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json::Value {
     serde_json::json!({
         "schema_version": "v1",
+        "install_id": install_id,
         "run_uuid": inputs.run_uuid,
         "sd_version": inputs.sd_version,
         "submitted_at_unix": now_unix(),
@@ -108,7 +114,7 @@ pub fn submit(state: &InstallState, inputs: &SubmissionInputs) -> SubmitOutcome 
             };
         }
     };
-    let payload = build_payload(inputs);
+    let payload = build_payload(inputs, &state.install_id);
     let body = hmac_signer::canonical_body(&payload);
     let signature = hmac_signer::sign(&install_key, &body);
 
@@ -208,12 +214,16 @@ pub fn queue_dir() -> std::io::Result<PathBuf> {
 /// Persist a payload + signature pair so the next launch can retry.
 /// Filename includes a timestamp + the first 8 hex chars of the
 /// payload hash for de-dup.
-pub fn enqueue(inputs: &SubmissionInputs, signature: &str) -> std::io::Result<PathBuf> {
+pub fn enqueue(
+    inputs: &SubmissionInputs,
+    install_id: &str,
+    signature: &str,
+) -> std::io::Result<PathBuf> {
     let dir = queue_dir()?;
     std::fs::create_dir_all(&dir)?;
     // Cap at 50 entries — oldest gets evicted first.
     prune_queue(&dir, 50)?;
-    let payload = build_payload(inputs);
+    let payload = build_payload(inputs, install_id);
     let body = hmac_signer::canonical_body(&payload);
     let body_hash_prefix = blake3::hash(&body).to_hex();
     let filename = format!(
@@ -358,8 +368,10 @@ mod tests {
 
     #[test]
     fn build_payload_contains_required_keys() {
-        let p = build_payload(&sample_inputs());
+        let p = build_payload(&sample_inputs(), "test-install-id");
         assert!(p.get("schema_version").is_some());
+        assert!(p.get("install_id").is_some());
+        assert_eq!(p.get("install_id").and_then(|v| v.as_str()), Some("test-install-id"));
         assert!(p.get("run_uuid").is_some());
         assert!(p.get("hardware").is_some());
         assert!(p.get("scan").is_some());
@@ -367,8 +379,8 @@ mod tests {
 
     #[test]
     fn canonical_body_is_deterministic_across_inputs() {
-        let p1 = build_payload(&sample_inputs());
-        let p2 = build_payload(&sample_inputs());
+        let p1 = build_payload(&sample_inputs(), "test-id");
+        let p2 = build_payload(&sample_inputs(), "test-id");
         let b1 = hmac_signer::canonical_body(&p1);
         let b2 = hmac_signer::canonical_body(&p2);
         assert_eq!(b1, b2);

@@ -1098,7 +1098,7 @@ fn print_sample_payload() {
                 "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
         },
     };
-    let payload = submission::build_payload(&inputs);
+    let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");
     match serde_json::to_string_pretty(&payload) {
         Ok(s) => {
             eprintln!("---- sample submission payload ----\n{s}\n-----------------------------------");
@@ -1199,13 +1199,15 @@ fn render_submit_section(ui: &mut egui::Ui) {
                     if let submission::SubmitOutcome::Transient { reason } = &outcome {
                         eprintln!("leaderboard: submit transient ({reason}); enqueueing");
                         let body = crate::leaderboard::hmac_signer::canonical_body(
-                            &submission::build_payload(&inputs),
+                            &submission::build_payload(&inputs, &state.install_id),
                         );
                         let signature = match state.install_key() {
                             Some(k) => crate::leaderboard::hmac_signer::sign(&k, &body),
                             None => String::new(),
                         };
-                        if let Err(e) = submission::enqueue(&inputs, &signature) {
+                        if let Err(e) =
+                            submission::enqueue(&inputs, &state.install_id, &signature)
+                        {
                             eprintln!("leaderboard: enqueue failed: {e:?}");
                         }
                     }

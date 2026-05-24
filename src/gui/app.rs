@@ -663,13 +663,13 @@ impl SuperdeduperApp {
             if let submission::SubmitOutcome::Transient { reason } = &outcome {
                 eprintln!("leaderboard: submit transient ({reason}); enqueueing");
                 let body = crate::leaderboard::hmac_signer::canonical_body(
-                    &submission::build_payload(&inputs),
+                    &submission::build_payload(&inputs, &state.install_id),
                 );
                 let signature = state
                     .install_key()
                     .map(|k| crate::leaderboard::hmac_signer::sign(&k, &body))
                     .unwrap_or_default();
-                if let Err(e) = submission::enqueue(&inputs, &signature) {
+                if let Err(e) = submission::enqueue(&inputs, &state.install_id, &signature) {
                     eprintln!("leaderboard: enqueue failed: {e:?}");
                 }
             }
@@ -708,8 +708,13 @@ impl SuperdeduperApp {
         // Cheap (small JSON, no IO); avoids holding state.
         let payload_preview: Option<String> =
             if matches!(self.scan_complete_modal, ScanCompleteState::Preview) {
+                let install_id = crate::leaderboard::install::load()
+                    .ok()
+                    .flatten()
+                    .map(|s| s.install_id)
+                    .unwrap_or_else(|| "<not-registered>".to_string());
                 submission::peek_pending().map(|inputs| {
-                    let v = submission::build_payload(&inputs);
+                    let v = submission::build_payload(&inputs, &install_id);
                     serde_json::to_string_pretty(&v).unwrap_or_default()
                 })
             } else {

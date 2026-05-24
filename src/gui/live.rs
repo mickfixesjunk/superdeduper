@@ -1057,7 +1057,13 @@ fn run(
                 corpus_signature_hash: corpus_sig.clone(),
             },
         };
-        let payload = submission::build_payload(&inputs);
+        // Diagnostic-only payload preview. install_id is empty string
+        // here because the engine doesn't load the install state at
+        // scan-end — the real submission flow re-loads it just-in-time
+        // so the most recent value (post-reset, post-register) is used.
+        // The byte-count printed below is approximate; the actual
+        // submit-time body will include install_id.
+        let payload = submission::build_payload(&inputs, "");
         let body = hmac_signer::canonical_body(&payload);
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
