@@ -143,6 +143,13 @@ pub fn show(
 
         match state {
             ScanCompleteState::Ready => {
+                // Pre-sign-in CTA per spec §10.4 + Mick's
+                // 2026-05-24T22:18Z direction. Renders ABOVE the
+                // submit action row when the active channel's
+                // install is anonymous; reads badge-count from the
+                // catalog's current profile snapshot. No-op for
+                // already-signed-in users.
+                render_signin_cta(ui);
                 render_action_buttons(ui, &mut action);
             }
             ScanCompleteState::Submitting => {
@@ -254,6 +261,115 @@ fn render_stats(ui: &mut egui::Ui, d: &ScanCompleteData) {
 fn big_stat_row(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
     ui.label(RichText::new(label).color(theme::TEXT_LO));
     ui.label(RichText::new(value).color(color).strong().size(18.0));
+}
+
+/// Pre-sign-in CTA shown above the submit action row when the
+/// active channel's install is anonymous. Per spec §10.4 + Mick's
+/// 2026-05-24T22:18Z direction. No-op for already-signed-in users.
+///
+/// Both providers visible (one-click flow; the post-scan moment is
+/// high-intent so we surface the full choice up front rather than
+/// indirecting through a chooser). Calls into the same
+/// `oauth::link_via_loopback` path the Account tab + the
+/// above-grid Login & Claim CTA both use.
+fn render_signin_cta(ui: &mut egui::Ui) {
+    use crate::leaderboard::oauth;
+
+    let active = crate::channel::active_channel();
+    let is_anon = matches!(
+        oauth::status_for(active),
+        Ok(oauth::AccountStatus::Anonymous) | Err(_)
+    );
+    if !is_anon {
+        return;
+    }
+
+    // Read granted-badge count from the catalog's cached profile.
+    // No grants yet ⇒ "start your collection"; grants ⇒ "keep your
+    // progress (you have earned N badges)".
+    let granted_count = crate::leaderboard::catalog::peek_state()
+        .profile
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|p| p.achievements.iter().filter(|g| g.granted).count())
+        .unwrap_or(0);
+    let copy = if granted_count > 0 {
+        format!(
+            "Sign in to keep your progress (you have earned {granted_count} badges)"
+        )
+    } else {
+        "Sign in to start your collection.".to_string()
+    };
+
+    ui.label(RichText::new(copy).color(theme::TEXT_HI).strong());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Connect Google")
+                        .color(theme::PANEL_DEEP)
+                        .strong(),
+                )
+                .fill(theme::ACCENT)
+                .min_size(egui::vec2(140.0, 28.0)),
+            )
+            .clicked()
+        {
+            trigger_signin(oauth::Provider::Google, active);
+        }
+        if ui
+            .add(
+                egui::Button::new(RichText::new("Connect Discord").color(theme::TEXT_HI))
+                    .min_size(egui::vec2(140.0, 28.0)),
+            )
+            .clicked()
+        {
+            trigger_signin(oauth::Provider::Discord, active);
+        }
+    });
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+}
+
+fn trigger_signin(
+    provider: crate::leaderboard::oauth::Provider,
+    channel: crate::channel::Channel,
+) {
+    use crate::leaderboard::{install, oauth};
+    let install_id = match install::load().ok().flatten() {
+        Some(s) => s.install_id,
+        None => {
+            eprintln!(
+                "post-scan-cta: not registered on channel {channel} — \
+                 run `superdeduper register --channel {channel}` first"
+            );
+            return;
+        }
+    };
+    let server_url = crate::channel::server_url_for(channel);
+    // Blocking call on UI thread, same trade-off as the
+    // Account tab + above-grid CTA. v1.1 moves to a background
+    // worker per design 22:38Z deferral list.
+    match oauth::link_via_loopback(
+        provider,
+        channel,
+        server_url,
+        &install_id,
+        oauth::DEFAULT_OAUTH_TIMEOUT,
+    ) {
+        Ok(token) => {
+            eprintln!(
+                "post-scan-cta: linked {} as {} on channel {channel}",
+                token.provider.display_name(),
+                token.display_name,
+            );
+        }
+        Err(e) => {
+            eprintln!("post-scan-cta: link failed: {e}");
+        }
+    }
 }
 
 fn render_action_buttons(ui: &mut egui::Ui, action: &mut Option<ScanCompleteAction>) {
