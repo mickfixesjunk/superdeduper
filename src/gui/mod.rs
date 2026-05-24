@@ -28,3 +28,6 @@ pub mod theme;
 pub mod widgets;
 
 pub use app::SuperdeduperApp;
+
+#[cfg(test)]
+mod theme_snapshot_test;

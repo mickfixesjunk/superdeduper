@@ -45,7 +45,12 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
         .resizable(false)
         .show_separator_line(false)
         .frame(
-            egui::Frame::none()
+            // `Frame::NONE` (egui 0.32+) starts from a zero-stroke,
+            // zero-rounding, transparent base — we then set just
+            // the fill. Replaces the deprecated `Frame::none()`
+            // call. Behaviour-identical; modernized as part of the
+            // 2026-05-24T21:45Z theme-regression defensive sweep.
+            egui::Frame::NONE
                 .fill(fill)
                 .inner_margin(egui::Margin::symmetric(0, 0)),
         )
