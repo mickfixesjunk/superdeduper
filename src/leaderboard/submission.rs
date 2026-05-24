@@ -116,6 +116,16 @@ pub enum SubmitOutcome {
     /// 5xx / network. Caller should enqueue to disk for next launch.
     /// (Persisting is done by `submit_with_queue` — see below.)
     Transient { reason: String },
+    /// User clicked "Submit for review" on a Rejected outcome. We
+    /// saved a copy to the local review queue and (best-effort)
+    /// uploaded to /api/v1/submit/review. `review_id` is the
+    /// server-assigned id on success; `None` if the upload didn't
+    /// land but the local save did. Rendered with a green ✓ so
+    /// the user knows the action succeeded.
+    FlaggedForReview {
+        review_id: Option<String>,
+        local_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,12 +325,16 @@ pub fn archive_attempt(
 /// best-effort — when the endpoint isn't live yet, the local copy
 /// is the source of truth and Mick collects them manually from
 /// beta testers.
+///
+/// Returns `(local_path, upload_review_id)`. `upload_review_id` is
+/// `Some` only when the upload landed 200; `None` for any failure
+/// (which still leaves the local save intact).
 pub fn flag_for_review(
     state: &super::install::InstallState,
     inputs: &SubmissionInputs,
     rejection: &SubmitOutcome,
     user_note: Option<&str>,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<(PathBuf, Option<String>)> {
     let body = build_payload(inputs, &state.install_id);
     let entry = ReviewSubmission {
         flagged_at_unix: now_unix(),
@@ -335,25 +349,27 @@ pub fn flag_for_review(
     };
     let path = write_review_entry(&entry)?;
     // Best-effort upload. Endpoint went live (web commit c8cceb9),
-    // so a real signed POST should land. Surface the outcome to
-    // stderr so the user (or Mick supporting beta testers) can see
-    // what happened.
-    match try_upload_review(state, &entry) {
+    // so a real signed POST should land. Stderr line is kept as a
+    // diagnostic trail; the structured review_id is what the GUI
+    // surfaces to the user.
+    let review_id = match try_upload_review(state, &entry) {
         Ok(review_id) => {
             eprintln!(
                 "review: uploaded ({}). Backend review_id={review_id}. Local copy at {}",
                 state.server_url,
                 path.display()
             );
+            Some(review_id)
         }
         Err(e) => {
             eprintln!(
                 "review: upload failed ({e}). Local copy at {}",
                 path.display()
             );
+            None
         }
-    }
-    Ok(path)
+    };
+    Ok((path, review_id))
 }
 
 /// POST the review entry to the backend review endpoint. On 200,
@@ -441,6 +457,7 @@ fn outcome_kind_tag(o: &SubmitOutcome) -> &'static str {
         SubmitOutcome::DuplicateNoChange => "duplicate",
         SubmitOutcome::Rejected { .. } => "rejected",
         SubmitOutcome::Transient { .. } => "transient",
+        SubmitOutcome::FlaggedForReview { .. } => "flagged-for-review",
     }
 }
 
@@ -489,6 +506,10 @@ enum SerializableOutcome {
     Transient {
         reason: String,
     },
+    FlaggedForReview {
+        review_id: Option<String>,
+        local_path: String,
+    },
 }
 
 impl From<&SubmitOutcome> for SerializableOutcome {
@@ -512,6 +533,13 @@ impl From<&SubmitOutcome> for SerializableOutcome {
             },
             SubmitOutcome::Transient { reason } => SerializableOutcome::Transient {
                 reason: reason.clone(),
+            },
+            SubmitOutcome::FlaggedForReview {
+                review_id,
+                local_path,
+            } => SerializableOutcome::FlaggedForReview {
+                review_id: review_id.clone(),
+                local_path: local_path.clone(),
             },
         }
     }

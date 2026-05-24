@@ -62,6 +62,27 @@ pub struct SettingsModalState {
     pub tab: SettingsTab,
 }
 
+/// Process-wide slot for the "Preview a sample submission" modal's
+/// JSON body. The Preview button (deep inside the leaderboard tab's
+/// closure) writes here; the outer `show()` reads it and renders a
+/// secondary window with the JSON. OnceLock + Mutex matches the
+/// pattern used by `leaderboard::submission` for cross-frame state
+/// that doesn't fit naturally on the per-render Ui chain.
+static SAMPLE_PREVIEW: parking_lot::Mutex<Option<String>> =
+    parking_lot::Mutex::new(None);
+
+fn show_sample_preview(json: String) {
+    *SAMPLE_PREVIEW.lock() = Some(json);
+}
+
+fn take_sample_preview() -> Option<String> {
+    SAMPLE_PREVIEW.lock().clone()
+}
+
+fn clear_sample_preview() {
+    *SAMPLE_PREVIEW.lock() = None;
+}
+
 /// Locked modal dimensions. `fixed_size()` alone wasn't holding
 /// the window against content that wanted to grow — `min_width` +
 /// `max_width` (and the height pair) clamp explicitly via the
@@ -89,6 +110,15 @@ pub fn show(
     settings: &mut ScanSettings,
     state: &mut SettingsModalState,
 ) -> bool {
+    // Render the sample-preview modal (if one's been requested via
+    // the Privacy tab's button) ABOVE the main settings layer. Sits
+    // on its own egui::Area so its close button can fire without
+    // affecting the main modal's state.
+    #[cfg(feature = "telemetry")]
+    if let Some(json) = take_sample_preview() {
+        render_sample_preview_modal(ctx, &json);
+    }
+
     if !*open {
         return false;
     }
@@ -1018,7 +1048,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            print_sample_payload();
+            show_sample_preview(build_sample_payload_json());
         }
         ui.add_space(4.0);
         if ui
@@ -1078,8 +1108,88 @@ fn render_privacy_section(ui: &mut egui::Ui) {
 /// stderr for now; a follow-up slice plumbs it into the
 /// "What gets shared?" modal alongside the post-scan modal's
 /// real payload preview.
+/// Render a secondary modal showing the sample submission JSON.
+/// Floats over the Settings modal. Close button clears the slot.
 #[cfg(feature = "telemetry")]
-fn print_sample_payload() {
+fn render_sample_preview_modal(ctx: &Context, json: &str) {
+    use egui::{Align2, Id};
+    egui::Area::new(Id::new("sd-sample-preview-backdrop"))
+        .order(egui::Order::Background)
+        .fixed_pos(ctx.screen_rect().left_top())
+        .show(ctx, |ui| {
+            ui.painter().rect_filled(
+                ctx.screen_rect(),
+                egui::Rounding::ZERO,
+                egui::Color32::from_black_alpha(160),
+            );
+        });
+    egui::Window::new(
+        RichText::new("Sample submission payload")
+            .color(theme::TEXT_HI)
+            .heading(),
+    )
+    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+    .collapsible(false)
+    .resizable(false)
+    .min_width(640.0)
+    .max_width(640.0)
+    .min_height(520.0)
+    .max_height(520.0)
+    .show(ctx, |ui| {
+        ui.label(
+            RichText::new(
+                "Synthetic data — exact JSON sd would POST to /api/v1/submit. \
+                 No real scan data here; safe to share publicly.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .max_height(400.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut buf = json.to_string();
+                ui.add(
+                    egui::TextEdit::multiline(&mut buf)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(22)
+                        .interactive(false),
+                );
+            });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Close").color(theme::PANEL_DEEP).strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(120.0, 28.0)),
+                )
+                .clicked()
+            {
+                clear_sample_preview();
+            }
+            ui.add_space(8.0);
+            ui.hyperlink_to(
+                RichText::new("Privacy policy").color(theme::ACCENT).small(),
+                "https://superdeduper.io/privacy/",
+            );
+        });
+    });
+    // The take_sample_preview call in the parent removed the value;
+    // re-store it so the next frame still renders the modal until
+    // the user clicks Close (which calls clear_sample_preview).
+    show_sample_preview(json.to_string());
+}
+
+/// Build the synthetic sample submission as a pretty-printed JSON
+/// string. Used by the Preview-sample-submission button to render
+/// in a modal (and as a debug echo to stderr for headless cases).
+#[cfg(feature = "telemetry")]
+fn build_sample_payload_json() -> String {
     use crate::leaderboard::{hardware, submission};
     use submission::{FEATURE_BIT_CACHE, FEATURE_BIT_FORMAT_AWARE};
     let inputs = submission::SubmissionInputs {
@@ -1108,12 +1218,9 @@ fn print_sample_payload() {
         },
     };
     let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");
-    match serde_json::to_string_pretty(&payload) {
-        Ok(s) => {
-            eprintln!("---- sample submission payload ----\n{s}\n-----------------------------------");
-        }
-        Err(e) => eprintln!("leaderboard: sample payload render failed: {e:?}"),
-    }
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|e| {
+        format!("(render failed: {e})")
+    })
 }
 
 #[cfg(feature = "telemetry")]
@@ -1305,6 +1412,31 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::S
                 ))
                 .color(theme::WARN)
                 .small(),
+            );
+        }
+        SubmitOutcome::FlaggedForReview { review_id, local_path } => {
+            ui.label(
+                RichText::new("✓ Flagged for review").color(theme::ACCENT).strong(),
+            );
+            if let Some(id) = review_id {
+                ui.label(
+                    RichText::new(format!("review_id: {id}"))
+                        .color(theme::TEXT_LO)
+                        .small()
+                        .monospace(),
+                );
+            } else {
+                ui.label(
+                    RichText::new("Upload failed — saved locally only.")
+                        .color(theme::WARN)
+                        .small(),
+                );
+            }
+            ui.label(
+                RichText::new(format!("Local: {local_path}"))
+                    .color(theme::TEXT_LO)
+                    .small()
+                    .monospace(),
             );
         }
     }

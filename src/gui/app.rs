@@ -801,18 +801,25 @@ impl SuperdeduperApp {
                 },
             );
             match submission::flag_for_review(&state, &inputs, &rejection, None) {
-                Ok(path) => {
+                Ok((path, review_id)) => {
                     eprintln!(
-                        "review: saved to {} (and attempted upload)",
-                        path.display()
+                        "review: saved to {} (review_id={:?})",
+                        path.display(),
+                        review_id
                     );
-                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
-                        status: 0,
-                        reason: "Flagged for admin review (saved locally + uploaded).".into(),
-                    });
+                    submission::store_last_outcome(
+                        submission::SubmitOutcome::FlaggedForReview {
+                            review_id,
+                            local_path: path.display().to_string(),
+                        },
+                    );
                 }
                 Err(e) => {
                     eprintln!("review: local save failed: {e:?}");
+                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                        status: 0,
+                        reason: format!("Review-save failed: {e}"),
+                    });
                 }
             }
         });

@@ -1063,6 +1063,21 @@ fn run(
             hit_rate
         ),
     });
+    // Diagnostic: surface both reclaim flavors + bytes_read at
+    // scan-end so a "reclaim > read" report (hardlink-heavy corpora,
+    // partial-hardlink groups with stale unique_inodes, etc.) is
+    // one log-line away. The leaderboard payload clamps reclaim
+    // against bytes_read; this line shows the raw figures.
+    let _ = tx.send(EngineEvent::Log {
+        level: LogLevel::Info,
+        message: format!(
+            "reclaim: path-aware={}, inode-aware={}, bytes-read={} — {} groups",
+            crate::gui::theme::humansize(reclaimable),
+            crate::gui::theme::humansize(reclaimable_inode),
+            crate::gui::theme::humansize(total_bytes_read),
+            total_dups,
+        ),
+    });
     // G1: build the leaderboard payload from this scan's results
     // and log its size. We don't auto-submit — that's the GUI
     // "Submit run" button's job. This step proves the integration

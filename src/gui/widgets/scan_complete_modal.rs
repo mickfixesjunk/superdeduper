@@ -391,6 +391,45 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
                 RichText::new(reason).color(theme::TEXT_LO).small(),
             );
         }
+        SubmitOutcome::FlaggedForReview { review_id, local_path } => {
+            ui.label(
+                RichText::new("✓ Flagged for review")
+                    .color(theme::ACCENT)
+                    .strong()
+                    .size(15.0),
+            );
+            ui.add_space(4.0);
+            match review_id {
+                Some(id) => {
+                    ui.label(
+                        RichText::new(format!("Backend review_id:  {id}"))
+                            .color(theme::TEXT_HI)
+                            .small()
+                            .monospace(),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Uploaded to the admin review queue + saved locally."
+                        )
+                        .color(theme::TEXT_LO)
+                        .small(),
+                    );
+                }
+                None => {
+                    ui.label(
+                        RichText::new("Upload failed — saved locally for manual collection.")
+                            .color(theme::WARN)
+                            .small(),
+                    );
+                }
+            }
+            ui.label(
+                RichText::new(format!("Local copy:  {local_path}"))
+                    .color(theme::TEXT_LO)
+                    .small()
+                    .monospace(),
+            );
+        }
     }
 }
 
