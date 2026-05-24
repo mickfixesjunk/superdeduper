@@ -1081,21 +1081,30 @@ fn render_privacy_section(ui: &mut egui::Ui) {
 #[cfg(feature = "telemetry")]
 fn print_sample_payload() {
     use crate::leaderboard::{hardware, submission};
+    use submission::{FEATURE_BIT_CACHE, FEATURE_BIT_FORMAT_AWARE};
     let inputs = submission::SubmissionInputs {
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
         run_uuid: "00000000-0000-0000-0000-000000000000".into(),
-        sd_version: env!("CARGO_PKG_VERSION").to_string(),
         hardware: hardware::detect(),
-        scan: submission::ScanResults {
-            files_scanned: 412_998,
+        run_shape: submission::RunShape {
+            wall_clock_seconds: 137.4,
             bytes_scanned: 320_000_000_000,
-            wall_clock_ms: 137_400,
+            files_scanned: 412_998,
+            hash_algorithm: "river5-aes-ni".into(),
+            walker_variant: "hybrid".into(),
+            scope: "subdirectory".into(),
+            features_used_bitmap: FEATURE_BIT_CACHE | FEATURE_BIT_FORMAT_AWARE,
+            corpus_kind: "user-data".into(),
+            cache_hit_ratio: Some(0.42),
+            easter_egg_hits: Vec::new(),
+        },
+        result_summary: submission::ResultSummary {
             duplicate_groups: 18_204,
-            reclaimable_inode_bytes: 38_100_000_000,
-            hash_algo: "river5".into(),
-            defender_rtp_state_pre: Some(false),
-            defender_rtp_state_post: Some(false),
-            corpus_signature_hash:
-                "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
+            duplicate_bytes_reclaimable: 38_100_000_000,
+            largest_single_group_bytes: 4_200_000_000,
+            actions_taken_summary: std::collections::BTreeMap::new(),
+            placeholder_skip_count: None,
+            placeholder_skip_bytes: None,
         },
     };
     let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");
@@ -1133,8 +1142,8 @@ fn render_submit_section(ui: &mut egui::Ui) {
             ui.label(
                 RichText::new(format!(
                     "Run ready ({} files, {}). Register this install above to enable submission.",
-                    p.scan.files_scanned,
-                    theme::humansize(p.scan.bytes_scanned),
+                    p.run_shape.files_scanned,
+                    theme::humansize(p.run_shape.bytes_scanned),
                 ))
                 .color(theme::WARN)
                 .small(),
@@ -1144,10 +1153,10 @@ fn render_submit_section(ui: &mut egui::Ui) {
             ui.label(
                 RichText::new(format!(
                     "Run ready: {} files, {} read, {} groups, hash={}",
-                    p.scan.files_scanned,
-                    theme::humansize(p.scan.bytes_scanned),
-                    p.scan.duplicate_groups,
-                    p.scan.hash_algo,
+                    p.run_shape.files_scanned,
+                    theme::humansize(p.run_shape.bytes_scanned),
+                    p.result_summary.duplicate_groups,
+                    p.run_shape.hash_algorithm,
                 ))
                 .color(theme::TEXT_HI)
                 .small(),

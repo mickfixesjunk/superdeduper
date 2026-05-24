@@ -625,6 +625,7 @@ fn run(
     let mut total_bytes_read: u64 = 0;
     let mut total_dups: u64 = 0;
     let mut reclaimable: u64 = 0;
+    let mut largest_group_bytes: u64 = 0;
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -925,6 +926,13 @@ fn run(
                 .size
                 .saturating_mul(visible_files.len().saturating_sub(1) as u64);
             reclaimable = reclaimable.saturating_add(savings);
+            // Track the largest group's total bytes (size * count of
+            // members) for the leaderboard `result_summary
+            // .largest_single_group_bytes` field.
+            let group_total = g.size.saturating_mul(visible_files.len() as u64);
+            if group_total > largest_group_bytes {
+                largest_group_bytes = group_total;
+            }
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
             // sampler thread sees fresh values without us holding
@@ -1035,26 +1043,70 @@ fn run(
     {
         use crate::leaderboard::hardware;
         use crate::leaderboard::hmac_signer;
-        use crate::leaderboard::submission;
-        let wall_ms = scan_started_at
-            .elapsed()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
-        let defender_post = crate::diagnose::probe_defender().rtp_enabled;
-        let inputs = submission::SubmissionInputs {
+        use crate::leaderboard::submission::{
+            self, FEATURE_BIT_ALLOW_RECALL_ON_READ, FEATURE_BIT_ALLOW_SYSTEM_PATHS,
+            FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB, FEATURE_BIT_FOLLOW_LINKS,
+            FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB, FEATURE_BIT_PARANOID,
+            FEATURE_BIT_REFERENCE_ROOTS, ResultSummary, RunShape, SubmissionInputs,
+        };
+        // Discard the defender post probe; current backend schema
+        // doesn't carry defender state. Keep the call commented in
+        // case a future schema reinstates it.
+        let _ = defender_rtp_pre;
+        // Wall-clock as seconds (number) per schema.
+        let wall_clock_seconds = scan_started_at.elapsed().as_secs_f64();
+        let hash_algorithm = match settings.hash_algo {
+            crate::pipeline::hash::HashAlgo::Blake3 => "blake3",
+            crate::pipeline::hash::HashAlgo::River5 => "river5-aes-ni",
+        }
+        .to_string();
+        // Scope heuristic from the root paths.
+        let scope = classify_scope(&roots);
+        // Corpus kind heuristic: "system" if any root looks like an
+        // OS-system tree (C:\Windows, /System, /usr, etc.), else
+        // "user-data".
+        let corpus_kind = classify_corpus_kind(&roots);
+        // Features bitmap built from the resolved settings.
+        let mut features_bits: u64 = 0;
+        if settings.use_cache { features_bits |= FEATURE_BIT_CACHE; }
+        if settings.use_format_aware { features_bits |= FEATURE_BIT_FORMAT_AWARE; }
+        if settings.paranoid { features_bits |= FEATURE_BIT_PARANOID; }
+        if cfg.follow_links { features_bits |= FEATURE_BIT_FOLLOW_LINKS; }
+        if cfg.allow_system_paths { features_bits |= FEATURE_BIT_ALLOW_SYSTEM_PATHS; }
+        if cfg.allow_recall_on_read { features_bits |= FEATURE_BIT_ALLOW_RECALL_ON_READ; }
+        if !cfg.reference_roots.is_empty() { features_bits |= FEATURE_BIT_REFERENCE_ROOTS; }
+        if cfg.include.is_some() { features_bits |= FEATURE_BIT_INCLUDE_GLOB; }
+        if cfg.exclude.is_some() { features_bits |= FEATURE_BIT_EXCLUDE_GLOB; }
+        // Cache hit ratio: tier-totals tracked above; ratio of
+        // cache_hits to total hash ops attempted.
+        let cache_hit_ratio = if total_hash_ops > 0 {
+            Some(total_cache_hits as f64 / total_hash_ops as f64)
+        } else {
+            None
+        };
+        let inputs = SubmissionInputs {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
             run_uuid: uuid::Uuid::new_v4().to_string(),
-            sd_version: env!("CARGO_PKG_VERSION").to_string(),
             hardware: hardware::detect(),
-            scan: submission::ScanResults {
-                files_scanned: total_files,
+            run_shape: RunShape {
+                wall_clock_seconds,
                 bytes_scanned: total_bytes_read,
-                wall_clock_ms: wall_ms,
+                files_scanned: total_files,
+                hash_algorithm,
+                walker_variant: "hybrid".to_string(),
+                scope,
+                features_used_bitmap: features_bits,
+                corpus_kind,
+                cache_hit_ratio,
+                easter_egg_hits: Vec::new(),
+            },
+            result_summary: ResultSummary {
                 duplicate_groups: total_dups,
-                reclaimable_inode_bytes: reclaimable,
-                hash_algo: settings.hash_algo.tag().to_string(),
-                defender_rtp_state_pre: defender_rtp_pre,
-                defender_rtp_state_post: defender_post,
-                corpus_signature_hash: corpus_sig.clone(),
+                duplicate_bytes_reclaimable: reclaimable,
+                largest_single_group_bytes: largest_group_bytes,
+                actions_taken_summary: std::collections::BTreeMap::new(),
+                placeholder_skip_count: None,
+                placeholder_skip_bytes: None,
             },
         };
         // Diagnostic-only payload preview. install_id is empty string
@@ -1068,12 +1120,11 @@ fn run(
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
             message: format!(
-                "leaderboard payload ready: {} bytes (run_uuid={}, hw={}/{}c, corpus_sig={})",
+                "leaderboard payload ready: {} bytes (run_uuid={}, hw={}/{}c)",
                 body.len(),
                 inputs.run_uuid.split('-').next().unwrap_or(""),
                 inputs.hardware.cpu_model_string,
                 inputs.hardware.cpu_threads,
-                corpus_sig.split(':').nth(1).map(|h| &h[..8]).unwrap_or(""),
             ),
         });
         // Stash the inputs in the engine→GUI handoff slot so the
@@ -1359,6 +1410,53 @@ fn chunk_groups(
         chunks.push(current);
     }
     chunks
+}
+
+/// Map roots → `run_shape.scope` enum:
+/// * single drive-root (e.g. `C:\`) → `whole-volume`
+/// * single non-root path → `subdirectory`
+/// * multiple paths → `selection`
+#[cfg(feature = "telemetry")]
+fn classify_scope(roots: &[RootEntry]) -> String {
+    if roots.len() > 1 {
+        return "selection".to_string();
+    }
+    match roots.first() {
+        Some(r) if is_drive_root(&r.path) => "whole-volume".to_string(),
+        Some(_) => "subdirectory".to_string(),
+        None => "subdirectory".to_string(),
+    }
+}
+
+/// "system" if any root path looks like an OS-system tree;
+/// otherwise "user-data". Conservative heuristic — the backend just
+/// uses this for category bucketing.
+#[cfg(feature = "telemetry")]
+fn classify_corpus_kind(roots: &[RootEntry]) -> String {
+    for r in roots {
+        let s = r.path.to_string_lossy().to_ascii_lowercase();
+        if s.contains("\\windows\\")
+            || s.ends_with("\\windows")
+            || s.contains("/system/")
+            || s.starts_with("/system")
+            || s.contains("\\program files")
+            || s.starts_with("/usr/")
+            || s.starts_with("/bin/")
+            || s.starts_with("/sbin/")
+        {
+            return "system".to_string();
+        }
+    }
+    "user-data".to_string()
+}
+
+#[cfg(feature = "telemetry")]
+fn is_drive_root(p: &std::path::Path) -> bool {
+    let s = p.to_string_lossy();
+    // Windows: "C:\", "D:\", "\\?\C:\". Unix: "/".
+    s == "/"
+        || (s.len() == 3 && s.chars().nth(1) == Some(':') && s.ends_with('\\'))
+        || (s.len() == 7 && s.starts_with("\\\\?\\") && s.ends_with('\\'))
 }
 
 fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<ScanConfig> {

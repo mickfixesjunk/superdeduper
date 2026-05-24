@@ -27,26 +27,77 @@ use super::install::InstallState;
 /// Inputs to the submission builder. Caller provides everything the
 /// engine knows about this scan; this module wraps it into the wire
 /// payload + signs + posts.
+///
+/// Mirrors the backend schema's required top-level keys (less
+/// `install_id` + `timestamp` which `build_payload` synthesises from
+/// freshest sources): `client_version`, `hardware`, `run_shape`,
+/// `result_summary`.
 #[derive(Debug, Clone)]
 pub struct SubmissionInputs {
-    pub run_uuid: String,
-    pub sd_version: String,
+    pub client_version: String,
     pub hardware: HardwareFingerprint,
-    pub scan: ScanResults,
+    pub run_shape: RunShape,
+    pub result_summary: ResultSummary,
+    /// Local copy of the run UUID — useful for engine-side
+    /// diagnostic logging (e.g. "payload built for run X"). NOT on
+    /// the wire; backend assigns its own submission_id.
+    pub run_uuid: String,
 }
 
+/// `run_shape` block per backend schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScanResults {
-    pub files_scanned: u64,
+pub struct RunShape {
+    pub wall_clock_seconds: f64,
     pub bytes_scanned: u64,
-    pub wall_clock_ms: u64,
-    pub duplicate_groups: u64,
-    pub reclaimable_inode_bytes: u64,
-    pub hash_algo: String,
-    pub defender_rtp_state_pre: Option<bool>,
-    pub defender_rtp_state_post: Option<bool>,
-    pub corpus_signature_hash: String,
+    pub files_scanned: u64,
+    /// Enum: `"river5-aes-ni" | "river5-96" | "blake3" | "sha256"
+    /// | "other"`.
+    pub hash_algorithm: String,
+    /// Enum: `"mft" | "walker" | "hybrid"`.
+    pub walker_variant: String,
+    /// Enum: `"whole-volume" | "subdirectory" | "selection" |
+    /// "canonical-bench"`.
+    pub scope: String,
+    /// Bitmap of which engine features were active during the scan.
+    /// See [`FEATURE_BIT_*`] constants.
+    pub features_used_bitmap: u64,
+    /// Enum: `"user-data" | "system" | "canonical-bench"`.
+    pub corpus_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_ratio: Option<f64>,
+    /// G2 client-claimed achievement IDs. Backend grants these
+    /// when the predicate is `unlock_kind: client-claimed`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub easter_egg_hits: Vec<String>,
 }
+
+/// `result_summary` block per backend schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultSummary {
+    pub duplicate_groups: u64,
+    pub duplicate_bytes_reclaimable: u64,
+    pub largest_single_group_bytes: u64,
+    /// Per-action counts, e.g. `{"recycle": 12, "hardlink": 0}`.
+    /// Empty `{}` is valid + the natural state at scan-end (actions
+    /// happen post-scan).
+    pub actions_taken_summary: std::collections::BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder_skip_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder_skip_bytes: Option<u64>,
+}
+
+// `features_used_bitmap` bit assignments. Stable; new features
+// append. Reserved bits stay 0 until claimed.
+pub const FEATURE_BIT_CACHE: u64 = 1 << 0;
+pub const FEATURE_BIT_FORMAT_AWARE: u64 = 1 << 1;
+pub const FEATURE_BIT_PARANOID: u64 = 1 << 2;
+pub const FEATURE_BIT_FOLLOW_LINKS: u64 = 1 << 3;
+pub const FEATURE_BIT_ALLOW_SYSTEM_PATHS: u64 = 1 << 4;
+pub const FEATURE_BIT_ALLOW_RECALL_ON_READ: u64 = 1 << 5;
+pub const FEATURE_BIT_REFERENCE_ROOTS: u64 = 1 << 6;
+pub const FEATURE_BIT_INCLUDE_GLOB: u64 = 1 << 7;
+pub const FEATURE_BIT_EXCLUDE_GLOB: u64 = 1 << 8;
 
 #[derive(Debug, Clone)]
 pub enum SubmitOutcome {
@@ -85,12 +136,12 @@ pub struct RankEntry {
 pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json::Value {
     serde_json::json!({
         "schema_version": "v1",
+        "client_version": inputs.client_version,
         "install_id": install_id,
-        "run_uuid": inputs.run_uuid,
-        "sd_version": inputs.sd_version,
-        "submitted_at_unix": now_unix(),
+        "timestamp": now_iso8601(),
         "hardware": inputs.hardware,
-        "scan": inputs.scan,
+        "run_shape": inputs.run_shape,
+        "result_summary": inputs.result_summary,
     })
 }
 
@@ -276,6 +327,37 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// RFC 3339 / ISO 8601 UTC timestamp of "now" with seconds
+/// precision, e.g. `"2026-05-24T05:42:33Z"`. Backend schema requires
+/// `timestamp` in this format (string with format: date-time).
+fn now_iso8601() -> String {
+    iso8601_from_unix(now_unix())
+}
+
+/// Render a unix timestamp (seconds since epoch) as RFC 3339 UTC.
+/// Hand-rolled (no chrono dep) using the same Howard Hinnant
+/// civil-from-days algorithm we already use in gui::app for the
+/// project-bundle stamp.
+fn iso8601_from_unix(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let h = (secs / 3_600) as u32;
+    let m = ((secs % 3_600) / 60) as u32;
+    let s = (secs % 60) as u32;
+    // Civil-from-days (days since 1970-01-01) — Howard Hinnant.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    format!("{year:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 // ============================================================
 // Engine→GUI handoff for the most-recent scan's submission inputs.
 //
@@ -341,63 +423,95 @@ mod tests {
 
     fn sample_inputs() -> SubmissionInputs {
         SubmissionInputs {
+            client_version: "0.1.0".into(),
             run_uuid: "9d4a0000-0000-0000-0000-000000000001".into(),
-            sd_version: "0.1.7-test".into(),
-            hardware: HardwareFingerprint {
-                schema_version: 1,
-                cpu_model_string: "Test CPU".into(),
-                cpu_threads: 8,
-                cpu_isa_flags: vec!["sse4_2".into(), "avx2".into()],
-                ram_gb_total: Some(32),
-                os_family: "linux".into(),
-                os_edition: None,
-            },
-            scan: ScanResults {
-                files_scanned: 1234,
+            hardware: crate::leaderboard::hardware::detect(),
+            run_shape: RunShape {
+                wall_clock_seconds: 5.678,
                 bytes_scanned: 9_876_543,
-                wall_clock_ms: 5678,
+                files_scanned: 1234,
+                hash_algorithm: "river5-aes-ni".into(),
+                walker_variant: "hybrid".into(),
+                scope: "subdirectory".into(),
+                features_used_bitmap: FEATURE_BIT_CACHE | FEATURE_BIT_FORMAT_AWARE,
+                corpus_kind: "user-data".into(),
+                cache_hit_ratio: None,
+                easter_egg_hits: Vec::new(),
+            },
+            result_summary: ResultSummary {
                 duplicate_groups: 42,
-                reclaimable_inode_bytes: 12345,
-                hash_algo: "river5-test".into(),
-                defender_rtp_state_pre: Some(true),
-                defender_rtp_state_post: Some(true),
-                corpus_signature_hash: "sha256:deadbeef".into(),
+                duplicate_bytes_reclaimable: 12345,
+                largest_single_group_bytes: 1000,
+                actions_taken_summary: std::collections::BTreeMap::new(),
+                placeholder_skip_count: None,
+                placeholder_skip_bytes: None,
             },
         }
     }
 
     #[test]
-    fn build_payload_contains_required_keys() {
+    fn build_payload_has_all_required_top_level_keys() {
         let p = build_payload(&sample_inputs(), "test-install-id");
-        assert!(p.get("schema_version").is_some());
-        assert!(p.get("install_id").is_some());
+        // Backend schema's `required` set.
+        for key in [
+            "schema_version",
+            "client_version",
+            "install_id",
+            "timestamp",
+            "hardware",
+            "run_shape",
+            "result_summary",
+        ] {
+            assert!(p.get(key).is_some(), "missing required key '{key}'");
+        }
         assert_eq!(p.get("install_id").and_then(|v| v.as_str()), Some("test-install-id"));
-        assert!(p.get("run_uuid").is_some());
-        assert!(p.get("hardware").is_some());
-        assert!(p.get("scan").is_some());
+        assert_eq!(p.get("schema_version").and_then(|v| v.as_str()), Some("v1"));
+    }
+
+    #[test]
+    fn build_payload_does_not_emit_disallowed_top_level_keys() {
+        // Backend schema is additionalProperties:false at the top
+        // level. The pre-rewrite payload had `run_uuid`,
+        // `sd_version`, `scan`, `submitted_at_unix` — all gone.
+        let p = build_payload(&sample_inputs(), "x");
+        for key in ["run_uuid", "sd_version", "scan", "submitted_at_unix"] {
+            assert!(
+                p.get(key).is_none(),
+                "unexpected key '{key}' on payload — backend rejects with schema_invalid",
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_is_rfc3339_seconds_zulu() {
+        let p = build_payload(&sample_inputs(), "x");
+        let ts = p.get("timestamp").and_then(|v| v.as_str()).unwrap();
+        // Shape: YYYY-MM-DDTHH:MM:SSZ — 20 chars.
+        assert_eq!(ts.len(), 20, "timestamp wrong length: {ts}");
+        assert!(ts.ends_with('Z'), "timestamp must end with Z (UTC): {ts}");
+        assert!(ts.contains('T'), "timestamp must have T separator: {ts}");
+    }
+
+    #[test]
+    fn iso8601_matches_known_unix_anchors() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        assert_eq!(iso8601_from_unix(1_704_067_200), "2024-01-01T00:00:00Z");
+        // 2026-05-24T03:42:33Z = 1779594153
+        assert_eq!(iso8601_from_unix(1_779_594_153), "2026-05-24T03:42:33Z");
+        // Epoch
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
     }
 
     #[test]
     fn canonical_body_is_deterministic_across_inputs() {
+        // Hardware uses detect() which queries the live machine — so
+        // back-to-back calls return the same bytes, but a snapshot
+        // test would break across machines. Just check shape.
         let p1 = build_payload(&sample_inputs(), "test-id");
         let p2 = build_payload(&sample_inputs(), "test-id");
         let b1 = hmac_signer::canonical_body(&p1);
         let b2 = hmac_signer::canonical_body(&p2);
         assert_eq!(b1, b2);
-        // Sorted keys at the top level. Note `schema_version` also
-        // appears nested inside `hardware`; use rfind() for the outer
-        // one which appears AFTER `scan` in the canonical output.
-        let s = String::from_utf8(b1).unwrap();
-        let idx_outer_schema = s.rfind("\"schema_version\"").unwrap();
-        let idx_scan = s.find("\"scan\"").unwrap();
-        let idx_hw = s.find("\"hardware\"").unwrap();
-        let idx_run = s.find("\"run_uuid\"").unwrap();
-        assert!(idx_hw < idx_run);
-        assert!(idx_run < idx_scan);
-        assert!(
-            idx_scan < idx_outer_schema,
-            "scan should sort before outer schema_version (s-c-a-n < s-c-h): {s}"
-        );
     }
 
     #[test]
