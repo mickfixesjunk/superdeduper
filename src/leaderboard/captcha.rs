@@ -260,21 +260,79 @@ fn urlencode(s: &str) -> String {
 }
 
 fn open_browser(url: &str) -> Result<(), CaptchaError> {
-    let result = if cfg!(target_os = "windows") {
-        // `cmd /c start "" url`. The empty quoted arg is `start`'s
-        // window-title slot — without it, `start` would interpret
-        // the URL itself as the title.
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
+    #[cfg(target_os = "windows")]
+    {
+        return open_browser_windows(url);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open")
+            .arg(url)
             .spawn()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
+            .map(|_| ())
+            .map_err(|e| CaptchaError::BrowserOpenFailed(format!("{e}")));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| CaptchaError::BrowserOpenFailed(format!("{e}")));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    {
+        let _ = url;
+        Err(CaptchaError::BrowserOpenFailed(
+            "no browser-open impl for this platform".into(),
+        ))
+    }
+}
+
+/// Open URL via `ShellExecuteW` instead of `cmd /c start "" url`.
+///
+/// Why: the prior `cmd`-based path mangled URLs containing `&` —
+/// cmd treats `&` as a command separator unless quoted, and Rust's
+/// std::process::Command arg-quoting doesn't add quotes around args
+/// without spaces. The result: `start "" https://...?cb=...&install_id=...`
+/// got split at the `&`, browser opened only the URL fragment up
+/// to it (no install_id), and the web's /setup page rejected the
+/// request as missing-params.
+///
+/// `ShellExecuteW` is the canonical Win32 "open a URL with the
+/// user's default handler" call. Takes the URL as a single wide
+/// string parameter; no cmd parsing involved.
+#[cfg(target_os = "windows")]
+fn open_browser_windows(url: &str) -> Result<(), CaptchaError> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let op_w: Vec<u16> = "open\0".encode_utf16().collect();
+    let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both wide strings are null-terminated; HWND::default() is
+    // a valid (null) owner; SW_SHOWNORMAL is a documented constant.
+    let h = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            PCWSTR(op_w.as_ptr()),
+            PCWSTR(url_w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
     };
-    result
-        .map(|_| ())
-        .map_err(|e| CaptchaError::BrowserOpenFailed(format!("{e}")))
+    // ShellExecuteW returns >32 on success per its docs. <=32 is one of
+    // the SE_ERR_* values (no handler registered, file not found, etc.).
+    let raw = h.0 as isize;
+    if raw > 32 {
+        Ok(())
+    } else {
+        Err(CaptchaError::BrowserOpenFailed(format!(
+            "ShellExecuteW returned {raw} (<=32 indicates SE_ERR_*)"
+        )))
+    }
 }
 
 #[cfg(test)]

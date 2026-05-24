@@ -114,6 +114,9 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_Security",
     "Win32_UI_Shell",
+    # G1 captcha browser-open uses ShellExecuteW (avoids `cmd /c start`
+    # mangling URLs that contain `&`) + SW_SHOWNORMAL from this module.
+    "Win32_UI_WindowsAndMessaging",
     # T2.3 — IFileOperation upgrade. The COM-based replacement for
     # SHFileOperationW needs CoInitializeEx / CoUninitialize plus the
     # SHCreateItemFromParsingName/IShellItem family.
