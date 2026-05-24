@@ -47,6 +47,7 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
         entries,
         ScanSettings::default(),
         Arc::new(AtomicBool::new(false)),
+        None,
     )
 }
 
@@ -55,11 +56,12 @@ pub fn spawn_with_settings(
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
+    defender_rtp_pre: Option<bool>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("superdeduper-engine".into())
         .spawn(move || {
-            if let Err(e) = run(tx.clone(), roots, settings, cancel) {
+            if let Err(e) = run(tx.clone(), roots, settings, cancel, defender_rtp_pre) {
                 let _ = tx.send(EngineEvent::Log {
                     level: LogLevel::Error,
                     message: format!("engine: {e}"),
@@ -75,6 +77,7 @@ fn run(
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
+    defender_rtp_pre: Option<bool>,
 ) -> crate::Result<()> {
     let scan_started_at = Instant::now();
     // Diagnostics report file — fresh per scan. Failure to open it
@@ -1037,6 +1040,7 @@ fn run(
             .elapsed()
             .as_millis()
             .min(u64::MAX as u128) as u64;
+        let defender_post = crate::diagnose::probe_defender().rtp_enabled;
         let inputs = submission::SubmissionInputs {
             run_uuid: uuid::Uuid::new_v4().to_string(),
             sd_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1048,8 +1052,8 @@ fn run(
                 duplicate_groups: total_dups,
                 reclaimable_inode_bytes: reclaimable,
                 hash_algo: settings.hash_algo.tag().to_string(),
-                defender_rtp_state_pre: None,
-                defender_rtp_state_post: None,
+                defender_rtp_state_pre: defender_rtp_pre,
+                defender_rtp_state_post: defender_post,
                 corpus_signature_hash: corpus_sig.clone(),
             },
         };

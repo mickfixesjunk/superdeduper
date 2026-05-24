@@ -780,7 +780,7 @@ fn read_for_disk_throughput(path: &Path) -> anyhow::Result<(u64, f64)> {
     Ok((total, t.elapsed().as_secs_f64()))
 }
 
-fn probe_defender() -> DefenderState {
+pub fn probe_defender() -> DefenderState {
     #[cfg(windows)]
     {
         // Shell out to PowerShell Get-MpComputerStatus and parse

@@ -442,7 +442,7 @@ impl SuperdeduperApp {
         // * this is a Resume (checkpoint already adopted; user already chose
         //   to continue — the score is the same machine we're already on)
         if self.persisted.settings.skip_preflight || self.can_resume {
-            self.launch_scan();
+            self.launch_scan(None);
             return;
         }
         let roots: Vec<PathBuf> = self
@@ -457,7 +457,11 @@ impl SuperdeduperApp {
     /// Spawn the actual scan worker. Called by `start_live` only
     /// AFTER preflight has been dismissed (Cancel branches out, Start
     /// proceeds here). The body is what `start_live` used to do.
-    fn launch_scan(&mut self) {
+    ///
+    /// `defender_rtp_pre` is `Some(_)` only when this launch came
+    /// through the preflight modal (the Defender probe ran there);
+    /// resume / skip-preflight paths pass `None`.
+    fn launch_scan(&mut self, defender_rtp_pre: Option<bool>) {
         self.is_scanning = true;
         self.cancel.store(false, Ordering::Relaxed);
         self.can_resume = false;
@@ -473,6 +477,7 @@ impl SuperdeduperApp {
             self.persisted.roots.clone(),
             effective_settings,
             self.cancel.clone(),
+            defender_rtp_pre,
         );
     }
 
@@ -503,9 +508,18 @@ impl SuperdeduperApp {
         if let Some(action) =
             crate::gui::widgets::preflight_modal::show(ctx, &self.preflight)
         {
+            // Snapshot the Defender RTP probe result *before* we drop
+            // the report — G1 wants pre-scan defender state in the
+            // leaderboard payload, and this is the only place the
+            // probe runs in the GUI happy path.
+            let defender_rtp_pre = if let PreflightState::Showing { report, .. } = &self.preflight {
+                report.defender.rtp_enabled
+            } else {
+                None
+            };
             self.preflight = PreflightState::Idle;
             match action {
-                PreflightAction::Start => self.launch_scan(),
+                PreflightAction::Start => self.launch_scan(defender_rtp_pre),
                 PreflightAction::Cancel => {}
             }
         }

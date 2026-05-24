@@ -293,24 +293,125 @@ fn detect_ram_gb() -> Option<u32> {
 }
 
 // ============================================================
-// OS edition — best-effort; deferred to follow-up commits per
-// platform. Linux gets the kernel uname for now.
+// OS edition — best-effort per platform.
 // ============================================================
 
 #[cfg(target_os = "linux")]
 fn detect_os_edition() -> Option<String> {
+    // Prefer /etc/os-release PRETTY_NAME (distro-flavoured); fall
+    // back to the first three tokens of /proc/version (kernel
+    // info). Both are non-PII.
+    if let Ok(s) = std::fs::read_to_string("/etc/os-release") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                let trimmed = rest.trim().trim_matches('"');
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
     std::fs::read_to_string("/proc/version")
         .ok()
-        .and_then(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" ").into())
-        .map(|s: String| s)
-        .map(Some)
-        .unwrap_or(None)
+        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn detect_os_edition() -> Option<String> {
-    // TODO(g1-followup): Windows registry CurrentVersion +
-    // DisplayVersion; macOS sw_vers -productVersion.
+    // sw_vers -productName -> "macOS"; -productVersion -> "14.5".
+    use std::process::Command;
+    let name = Command::new("sw_vers")
+        .arg("-productName")
+        .output()
+        .ok()
+        .and_then(|o| o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .unwrap_or_else(|| "macOS".to_string());
+    let version = Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|o| o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()));
+    Some(match version {
+        Some(v) if !v.is_empty() => format!("{name} {v}"),
+        _ => name,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn detect_os_edition() -> Option<String> {
+    // HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion holds the
+    // canonical OS edition + display version. ProductName is stuck
+    // at "Windows 10 ..." on Windows 11 (Microsoft never updated
+    // the registry value), so we substitute "Windows 11" when
+    // CurrentBuild >= 22000.
+    let key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+    let product_name = read_registry_string(key, "ProductName")?;
+    let display_version = read_registry_string(key, "DisplayVersion");
+    let build_str = read_registry_string(key, "CurrentBuild");
+    let build_num: Option<u32> = build_str.as_deref().and_then(|s| s.parse().ok());
+    let product_name = match build_num {
+        Some(n) if n >= 22000 => product_name.replacen("Windows 10", "Windows 11", 1),
+        _ => product_name,
+    };
+    Some(match display_version {
+        Some(v) if !v.is_empty() => format!("{product_name} {v}"),
+        _ => product_name,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn read_registry_string(subkey: &str, value: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+    };
+
+    let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let value_w: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut key = HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key,
+        )
+    };
+    if opened.is_err() {
+        return None;
+    }
+    let mut buf = [0u16; 256];
+    let mut buf_bytes = (buf.len() * 2) as u32;
+    let mut kind = REG_SZ;
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(value_w.as_ptr()),
+            None,
+            Some(&mut kind),
+            Some(buf.as_mut_ptr() as *mut u8),
+            Some(&mut buf_bytes),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    if queried.is_err() {
+        return None;
+    }
+    let chars = (buf_bytes as usize) / 2;
+    let len = buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
+    let s = String::from_utf16_lossy(&buf[..len]).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn detect_os_edition() -> Option<String> {
     None
 }
 
