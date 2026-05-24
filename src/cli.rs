@@ -314,7 +314,7 @@ pub enum KeepStrategy {
     Smart,
 }
 
-/// G-track CLI args for `sd register`.
+/// G-track CLI args for `superdeduper register`.
 #[cfg(feature = "telemetry")]
 #[derive(Debug, Args)]
 pub struct RegisterArgs {
@@ -330,7 +330,7 @@ pub struct RegisterArgs {
     pub server_url: Option<String>,
 }
 
-/// G-track CLI subcommands for `sd achievements`. Minimum-viable
+/// G-track CLI subcommands for `superdeduper achievements`. Minimum-viable
 /// triage surface: `list` + `refetch`. Fuller surface (show, verify,
 /// diff, anchor) lands as v0.1.9 per design's plan.
 #[cfg(feature = "telemetry")]
@@ -338,7 +338,7 @@ pub struct RegisterArgs {
 pub enum AchievementsCommand {
     /// Print the install's granted achievements as a table (default)
     /// or JSON. Reads from the local cache populated by the most
-    /// recent fetch. Run `sd achievements refetch` first to ensure
+    /// recent fetch. Run `superdeduper achievements refetch` first to ensure
     /// the printout reflects current server state.
     List {
         /// Output format. `text` (default, human) or `json` (machine).
@@ -360,7 +360,7 @@ pub enum AchievementsCommand {
     },
 }
 
-/// G-track CLI subcommands for `sd config`.
+/// G-track CLI subcommands for `superdeduper config`.
 #[cfg(feature = "telemetry")]
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {

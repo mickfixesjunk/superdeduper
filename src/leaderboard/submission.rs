@@ -168,7 +168,7 @@ pub fn submit(state: &InstallState, inputs: &SubmissionInputs) -> SubmitOutcome 
     if !state.registered {
         return SubmitOutcome::Rejected {
             status: 0,
-            reason: "install not registered — call `sd register` first".to_string(),
+            reason: "install not registered — call `superdeduper register` first".to_string(),
         };
     }
     let install_key = match state.install_key() {

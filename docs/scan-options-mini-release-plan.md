@@ -68,7 +68,7 @@ Cross-platform, biggest UI surface, the user-visible piece. Land first.
    - Counter wiring → `EngineCounters`
 3. **Day 3 — CLI flags + config persistence.**
    - All 5 new ScanArgs flags
-   - `sd config set exclusions.*` subcommands (extends the existing `sd config` skeleton)
+   - `superdeduper config set exclusions.*` subcommands (extends the existing `superdeduper config` skeleton)
    - Integration tests against synthetic dirs (`.dll`, `node_modules/`, custom patterns)
 4. **Days 4-5 — GUI Settings → Exclusions tab.**
    - Master toggle

@@ -130,19 +130,19 @@ the Go button (Recycle / Hardlink / Reflink / Archive / Safe-rename).
 
 ### Achievements + leaderboard (opt-in)
 
-`sd register` to opt in; `sd achievements list` to see your grants;
-`superdeduper.io` for the public leaderboard. Default share preference
-is "ask me each time" — flip to auto-submit or never-submit in
-Settings → Leaderboard.
+`superdeduper register` to opt in; `superdeduper achievements list` to
+see your grants; `superdeduper.io` for the public leaderboard. Default
+share preference is "ask me each time" — flip to auto-submit or
+never-submit in Settings → Leaderboard.
 
 See `superdeduper --help` for the full CLI.
 
 ## Non-goals
 
 * macOS support (not on the roadmap for v0.1.x; revisit at v0.2+)
-* Filename- or tag-based fuzzy matching (sd dedupes by content, not by name)
-* Cloud / network-only sync (sd reads local filesystems; cloud-placeholder
-  files are detected + skipped by default, not hydrated)
+* Filename- or tag-based fuzzy matching (superdeduper dedupes by content, not by name)
+* Cloud / network-only sync (superdeduper reads local filesystems;
+  cloud-placeholder files are detected + skipped by default, not hydrated)
 
 ## Acknowledgments
 
