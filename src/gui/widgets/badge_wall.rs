@@ -73,15 +73,62 @@ static LOGIN_CTA_CHOOSER_OPEN: parking_lot::Mutex<bool> = parking_lot::Mutex::ne
 /// uses); v1.1 will move to a background thread + progress
 /// spinner.
 fn render_login_cta(ui: &mut egui::Ui) {
+    use crate::leaderboard::oauth;
+
+    // Drain any completed session BEFORE deciding visibility — if
+    // the user just finished OAuth, the next frame's status reads
+    // as Linked and the CTA goes away cleanly.
+    if let Some(result) = oauth::poll_session() {
+        match result {
+            Ok(token) => eprintln!(
+                "login-cta: linked {} as {}",
+                token.provider.display_name(),
+                token.display_name
+            ),
+            Err(e) => eprintln!("login-cta: link failed: {e}"),
+        }
+    }
+
     // Read link status best-effort. Any I/O error reads as
     // "anonymous" so the CTA still shows — never hide the CTA
     // because of a transient filesystem hiccup.
     let active = crate::channel::active_channel();
-    let is_anon = match crate::leaderboard::oauth::status_for(active) {
-        Ok(crate::leaderboard::oauth::AccountStatus::Anonymous) | Err(_) => true,
-        Ok(crate::leaderboard::oauth::AccountStatus::Linked { .. }) => false,
+    let is_anon = match oauth::status_for(active) {
+        Ok(oauth::AccountStatus::Anonymous) | Err(_) => true,
+        Ok(oauth::AccountStatus::Linked { .. }) => false,
     };
     if !is_anon {
+        return;
+    }
+
+    // While a flow is in flight (regardless of which UI surface
+    // started it), render the spinner + Cancel row from any CTA
+    // the user looks at — that's the responsive feedback issue #2
+    // demanded.
+    if let Some((provider, elapsed)) = oauth::current_session_snapshot() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Waiting for {} sign-in ({}s)…",
+                    provider.display_name(),
+                    elapsed.as_secs(),
+                ))
+                .color(theme::TEXT_HI),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel").color(theme::HOT))
+                        .min_size(egui::vec2(60.0, 24.0)),
+                )
+                .clicked()
+            {
+                oauth::cancel_current_session();
+            }
+        });
+        ui.add_space(6.0);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         return;
     }
 
@@ -115,11 +162,11 @@ fn render_login_cta(ui: &mut egui::Ui) {
             if pick_google {
                 *open = false;
                 drop(open);
-                trigger_link(crate::leaderboard::oauth::Provider::Google, active);
+                start_link(oauth::Provider::Google, active);
             } else if pick_discord {
                 *open = false;
                 drop(open);
-                trigger_link(crate::leaderboard::oauth::Provider::Discord, active);
+                start_link(oauth::Provider::Discord, active);
             } else if cancel {
                 *open = false;
             }
@@ -145,7 +192,10 @@ fn render_login_cta(ui: &mut egui::Ui) {
     ui.add_space(6.0);
 }
 
-fn trigger_link(
+/// Kick off an OAuth flow on the background worker. Caller stays
+/// responsive — per-frame `poll_session()` drains the result when
+/// the worker finishes. Per issue #2 fix.
+fn start_link(
     provider: crate::leaderboard::oauth::Provider,
     channel: crate::channel::Channel,
 ) {
@@ -161,25 +211,16 @@ fn trigger_link(
         }
     };
     let server_url = crate::channel::server_url_for(channel);
-    // Blocking call; same constraint the Account tab already
-    // accepts. v1.1 moves to background thread.
-    match oauth::link_via_loopback(
+    if oauth::try_start_session(
         provider,
         channel,
         server_url,
         &install_id,
         oauth::DEFAULT_OAUTH_TIMEOUT,
-    ) {
-        Ok(token) => {
-            eprintln!(
-                "login-cta: linked {} as {} on channel {channel}",
-                token.provider.display_name(),
-                token.display_name,
-            );
-        }
-        Err(e) => {
-            eprintln!("login-cta: link failed: {e}");
-        }
+    )
+    .is_err()
+    {
+        eprintln!("login-cta: another OAuth flow is already in flight; ignoring");
     }
 }
 

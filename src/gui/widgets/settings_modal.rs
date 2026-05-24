@@ -893,6 +893,21 @@ fn render_account(ui: &mut egui::Ui) {
     use crate::leaderboard::{install, oauth};
 
     let active = channel::active_channel();
+
+    // Drain any completed background OAuth session BEFORE reading
+    // status, so the post-link "Linked: …" row shows up the same
+    // frame the user finished sign-in. Issue #2 fix.
+    if let Some(result) = oauth::poll_session() {
+        match result {
+            Ok(token) => eprintln!(
+                "account: linked {} as {}",
+                token.provider.display_name(),
+                token.display_name
+            ),
+            Err(e) => eprintln!("account: link failed: {e}"),
+        }
+    }
+
     let status = oauth::status_for(active).ok();
 
     ui.heading("Account");
@@ -954,6 +969,46 @@ fn render_account(ui: &mut egui::Ui) {
     ui.separator();
     ui.add_space(8.0);
 
+    // In-flight render: spinner + Cancel. While a background
+    // session runs, the Link / Unlink rows are replaced with the
+    // "Waiting for ${provider} sign-in (${elapsed}s)…" affordance.
+    // Issue #2 fix: never block the egui render loop.
+    if let Some((provider, elapsed)) = oauth::current_session_snapshot() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Waiting for {} sign-in ({}s)…",
+                    provider.display_name(),
+                    elapsed.as_secs(),
+                ))
+                .color(theme::TEXT_HI),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel").color(theme::HOT))
+                        .min_size(egui::vec2(80.0, 28.0)),
+                )
+                .clicked()
+            {
+                oauth::cancel_current_session();
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "Complete the sign-in in the browser window that opened. \
+                 Cancel here to abort + reuse the loopback port.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+        // Keep the spinner ticking smoothly while we wait.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        return;
+    }
+
     // Action row depends on link state. The actions intentionally
     // surface BOTH providers per spec — Settings → Account is the
     // canonical management surface that always exposes the full
@@ -968,7 +1023,7 @@ fn render_account(ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            link_clicked(oauth::Provider::Google, active);
+            start_link(oauth::Provider::Google, active);
         }
         if ui
             .add(
@@ -977,7 +1032,7 @@ fn render_account(ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            link_clicked(oauth::Provider::Discord, active);
+            start_link(oauth::Provider::Discord, active);
         }
         ui.add_space(12.0);
         let unlink_btn = egui::Button::new(
@@ -995,17 +1050,21 @@ fn render_account(ui: &mut egui::Ui) {
     ui.label(
         RichText::new(
             "Clicking Link opens your browser to the provider's sign-in \
-             page. After you complete OAuth there, this window resumes \
-             automatically. Use the CLI `superdeduper account link \
-             google|discord` for the same flow.",
+             page. The Cancel button stays available while you sign in; \
+             this window updates automatically when the flow finishes. \
+             CLI: `superdeduper account link google|discord`.",
         )
         .color(theme::TEXT_LO)
         .small(),
     );
 }
 
+/// Spawn a background OAuth session. The Settings → Account tab
+/// (and the other CTAs) check `oauth::current_session_snapshot()`
+/// each frame to render the spinner + Cancel row, then drain via
+/// `oauth::poll_session()` once it completes. Per issue #2 fix.
 #[cfg(feature = "telemetry")]
-fn link_clicked(provider: crate::leaderboard::oauth::Provider, channel: crate::channel::Channel) {
+fn start_link(provider: crate::leaderboard::oauth::Provider, channel: crate::channel::Channel) {
     use crate::leaderboard::{install, oauth};
     let install_id = match install::load().ok().flatten() {
         Some(s) => s.install_id,
@@ -1015,29 +1074,16 @@ fn link_clicked(provider: crate::leaderboard::oauth::Provider, channel: crate::c
         }
     };
     let server_url = crate::channel::server_url_for(channel);
-    // Blocks the UI thread for up to 5 minutes while the user
-    // completes OAuth. v1.1 can move this to a background thread
-    // with a progress spinner; for now the modal-blocked
-    // single-thread approach is simplest + matches the
-    // register flow's existing UX.
-    match oauth::link_via_loopback(
+    if oauth::try_start_session(
         provider,
         channel,
         server_url,
         &install_id,
         oauth::DEFAULT_OAUTH_TIMEOUT,
-    ) {
-        Ok(token) => {
-            eprintln!(
-                "account: linked {} as {} on channel {}",
-                token.provider.display_name(),
-                token.display_name,
-                channel,
-            );
-        }
-        Err(e) => {
-            eprintln!("account: link failed: {e}");
-        }
+    )
+    .is_err()
+    {
+        eprintln!("account: another OAuth flow is already in flight; ignoring");
     }
 }
 

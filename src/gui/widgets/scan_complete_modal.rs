@@ -275,12 +275,56 @@ fn big_stat_row(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color3
 fn render_signin_cta(ui: &mut egui::Ui) {
     use crate::leaderboard::oauth;
 
+    // Drain any completed background session before deciding
+    // visibility. Same pattern as badge_wall's render_login_cta.
+    if let Some(result) = oauth::poll_session() {
+        match result {
+            Ok(token) => eprintln!(
+                "post-scan-cta: linked {} as {}",
+                token.provider.display_name(),
+                token.display_name
+            ),
+            Err(e) => eprintln!("post-scan-cta: link failed: {e}"),
+        }
+    }
+
     let active = crate::channel::active_channel();
     let is_anon = matches!(
         oauth::status_for(active),
         Ok(oauth::AccountStatus::Anonymous) | Err(_)
     );
     if !is_anon {
+        return;
+    }
+
+    // In-flight render: spinner + Cancel. Shows on whichever CTA
+    // surface the user looks at while a flow is running.
+    if let Some((provider, elapsed)) = oauth::current_session_snapshot() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Waiting for {} sign-in ({}s)…",
+                    provider.display_name(),
+                    elapsed.as_secs(),
+                ))
+                .color(theme::TEXT_HI),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel").color(theme::HOT))
+                        .min_size(egui::vec2(60.0, 24.0)),
+                )
+                .clicked()
+            {
+                oauth::cancel_current_session();
+            }
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         return;
     }
 
@@ -316,7 +360,7 @@ fn render_signin_cta(ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            trigger_signin(oauth::Provider::Google, active);
+            start_signin(oauth::Provider::Google, active);
         }
         if ui
             .add(
@@ -325,7 +369,7 @@ fn render_signin_cta(ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            trigger_signin(oauth::Provider::Discord, active);
+            start_signin(oauth::Provider::Discord, active);
         }
     });
     ui.add_space(8.0);
@@ -333,7 +377,10 @@ fn render_signin_cta(ui: &mut egui::Ui) {
     ui.add_space(8.0);
 }
 
-fn trigger_signin(
+/// Background-thread OAuth start; per-frame `poll_session()`
+/// drains the completion. Per issue #2 fix — never blocks the
+/// egui render loop.
+fn start_signin(
     provider: crate::leaderboard::oauth::Provider,
     channel: crate::channel::Channel,
 ) {
@@ -349,26 +396,16 @@ fn trigger_signin(
         }
     };
     let server_url = crate::channel::server_url_for(channel);
-    // Blocking call on UI thread, same trade-off as the
-    // Account tab + above-grid CTA. v1.1 moves to a background
-    // worker per design 22:38Z deferral list.
-    match oauth::link_via_loopback(
+    if oauth::try_start_session(
         provider,
         channel,
         server_url,
         &install_id,
         oauth::DEFAULT_OAUTH_TIMEOUT,
-    ) {
-        Ok(token) => {
-            eprintln!(
-                "post-scan-cta: linked {} as {} on channel {channel}",
-                token.provider.display_name(),
-                token.display_name,
-            );
-        }
-        Err(e) => {
-            eprintln!("post-scan-cta: link failed: {e}");
-        }
+    )
+    .is_err()
+    {
+        eprintln!("post-scan-cta: another OAuth flow is already in flight; ignoring");
     }
 }
 
