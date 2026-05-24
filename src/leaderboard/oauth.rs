@@ -577,6 +577,102 @@ fn base64url_nopad(bytes: &[u8]) -> String {
     out
 }
 
+/// Fixed-port range for the OAuth loopback. Discord (and some
+/// other strict providers) won't accept random `127.0.0.1:N`
+/// redirect URIs at runtime — they only honor what's been
+/// registered in the developer console. By picking from a known
+/// small range, web can register all of them in Discord's app
+/// config once. Google accepts any loopback port, but we use the
+/// same range for both providers for consistency.
+///
+/// 10 ports = enough headroom for multiple parallel sd installs
+/// on the same machine + a stuck previous process. Range is
+/// arbitrary but stays well clear of common dev-server ports.
+pub const OAUTH_LOOPBACK_PORTS: &[u16] = &[
+    53000, 53001, 53002, 53003, 53004, 53005, 53006, 53007, 53008, 53009,
+];
+
+/// Append a timestamped event to `<data_dir>/install/oauth.log`.
+/// Same dir as `install.{channel}.json` + `oauth.{channel}.json`.
+/// Best-effort: failures here go nowhere — they shouldn't break
+/// the OAuth flow itself. The log is the canonical "what happened"
+/// surface on Windows where the GUI binary hides stderr (the
+/// `windows_subsystem = "windows"` attribute on
+/// `src/bin/superdeduper_gui.rs` suppresses the console window,
+/// so eprintln output is invisible to users).
+/// Bind a `TcpListener` to the first free port in
+/// [`OAUTH_LOOPBACK_PORTS`]. Returns the listener + the port that
+/// was assigned. Surfaces a clear error message listing all the
+/// ports tried if every one of them was busy (so the user knows
+/// to close another superdeduper-gui instance or kill a stuck
+/// process).
+fn bind_loopback_in_range() -> Result<(std::net::TcpListener, u16), String> {
+    let mut errors = Vec::new();
+    for &port in OAUTH_LOOPBACK_PORTS {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return Ok((listener, port)),
+            Err(e) => errors.push(format!("{port}: {e}")),
+        }
+    }
+    Err(format!(
+        "all OAuth loopback ports busy ({}): close other superdeduper-gui \
+         instances or kill any stuck oauth callback processes",
+        errors.join(", "),
+    ))
+}
+
+pub fn log_oauth_event(line: &str) {
+    use std::io::Write;
+    let path = match oauth_log_path() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let ts = iso8601_now();
+    let formatted = format!("{ts} {line}\n");
+    // Open in append + create mode. Don't fight with the OS if it
+    // can't open — silently no-op so the OAuth flow still runs.
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(formatted.as_bytes());
+    }
+    // Also fan to stderr for terminal users (CLI invocations + dev
+    // builds without the windows_subsystem attribute).
+    eprintln!("oauth: {line}");
+}
+
+/// Canonical path for the OAuth event log. Lives next to the
+/// install state + token files.
+fn oauth_log_path() -> io::Result<PathBuf> {
+    let mut p = oauth_path_for(Channel::Prod)?;
+    p.set_file_name("oauth.log");
+    Ok(p)
+}
+
+fn iso8601_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400) as u32;
+    let (h, m, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let mut y = yoe as i32 + (era as i32) * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    if mo <= 2 {
+        y += 1;
+    }
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 fn link_via_loopback_inner(
     provider: Provider,
     channel: Channel,
@@ -594,12 +690,24 @@ fn link_via_loopback_inner(
     // for callers that still thread it through.
     let _ = install_id;
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| OauthError::BindFailed(format!("{e}")))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| OauthError::BindFailed(format!("{e}")))?
-        .port();
+    log_oauth_event(&format!(
+        "start: provider={} channel={} server={}",
+        provider, channel, server_url
+    ));
+
+    // Bind to the first free port in OAUTH_LOOPBACK_PORTS. Discord
+    // won't accept random ports — see the OAUTH_LOOPBACK_PORTS
+    // doc-comment. If none of the ports are free, surface a clear
+    // error so the user knows to close another superdeduper-gui
+    // instance / kill a stuck process.
+    let (listener, port) = match bind_loopback_in_range() {
+        Ok(pair) => pair,
+        Err(e) => {
+            log_oauth_event(&format!("bind_failed: {e}"));
+            return Err(OauthError::BindFailed(e));
+        }
+    };
+    log_oauth_event(&format!("listening on 127.0.0.1:{port}"));
 
     // `state` is the OAuth CSRF nonce. We send it on the auth URL
     // and verify it on the callback. The redirect_uri is the
@@ -693,7 +801,13 @@ fn link_via_loopback_inner(
         }
     });
 
+    log_oauth_event(&format!(
+        "opening browser to {} (redirect_uri={})",
+        truncate_for_log(&auth_url, 200),
+        redirect_uri,
+    ));
     if !try_open_browser(&auth_url) {
+        log_oauth_event("browser_open_failed");
         return Err(OauthError::BrowserOpenFailed {
             url: auth_url.clone(),
             detail: "could not launch system browser".to_string(),
@@ -706,41 +820,83 @@ fn link_via_loopback_inner(
     let payload = loop {
         match rx.try_recv() {
             Ok(p) => break p,
-            Err(mpsc::TryRecvError::Disconnected) => return Err(OauthError::ServerDied),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                log_oauth_event("listener_thread_died");
+                return Err(OauthError::ServerDied);
+            }
             Err(mpsc::TryRecvError::Empty) => {}
         }
         if let Some(c) = &cancel {
             if c.load(Ordering::Relaxed) {
+                log_oauth_event("cancelled by user");
                 return Err(OauthError::Cancelled);
             }
         }
         if started.elapsed() >= timeout {
+            log_oauth_event(&format!(
+                "timeout after {}s (no provider redirect received)",
+                started.elapsed().as_secs()
+            ));
             return Err(OauthError::Timeout);
         }
         std::thread::sleep(poll_tick);
     };
 
     if let Some(e) = payload.error {
+        log_oauth_event(&format!("provider_rejected: {e}"));
         return Err(OauthError::ProviderRejected(e));
     }
-    let code = payload
-        .code
-        .ok_or_else(|| OauthError::BadCallback("callback missing `code`".to_string()))?;
+    let code = payload.code.ok_or_else(|| {
+        log_oauth_event("callback missing `code` (no auth code from provider)");
+        OauthError::BadCallback("callback missing `code`".to_string())
+    })?;
+    log_oauth_event(&format!(
+        "received auth code (len={}); posting to exchange endpoint",
+        code.len()
+    ));
 
     // Exchange the auth code for a token via the engine backend.
     // This is the ONE server endpoint in the direct-to-provider
     // flow (web 2026-05-24T23:12Z spec); web does the
     // code↔token round-trip with the provider on its side so the
     // client never holds the client_secret.
-    let token = exchange_code(
+    let token = match exchange_code(
         provider,
         server_url,
         &code,
         &redirect_uri,
         code_verifier.as_deref(),
-    )?;
-    save_for(channel, &token).map_err(|e| OauthError::SaveFailed(format!("{e}")))?;
+    ) {
+        Ok(t) => {
+            log_oauth_event(&format!(
+                "exchange OK: linked {} as {} (account_id={})",
+                t.provider.display_name(),
+                t.display_name,
+                t.account_id,
+            ));
+            t
+        }
+        Err(e) => {
+            log_oauth_event(&format!("exchange_failed: {e}"));
+            return Err(e);
+        }
+    };
+    save_for(channel, &token).map_err(|e| {
+        log_oauth_event(&format!("save_failed: {e}"));
+        OauthError::SaveFailed(format!("{e}"))
+    })?;
+    log_oauth_event("token saved to disk");
     Ok(token)
+}
+
+/// Clip overly-long log lines (full auth URL with all query params
+/// can run 400+ chars). Keep the log file scannable in a terminal.
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}… ({} more chars)", &s[..max], s.len() - max)
+    }
 }
 
 /// Parsed query string from the provider's redirect to our loopback.
