@@ -18,7 +18,7 @@
 //! reachable through the browser URL we opened, which is private to
 //! the user's session.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -102,6 +102,7 @@ pub fn await_captcha_token(
     })
 }
 
+#[derive(Debug)]
 enum RequestOutcome {
     /// Token captured; the listener thread should exit.
     Token(String),
@@ -119,7 +120,25 @@ fn handle_request(stream: &mut std::net::TcpStream, expected_path: &str) -> Requ
         Err(_) => return RequestOutcome::Continue,
     };
     let mut reader = BufReader::new(read_stream);
+    // Use the same parse/write code path on synthetic byte streams
+    // so the integration tests below cover the security-sensitive
+    // parser without spawning a real TcpListener.
+    handle_request_generic(&mut reader, stream, expected_path)
+}
 
+/// Generic HTTP-handler parameterised on the reader + writer so
+/// tests can drive it with `Cursor<&[u8]>` + `Vec<u8>`. The real
+/// caller passes a `BufReader<TcpStream>` + the original
+/// `TcpStream`; tests pass in-memory byte streams.
+fn handle_request_generic<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    expected_path: &str,
+) -> RequestOutcome
+where
+    R: std::io::BufRead,
+    W: std::io::Write,
+{
     let mut req_line = String::new();
     if reader.read_line(&mut req_line).is_err() {
         return RequestOutcome::Continue;
@@ -167,13 +186,13 @@ fn handle_request(stream: &mut std::net::TcpStream, expected_path: &str) -> Requ
              Vary: Origin\r\n\
              Content-Length: 0\r\n\r\n"
         );
-        let _ = stream.write_all(resp.as_bytes());
+        let _ = writer.write_all(resp.as_bytes());
         return RequestOutcome::Continue;
     }
 
     // Anything that's not a POST to our exact path is a 404.
     if method != "POST" || path != expected_path {
-        let _ = stream.write_all(
+        let _ = writer.write_all(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
         );
         return RequestOutcome::Continue;
@@ -183,7 +202,7 @@ fn handle_request(stream: &mut std::net::TcpStream, expected_path: &str) -> Requ
     let body_cap = content_length.min(16 * 1024);
     let mut body = vec![0u8; body_cap];
     if reader.read_exact(&mut body).is_err() {
-        let _ = stream.write_all(
+        let _ = writer.write_all(
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
         );
         return RequestOutcome::Continue;
@@ -207,11 +226,11 @@ fn handle_request(stream: &mut std::net::TcpStream, expected_path: &str) -> Requ
              Content-Length: {}\r\n\r\n",
             body_out.len()
         );
-        let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.write_all(body_out);
+        let _ = writer.write_all(resp.as_bytes());
+        let _ = writer.write_all(body_out);
         RequestOutcome::Token(token)
     } else {
-        let _ = stream.write_all(
+        let _ = writer.write_all(
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
         );
         RequestOutcome::Continue
@@ -384,5 +403,209 @@ mod tests {
     #[test]
     fn two_nonces_differ() {
         assert_ne!(make_nonce(), make_nonce());
+    }
+
+    // ============================================================
+    // HTTP request handler — drives `handle_request_generic`
+    // against synthetic byte streams (`Cursor<&[u8]>` for the
+    // reader, `Vec<u8>` for the writer). Exercises every code
+    // path in the parser + every response shape without spawning
+    // a TcpListener. The security-sensitive surface here is:
+    //
+    // * CORS preflight: must echo the caller's Origin (or `*` if
+    //   missing) so the page's fetch() lands cleanly.
+    // * Path validation: only POST to the per-session-nonce path
+    //   produces a Token outcome; anything else 404s. This is
+    //   what prevents a third party from blindly POSTing a forged
+    //   token without knowing the user's per-session nonce.
+    // * Body parsing: malformed JSON, missing field, oversize all
+    //   reject without crashing.
+    // ============================================================
+
+    use std::io::{BufReader, Cursor};
+
+    fn drive(input: &str, expected_path: &str) -> (RequestOutcome, String) {
+        let mut reader = BufReader::new(Cursor::new(input.as_bytes()));
+        let mut writer: Vec<u8> = Vec::new();
+        let outcome = handle_request_generic(&mut reader, &mut writer, expected_path);
+        let response = String::from_utf8_lossy(&writer).into_owned();
+        (outcome, response)
+    }
+
+    #[test]
+    fn options_preflight_returns_204_with_cors_headers() {
+        let req = "OPTIONS /captcha-callback/abc HTTP/1.1\r\n\
+            Host: 127.0.0.1:12345\r\n\
+            Origin: https://superdeduper.io\r\n\
+            Access-Control-Request-Method: POST\r\n\
+            \r\n";
+        let (outcome, resp) = drive(req, "/captcha-callback/abc");
+        assert!(
+            matches!(outcome, RequestOutcome::Continue),
+            "OPTIONS preflight must NOT capture a token"
+        );
+        assert!(resp.contains("204 No Content"));
+        assert!(resp.contains("Access-Control-Allow-Origin: https://superdeduper.io"));
+        assert!(resp.contains("Access-Control-Allow-Methods: POST, OPTIONS"));
+        assert!(resp.contains("Access-Control-Allow-Headers: Content-Type"));
+        assert!(resp.contains("Vary: Origin"));
+    }
+
+    #[test]
+    fn options_preflight_falls_back_to_wildcard_origin_when_missing() {
+        let req = "OPTIONS /captcha-callback/abc HTTP/1.1\r\n\r\n";
+        let (_, resp) = drive(req, "/captcha-callback/abc");
+        assert!(resp.contains("204 No Content"));
+        assert!(resp.contains("Access-Control-Allow-Origin: *"));
+    }
+
+    #[test]
+    fn post_to_correct_path_with_valid_token_returns_token() {
+        let body = r#"{"captcha_token":"the-real-token-payload"}"#;
+        let req = format!(
+            "POST /captcha-callback/abc HTTP/1.1\r\n\
+            Host: 127.0.0.1:12345\r\n\
+            Origin: https://superdeduper.io\r\n\
+            Content-Type: application/json\r\n\
+            Content-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        let (outcome, resp) = drive(&req, "/captcha-callback/abc");
+        match outcome {
+            RequestOutcome::Token(t) => assert_eq!(t, "the-real-token-payload"),
+            other => panic!("expected Token, got {other:?}"),
+        }
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains(r#"{"ok":true}"#));
+        assert!(resp.contains("Access-Control-Allow-Origin: https://superdeduper.io"));
+    }
+
+    #[test]
+    fn post_to_wrong_path_404s_without_token() {
+        // Per-session nonce mismatch — attacker can't blindly hit
+        // /captcha-callback without knowing the nonce.
+        let body = r#"{"captcha_token":"forged"}"#;
+        let req = format!(
+            "POST /captcha-callback/WRONG-NONCE HTTP/1.1\r\n\
+            Content-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        let (outcome, resp) = drive(&req, "/captcha-callback/abc");
+        assert!(matches!(outcome, RequestOutcome::Continue));
+        assert!(resp.contains("404 Not Found"));
+        assert!(!resp.contains("forged"));
+    }
+
+    #[test]
+    fn get_method_404s() {
+        let req = "GET /captcha-callback/abc HTTP/1.1\r\n\r\n";
+        let (outcome, resp) = drive(req, "/captcha-callback/abc");
+        assert!(matches!(outcome, RequestOutcome::Continue));
+        assert!(resp.contains("404 Not Found"));
+    }
+
+    #[test]
+    fn post_with_missing_captcha_token_field_400s() {
+        let body = r#"{"unrelated":"field"}"#;
+        let req = format!(
+            "POST /captcha-callback/abc HTTP/1.1\r\n\
+            Content-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        let (outcome, resp) = drive(&req, "/captcha-callback/abc");
+        assert!(matches!(outcome, RequestOutcome::Continue));
+        assert!(resp.contains("400 Bad Request"));
+    }
+
+    #[test]
+    fn post_with_malformed_json_400s() {
+        let body = "{not json";
+        let req = format!(
+            "POST /captcha-callback/abc HTTP/1.1\r\n\
+            Content-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        let (outcome, resp) = drive(&req, "/captcha-callback/abc");
+        assert!(matches!(outcome, RequestOutcome::Continue));
+        assert!(resp.contains("400 Bad Request"));
+    }
+
+    #[test]
+    fn post_body_too_short_for_content_length_400s() {
+        // Content-Length claims 100 bytes; we only send 10. The
+        // read_exact call will fail. Handler must respond 400, not
+        // panic or hang.
+        let body = "shortbody!"; // exactly 10 bytes
+        let req = format!(
+            "POST /captcha-callback/abc HTTP/1.1\r\n\
+            Content-Length: 100\r\n\r\n{body}",
+        );
+        let (outcome, resp) = drive(&req, "/captcha-callback/abc");
+        assert!(matches!(outcome, RequestOutcome::Continue));
+        assert!(resp.contains("400 Bad Request"));
+    }
+
+    #[test]
+    fn body_size_capped_at_16k() {
+        // Content-Length claims 1 GB; the handler caps the read
+        // at 16 KB so a hostile client can't allocate gigabytes
+        // of buffer on our side. Body that's actually 16 KB will
+        // be parsed; anything beyond is ignored.
+        let claimed_length = 1_000_000_000;
+        let mut payload = String::from(r#"{"captcha_token":"validtoken"}"#);
+        // Pad up to 16 KB with whitespace inside the JSON. The
+        // parser truncates at 16 KB.
+        while payload.len() < 16 * 1024 {
+            payload.push(' ');
+        }
+        let req = format!(
+            "POST /captcha-callback/abc HTTP/1.1\r\n\
+            Content-Length: {claimed_length}\r\n\r\n{payload}",
+        );
+        let (outcome, _) = drive(&req, "/captcha-callback/abc");
+        // We expect this to land as Continue (the parsed body at
+        // 16K probably won't deserialize cleanly + has trailing
+        // garbage), but the important property is NO PANIC + we
+        // get a response back. Either Token (if the slice happens
+        // to be valid JSON) or Continue (if not).
+        match outcome {
+            RequestOutcome::Token(_) | RequestOutcome::Continue => {}
+        }
+    }
+
+    #[test]
+    fn lowercase_content_length_header_parses() {
+        // RFC 7230 §3.2 says header names are case-insensitive.
+        // Some clients lowercase. Make sure we don't only match
+        // the canonical capitalisation.
+        let body = r#"{"captcha_token":"x"}"#;
+        let req = format!(
+            "POST /captcha-callback/abc HTTP/1.1\r\n\
+            content-length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        let (outcome, _) = drive(&req, "/captcha-callback/abc");
+        assert!(
+            matches!(outcome, RequestOutcome::Token(_)),
+            "lowercase content-length header must still parse"
+        );
+    }
+
+    #[test]
+    fn lowercase_origin_header_parses_for_cors_echo() {
+        let req = "OPTIONS /captcha-callback/abc HTTP/1.1\r\n\
+            origin: https://example.com\r\n\r\n";
+        let (_, resp) = drive(req, "/captcha-callback/abc");
+        assert!(resp.contains("Access-Control-Allow-Origin: https://example.com"));
+    }
+
+    #[test]
+    fn malformed_request_line_does_not_panic() {
+        // Truncated / garbage request line. Handler must return
+        // Continue without crashing — would be a DoS vector if
+        // any garbage in could panic the listener thread.
+        let req = "garbage";
+        let (outcome, _resp) = drive(req, "/captcha-callback/abc");
+        assert!(matches!(outcome, RequestOutcome::Continue));
     }
 }
