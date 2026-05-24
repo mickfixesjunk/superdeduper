@@ -82,6 +82,46 @@ pub enum Command {
     #[cfg(feature = "telemetry")]
     #[command(subcommand)]
     Achievements(AchievementsCommand),
+
+    /// G3: link this install to a Google or Discord account so
+    /// achievements roll up across machines + the public profile
+    /// can show a display name. Per-channel: linking on prod
+    /// doesn't transfer to dev.
+    #[cfg(feature = "telemetry")]
+    #[command(subcommand)]
+    Account(AccountCommand),
+}
+
+/// G-track CLI subcommands for `superdeduper account`.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Subcommand)]
+pub enum AccountCommand {
+    /// Open a browser to the chosen OAuth provider, wait for the
+    /// loopback callback, and store the resulting token at
+    /// `<data_dir>/install/oauth.{channel}.json`. Per spec §10.3
+    /// + Mick's 2026-05-24T22:14:51Z directive.
+    Link {
+        /// Which provider: `google` or `discord`.
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        /// Override the OAuth flow timeout. Default 5 minutes —
+        /// longer than provider authorization codes usually live.
+        #[arg(long, value_name = "SECS", default_value_t = 300)]
+        timeout_secs: u64,
+    },
+
+    /// Delete the stored OAuth token + tell the backend to revoke
+    /// the link. Future scans on this channel revert to the
+    /// anonymous install_id identity.
+    Unlink,
+
+    /// Print the current account status: Anonymous (UUID) or
+    /// Linked (provider + display name + expired-flag).
+    Status {
+        /// JSON output for scripting; default text is human.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Args)]
