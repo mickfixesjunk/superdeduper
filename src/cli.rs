@@ -321,6 +321,26 @@ pub struct DedupeArgs {
     /// guard against cloud-hydration, not FS-dedup transparency.
     #[arg(long)]
     pub allow_destructive_on_deduped: bool,
+
+    /// Emit a structured NDJSON action receipt for every action
+    /// attempted (one JSON object per line). Receipts carry
+    /// pre-/post-action inode IDs, hardlink-count deltas, recycle
+    /// bin metadata, and an outcome enum so integration test
+    /// harnesses can assert containment ("did this action affect
+    /// EXACTLY what it was told to and NOTHING else"). Schema
+    /// `superdeduper.action_receipt.v1`; see
+    /// `~/sd-bench-local/testdesign/specs/behavior-containment-integration-spec.md` §7.
+    ///
+    /// Output goes to stdout unless `--receipt-file <path>` is set.
+    #[arg(long)]
+    pub integration_test_mode: bool,
+
+    /// Redirect `--integration-test-mode` receipts to this file
+    /// instead of stdout. Each receipt is one NDJSON line; the
+    /// file is opened in append mode + truncated at start of the
+    /// run so re-running overwrites prior output.
+    #[arg(long, value_name = "PATH", requires = "integration_test_mode")]
+    pub receipt_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
