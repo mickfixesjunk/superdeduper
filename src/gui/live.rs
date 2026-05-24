@@ -1642,3 +1642,104 @@ fn saved_files_from_runtime(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ============================================================
+    // display_path — verbatim-prefix stripping for Log tab paths.
+    // ============================================================
+
+    #[test]
+    fn display_path_strips_verbatim_drive_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Windows\System32\foo.dll")),
+            r"C:\Windows\System32\foo.dll"
+        );
+    }
+
+    #[test]
+    fn display_path_rewrites_verbatim_unc() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\fs\share\thing")),
+            r"\\fs\share\thing"
+        );
+    }
+
+    #[test]
+    fn display_path_passes_through_normal_paths() {
+        assert_eq!(
+            display_path(Path::new(r"C:\Users\Mick\file")),
+            r"C:\Users\Mick\file"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/neomatrix/file")),
+            "/home/neomatrix/file"
+        );
+    }
+
+    // ============================================================
+    // classify_scope / classify_corpus_kind / is_drive_root —
+    // the heuristics that produce run_shape.scope + corpus_kind on
+    // the leaderboard payload. Wrong outputs land in the backend
+    // and bucket users incorrectly; pin the obvious cases.
+    // ============================================================
+
+    #[cfg(feature = "telemetry")]
+    fn root(path: &str) -> RootEntry {
+        RootEntry {
+            path: std::path::PathBuf::from(path),
+            is_reference: false,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_scope_whole_volume_for_single_drive_root() {
+        assert_eq!(classify_scope(&[root(r"C:\")]), "whole-volume");
+        assert_eq!(classify_scope(&[root("/")]), "whole-volume");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_scope_subdirectory_for_single_non_root() {
+        assert_eq!(classify_scope(&[root(r"C:\Users\Mick")]), "subdirectory");
+        assert_eq!(classify_scope(&[root("/home/neomatrix/Documents")]), "subdirectory");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_scope_selection_for_multiple_roots() {
+        assert_eq!(
+            classify_scope(&[root(r"C:\Users\A"), root(r"D:\Backup")]),
+            "selection"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_corpus_kind_system_on_windows_system_paths() {
+        assert_eq!(classify_corpus_kind(&[root(r"C:\Windows\System32")]), "system");
+        assert_eq!(classify_corpus_kind(&[root(r"C:\Program Files\Foo")]), "system");
+        assert_eq!(classify_corpus_kind(&[root("/usr/local/bin")]), "system");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn classify_corpus_kind_user_data_on_user_paths() {
+        assert_eq!(classify_corpus_kind(&[root(r"C:\Users\Mick")]), "user-data");
+        assert_eq!(classify_corpus_kind(&[root("/home/neomatrix/Photos")]), "user-data");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn is_drive_root_recognises_windows_and_unix_roots() {
+        assert!(is_drive_root(Path::new(r"C:\")));
+        assert!(is_drive_root(Path::new(r"D:\")));
+        assert!(is_drive_root(Path::new("/")));
+        assert!(!is_drive_root(Path::new(r"C:\Users")));
+        assert!(!is_drive_root(Path::new("/home")));
+    }
+}

@@ -698,3 +698,65 @@ fn group_passes_filter(
         .iter()
         .any(|p| p.starts_with(root) || reference_roots.iter().any(|r| p.starts_with(r)))
 }
+
+#[cfg(test)]
+mod path_display_tests {
+    use super::*;
+
+    #[test]
+    fn drops_verbatim_drive_prefix() {
+        let p = Path::new(r"\\?\C:\Windows\System32\notepad.exe");
+        assert_eq!(format_path(p), r"C:\Windows\System32\notepad.exe");
+    }
+
+    #[test]
+    fn drops_verbatim_drive_prefix_with_lowercase_drive() {
+        // Some Windows APIs return lowercase drive letters in the
+        // verbatim form. Stripping the prefix must not change the
+        // case of what's underneath.
+        let p = Path::new(r"\\?\c:\foo\bar.txt");
+        assert_eq!(format_path(p), r"c:\foo\bar.txt");
+    }
+
+    #[test]
+    fn rewrites_verbatim_unc_form() {
+        // \\?\UNC\server\share\file -> \\server\share\file
+        let p = Path::new(r"\\?\UNC\fileserver\public\report.pdf");
+        assert_eq!(format_path(p), r"\\fileserver\public\report.pdf");
+    }
+
+    #[test]
+    fn passes_through_normal_windows_path() {
+        let p = Path::new(r"C:\Users\Mick\Documents\thing.txt");
+        assert_eq!(format_path(p), r"C:\Users\Mick\Documents\thing.txt");
+    }
+
+    #[test]
+    fn passes_through_normal_unc_path() {
+        // Already-displayable UNC (no \\?\ prefix) stays put.
+        let p = Path::new(r"\\fileserver\share\thing");
+        assert_eq!(format_path(p), r"\\fileserver\share\thing");
+    }
+
+    #[test]
+    fn passes_through_unix_paths() {
+        // Non-Windows paths trip neither branch — engine uses
+        // format_path on the Log tab for cross-platform display.
+        let p = Path::new("/home/neomatrix/file.bin");
+        assert_eq!(format_path(p), "/home/neomatrix/file.bin");
+    }
+
+    #[test]
+    fn handles_root_verbatim_path() {
+        // Edge case: just the prefix + drive root. Should produce
+        // just the drive root, not crash.
+        let p = Path::new(r"\\?\D:\");
+        assert_eq!(format_path(p), r"D:\");
+    }
+
+    #[test]
+    fn empty_path_passes_through() {
+        let p = Path::new("");
+        assert_eq!(format_path(p), "");
+    }
+}
