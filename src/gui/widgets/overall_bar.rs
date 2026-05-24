@@ -49,11 +49,12 @@ fn show_inner(ui: &mut Ui, state: &UiState, fast_forward: bool) -> BarRects {
     );
     let painter = ui.painter_at(rect);
 
-    painter.rect_filled(rect, Rounding::same(4.0), theme::PANEL_DEEP);
+    painter.rect_filled(rect, Rounding::same(4), theme::PANEL_DEEP);
     painter.rect_stroke(
         rect,
-        Rounding::same(4.0),
+        Rounding::same(4),
         Stroke::new(1.0, Color32::from_rgb(0x1f, 0x28, 0x36)),
+        egui::StrokeKind::Outside,
     );
 
     let stage = state.overall.stage;
@@ -72,7 +73,7 @@ fn show_inner(ui: &mut Ui, state: &UiState, fast_forward: bool) -> BarRects {
         let frac = state.overall.fraction();
         let mut fill_rect = rect;
         fill_rect.set_width(rect.width() * frac);
-        painter.rect_filled(fill_rect, Rounding::same(4.0), color);
+        painter.rect_filled(fill_rect, Rounding::same(4), color);
         fill_rect_out = Some(fill_rect);
 
         let mid = rect.center();
@@ -100,7 +101,7 @@ fn show_inner(ui: &mut Ui, state: &UiState, fast_forward: bool) -> BarRects {
         let mut pulse =
             egui::Rect::from_min_size(egui::pos2(pos, rect.top()), vec2(wave_w, rect.height()));
         pulse = pulse.intersect(rect);
-        painter.rect_filled(pulse, Rounding::same(4.0), color);
+        painter.rect_filled(pulse, Rounding::same(4), color);
 
         let mid = rect.center();
         let text = if state.overall.done == 0 {

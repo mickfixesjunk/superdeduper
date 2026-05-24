@@ -96,7 +96,7 @@ pub fn show(ctx: &Context) {
                     .fill(bg)
                     .stroke(egui::Stroke::new(1.0, stroke_col))
                     .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
                         ui.set_min_width(toast_width - 24.0);
                         ui.set_max_width(toast_width - 24.0);

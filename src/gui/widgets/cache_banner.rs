@@ -45,7 +45,7 @@ pub fn show(ui: &mut Ui, state: &mut UiState, always_use_cache: bool) {
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke))
         .rounding(6.0)
-        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(

@@ -149,8 +149,8 @@ pub fn show(
             egui::Frame::popup(ui.style())
                 .fill(theme::PANEL_DEEP)
                 .stroke(egui::Stroke::new(1.0, theme::ACCENT_DIM))
-                .rounding(egui::Rounding::same(6.0))
-                .inner_margin(egui::Margin::same(12.0))
+                .rounding(egui::Rounding::same(6))
+                .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.set_min_size(egui::vec2(MODAL_WIDTH, MODAL_HEIGHT));
                     ui.set_max_size(egui::vec2(MODAL_WIDTH, MODAL_HEIGHT));

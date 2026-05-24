@@ -148,9 +148,9 @@ fn hash_algo_pill(ui: &mut Ui, algo: HashAlgo) -> bool {
     let bg = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 32);
     let frame = Frame::none()
         .fill(bg)
-        .rounding(Rounding::same(10.0))
+        .rounding(Rounding::same(10))
         .stroke(Stroke::new(1.0, fill))
-        .inner_margin(egui::Margin::symmetric(10.0, 4.0));
+        .inner_margin(egui::Margin::symmetric(10, 4));
     let resp = frame
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -187,9 +187,9 @@ fn hash_algo_pill_disabled(ui: &mut Ui, algo: HashAlgo) {
     let bg = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 32);
     let frame = Frame::none()
         .fill(bg)
-        .rounding(Rounding::same(10.0))
+        .rounding(Rounding::same(10))
         .stroke(Stroke::new(1.0, fill))
-        .inner_margin(egui::Margin::symmetric(10.0, 4.0));
+        .inner_margin(egui::Margin::symmetric(10, 4));
     frame
         .show(ui, |ui| {
             ui.horizontal(|ui| {

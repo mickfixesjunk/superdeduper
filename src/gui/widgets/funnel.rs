@@ -86,6 +86,7 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: crate::pipeline::hash::Hash
                 rect,
                 2.0,
                 Stroke::new(1.0 + pulse, blend(theme::ACCENT, Color32::WHITE, pulse)),
+                egui::StrokeKind::Outside,
             );
         }
 

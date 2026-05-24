@@ -211,8 +211,8 @@ fn render_tile(
     let resp = egui::Frame::none()
         .fill(fill)
         .stroke(egui::Stroke::new(1.0, stroke_color))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+        .rounding(egui::Rounding::same(6))
+        .inner_margin(egui::Margin::symmetric(6, 6))
         .show(ui, |ui| {
             ui.set_min_size(size);
             ui.set_max_size(size);

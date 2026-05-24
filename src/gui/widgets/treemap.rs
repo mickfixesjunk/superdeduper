@@ -316,7 +316,7 @@ fn draw_tile(painter: &egui::Painter, placement: &Placement<'_>) {
     let inset = placement.rect.shrink(1.0);
     let color = color_for_size(placement.tile.size_each);
     painter.rect_filled(inset, 2.0, color);
-    painter.rect_stroke(inset, 2.0, Stroke::new(0.5, theme::BG));
+    painter.rect_stroke(inset, 2.0, Stroke::new(0.5, theme::BG), egui::StrokeKind::Outside);
 
     if inset.width() < 40.0 || inset.height() < 18.0 {
         return;
