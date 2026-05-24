@@ -660,6 +660,10 @@ impl SuperdeduperApp {
                 }
             };
             let outcome = submission::submit(&state, &inputs);
+            // Archive every attempt — success, duplicate, rejected,
+            // or transient — to the local archive dir so the user
+            // has a permanent record they can come back to.
+            submission::archive_attempt(&inputs, &state.install_id, &outcome);
             if let submission::SubmitOutcome::Transient { reason } = &outcome {
                 eprintln!("leaderboard: submit transient ({reason}); enqueueing");
                 let body = crate::leaderboard::hmac_signer::canonical_body(
@@ -755,12 +759,63 @@ impl SuperdeduperApp {
                             ScanCompleteState::Ready
                         };
                 }
+                ScanCompleteAction::SubmitForReview => {
+                    self.flag_pending_for_review();
+                }
                 ScanCompleteAction::Close => {
                     self.scan_complete_modal = ScanCompleteState::Hidden;
                     self.scan_complete_data = None;
                 }
             }
         }
+    }
+
+    /// Flag the current pending submission + its rejection for admin
+    /// review. Writes a local copy to the review-queue dir + best-
+    /// effort POST to the backend review endpoint. Spawns off-thread
+    /// so the UI doesn't block on the upload. Stashes a synthetic
+    /// outcome in the last-outcome slot so the modal updates to
+    /// confirm the action.
+    #[cfg(feature = "telemetry")]
+    fn flag_pending_for_review(&self) {
+        std::thread::spawn(|| {
+            use crate::leaderboard::{install, submission};
+            let state = match install::load() {
+                Ok(Some(s)) => s,
+                _ => {
+                    eprintln!("review: install not loaded; skipping");
+                    return;
+                }
+            };
+            let inputs = match submission::peek_pending() {
+                Some(i) => i,
+                None => {
+                    eprintln!("review: no pending payload to flag");
+                    return;
+                }
+            };
+            let rejection = submission::peek_last_outcome().unwrap_or(
+                submission::SubmitOutcome::Rejected {
+                    status: 0,
+                    reason: "unknown".into(),
+                },
+            );
+            match submission::flag_for_review(&state, &inputs, &rejection, None) {
+                Ok(path) => {
+                    eprintln!(
+                        "review: saved to {} (and attempted upload)",
+                        path.display()
+                    );
+                    submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                        status: 0,
+                        reason: "Flagged for admin review (saved locally + uploaded).".into(),
+                    });
+                }
+                Err(e) => {
+                    eprintln!("review: local save failed: {e:?}");
+                }
+            }
+        });
     }
 
     /// Route a click from the badge-wall panel. Tile clicks log to

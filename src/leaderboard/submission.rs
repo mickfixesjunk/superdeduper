@@ -262,6 +262,223 @@ pub fn queue_dir() -> std::io::Result<PathBuf> {
     Ok(p)
 }
 
+/// Directory under the install data dir where EVERY submission
+/// (successful, rejected, transient-failed) is archived. Gives the
+/// user a permanent local record of what's been sent + how the
+/// server responded — useful for diagnosis, audit, or restoring
+/// runs that need re-submission after a backend fix.
+pub fn archive_dir() -> std::io::Result<PathBuf> {
+    let mut p = super::install::install_path()?;
+    p.set_file_name("submission-archive");
+    Ok(p)
+}
+
+/// Directory under the install data dir where the user has
+/// explicitly flagged failed submissions for admin review. The
+/// engine also tries to POST these to a backend review endpoint
+/// (TBD; falls back to local-only when the endpoint isn't live).
+pub fn review_dir() -> std::io::Result<PathBuf> {
+    let mut p = super::install::install_path()?;
+    p.set_file_name("submission-review");
+    Ok(p)
+}
+
+/// Archive a submission attempt — body + outcome + timestamp — to
+/// the local archive directory. Called from every submit code path
+/// regardless of outcome. Best-effort: failure is logged + swallowed
+/// so a write error on the archive can't suppress the actual
+/// submission outcome from the UI.
+pub fn archive_attempt(
+    inputs: &SubmissionInputs,
+    install_id: &str,
+    outcome: &SubmitOutcome,
+) {
+    let body = build_payload(inputs, install_id);
+    let entry = ArchivedSubmission {
+        archived_at_unix: now_unix(),
+        archived_at_iso: now_iso8601(),
+        run_uuid: inputs.run_uuid.clone(),
+        install_id: install_id.to_string(),
+        outcome_kind: outcome_kind_tag(outcome).to_string(),
+        outcome_detail: serde_json::to_value(SerializableOutcome::from(outcome))
+            .unwrap_or(serde_json::Value::Null),
+        payload: body,
+    };
+    if let Err(e) = write_archive_entry(&entry) {
+        eprintln!("leaderboard: archive write failed: {e:?}");
+    }
+}
+
+/// Save a rejected submission to the review-queue directory AND
+/// attempt to POST it to the backend review endpoint. The local
+/// save always happens (zero-dependency MVP); the POST is
+/// best-effort — when the endpoint isn't live yet, the local copy
+/// is the source of truth and Mick collects them manually from
+/// beta testers.
+pub fn flag_for_review(
+    state: &super::install::InstallState,
+    inputs: &SubmissionInputs,
+    rejection: &SubmitOutcome,
+    user_note: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let body = build_payload(inputs, &state.install_id);
+    let entry = ReviewSubmission {
+        flagged_at_unix: now_unix(),
+        flagged_at_iso: now_iso8601(),
+        run_uuid: inputs.run_uuid.clone(),
+        install_id: state.install_id.clone(),
+        client_version: inputs.client_version.clone(),
+        rejection: serde_json::to_value(SerializableOutcome::from(rejection))
+            .unwrap_or(serde_json::Value::Null),
+        user_note: user_note.map(String::from),
+        payload: body.clone(),
+    };
+    let path = write_review_entry(&entry)?;
+    // Best-effort upload; ignore the response. Endpoint may 404
+    // until backend ships it — that's fine, local copy persists.
+    let _ = try_upload_review(state, &entry);
+    Ok(path)
+}
+
+fn try_upload_review(
+    state: &super::install::InstallState,
+    entry: &ReviewSubmission,
+) -> Result<(), String> {
+    let install_key = state.install_key().ok_or("install_key malformed")?;
+    let body_value = serde_json::to_value(entry).map_err(|e| format!("{e}"))?;
+    let canonical = hmac_signer::canonical_body(&body_value);
+    let signature = hmac_signer::sign(&install_key, &canonical);
+    let url = format!(
+        "{}/api/v1/submit/review",
+        state.server_url.trim_end_matches('/')
+    );
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("X-Sd-Signature", &signature)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_bytes(&canonical);
+    match resp {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+fn write_archive_entry(entry: &ArchivedSubmission) -> std::io::Result<PathBuf> {
+    let dir = archive_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    // Archive grows forever (intentional — user wants a permanent
+    // record of every submission). Could revisit a cap if it ever
+    // grows large enough to matter; today each entry is < 4 KB.
+    let filename = format!(
+        "{}-{}-{}.json",
+        entry.archived_at_unix,
+        entry.outcome_kind,
+        short_uuid(&entry.run_uuid),
+    );
+    let path = dir.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(entry)?)?;
+    Ok(path)
+}
+
+fn write_review_entry(entry: &ReviewSubmission) -> std::io::Result<PathBuf> {
+    let dir = review_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let filename = format!(
+        "{}-{}.json",
+        entry.flagged_at_unix,
+        short_uuid(&entry.run_uuid),
+    );
+    let path = dir.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(entry)?)?;
+    Ok(path)
+}
+
+fn short_uuid(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
+fn outcome_kind_tag(o: &SubmitOutcome) -> &'static str {
+    match o {
+        SubmitOutcome::Accepted { .. } => "accepted",
+        SubmitOutcome::DuplicateNoChange => "duplicate",
+        SubmitOutcome::Rejected { .. } => "rejected",
+        SubmitOutcome::Transient { .. } => "transient",
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArchivedSubmission {
+    archived_at_unix: i64,
+    archived_at_iso: String,
+    run_uuid: String,
+    install_id: String,
+    outcome_kind: String,
+    outcome_detail: serde_json::Value,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReviewSubmission {
+    flagged_at_unix: i64,
+    flagged_at_iso: String,
+    run_uuid: String,
+    install_id: String,
+    client_version: String,
+    rejection: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_note: Option<String>,
+    payload: serde_json::Value,
+}
+
+/// Mirror of `SubmitOutcome` that derives Serialize via tagged-union
+/// JSON. Used so the archive + review files include the full
+/// structured outcome (ranks, achievements, rejection reason)
+/// without losing variant info.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SerializableOutcome {
+    Accepted {
+        submission_id: String,
+        ranks: Vec<RankEntry>,
+        achievements_unlocked: Vec<String>,
+        profile_url: Option<String>,
+    },
+    DuplicateNoChange,
+    Rejected {
+        status: u16,
+        reason: String,
+    },
+    Transient {
+        reason: String,
+    },
+}
+
+impl From<&SubmitOutcome> for SerializableOutcome {
+    fn from(o: &SubmitOutcome) -> Self {
+        match o {
+            SubmitOutcome::Accepted {
+                submission_id,
+                ranks,
+                achievements_unlocked,
+                profile_url,
+            } => SerializableOutcome::Accepted {
+                submission_id: submission_id.clone(),
+                ranks: ranks.clone(),
+                achievements_unlocked: achievements_unlocked.clone(),
+                profile_url: profile_url.clone(),
+            },
+            SubmitOutcome::DuplicateNoChange => SerializableOutcome::DuplicateNoChange,
+            SubmitOutcome::Rejected { status, reason } => SerializableOutcome::Rejected {
+                status: *status,
+                reason: reason.clone(),
+            },
+            SubmitOutcome::Transient { reason } => SerializableOutcome::Transient {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
 /// Persist a payload + signature pair so the next launch can retry.
 /// Filename includes a timestamp + the first 8 hex chars of the
 /// payload hash for de-dup.

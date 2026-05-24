@@ -1204,6 +1204,11 @@ fn render_submit_section(ui: &mut egui::Ui) {
                         }
                     };
                     let outcome = submission::submit(&state, &inputs);
+                    // Archive the attempt locally regardless of
+                    // outcome — gives the user a permanent record
+                    // they can come back to (and Mick a paper trail
+                    // for beta-tester support).
+                    submission::archive_attempt(&inputs, &state.install_id, &outcome);
                     // 5xx / transport failures queue for retry.
                     if let submission::SubmitOutcome::Transient { reason } = &outcome {
                         eprintln!("leaderboard: submit transient ({reason}); enqueueing");

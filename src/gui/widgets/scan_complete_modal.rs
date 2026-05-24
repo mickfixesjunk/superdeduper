@@ -96,6 +96,11 @@ pub enum ScanCompleteAction {
     OpenPreview,
     /// User dismissed the Preview sub-modal.
     ClosePreview,
+    /// Backend rejected the submission with a 4xx; the user clicked
+    /// "Submit for review" to flag the failed payload for admin
+    /// inspection. Caller archives + uploads (best-effort) to a
+    /// review endpoint and shows a confirmation toast.
+    SubmitForReview,
     /// User clicked Close on the Done state.
     Close,
 }
@@ -162,20 +167,45 @@ pub fn show(
                     render_outcome(ui, outcome);
                 }
                 ui.add_space(10.0);
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("Close")
-                                .color(theme::PANEL_DEEP)
-                                .strong(),
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Close")
+                                    .color(theme::PANEL_DEEP)
+                                    .strong(),
+                            )
+                            .fill(theme::ACCENT)
+                            .min_size(egui::vec2(120.0, 28.0)),
                         )
-                        .fill(theme::ACCENT)
-                        .min_size(egui::vec2(120.0, 28.0)),
-                    )
-                    .clicked()
-                {
-                    action = Some(ScanCompleteAction::Close);
-                }
+                        .clicked()
+                    {
+                        action = Some(ScanCompleteAction::Close);
+                    }
+                    // "Submit for review" — only on Rejected (4xx)
+                    // outcomes. Gives beta testers a way to flag
+                    // backend rejections for admin inspection
+                    // without losing the payload.
+                    if matches!(outcome, Some(SubmitOutcome::Rejected { .. }))
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Submit for review")
+                                        .color(theme::TEXT_HI),
+                                )
+                                .min_size(egui::vec2(160.0, 28.0)),
+                            )
+                            .on_hover_text(
+                                "Save this rejected payload locally + send to \
+                                 the admin review queue so Mick can take a \
+                                 look. Use this when you think the rejection \
+                                 was a bug, not a real schema issue.",
+                            )
+                            .clicked()
+                    {
+                        action = Some(ScanCompleteAction::SubmitForReview);
+                    }
+                });
             }
             ScanCompleteState::Hidden | ScanCompleteState::Preview => {}
         }
