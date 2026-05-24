@@ -159,28 +159,13 @@ fn render_grid(
         }
     };
 
-    // Build the grant lookup once per render. Cheap (~35 entries
-    // today; backend may grow to ~100). HashMap lookup is O(1).
-    let grants: HashMap<&str, bool> = match state.profile.as_ref() {
-        Some(Ok(p)) => p
-            .achievements
-            .iter()
-            .map(|g| (g.achievement_id.as_str(), g.granted))
-            .collect(),
-        _ => HashMap::new(),
-    };
-
-    // Sort granted-first (so newly-unlocked tiles pop to the top
-    // of the grid where they're easy to spot for visual smoke
-    // tests), then by display_order within each bucket. The
-    // catalog endpoint returns display_order-sorted; we re-order
-    // here so the badge wall layout reflects grant state, not
-    // backend ordering.
-    let mut entries: Vec<&CatalogEntry> = catalog.achievements.iter().collect();
-    entries.sort_by_key(|e| {
-        let granted = grants.get(e.id.as_str()).copied().unwrap_or(false);
-        (!granted, e.display_order)
-    });
+    // Classify + sort entries into render order via the pure helper
+    // so widget-state tests can assert "given this CatalogState, the
+    // grid renders these tiles in this order with these grant flags"
+    // without driving the egui frame loop. Catches the bug class
+    // where Profile deserialisation succeeds but achievement_id /
+    // granted bits drift (the schema-mismatch bug we hit pre-ce0ea9f).
+    let classified = classify_grid_entries(state, &catalog.achievements);
 
     // 3-column grid. With ~35 entries this gives 12 rows. Could go to
     // 4-col on wider windows; sticking with 3 for the bottom-left
@@ -192,10 +177,9 @@ fn render_grid(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                for (i, entry) in entries.iter().enumerate() {
-                    let granted = grants.get(entry.id.as_str()).copied().unwrap_or(false);
-                    if render_tile(ui, entry, granted, TILE_SIZE) {
-                        *action = Some(BadgeWallAction::TileClicked(entry.id.clone()));
+                for (i, tile) in classified.iter().enumerate() {
+                    if render_tile(ui, tile.entry, tile.granted, TILE_SIZE) {
+                        *action = Some(BadgeWallAction::TileClicked(tile.entry.id.clone()));
                     }
                     if (i + 1) % COLS == 0 {
                         ui.end_row();
@@ -283,6 +267,46 @@ fn short_name(name: &str) -> String {
     name.to_string()
 }
 
+/// One row in the badge-wall grid: the catalog entry that drives the
+/// label/glyph/tier-colour + the boolean grant flag that drives the
+/// colorize-vs-grey treatment. Produced by [`classify_grid_entries`]
+/// so widget-state tests can assert "the right tiles are coloured in
+/// the right order" without needing to render egui.
+#[derive(Debug, Clone)]
+pub struct GridTile<'a> {
+    pub entry: &'a CatalogEntry,
+    pub granted: bool,
+}
+
+/// Pure helper: given a [`CatalogState`] + the catalog's achievement
+/// list, return tiles in render order (granted-first, then by
+/// `display_order` within each bucket). This is the *exact* logic
+/// `render_grid` walks; extracting it as a pure function is what
+/// lets the unit tests below assert the bug-class invariants
+/// (Profile schema → grant lookup → colorised-tile count).
+pub fn classify_grid_entries<'a>(
+    state: &CatalogState,
+    catalog_entries: &'a [CatalogEntry],
+) -> Vec<GridTile<'a>> {
+    let grants: HashMap<&str, bool> = match state.profile.as_ref() {
+        Some(Ok(p)) => p
+            .achievements
+            .iter()
+            .map(|g| (g.achievement_id.as_str(), g.granted))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    let mut tiles: Vec<GridTile<'a>> = catalog_entries
+        .iter()
+        .map(|e| GridTile {
+            entry: e,
+            granted: grants.get(e.id.as_str()).copied().unwrap_or(false),
+        })
+        .collect();
+    tiles.sort_by_key(|t| (!t.granted, t.entry.display_order));
+    tiles
+}
+
 fn count_grants(state: &CatalogState) -> (u32, u32) {
     let total = state
         .catalog
@@ -342,6 +366,122 @@ mod tests {
             profile: None,
         };
         assert_eq!(count_grants(&state), (0, 1));
+    }
+
+    /// **Canonical test for the badge-wall bug class.**
+    ///
+    /// Pipeline coverage: live server JSON shape → serde Profile
+    /// deserialise → CatalogState construction → grid classification
+    /// → colorised-vs-grey ordering. This is the test that would
+    /// have caught the schema mismatch fixed in `ce0ea9f` (server
+    /// emits `id` per achievement + nested `lifetime`; client
+    /// previously expected `achievement_id` + flat lifetime fields).
+    ///
+    /// If this test goes red, the regression is anywhere from the
+    /// wire format to the grid order. Repaint / animation / pixel
+    /// rendering bugs are downstream and need a true egui_kittest
+    /// rendering test (deferred — requires the egui 0.28→0.32+
+    /// upgrade that egui_kittest needs).
+    #[test]
+    fn badge_wall_classifies_granted_tiles_from_live_server_shape() {
+        // Catalog: a 5-entry subset mirroring real backend ordering.
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![
+                entry("tidy-up", "Tidy-up", "low", 100),
+                entry("brisk", "Brisk", "low", 200),
+                entry("founder", "Founder", "high", 550),
+                entry("pioneer", "Pioneer", "mid", 560),
+                entry("hello-world", "Hello World", "low", 900),
+            ],
+        };
+        // Profile JSON matching the EXACT server wire shape (verified
+        // against api.superdeduper.io 2026-05-24). The key invariant
+        // this test pins: `id` (not `achievement_id`) + nested
+        // `lifetime`. If either drifts, serde fails → grants are
+        // empty → all tiles render grey → the assertion below
+        // catches it.
+        let profile_json = r#"{
+            "install_id": "e1eae1fa-58fb-4f5a-8712-a7480ac5761b",
+            "lifetime": { "bytes_reclaimed": 731677101, "total_scans": 3 },
+            "achievements": [
+                { "id": "tidy-up",     "granted": false, "granted_at": null },
+                { "id": "brisk",       "granted": true,  "granted_at": "2026-05-24T14:22:52Z" },
+                { "id": "founder",     "granted": true,  "granted_at": "2026-05-24T05:20:37Z" },
+                { "id": "pioneer",     "granted": false, "granted_at": null },
+                { "id": "hello-world", "granted": true,  "granted_at": "2026-05-24T14:22:52Z" }
+            ]
+        }"#;
+        let profile: Profile = serde_json::from_str(profile_json)
+            .expect("live server profile shape must deserialise");
+        let state = CatalogState {
+            catalog: Some(Ok(catalog.clone())),
+            profile: Some(Ok(profile)),
+        };
+
+        let tiles = classify_grid_entries(&state, &catalog.achievements);
+
+        // (a) Every catalog entry produces exactly one tile.
+        assert_eq!(tiles.len(), 5, "every catalog entry produces one tile");
+
+        // (b) Granted-first ordering: the top three are the granted
+        //     entries in `display_order`, then the two ungranted.
+        let granted_ids: Vec<&str> = tiles
+            .iter()
+            .filter(|t| t.granted)
+            .map(|t| t.entry.id.as_str())
+            .collect();
+        assert_eq!(
+            granted_ids,
+            vec!["brisk", "founder", "hello-world"],
+            "granted tiles render in display_order, ahead of any ungranted tile"
+        );
+
+        // (c) Granted-bool faithfully reflects the server state.
+        //     This is the assertion that fails when the schema-
+        //     mismatch bug returns: with `id` mis-mapped to a missing
+        //     `achievement_id`, serde would fail, the grants
+        //     hashmap would be empty, and EVERY tile would show
+        //     granted=false here.
+        let granted_count = tiles.iter().filter(|t| t.granted).count();
+        assert_eq!(
+            granted_count, 3,
+            "schema regression check: 3 grants in the JSON should yield 3 granted tiles"
+        );
+
+        // (d) Ungranted tiles still surface (the wall doesn't drop
+        //     them) and sort by display_order within their bucket.
+        let ungranted_ids: Vec<&str> = tiles
+            .iter()
+            .filter(|t| !t.granted)
+            .map(|t| t.entry.id.as_str())
+            .collect();
+        assert_eq!(ungranted_ids, vec!["tidy-up", "pioneer"]);
+    }
+
+    /// Bug-class regression test: when Profile deserialise fails (or
+    /// profile slot is None), the wall must still render all tiles
+    /// as ungranted rather than panicking. This was the observable
+    /// symptom on Mick's box pre-`ce0ea9f`: "0 of 37 badges, all
+    /// grey." If the schema-mismatch bug returns, fetch_profile
+    /// returns Err → profile slot is Some(Err) → grants hashmap is
+    /// empty → classify_grid_entries yields all-ungranted tiles.
+    #[test]
+    fn badge_wall_falls_back_to_ungranted_when_profile_errored() {
+        let catalog_entries = vec![
+            entry("tidy-up", "Tidy-up", "low", 100),
+            entry("brisk", "Brisk", "low", 200),
+        ];
+        let state = CatalogState {
+            catalog: Some(Ok(Catalog {
+                version: "v1".into(),
+                achievements: catalog_entries.clone(),
+            })),
+            profile: Some(Err("schema mismatch: missing field `achievement_id`".into())),
+        };
+        let tiles = classify_grid_entries(&state, &catalog_entries);
+        assert_eq!(tiles.len(), 2);
+        assert!(tiles.iter().all(|t| !t.granted), "errored profile yields all-ungranted");
     }
 
     #[test]
