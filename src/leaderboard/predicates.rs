@@ -14,7 +14,7 @@
 //! |--------------------------|------------------------------------------------------------------|------------|
 //! | `time-capsule`           | mtime < 2010-01-01 on any dup-group member                       | implemented |
 //! | `abyss-walker`           | path depth >= 15 on any scanned file                             | implemented |
-//! | `polyglot-paths`         | Unicode-script count >= 3 in any scanned path                    | stub (TODO: unicode-script dep) |
+//! | `polyglot-paths`         | Unicode-script count >= 3 in any scanned path                    | implemented |
 //! | `format-fanatic`         | 5+ distinct formats in any dup group; T1.2 perceptual mode only  | stub (T1.2-gated) |
 //! | `screenshot-graveyard`   | filename matches >= 100 screenshot patterns in scan              | implemented |
 //! | `download-archaeology`   | Downloads folder + mtime >= 5y on any group member               | implemented |
@@ -224,17 +224,42 @@ fn download_archaeology(ctx: &PredicateContext<'_>) -> Option<&'static str> {
     }
 }
 
-// =====================================================================
-// Stub predicates (return None until follow-up commits add deps /
-// counter persistence / T1.2 perceptual mode)
-// =====================================================================
-
-/// polyglot-paths: Unicode-script count >= 3 in any path.
-/// Requires `unicode-script` crate dep — landing in a follow-up
-/// commit. Until then, returns None (predicate just never grants).
-fn polyglot_paths(_ctx: &PredicateContext<'_>) -> Option<&'static str> {
+/// polyglot-paths: at least 3 distinct Unicode scripts present in
+/// any single scanned path. Catches mixed-locale corpora — e.g. a
+/// user with Latin + Cyrillic + Han characters in a single filename
+/// or directory chain.
+///
+/// `Script::Common` (ASCII punctuation, digits, whitespace, currency
+/// symbols), `Script::Inherited` (combining marks), and
+/// `Script::Unknown` are excluded from the count — they're filler
+/// characters that appear in nearly every path and would
+/// false-positive on plain "english-with-numbers" file names.
+///
+/// Short-circuits per-path: once a path crosses the threshold the
+/// predicate returns Some without scanning the rest of the corpus.
+fn polyglot_paths(ctx: &PredicateContext<'_>) -> Option<&'static str> {
+    use unicode_script::{Script, UnicodeScript};
+    const THRESHOLD: usize = 3;
+    for path in ctx.all_paths {
+        let mut scripts: std::collections::HashSet<Script> = std::collections::HashSet::new();
+        for c in path.to_string_lossy().chars() {
+            let s = c.script();
+            if matches!(s, Script::Common | Script::Inherited | Script::Unknown) {
+                continue;
+            }
+            scripts.insert(s);
+            if scripts.len() >= THRESHOLD {
+                return Some("polyglot-paths");
+            }
+        }
+    }
     None
 }
+
+// =====================================================================
+// Stub predicates (return None until follow-up commits add
+// counter persistence / T1.2 perceptual mode)
+// =====================================================================
 
 /// format-fanatic: 5+ distinct formats in any dup group, gated on
 /// T1.2 perceptual mode. T1.2 hasn't shipped; perceptual_mode_active
@@ -509,12 +534,75 @@ mod tests {
         assert_eq!(download_archaeology(&ctx), None);
     }
 
-    // -------------------- stubs --------------------
+    // -------------------- polyglot-paths --------------------
 
     #[test]
-    fn polyglot_paths_stub_returns_none() {
+    fn polyglot_paths_grants_at_three_scripts() {
+        // Latin + Cyrillic + Han = 3 distinct scripts in one path.
+        let p = PathBuf::from("photos/привет/世界/hello.jpg");
+        let paths: Vec<&Path> = vec![&p];
+        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let ctx = PredicateContext {
+            all_paths: &path_refs,
+            ..ctx_empty()
+        };
+        assert_eq!(polyglot_paths(&ctx), Some("polyglot-paths"));
+    }
+
+    #[test]
+    fn polyglot_paths_misses_at_two_scripts() {
+        // Latin + Cyrillic only = 2 distinct scripts.
+        let p = PathBuf::from("photos/привет/hello.jpg");
+        let paths: Vec<&Path> = vec![&p];
+        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let ctx = PredicateContext {
+            all_paths: &path_refs,
+            ..ctx_empty()
+        };
+        assert_eq!(polyglot_paths(&ctx), None);
+    }
+
+    #[test]
+    fn polyglot_paths_ignores_common_script_filler() {
+        // ASCII digits + punctuation are Script::Common — must not
+        // contribute toward the 3-script threshold. This path has
+        // only Latin letters; everything else is Common (digits,
+        // dashes, slashes, dots). Should be 1 script = no grant.
+        let p = PathBuf::from("Downloads/installer-1.2.3-x86_64.exe");
+        let paths: Vec<&Path> = vec![&p];
+        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let ctx = PredicateContext {
+            all_paths: &path_refs,
+            ..ctx_empty()
+        };
+        assert_eq!(polyglot_paths(&ctx), None);
+    }
+
+    #[test]
+    fn polyglot_paths_short_circuits_per_path() {
+        // First path crosses the threshold (4 distinct scripts:
+        // Latin + Cyrillic + Han + Arabic); the second is bogus
+        // and would panic if path-level short-circuit didn't work.
+        // (We can't actually inject a panicking path through the
+        // type system here, but assert the happy path with mixed
+        // corpus still grants.)
+        let p1 = PathBuf::from("a/привет/世界/مرحبا/file.txt");
+        let p2 = PathBuf::from("b/plain-path.txt");
+        let paths: Vec<&Path> = vec![&p1, &p2];
+        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let ctx = PredicateContext {
+            all_paths: &path_refs,
+            ..ctx_empty()
+        };
+        assert_eq!(polyglot_paths(&ctx), Some("polyglot-paths"));
+    }
+
+    #[test]
+    fn polyglot_paths_returns_none_when_no_paths() {
         assert_eq!(polyglot_paths(&ctx_empty()), None);
     }
+
+    // -------------------- stubs --------------------
 
     #[test]
     fn format_fanatic_short_circuits_without_perceptual_mode() {
