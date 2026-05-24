@@ -193,13 +193,14 @@ pub fn show_filtered(
         .enumerate()
         .filter(|(_, g)| group_passes_filter(g, drive_root, reference_roots))
         .collect();
+    // Sort by inode-aware reclaim (biggest actual freeable space
+    // first). Path-aware would float hardlink-equivalent groups to
+    // the top on hardlink-heavy corpora even though they have 0 B
+    // to reclaim — bad UX (the most-clickable row is the least
+    // useful one).
     sorted.sort_by(|a, b| {
-        let sa =
-            a.1.size
-                .saturating_mul(a.1.files.len().saturating_sub(1) as u64);
-        let sb =
-            b.1.size
-                .saturating_mul(b.1.files.len().saturating_sub(1) as u64);
+        let sa = crate::gui::state::inode_aware_savings(a.1);
+        let sb = crate::gui::state::inode_aware_savings(b.1);
         sb.cmp(&sa)
     });
 
@@ -417,17 +418,14 @@ pub fn show_filtered(
                         {
                             continue;
                         }
-                        // Reclaimable bytes is the (n-1) × size that
-                        // WOULD be freed if you collapsed the group
-                        // — unless the group is already a hardlink
-                        // set, in which case the data is shared and
-                        // there's nothing to reclaim.
-                        let savings = if g.link_equivalent {
-                            0
-                        } else {
-                            g.size
-                                .saturating_mul(g.files.len().saturating_sub(1) as u64)
-                        };
+                        // Inode-aware reclaim per row — for partial-
+                        // hardlink groups (some aliases of inode A +
+                        // some genuine copies), counts (unique_inodes
+                        // - 1) * size rather than (path_count - 1) *
+                        // size. Falls back to path-aware when
+                        // unique_inodes==0 (older checkpoint format).
+                        // link_equivalent groups read 0 by definition.
+                        let savings = crate::gui::state::inode_aware_savings(g);
                         let is_open = table_state.expanded.contains(orig_idx);
                         let acted = table_state.acted.contains(orig_idx);
                         let keeper = g.files.first().cloned();
