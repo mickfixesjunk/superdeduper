@@ -170,11 +170,18 @@ fn deliver_ranks(ranks: Vec<RankEntry>) {
         })
         .collect();
 
+    // Toast widget only exists when the GUI is in the build. CLI
+    // bin builds with telemetry but without gui, and rank-poll still
+    // mutates the cached outcome + profile in that path (so `sd
+    // achievements list` reflects fresh state) — just no UI toast.
+    #[cfg(feature = "gui")]
     crate::gui::widgets::toast::push(
         "Leaderboard rank in",
         lines,
         Duration::from_secs(8),
     );
+    #[cfg(not(feature = "gui"))]
+    let _ = lines;
 
     if let Ok(Some(state)) = crate::leaderboard::install::load() {
         if state.registered {

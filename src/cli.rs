@@ -65,6 +65,15 @@ pub enum Command {
     #[cfg(feature = "telemetry")]
     #[command(subcommand)]
     Config(ConfigCommand),
+
+    /// G-track: list, refresh, or inspect the install's
+    /// achievement-grant state. Useful for verifying that a recent
+    /// submission actually granted the badges it should have, and
+    /// for testdesign-style acceptance tests that shell out + parse
+    /// JSON.
+    #[cfg(feature = "telemetry")]
+    #[command(subcommand)]
+    Achievements(AchievementsCommand),
 }
 
 #[derive(Debug, Args)]
@@ -319,6 +328,36 @@ pub struct RegisterArgs {
     /// Override the backend URL. Default `https://api.superdeduper.io`.
     #[arg(long, value_name = "URL")]
     pub server_url: Option<String>,
+}
+
+/// G-track CLI subcommands for `sd achievements`. Minimum-viable
+/// triage surface: `list` + `refetch`. Fuller surface (show, verify,
+/// diff, anchor) lands as v0.1.9 per design's plan.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Subcommand)]
+pub enum AchievementsCommand {
+    /// Print the install's granted achievements as a table (default)
+    /// or JSON. Reads from the local cache populated by the most
+    /// recent fetch. Run `sd achievements refetch` first to ensure
+    /// the printout reflects current server state.
+    List {
+        /// Output format. `text` (default, human) or `json` (machine).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        /// Include ungranted entries with their unlock criterion.
+        /// Default lists only granted achievements.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Force a fresh GET /api/v1/profile/{install_id} and overwrite
+    /// the local cache. Use this after a Submit if the GUI's badge
+    /// wall is showing stale state.
+    Refetch {
+        /// Suppress stdout output (returns exit code 0 / 1 only).
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 /// G-track CLI subcommands for `sd config`.

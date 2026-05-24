@@ -26,6 +26,154 @@ fn main() -> anyhow::Result<()> {
         Command::Register(args) => run_register(args),
         #[cfg(feature = "telemetry")]
         Command::Config(cmd) => run_config(cmd),
+        #[cfg(feature = "telemetry")]
+        Command::Achievements(cmd) => run_achievements(cmd),
+    }
+}
+
+/// G-track: `sd achievements` — list / refetch the install's
+/// achievement state. Triage tool: pair with the GUI when the badge
+/// wall looks wrong.
+#[cfg(feature = "telemetry")]
+fn run_achievements(
+    cmd: superdeduper::cli::AchievementsCommand,
+) -> anyhow::Result<()> {
+    use superdeduper::cli::AchievementsCommand;
+    use superdeduper::leaderboard::{catalog, install};
+
+    let state = match install::load()? {
+        Some(s) if s.registered => s,
+        Some(_) => {
+            anyhow::bail!(
+                "not registered yet — run `sd register` first to enable achievement tracking"
+            );
+        }
+        None => {
+            anyhow::bail!(
+                "no install.json found — run `sd register` to create one"
+            );
+        }
+    };
+
+    match cmd {
+        AchievementsCommand::Refetch { quiet } => {
+            let profile = catalog::fetch_profile_fresh(&state.server_url, &state.install_id)
+                .map_err(|e| anyhow::anyhow!("profile fetch failed: {e:?}"))?;
+            catalog::set_profile(Ok(profile.clone()));
+            if !quiet {
+                let granted = profile.achievements.iter().filter(|g| g.granted).count();
+                let total = profile.achievements.len();
+                println!(
+                    "Refetched: {granted}/{total} granted; lifetime_reclaimed_bytes={}",
+                    profile.lifetime_reclaimed_bytes
+                );
+            }
+            Ok(())
+        }
+        AchievementsCommand::List { format, all } => {
+            // List reads from the local cache. If the slot hasn't
+            // been populated by spawn_initial_fetch (CLI doesn't run
+            // the GUI app start path), we fetch once on-demand.
+            let cat_state = catalog::peek_state();
+            let catalog_data = match cat_state.catalog {
+                Some(Ok(c)) => c,
+                _ => catalog::fetch_catalog(&state.server_url)
+                    .map_err(|e| anyhow::anyhow!("catalog fetch failed: {e:?}"))?,
+            };
+            let profile = match cat_state.profile {
+                Some(Ok(p)) => p,
+                _ => catalog::fetch_profile_fresh(&state.server_url, &state.install_id)
+                    .map_err(|e| anyhow::anyhow!("profile fetch failed: {e:?}"))?,
+            };
+            print_achievements(&catalog_data, &profile, format, all);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "telemetry")]
+fn print_achievements(
+    catalog: &superdeduper::leaderboard::catalog::Catalog,
+    profile: &superdeduper::leaderboard::catalog::Profile,
+    format: superdeduper::cli::OutputFormat,
+    all: bool,
+) {
+    use std::collections::HashMap;
+    use superdeduper::cli::OutputFormat;
+
+    let grants: HashMap<&str, &superdeduper::leaderboard::catalog::ProfileGrant> = profile
+        .achievements
+        .iter()
+        .map(|g| (g.achievement_id.as_str(), g))
+        .collect();
+
+    let mut entries: Vec<_> = catalog.achievements.iter().collect();
+    entries.sort_by_key(|e| e.display_order);
+
+    match format {
+        OutputFormat::Json => {
+            let rows: Vec<serde_json::Value> = entries
+                .iter()
+                .filter_map(|e| {
+                    let granted = grants.get(e.id.as_str()).map(|g| g.granted).unwrap_or(false);
+                    if !all && !granted {
+                        return None;
+                    }
+                    let granted_at = grants
+                        .get(e.id.as_str())
+                        .and_then(|g| g.granted_at.as_deref());
+                    Some(serde_json::json!({
+                        "id": e.id,
+                        "name": e.name,
+                        "tier": e.tier,
+                        "unlock_kind": e.unlock_kind,
+                        "granted": granted,
+                        "granted_at": granted_at,
+                    }))
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "install_id": profile.install_id,
+                "lifetime_reclaimed_bytes": profile.lifetime_reclaimed_bytes,
+                "lifetime_scans": profile.lifetime_scans,
+                "achievements": rows,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+        }
+        OutputFormat::Text | OutputFormat::Csv => {
+            println!("install_id: {}", profile.install_id);
+            println!(
+                "lifetime: {} bytes reclaimed across {} scans",
+                profile.lifetime_reclaimed_bytes, profile.lifetime_scans
+            );
+            let granted_count = grants.values().filter(|g| g.granted).count();
+            println!(
+                "achievements: {}/{} granted{}",
+                granted_count,
+                entries.len(),
+                if all { " (showing all)" } else { " (showing granted only; --all for full list)" }
+            );
+            println!();
+            println!("{:<28}  {:<6}  {:<22}  {}", "ID", "TIER", "GRANTED_AT", "NAME");
+            for e in entries {
+                let grant = grants.get(e.id.as_str());
+                let granted = grant.map(|g| g.granted).unwrap_or(false);
+                if !all && !granted {
+                    continue;
+                }
+                let marker = if granted { "✓" } else { " " };
+                let at = grant
+                    .and_then(|g| g.granted_at.as_deref())
+                    .unwrap_or("-");
+                println!(
+                    "{marker} {:<26}  {:<6}  {:<22}  {}",
+                    e.id, e.tier, at, e.name
+                );
+            }
+        }
     }
 }
 
