@@ -1186,13 +1186,73 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
 }
 
 /// Shorten a long string for inline display (the original-error
-/// line on the FlaggedForReview outcome). Trims to `cap` chars +
-/// adds an ellipsis when truncated; otherwise returns the original.
+/// line on the FlaggedForReview outcome). Trims to ≤`cap` bytes
+/// + adds an ellipsis when truncated; otherwise returns the
+/// original.
+///
+/// Safe against UTF-8 multi-byte boundaries: backs up to the
+/// previous char boundary if `cap` lands mid-codepoint. Without
+/// this guard, a rejection reason carrying e.g. an em-dash (3-byte
+/// UTF-8) could panic with `byte index N is not a char boundary`
+/// — and rejection messages come from network input we don't
+/// control, so a hostile backend could crash the GUI.
 fn truncate_for_display(s: &str, cap: usize) -> String {
     if s.len() <= cap {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..cap])
+        return s.to_string();
+    }
+    // Back up to the previous char boundary. `is_char_boundary(0)`
+    // is always true, so this loop terminates.
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_for_display;
+
+    #[test]
+    fn passes_through_short_strings() {
+        assert_eq!(truncate_for_display("hello", 10), "hello");
+        assert_eq!(truncate_for_display("", 10), "");
+    }
+
+    #[test]
+    fn truncates_with_ellipsis_when_too_long() {
+        let s = "the quick brown fox jumps over the lazy dog";
+        let out = truncate_for_display(s, 9);
+        assert_eq!(out, "the quick…");
+    }
+
+    #[test]
+    fn handles_utf8_multibyte_at_boundary() {
+        // Em-dash is 3 bytes UTF-8. Slicing at byte 11 (mid-codepoint)
+        // would panic without the char-boundary guard. Network input
+        // can carry arbitrary unicode in reason strings — this fn
+        // mustn't crash.
+        let s = "error — bad request";
+        // cap of 12 lands in the middle of the em-dash; expect the
+        // function to back up to byte 10 (just before "—").
+        let out = truncate_for_display(s, 12);
+        // The truncated prefix must be valid UTF-8 + end on a char
+        // boundary. Don't assert the exact length (depends on the
+        // backup); assert structure.
+        assert!(out.ends_with('…'));
+        assert!(out.is_char_boundary(out.len() - '…'.len_utf8()));
+    }
+
+    #[test]
+    fn cap_zero_returns_just_ellipsis() {
+        let out = truncate_for_display("not-empty", 0);
+        assert_eq!(out, "…");
+    }
+
+    #[test]
+    fn cap_exactly_at_byte_len_passes_through() {
+        let s = "hello";
+        assert_eq!(truncate_for_display(s, 5), "hello");
     }
 }
 
