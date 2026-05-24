@@ -520,6 +520,50 @@ fn run(
         return Ok(());
     }
 
+    // G1.x: client-claimed predicate evaluation. Runs at end of
+    // Stage 1 while `files` (the full post-walker inventory) is
+    // still owned by this scope — Stage 2's group_by_size moves
+    // it. Matched predicate IDs are stashed in `easter_egg_hits`
+    // for inclusion in the leaderboard payload at end-of-scan.
+    // Without the `telemetry` feature this is a no-op + the
+    // payload code path is also gated off, so the Vec stays as
+    // a zero-cost empty slot.
+    #[cfg(feature = "telemetry")]
+    let easter_egg_hits: Vec<String> = {
+        use crate::leaderboard::install;
+        use crate::leaderboard::predicates::{evaluate_all, PredicateContext};
+        let all_paths: Vec<&std::path::Path> =
+            files.iter().map(|e| e.path.as_path()).collect();
+        // FILETIME (100ns ticks since 1601-01-01) → Unix seconds.
+        // Inverse of inventory::walk::filetime_ticks. `mtime == 0`
+        // is the walker's "unknown" sentinel; surface as None so
+        // mtime-dependent predicates short-circuit cleanly per-file.
+        const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
+        let mtimes_unix_secs: Vec<Option<i64>> = files
+            .iter()
+            .map(|e| {
+                if e.mtime == 0 {
+                    None
+                } else {
+                    Some((e.mtime - UNIX_EPOCH_AS_FILETIME) / 10_000_000)
+                }
+            })
+            .collect();
+        // Counters: best-effort load. If install.json is missing
+        // or corrupt the counter-driven predicates (picky-eater /
+        // verify-veteran) silently return None — they just won't
+        // grant yet.
+        let install_state = install::load().ok().flatten();
+        let install_counters = install_state.as_ref().map(|s| &s.counters);
+        let pred_ctx = PredicateContext {
+            all_paths: &all_paths,
+            mtimes_unix_secs: Some(&mtimes_unix_secs),
+            install_counters,
+            perceptual_mode_active: false,
+        };
+        evaluate_all(&pred_ctx)
+    };
+
     // ---------------- Stage 2: size grouping ----------------
     let _ = tx.send(EngineEvent::Status("Stage 2 — size grouping".into()));
     let _ = tx.try_send(EngineEvent::OverallProgress {
@@ -1192,6 +1236,7 @@ fn run(
         } else {
             None
         };
+
         let inputs = SubmissionInputs {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             run_uuid: uuid::Uuid::new_v4().to_string(),
@@ -1206,7 +1251,7 @@ fn run(
                 features_used_bitmap: features_bits,
                 corpus_kind,
                 cache_hit_ratio,
-                easter_egg_hits: Vec::new(),
+                easter_egg_hits,
                 // Computed during dup-group emission above.
                 zero_byte_group_max: if zero_byte_group_max > 0 {
                     Some(zero_byte_group_max)
