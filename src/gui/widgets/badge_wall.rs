@@ -135,7 +135,9 @@ fn render_login_cta(ui: &mut egui::Ui) {
                 .fill(theme::ACCENT)
                 .min_size(egui::vec2(140.0, 28.0)),
             )
-            .on_hover_text("Claim your achievements for this machine");
+            .on_hover_text(
+                "Sign in to permanently keep your achievements across all your machines",
+            );
         if resp.clicked() {
             *open = true;
         }
