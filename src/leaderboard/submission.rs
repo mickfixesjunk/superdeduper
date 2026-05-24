@@ -99,15 +99,41 @@ pub struct ResultSummary {
     pub duplicate_groups: u64,
     pub duplicate_bytes_reclaimable: u64,
     pub largest_single_group_bytes: u64,
-    /// Per-action counts, e.g. `{"recycle": 12, "hardlink": 0}`.
+    /// Per-action BYTES applied during dedupe, keyed by the
+    /// locked schema strings web's `lifetime-audit.ts` expects:
+    ///
+    /// - `"deleted_to_recycle_bytes"`: sum of source-file sizes
+    ///   moved to the Recycle Bin via `delete-to-recycle`.
+    /// - `"deleted_permanently_bytes"`: sum of sizes irrecoverably
+    ///   deleted via `delete-permanently`.
+    /// - `"hardlink_replaced_bytes"`: sum of source sizes replaced
+    ///   by hardlinks pointing at the keeper. On-disk reclaim
+    ///   equals these bytes (the keeper's data is now shared).
+    ///
     /// Empty `{}` is valid + the natural state at scan-end (actions
-    /// happen post-scan).
+    /// happen post-scan). When the user has run dedupe actions
+    /// between scan + submit, this map carries the totals.
+    ///
+    /// **Key names are LOCKED** per design's
+    /// `gamification-achievement-balance.md` action-bytes formula;
+    /// web's auditor will reject submissions using different keys.
+    /// Use [`ACTION_BYTES_KEY_*`] constants instead of hardcoding.
     pub actions_taken_summary: std::collections::BTreeMap<String, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder_skip_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder_skip_bytes: Option<u64>,
 }
+
+/// Locked key for the "delete-to-recycle bytes" entry in
+/// [`ResultSummary::actions_taken_summary`]. Web's `lifetime-audit.ts`
+/// validates against this exact string; any drift here will cause
+/// submissions to be rejected.
+pub const ACTION_BYTES_KEY_DELETED_TO_RECYCLE: &str = "deleted_to_recycle_bytes";
+/// Locked key for permanent-delete bytes.
+pub const ACTION_BYTES_KEY_DELETED_PERMANENTLY: &str = "deleted_permanently_bytes";
+/// Locked key for hardlink-replace bytes.
+pub const ACTION_BYTES_KEY_HARDLINK_REPLACED: &str = "hardlink_replaced_bytes";
 
 // `features_used_bitmap` bit assignments. Stable; new features
 // append. Reserved bits stay 0 until claimed.
@@ -969,5 +995,35 @@ mod tests {
         let p2 = build_payload(&inputs, "id-b");
         assert_eq!(p1.get("install_id").and_then(|v| v.as_str()), Some("id-a"));
         assert_eq!(p2.get("install_id").and_then(|v| v.as_str()), Some("id-b"));
+    }
+
+    #[test]
+    fn action_bytes_keys_match_locked_schema() {
+        // Web's `lifetime-audit.ts` validates against these exact
+        // strings; drift here = backend rejects submissions. Test
+        // pins the constants byte-for-byte so a casual rename
+        // surfaces here first.
+        assert_eq!(ACTION_BYTES_KEY_DELETED_TO_RECYCLE, "deleted_to_recycle_bytes");
+        assert_eq!(ACTION_BYTES_KEY_DELETED_PERMANENTLY, "deleted_permanently_bytes");
+        assert_eq!(ACTION_BYTES_KEY_HARDLINK_REPLACED, "hardlink_replaced_bytes");
+    }
+
+    #[test]
+    fn action_bytes_keys_round_trip_through_btreemap() {
+        // Round-trip the locked keys through the actual
+        // BTreeMap<String, u64> field to confirm they encode
+        // cleanly as JSON object keys (no surprise quoting / Unicode
+        // shenanigans).
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(ACTION_BYTES_KEY_DELETED_TO_RECYCLE.to_string(), 1234u64);
+        m.insert(ACTION_BYTES_KEY_DELETED_PERMANENTLY.to_string(), 5678u64);
+        m.insert(ACTION_BYTES_KEY_HARDLINK_REPLACED.to_string(), 9012u64);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"deleted_to_recycle_bytes\":1234"));
+        assert!(json.contains("\"deleted_permanently_bytes\":5678"));
+        assert!(json.contains("\"hardlink_replaced_bytes\":9012"));
+        let back: std::collections::BTreeMap<String, u64> =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(back.get(ACTION_BYTES_KEY_DELETED_TO_RECYCLE), Some(&1234));
     }
 }
