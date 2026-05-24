@@ -111,23 +111,96 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     }
 }
 
-/// GUI registration via loopback HTTP server. Stubbed; lands in
-/// follow-up commit alongside G3 OAuth (same code shape — browser
-/// open + 127.0.0.1:0 listener + token capture).
-pub fn register_gui_via_loopback(_state: &mut InstallState) -> Result<(), RegisterError> {
-    // TODO(g1-followup): same loopback pattern as G3 OAuth.
-    //
-    // Flow:
-    // 1. Bind 127.0.0.1:0; remember the port.
-    // 2. Open browser to `{server_url}/setup?cb=http://127.0.0.1:{port}/captcha-callback`.
-    // 3. User solves Turnstile on superdeduper.io.
-    // 4. superdeduper.io POSTs `{ "captcha_token": "..." }` to our loopback.
-    // 5. We POST `/api/v1/register` with `registration_proof: {kind: "captcha", provider: "turnstile", token}`.
-    // 6. Close loopback.
-    Err(RegisterError::Network(
-        "GUI registration not implemented yet — use CLI `sd register`".into(),
-    ))
+/// GUI registration via loopback HTTP server. Opens the system
+/// browser to `{server_url}/setup?cb=http://127.0.0.1:{port}/...`,
+/// captures the Turnstile token POSTed back to our loopback, and
+/// completes registration with `proof = captcha` instead of PoW.
+///
+/// Caller's responsibility: spawn this off the UI thread — the
+/// captcha-await blocks for up to `CAPTCHA_TIMEOUT`.
+pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), RegisterError> {
+    if state.registered {
+        return Err(RegisterError::AlreadyRegistered);
+    }
+    let key = state.install_key().ok_or(RegisterError::MalformedKey)?;
+    let token = super::captcha::await_captcha_token(
+        &state.server_url,
+        &state.install_id,
+        CAPTCHA_TIMEOUT,
+    )
+    .map_err(|e| match e {
+        super::captcha::CaptchaError::Timeout => {
+            RegisterError::Network("captcha not completed within 5 minutes".into())
+        }
+        super::captcha::CaptchaError::BrowserOpenFailed(msg) => {
+            RegisterError::Network(format!(
+                "could not launch browser ({msg}) — use `sd register` from a terminal instead"
+            ))
+        }
+        super::captcha::CaptchaError::BindFailed(msg) => {
+            RegisterError::Network(format!("could not bind loopback port: {msg}"))
+        }
+        super::captcha::CaptchaError::ServerDied => {
+            RegisterError::Network("captcha listener died unexpectedly".into())
+        }
+    })?;
+
+    let body = serde_json::json!({
+        "install_id": state.install_id,
+        "client_version": state.client_version_at_register,
+        "registration_proof": {
+            "kind": "captcha",
+            "provider": "turnstile",
+            "token": token,
+        }
+    });
+    let canonical = hmac_signer::canonical_body(&body);
+    let signature = hmac_signer::sign(&key, &canonical);
+
+    let url = format!(
+        "{}/api/v1/register",
+        state.server_url.trim_end_matches('/')
+    );
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("X-Sd-Signature", &signature)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_bytes(&canonical);
+
+    match resp {
+        Ok(_) => {
+            state.registered = true;
+            install::save(state).map_err(|e| {
+                RegisterError::SaveFailedAfterServerAck(format!("{e}"))
+            })?;
+            Ok(())
+        }
+        Err(ureq::Error::Status(429, _)) => Err(RegisterError::RateLimited),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body_text = resp.into_string().unwrap_or_default();
+            let reason = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .or_else(|| v.get("reason"))
+                        .and_then(|r| r.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or(body_text);
+            Err(RegisterError::ServerRejected {
+                status: code,
+                reason,
+            })
+        }
+        Err(ureq::Error::Transport(t)) => Err(RegisterError::Network(format!("{t}"))),
+    }
 }
+
+/// Wall-clock budget for the GUI captcha flow. 5 minutes is generous
+/// enough for any reasonable user interaction (read page, complete
+/// Turnstile widget, return to app) without being so long that an
+/// abandoned listener stays alive forever.
+pub const CAPTCHA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Hashcash-style PoW: find a `nonce` (decimal string) such that
 /// `sha256(challenge_bytes || nonce_bytes)` has at least `bits`

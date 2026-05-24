@@ -642,54 +642,109 @@ fn render_leaderboard(ui: &mut egui::Ui) {
                 .color(theme::TEXT_HI),
             );
             ui.add_space(8.0);
-            // Note: button clicks fire on the UI thread. Registration
-            // is ~1s of CPU (PoW) + a 15s timeout HTTP POST; we spawn
-            // off-thread so the modal stays responsive. Failures /
-            // success are written back via a status string stored in
-            // a thread-shared OnceLock (next slice) — for now we
-            // print to stdout and ask the user to retry / check log.
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("Register this install")
-                            .color(theme::PANEL_DEEP)
-                            .strong(),
+            // Two registration paths share this slot:
+            // * Browser captcha (spec-default for GUI; opens the
+            //   superdeduper.io setup page and captures the
+            //   Turnstile token on a loopback HTTP server)
+            // * PoW (CLI-style, ~1s CPU; works without a working
+            //   browser — useful on headless boxes or when the
+            //   captcha page isn't reachable yet)
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Register via browser")
+                                .color(theme::PANEL_DEEP)
+                                .strong(),
+                        )
+                        .fill(theme::ACCENT)
+                        .min_size(egui::vec2(180.0, 28.0)),
                     )
-                    .fill(theme::ACCENT)
-                    .min_size(egui::vec2(180.0, 28.0)),
-                )
-                .on_hover_text(
-                    "Generates a UUID + HMAC key, solves a 22-bit hashcash proof-of-work, \
-                     then POSTs to api.superdeduper.io/api/v1/register. \
-                     Idempotent — clicking again when registered is a no-op.",
-                )
-                .clicked()
-            {
-                std::thread::spawn(|| {
-                    let mut state = match install::load() {
-                        Ok(Some(s)) => s,
-                        _ => install::new_unregistered(
-                            "https://api.superdeduper.io".to_string(),
-                        ),
-                    };
-                    if state.registered {
-                        eprintln!("leaderboard: already registered ({})", state.install_id);
-                        return;
-                    }
-                    eprintln!(
-                        "leaderboard: solving PoW + POSTing /api/v1/register (install_id={})...",
-                        state.install_id
-                    );
-                    match crate::leaderboard::registration::register_cli(&mut state) {
-                        Ok(()) => {
-                            eprintln!("leaderboard: registered. id={}", state.install_id);
+                    .on_hover_text(
+                        "Opens superdeduper.io/setup in your default browser. \
+                         You solve a Cloudflare Turnstile, the page POSTs the \
+                         token back to a loopback HTTP server, and we complete \
+                         registration. 5-minute timeout.",
+                    )
+                    .clicked()
+                {
+                    std::thread::spawn(|| {
+                        let mut state = match install::load() {
+                            Ok(Some(s)) => s,
+                            _ => install::new_unregistered(
+                                "https://api.superdeduper.io".to_string(),
+                            ),
+                        };
+                        if state.registered {
+                            eprintln!(
+                                "leaderboard: already registered ({})",
+                                state.install_id
+                            );
+                            return;
                         }
-                        Err(e) => {
-                            eprintln!("leaderboard: register failed: {e:?}");
+                        eprintln!(
+                            "leaderboard: opening browser captcha (install_id={})...",
+                            state.install_id
+                        );
+                        match crate::leaderboard::registration::register_gui_via_loopback(
+                            &mut state,
+                        ) {
+                            Ok(()) => eprintln!(
+                                "leaderboard: registered via captcha. id={}",
+                                state.install_id
+                            ),
+                            Err(e) => {
+                                eprintln!("leaderboard: captcha register failed: {e:?}")
+                            }
                         }
-                    }
-                });
-            }
+                    });
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("PoW (no browser)")
+                                .color(theme::TEXT_HI),
+                        )
+                        .fill(theme::PANEL_DEEP)
+                        .min_size(egui::vec2(150.0, 28.0)),
+                    )
+                    .on_hover_text(
+                        "Fallback for headless / sandboxed boxes. Solves a \
+                         22-bit hashcash proof-of-work (~1s CPU) and POSTs to \
+                         /api/v1/register. Idempotent — clicking again when \
+                         registered is a no-op.",
+                    )
+                    .clicked()
+                {
+                    std::thread::spawn(|| {
+                        let mut state = match install::load() {
+                            Ok(Some(s)) => s,
+                            _ => install::new_unregistered(
+                                "https://api.superdeduper.io".to_string(),
+                            ),
+                        };
+                        if state.registered {
+                            eprintln!(
+                                "leaderboard: already registered ({})",
+                                state.install_id
+                            );
+                            return;
+                        }
+                        eprintln!(
+                            "leaderboard: solving PoW + POSTing /api/v1/register (install_id={})...",
+                            state.install_id
+                        );
+                        match crate::leaderboard::registration::register_cli(&mut state) {
+                            Ok(()) => eprintln!(
+                                "leaderboard: registered via PoW. id={}",
+                                state.install_id
+                            ),
+                            Err(e) => eprintln!("leaderboard: register failed: {e:?}"),
+                        }
+                    });
+                }
+            });
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
