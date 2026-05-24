@@ -151,8 +151,10 @@ fn run(submission_id: String) {
 }
 
 /// On a successful poll, update the in-memory outcome (so an open
-/// modal re-renders with the ranks) AND push a toast (so a closed
-/// modal user still sees them).
+/// modal re-renders with the ranks), push a toast (so a closed
+/// modal user still sees them), and refresh the achievement
+/// profile (some achievements unlock retroactively when ranks
+/// resolve — e.g. a "top-10 throughput" badge).
 fn deliver_ranks(ranks: Vec<RankEntry>) {
     submission::update_last_outcome_ranks(ranks.clone());
 
@@ -173,6 +175,15 @@ fn deliver_ranks(ranks: Vec<RankEntry>) {
         lines,
         Duration::from_secs(8),
     );
+
+    if let Ok(Some(state)) = crate::leaderboard::install::load() {
+        if state.registered {
+            crate::leaderboard::catalog::spawn_profile_refresh(
+                state.server_url,
+                state.install_id,
+            );
+        }
+    }
 }
 
 /// Map backend `category` codes to user-facing labels. Web returns

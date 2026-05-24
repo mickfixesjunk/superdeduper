@@ -193,6 +193,25 @@ pub fn spawn_initial_fetch(server_url: String, install_id: Option<String>) {
     });
 }
 
+/// Refetch only the profile and overwrite the slot. Fired by the
+/// post-submit path: when a submission grants achievements the
+/// backend updates the profile but the GUI's cached snapshot is
+/// stale until we re-fetch. Catalog is untouched (its contents
+/// don't change per-submit).
+pub fn spawn_profile_refresh(server_url: String, install_id: String) {
+    std::thread::spawn(move || {
+        match fetch_profile(&server_url, &install_id) {
+            Ok(p) => set_profile(Ok(p)),
+            Err(e) => {
+                eprintln!("catalog: profile refresh failed: {e:?}");
+                // Deliberately don't overwrite a previously-good
+                // profile with an error — a transient network blip
+                // shouldn't grey out the badge wall.
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -673,8 +673,17 @@ impl SuperdeduperApp {
             // ranks async-but-immediate (~200ms typical); the poller
             // surfaces them via toast + modal-update once the
             // backend's worker lands them.
+            //
+            // Also refresh the cached profile so any achievements
+            // unlocked by THIS submission flip greyed → coloured in
+            // the badge wall. Without this, badge tiles only update
+            // on app restart.
             if let submission::SubmitOutcome::Accepted { submission_id, .. } = &outcome {
                 crate::leaderboard::ranks_poll::spawn_ranks_poll_worker(submission_id.clone());
+                crate::leaderboard::catalog::spawn_profile_refresh(
+                    state.server_url.clone(),
+                    state.install_id.clone(),
+                );
             }
             // Clear the pending slot only when the server accepted
             // the payload (or has it on file via 409). Rejected /
