@@ -14,7 +14,7 @@
 
 ## Pack 1: System libraries
 
-**Why:** Shared libraries + packaged resources. Deleting them breaks the apps that ship them.
+**Why:** Shared + static libraries and packaged resources. Deleting them breaks the apps that ship them.
 
 **Extensions** (15):
 ```
@@ -91,7 +91,7 @@ Notes:
 
 **Why:** Per-user dependency caches. Deletion forces re-download but doesn't break installed software. Often gigabytes of "dups" that aren't really dups.
 
-**Path patterns** (14):
+**Path patterns** (13):
 ```
 **/.m2/repository/**
 **/.gradle/caches/**
@@ -106,22 +106,21 @@ Notes:
 **/.cache/pip/**
 **/.cache/uv/**
 **/Library/Caches/Homebrew/**
-**/.local/share/Trash/**
 ```
 
 Notes:
 - pnpm content-addressable store: `.pnpm-store` (per-machine) or `node_modules/.pnpm` (in-project — covered by Build artefacts)
 - `.cache/pip/`, `.cache/uv/` — XDG cache dir on Linux + macOS
-- `.local/share/Trash/` — Linux XDG trash (sd should NOT dedupe files inside the user's trash)
 - Homebrew: macOS-specific path
+- (`.local/share/Trash/` moved to Pack 5 OS system trees per design review — fits semantically as OS-shell concept, not a PM cache)
 
 **Extensions:** (none)
 
 ## Pack 5: OS system trees
 
-**Why:** OS internals. Deleting these = reinstall (Windows) or `sudo apt --reinstall` (Linux). Heavy "dup" content because Windows ships multi-version side-by-side and Linux ships compiled stdlib variants.
+**Why:** OS internals + OS-shell-managed dirs (Trash, Recycle Bin). Deleting these = reinstall (Windows) or `sudo apt --reinstall` (Linux). Heavy "dup" content because Windows ships multi-version side-by-side and Linux ships compiled stdlib variants. User's Trash also lives here — files the user explicitly deleted should not be deduped, since the user already chose to throw them away.
 
-**Path patterns** (12):
+**Path patterns** (13):
 ```
 C:\Windows\WinSxS\**
 C:\Windows\System32\**
@@ -135,6 +134,7 @@ C:\Windows\servicing\**
 /usr/lib64/**
 /usr/share/locale/**
 /var/lib/dpkg/info/**
+**/.local/share/Trash/**
 ```
 
 Notes:

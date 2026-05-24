@@ -30,13 +30,17 @@
 
 pub mod config;
 pub mod matcher;
+pub mod presets;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use globset::GlobSet;
 
 pub use self::config::{ExclusionConfig, ExclusionConfigError};
+pub use self::presets::BuiltinPresets;
 
 /// Stable identifier for a built-in preset pack. The full pack
 /// content (extensions + path patterns) is filled in on Day 2 in
@@ -183,11 +187,7 @@ impl ExclusionPolicy {
         for pack_id in &config.active_packs {
             let pack = presets.get(*pack_id);
             for pat in pack.paths {
-                let glob =
-                    globset::Glob::new(pat).map_err(|e| ExclusionConfigError::BadPattern {
-                        pattern: pat.to_string(),
-                        source: e,
-                    })?;
+                let glob = build_glob_with_literal_separator(pat)?;
                 combined_path_builder.add(glob);
             }
             for ext in pack.extensions {
@@ -196,10 +196,7 @@ impl ExclusionPolicy {
         }
 
         for pat in &config.custom_patterns {
-            let glob = globset::Glob::new(pat).map_err(|e| ExclusionConfigError::BadPattern {
-                pattern: pat.clone(),
-                source: e,
-            })?;
+            let glob = build_glob_with_literal_separator(pat)?;
             combined_path_builder.add(glob.clone());
             custom_path_builder.add(glob);
         }
@@ -229,25 +226,41 @@ impl ExclusionPolicy {
     /// Hot-path per-file check. Application order per spec §2.4:
     /// path match first, then extension. Excluded files are
     /// dropped silently from the walker output.
+    ///
+    /// Path normalisation: backslashes in the input are converted
+    /// to forward slashes before matching, so Windows-shell paths
+    /// (`C:\Windows\WinSxS\...`) match patterns stored with
+    /// forward slashes (`C:/Windows/WinSxS/**`). Allocates a
+    /// `String` only when the input actually contains a `\` —
+    /// pure-forward-slash paths take the zero-allocation path.
     pub fn evaluate(&self, path: &Path) -> Decision {
         if !self.enabled {
             return Decision::Included;
         }
-        if self.combined_paths.is_match(path) {
-            // Disambiguate the reason: if this path is in the
-            // custom-only set too, attribute to user rule.
-            // Otherwise it must have come from a preset pack —
-            // but we don't yet know WHICH pack. Day 2 lookup adds
-            // per-pack attribution; for Day 1 we report "some
-            // preset pack" via a sentinel.
-            let reason = if self.custom_paths.is_match(path) {
+        let path_str_buf;
+        let match_target: &Path = if cfg!(windows)
+            || path.to_str().map(|s| s.contains('\\')).unwrap_or(false)
+        {
+            // Normalise backslashes once; reuse the buffer for
+            // both the path-match and the extension lookup.
+            let normalised = path
+                .to_str()
+                .map(|s| s.replace('\\', "/"))
+                .unwrap_or_default();
+            path_str_buf = std::path::PathBuf::from(normalised);
+            &path_str_buf
+        } else {
+            path
+        };
+        if self.combined_paths.is_match(match_target) {
+            let reason = if self.custom_paths.is_match(match_target) {
                 ExclusionReason::CustomPattern
             } else {
                 ExclusionReason::PresetPackPath(PresetPackId::SystemLibraries)
             };
             return Decision::Excluded(reason);
         }
-        if let Some(ext) = matcher::lowercased_extension(path) {
+        if let Some(ext) = matcher::lowercased_extension(match_target) {
             if self.combined_exts.contains(&ext) {
                 let reason = if self.custom_exts.contains(&ext) {
                     ExclusionReason::CustomExtension
@@ -295,12 +308,79 @@ impl PresetSource for EmptyPresets {
     }
 }
 
+/// Live counters bumped by the walker when an exclusion fires.
+/// Wrapped in [`Arc`] so multiple worker threads can share a single
+/// instance without lock contention — atomics are lock-free for
+/// `u64` increments on every supported platform.
+///
+/// Surfaced in the scan summary as `"Excluded by Settings →
+/// Exclusions: N files (Y bytes)"`. Reset implicitly per scan
+/// because the walker constructs a fresh `Arc<ExclusionCounters>`
+/// alongside the rest of the per-scan state.
+#[derive(Debug, Default)]
+pub struct ExclusionCounters {
+    pub excluded_files: AtomicU64,
+    pub excluded_bytes: AtomicU64,
+}
+
+impl ExclusionCounters {
+    /// Allocate fresh counters. Cheap; just two atomics.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Record one excluded file. Called from the walker hot path
+    /// each time `ExclusionPolicy::evaluate` returns Excluded.
+    pub fn record(&self, bytes: u64) {
+        self.excluded_files.fetch_add(1, Ordering::Relaxed);
+        self.excluded_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Snapshot reader for the scan summary.
+    pub fn snapshot(&self) -> ExclusionCountersSnapshot {
+        ExclusionCountersSnapshot {
+            excluded_files: self.excluded_files.load(Ordering::Relaxed),
+            excluded_bytes: self.excluded_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Value-only snapshot for scan-summary rendering. Decoupled from
+/// `ExclusionCounters` so summary code doesn't pull `AtomicU64` or
+/// `Arc` into its signature.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExclusionCountersSnapshot {
+    pub excluded_files: u64,
+    pub excluded_bytes: u64,
+}
+
 /// Normalise an extension to lowercase + strip any leading dot.
 /// `.DLL` and `dll` both store as `dll`. Comparison happens
 /// against the lowercased file extension extracted by
 /// `matcher::lowercased_extension`.
 fn normalize_extension(ext: &str) -> String {
     ext.trim_start_matches('.').to_ascii_lowercase()
+}
+
+/// Build a glob with `literal_separator(true)`. This makes the
+/// single-`*` wildcard match exactly one path segment (no `/` or
+/// `\` crossings). `**` continues to match across separators
+/// regardless of the setting.
+///
+/// Why this matters: a pattern like `**/.mozilla/firefox/*/cache2/**`
+/// is meant to match a profile dir + its `cache2/` subdir.
+/// With default `literal_separator(false)`, the middle `*` would
+/// match `foo/bar/baz/cache2`, catching everything under the
+/// firefox dir. Spec acceptance §2.4 ordering depends on accurate
+/// per-segment matching to avoid over-broad exclusions.
+fn build_glob_with_literal_separator(pat: &str) -> Result<globset::Glob, ExclusionConfigError> {
+    globset::GlobBuilder::new(pat)
+        .literal_separator(true)
+        .build()
+        .map_err(|e| ExclusionConfigError::BadPattern {
+            pattern: pat.to_string(),
+            source: e,
+        })
 }
 
 #[cfg(test)]
