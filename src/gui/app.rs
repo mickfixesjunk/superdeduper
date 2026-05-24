@@ -243,6 +243,21 @@ impl SuperdeduperApp {
         // have been seeded from persistence or a CLI argument.
         app.refresh_cache_banner();
 
+        // Spawn the badge-wall data fetch in the background. Catalog
+        // is public + cached on a CDN; profile fetch only fires if the
+        // install is registered (otherwise the wall renders the
+        // greyed-out catalog with the empty-grant overlay). Best-effort:
+        // failure is surfaced inline in the widget, doesn't block UI.
+        #[cfg(feature = "telemetry")]
+        {
+            use crate::leaderboard::{catalog, install};
+            let (server_url, install_id) = match install::load() {
+                Ok(Some(s)) => (s.server_url, Some(s.install_id)),
+                _ => ("https://api.superdeduper.io".to_string(), None),
+            };
+            catalog::spawn_initial_fetch(server_url, install_id);
+        }
+
         // Intentionally NO auto-load of prior scan results on launch.
         // Projects are now explicit — File → Open Project loads one;
         // File → New / a fresh launch starts empty. The Resume modal
@@ -739,6 +754,39 @@ impl SuperdeduperApp {
                     self.scan_complete_modal = ScanCompleteState::Hidden;
                     self.scan_complete_data = None;
                 }
+            }
+        }
+    }
+
+    /// Route a click from the badge-wall panel. Tile clicks log to
+    /// stderr for now (proper tile-detail modal is a follow-up);
+    /// header link opens the live profile URL; register CTA pops
+    /// the Settings modal at the Leaderboard tab.
+    #[cfg(feature = "telemetry")]
+    fn dispatch_badge_wall_action(
+        &mut self,
+        action: crate::gui::widgets::badge_wall::BadgeWallAction,
+    ) {
+        use crate::gui::widgets::badge_wall::BadgeWallAction;
+        use crate::leaderboard::install;
+        match action {
+            BadgeWallAction::TileClicked(id) => {
+                eprintln!("badge-wall: tile clicked: {id}");
+            }
+            BadgeWallAction::OpenProfile => {
+                let url = match install::load() {
+                    Ok(Some(s)) => format!(
+                        "https://superdeduper.io/profile/{}",
+                        s.install_id
+                    ),
+                    _ => "https://superdeduper.io/".to_string(),
+                };
+                open_url_in_browser(&url);
+            }
+            BadgeWallAction::OpenRegister => {
+                self.settings_open = true;
+                self.settings_modal_state.tab =
+                    crate::gui::widgets::settings_modal::SettingsTab::Leaderboard;
             }
         }
     }
@@ -2213,6 +2261,26 @@ impl eframe::App for SuperdeduperApp {
                 ui.separator();
                 ui.add_space(6.0);
                 funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
+
+                // §10.4 badge-wall: bottom-left always-visible
+                // achievements grid. Auto-degrades to §10.5 mini-
+                // widget when the sidebar is narrower than ~280 px
+                // (3 tile-columns won't fit).
+                #[cfg(feature = "telemetry")]
+                {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    let state = crate::leaderboard::catalog::peek_state();
+                    let action = if ui.available_width() < 280.0 {
+                        crate::gui::widgets::badge_wall::show_mini(ui, &state)
+                    } else {
+                        crate::gui::widgets::badge_wall::show(ui, &state)
+                    };
+                    if let Some(a) = action {
+                        self.dispatch_badge_wall_action(a);
+                    }
+                }
             });
 
         CentralPanel::default()
@@ -2536,4 +2604,24 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Open a URL in the user's default browser. Per-OS shell-out;
+/// non-blocking. Failure logs to stderr and is otherwise silent —
+/// this is invoked from UI button clicks, no good way to surface
+/// "browser refused to launch" inline.
+#[cfg(feature = "telemetry")]
+fn open_url_in_browser(url: &str) {
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if let Err(e) = result {
+        eprintln!("failed to open browser to {url}: {e}");
+    }
 }

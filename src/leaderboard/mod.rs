@@ -22,6 +22,7 @@
 #![cfg(feature = "telemetry")]
 
 pub mod captcha;
+pub mod catalog;
 pub mod hardware;
 pub mod install;
 pub mod hmac_signer;
