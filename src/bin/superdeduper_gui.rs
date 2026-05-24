@@ -32,11 +32,20 @@ struct Args {
 fn main() -> eframe::Result<()> {
     let args = Args::parse();
 
+    // Window title carries version + git SHA so multi-window users
+    // can disambiguate which build is which without us shipping
+    // uniquely-named EXEs. SD_BUILD_SHA is set at compile-time by
+    // build.rs ("dev" if git isn't available).
+    let window_title = format!(
+        "superdeduper v{} · {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("SD_BUILD_SHA"),
+    );
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1100.0, 720.0])
-            .with_title("superdeduper"),
+            .with_title(&window_title),
         vsync: true,
         ..Default::default()
     };
