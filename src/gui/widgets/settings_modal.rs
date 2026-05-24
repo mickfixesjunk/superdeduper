@@ -1185,6 +1185,17 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
     show_sample_preview(json.to_string());
 }
 
+/// Shorten a long string for inline display (the original-error
+/// line on the FlaggedForReview outcome). Trims to `cap` chars +
+/// adds an ellipsis when truncated; otherwise returns the original.
+fn truncate_for_display(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..cap])
+    }
+}
+
 /// Build the synthetic sample submission as a pretty-printed JSON
 /// string. Used by the Preview-sample-submission button to render
 /// in a modal (and as a debug echo to stderr for headless cases).
@@ -1414,7 +1425,12 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::S
                 .small(),
             );
         }
-        SubmitOutcome::FlaggedForReview { review_id, local_path } => {
+        SubmitOutcome::FlaggedForReview {
+            review_id,
+            local_path,
+            original_status,
+            original_reason,
+        } => {
             ui.label(
                 RichText::new("✓ Flagged for review").color(theme::ACCENT).strong(),
             );
@@ -1437,6 +1453,14 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::S
                     .color(theme::TEXT_LO)
                     .small()
                     .monospace(),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Original error (HTTP {original_status}): {}",
+                    truncate_for_display(original_reason, 240),
+                ))
+                .color(theme::TEXT_LO)
+                .small(),
             );
         }
     }

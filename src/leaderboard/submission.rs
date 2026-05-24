@@ -120,11 +120,16 @@ pub enum SubmitOutcome {
     /// saved a copy to the local review queue and (best-effort)
     /// uploaded to /api/v1/submit/review. `review_id` is the
     /// server-assigned id on success; `None` if the upload didn't
-    /// land but the local save did. Rendered with a green ✓ so
-    /// the user knows the action succeeded.
+    /// land but the local save did. `original_status` /
+    /// `original_reason` carry the rejection that triggered this
+    /// review — surfaced in the GUI confirmation card so the user
+    /// sees both "we sent it" + "here's what was wrong" in the
+    /// same view. Rendered with a green ✓.
     FlaggedForReview {
         review_id: Option<String>,
         local_path: String,
+        original_status: u16,
+        original_reason: String,
     },
 }
 
@@ -509,6 +514,8 @@ enum SerializableOutcome {
     FlaggedForReview {
         review_id: Option<String>,
         local_path: String,
+        original_status: u16,
+        original_reason: String,
     },
 }
 
@@ -537,9 +544,13 @@ impl From<&SubmitOutcome> for SerializableOutcome {
             SubmitOutcome::FlaggedForReview {
                 review_id,
                 local_path,
+                original_status,
+                original_reason,
             } => SerializableOutcome::FlaggedForReview {
                 review_id: review_id.clone(),
                 local_path: local_path.clone(),
+                original_status: *original_status,
+                original_reason: original_reason.clone(),
             },
         }
     }

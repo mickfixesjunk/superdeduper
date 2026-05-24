@@ -391,7 +391,12 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
                 RichText::new(reason).color(theme::TEXT_LO).small(),
             );
         }
-        SubmitOutcome::FlaggedForReview { review_id, local_path } => {
+        SubmitOutcome::FlaggedForReview {
+            review_id,
+            local_path,
+            original_status,
+            original_reason,
+        } => {
             ui.label(
                 RichText::new("✓ Flagged for review")
                     .color(theme::ACCENT)
@@ -429,6 +434,33 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
                     .small()
                     .monospace(),
             );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Original error (sent with the review):")
+                    .color(theme::TEXT_LO)
+                    .small()
+                    .italics(),
+            );
+            ui.label(
+                RichText::new(format!("HTTP {original_status}"))
+                    .color(theme::HOT)
+                    .small()
+                    .strong(),
+            );
+            // Reason can be long JSON; show in a small scrollable
+            // mono box so the user can read what they sent.
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .id_source("flagged-orig-reason")
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut original_reason.clone())
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(5)
+                            .interactive(false),
+                    );
+                });
         }
     }
 }

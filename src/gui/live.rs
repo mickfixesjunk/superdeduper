@@ -778,7 +778,10 @@ fn run(
                 if f <= 50 {
                     let _ = progress_tx.try_send(EngineEvent::Log {
                         level: LogLevel::Warn,
-                        message: format!("hash failed · {} · {error}", path.display()),
+                        message: format!(
+                            "hash failed · {} · {error}",
+                            display_path(path),
+                        ),
                     });
                 } else if f == 51 {
                     let _ = progress_tx.try_send(EngineEvent::Log {
@@ -1031,12 +1034,16 @@ fn run(
     // Emit log lines BEFORE ScanFinished so listeners that break
     // on ScanFinished (UI, tests) still see them. Order matters:
     // ScanFinished is the terminal signal.
+    // Use inode-aware reclaim here so this user-visible line agrees
+    // with the header tile (which also uses inode-aware via
+    // gui::state::inode_aware_savings). The diagnostic line below
+    // prints both flavors for debugging hardlink-heavy corpora.
     let _ = tx.send(EngineEvent::Log {
         level: LogLevel::Info,
         message: format!(
             "scan complete: {} group(s), {} reclaimable",
             total_dups,
-            crate::gui::theme::humansize(reclaimable)
+            crate::gui::theme::humansize(reclaimable_inode)
         ),
     });
     // Cache stats so a resumed scan that *should* have fast-
@@ -1460,6 +1467,23 @@ fn chunk_groups(
         chunks.push(current);
     }
     chunks
+}
+
+/// User-facing path display that strips the Windows verbatim-path
+/// prefix (`\\?\`). The engine uses verbatim paths internally to
+/// bypass MAX_PATH; surfacing them to the user as `\\?\C:\foo\bar`
+/// is jarring. Keeps UNC shares (`\\?\UNC\server\share`) intact —
+/// only the local-drive verbatim form is normalized.
+fn display_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.starts_with("UNC\\") {
+            // \\?\UNC\server\share -> \\server\share
+            return format!(r"\\{}", &rest[4..]);
+        }
+        return rest.to_string();
+    }
+    s.into_owned()
 }
 
 /// Map roots → `run_shape.scope` enum:

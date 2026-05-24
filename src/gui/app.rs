@@ -649,7 +649,12 @@ impl SuperdeduperApp {
                     return;
                 }
             };
-            let inputs = match submission::take_pending() {
+            // PEEK (not take) so the pending payload survives a
+            // failed submit — lets the "Submit for review" fallback
+            // path on the modal still find inputs to flag. Only
+            // clear the slot on Accepted (or DuplicateNoChange, where
+            // the server already has it).
+            let inputs = match submission::peek_pending() {
                 Some(i) => i,
                 None => {
                     submission::store_last_outcome(submission::SubmitOutcome::Rejected {
@@ -664,6 +669,17 @@ impl SuperdeduperApp {
             // or transient — to the local archive dir so the user
             // has a permanent record they can come back to.
             submission::archive_attempt(&inputs, &state.install_id, &outcome);
+            // Clear the pending slot only when the server accepted
+            // the payload (or has it on file via 409). Rejected /
+            // Transient stay pending so a follow-up Submit-for-
+            // review (or retry) has data to work with.
+            if matches!(
+                &outcome,
+                submission::SubmitOutcome::Accepted { .. }
+                    | submission::SubmitOutcome::DuplicateNoChange
+            ) {
+                let _ = submission::take_pending();
+            }
             if let submission::SubmitOutcome::Transient { reason } = &outcome {
                 eprintln!("leaderboard: submit transient ({reason}); enqueueing");
                 let body = crate::leaderboard::hmac_signer::canonical_body(
@@ -800,6 +816,19 @@ impl SuperdeduperApp {
                     reason: "unknown".into(),
                 },
             );
+            // Capture the original rejection's status + reason so
+            // the confirmation card can surface both "we flagged
+            // this for review" AND the error that triggered it,
+            // side by side, in the same view.
+            let (original_status, original_reason) = match &rejection {
+                submission::SubmitOutcome::Rejected { status, reason } => {
+                    (*status, reason.clone())
+                }
+                submission::SubmitOutcome::Transient { reason } => {
+                    (0, reason.clone())
+                }
+                _ => (0, "unknown".to_string()),
+            };
             match submission::flag_for_review(&state, &inputs, &rejection, None) {
                 Ok((path, review_id)) => {
                     eprintln!(
@@ -811,6 +840,8 @@ impl SuperdeduperApp {
                         submission::SubmitOutcome::FlaggedForReview {
                             review_id,
                             local_path: path.display().to_string(),
+                            original_status,
+                            original_reason,
                         },
                     );
                 }

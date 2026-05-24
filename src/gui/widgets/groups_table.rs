@@ -322,31 +322,38 @@ pub fn show_filtered(
                 .small()
                 .italics(),
         );
-    });
-    ui.add_space(4.0);
-    // "Hide unreclaimable (0 bytes)" filter — drops hardlinked groups
-    // (link_equivalent + partial-hardlink with unique_inodes < 2) from
-    // the table view. The data is still in state.duplicates; only the
-    // table rendering is affected. Total reclaimable in the header
-    // already excludes these via inode_aware_savings, so the filter is
-    // purely cosmetic.
-    ui.horizontal(|ui| {
+
+        // "Hide unreclaimable" toggle on the SAME row as the bulk-
+        // action toolbar so it's visually unmissable. Renders as a
+        // toggle-button (pressed when active, like a switch) rather
+        // than a checkbox so it reads as a filter control.
         let hidden_count = sorted
             .iter()
             .filter(|(_, g)| crate::gui::state::inode_aware_savings(g) == 0)
             .count();
-        let label = if hidden_count > 0 {
-            format!("Hide unreclaimable (0 bytes) — {hidden_count} group(s)")
+        ui.add_space(12.0);
+        let toggle_text = if table_state.hide_unreclaimable {
+            format!("🚫 Showing reclaimable only ({hidden_count} hidden)")
+        } else if hidden_count > 0 {
+            format!("👁 Showing all · {hidden_count} are 0 B")
         } else {
-            "Hide unreclaimable (0 bytes)".to_string()
+            "👁 Showing all".to_string()
         };
-        ui.checkbox(&mut table_state.hide_unreclaimable, label)
-            .on_hover_text(
-                "Filter out groups whose files are already hardlinked / \
-                 share storage on disk (nothing to free). Groups stay in \
-                 the data model; only the table view hides them. Doesn't \
-                 affect the Reclaimable total in the header.",
-            );
+        let toggle_color = if table_state.hide_unreclaimable {
+            theme::ACCENT
+        } else {
+            theme::TEXT_HI
+        };
+        ui.toggle_value(
+            &mut table_state.hide_unreclaimable,
+            RichText::new(toggle_text).color(toggle_color).strong(),
+        )
+        .on_hover_text(
+            "Toggle: hide groups whose files are already hardlinked / \
+             share storage on disk (nothing to free). Groups stay in \
+             the data model; only the table view hides them. Doesn't \
+             affect the Reclaimable total in the header.",
+        );
     });
     ui.add_space(4.0);
 
@@ -657,8 +664,19 @@ pub fn show_filtered(
     clicked
 }
 
+/// User-facing path display. Strips Windows verbatim-path prefix
+/// (`\\?\`) so dup-table rows + tooltips show `C:\Foo\bar` instead of
+/// `\\?\C:\Foo\bar`. UNC verbatim form (`\\?\UNC\srv\share`) is
+/// rewritten back to `\\srv\share`.
 fn format_path(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.starts_with("UNC\\") {
+            return format!(r"\\{}", &rest[4..]);
+        }
+        return rest.to_string();
+    }
+    s.into_owned()
 }
 
 fn group_passes_filter(
