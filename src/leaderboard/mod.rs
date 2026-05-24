@@ -26,6 +26,7 @@ pub mod catalog;
 pub mod hardware;
 pub mod install;
 pub mod hmac_signer;
+pub mod ranks_poll;
 pub mod registration;
 pub mod submission;
 

@@ -710,6 +710,22 @@ pub fn clear_last_outcome() {
     }
 }
 
+/// Merge fresh ranks into the stored Accepted outcome. Called by the
+/// ranks-poll worker once the backend's async compute completes.
+/// No-op if the stored outcome isn't Accepted — by then the modal
+/// has either moved on or the submission failed; either way the
+/// ranks are stale.
+pub fn update_last_outcome_ranks(fresh: Vec<RankEntry>) {
+    let m = match LAST_OUTCOME.get() {
+        Some(m) => m,
+        None => return,
+    };
+    let mut guard = m.lock();
+    if let Some(SubmitOutcome::Accepted { ranks, .. }) = guard.as_mut() {
+        *ranks = fresh;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

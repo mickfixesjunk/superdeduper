@@ -29,6 +29,14 @@ pub fn sign(install_key: &InstallKey, body: &[u8]) -> String {
     hex_encode(&bytes)
 }
 
+/// Sign a canonical string. Used by GET endpoints (no body) where
+/// the server's canonical input is a deterministic string assembled
+/// from query params (e.g. `${install_id}|${submission_id}` for
+/// `/api/v1/ranks`). No trailing newline, no whitespace.
+pub fn sign_canonical(install_key: &InstallKey, canonical: &str) -> String {
+    sign(install_key, canonical.as_bytes())
+}
+
 /// Serialise a JSON value into canonical bytes: keys sorted, no
 /// trailing whitespace, no insignificant whitespace. This is what
 /// `sign()` operates on AND what gets POSTed as the request body —

@@ -669,6 +669,13 @@ impl SuperdeduperApp {
             // or transient — to the local archive dir so the user
             // has a permanent record they can come back to.
             submission::archive_attempt(&inputs, &state.install_id, &outcome);
+            // On Accepted, kick off the ranks poller. Web computes
+            // ranks async-but-immediate (~200ms typical); the poller
+            // surfaces them via toast + modal-update once the
+            // backend's worker lands them.
+            if let submission::SubmitOutcome::Accepted { submission_id, .. } = &outcome {
+                crate::leaderboard::ranks_poll::spawn_ranks_poll_worker(submission_id.clone());
+            }
             // Clear the pending slot only when the server accepted
             // the payload (or has it on file via 409). Rejected /
             // Transient stay pending so a follow-up Submit-for-
@@ -2657,6 +2664,11 @@ impl eframe::App for SuperdeduperApp {
         // with preflight (both are scan-boundary modals).
         #[cfg(feature = "telemetry")]
         self.tick_scan_complete_modal(ctx);
+
+        // Corner toasts (rank-ready, etc). Renders in the foreground
+        // layer over everything; auto-expires + fades. Pushed from
+        // background workers via gui::widgets::toast::push().
+        crate::gui::widgets::toast::show(ctx);
 
         // Sparkles render LAST in their own foreground layer +
         // clipped to the progress-bar fill rect. Anything that
