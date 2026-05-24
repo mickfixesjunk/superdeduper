@@ -12,7 +12,7 @@
 //!   system-path permission
 //! * **Pre-flight** — skip the score-card modal before scans
 
-use egui::{Context, RichText, Window};
+use egui::{Context, RichText};
 
 use crate::gui::state::ScanSettings;
 use crate::gui::theme;
@@ -74,87 +74,160 @@ const TAB_BUTTON_WIDTH: f32 = 124.0;
 const PANEL_HEIGHT: f32 = 390.0;
 
 /// Returns `true` if the user clicked Close / Done this frame.
+///
+/// Layout note: previously used `egui::Window` which got hijacked
+/// by egui's persistent window-state memory — a prior session that
+/// dragged or resized the modal would have its geometry restored
+/// even with `.fixed_size()` set on the builder. Switched to an
+/// `egui::Area` with a versioned id so persistence resets cleanly,
+/// plus an inner `Frame` with a fixed allocated rect so the body's
+/// dimensions are computed from one explicit source of truth instead
+/// of inferred from content.
 pub fn show(
     ctx: &Context,
     open: &mut bool,
     settings: &mut ScanSettings,
     state: &mut SettingsModalState,
 ) -> bool {
+    if !*open {
+        return false;
+    }
     let mut closed = false;
-    Window::new(RichText::new("⚙ Settings").color(theme::TEXT_HI).heading())
-        .open(open)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        // Hard-clamp width AND height. Earlier .fixed_size() alone
-        // didn't always hold — content wanting to grow could push
-        // the modal to full window width, leaving the tab list
-        // "splatted across the page." Explicit min/max on both
-        // axes makes the constraint un-bypassable by inner UIs.
-        .min_width(MODAL_WIDTH)
-        .max_width(MODAL_WIDTH)
-        .min_height(MODAL_HEIGHT)
-        .max_height(MODAL_HEIGHT)
-        .default_size(egui::vec2(MODAL_WIDTH, MODAL_HEIGHT))
-        .show(ctx, |ui| {
-            ui.set_max_width(MODAL_WIDTH - 16.0);
-            ui.label(
-                RichText::new("Knobs apply to the next scan.")
-                    .color(theme::TEXT_LO)
-                    .small(),
-            );
-            ui.add_space(6.0);
+    let screen = ctx.screen_rect();
+    let top_left = egui::pos2(
+        (screen.width() - MODAL_WIDTH).max(0.0) / 2.0 + screen.left(),
+        (screen.height() - MODAL_HEIGHT).max(0.0) / 2.0 + screen.top(),
+    );
 
-            // Both panels (tab list, content) share an explicit
-            // height so neither can grow past the window's reserved
-            // area. The content panel uses ScrollArea inside this
-            // height so over-long tabs scroll instead of overflow.
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), PANEL_HEIGHT),
-                egui::Layout::left_to_right(egui::Align::TOP),
-                |ui| {
-                    // Left: tab list — locked column so the list
-                    // can never reflow to a horizontal layout.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(TAB_LIST_WIDTH, PANEL_HEIGHT),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_max_width(TAB_LIST_WIDTH);
-                            for tab in SettingsTab::all() {
-                                let selected = state.tab == tab;
-                                let label = if selected {
-                                    RichText::new(tab.label())
-                                        .color(theme::ACCENT)
-                                        .strong()
-                                        .size(14.0)
-                                } else {
-                                    RichText::new(tab.label())
-                                        .color(theme::TEXT_HI)
-                                        .size(14.0)
-                                };
-                                let btn = egui::Button::new(label)
-                                    .frame(false)
-                                    .fill(if selected {
-                                        theme::ACCENT_DIM
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    })
-                                    .min_size(egui::vec2(TAB_BUTTON_WIDTH, 26.0));
-                                if ui.add(btn).clicked() {
-                                    state.tab = tab;
-                                }
-                            }
-                        },
-                    );
-                    ui.separator();
-                    ui.add_space(4.0);
-                    // Right: tab content. ScrollArea constrained so
-                    // over-long tabs scroll inside the panel; the
-                    // panel never pushes the footer off-screen.
-                    egui::ScrollArea::vertical()
-                        .max_height(PANEL_HEIGHT)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| match state.tab {
+    // Dim background — full-screen overlay so the modal feels modal.
+    egui::Area::new(egui::Id::new("sd-settings-modal-v3-backdrop"))
+        .order(egui::Order::Background)
+        .fixed_pos(screen.left_top())
+        .show(ctx, |ui| {
+            let painter = ui.painter();
+            painter.rect_filled(
+                screen,
+                egui::Rounding::ZERO,
+                egui::Color32::from_black_alpha(140),
+            );
+        });
+
+    egui::Area::new(egui::Id::new("sd-settings-modal-v3"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(top_left)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(theme::PANEL_DEEP)
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT_DIM))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(egui::Margin::same(12.0))
+                .show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(MODAL_WIDTH, MODAL_HEIGHT));
+                    ui.set_max_size(egui::vec2(MODAL_WIDTH, MODAL_HEIGHT));
+                    closed = render_modal_body(ui, open, settings, state);
+                });
+        });
+
+    closed
+}
+
+/// Inner body of the modal — title bar, tab list + content panel,
+/// footer. Returns `true` if the user clicked Done or the X close
+/// button.
+fn render_modal_body(
+    ui: &mut egui::Ui,
+    open: &mut bool,
+    settings: &mut ScanSettings,
+    state: &mut SettingsModalState,
+) -> bool {
+    let mut closed = false;
+
+    // Title bar — heading + flush-right X close button.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("⚙ Settings")
+                .color(theme::TEXT_HI)
+                .heading(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("✕").color(theme::TEXT_HI))
+                        .frame(false)
+                        .min_size(egui::vec2(24.0, 24.0)),
+                )
+                .clicked()
+            {
+                *open = false;
+                closed = true;
+            }
+        });
+    });
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Knobs apply to the next scan.")
+            .color(theme::TEXT_LO)
+            .small(),
+    );
+    ui.add_space(8.0);
+
+    // Body — two-column layout with explicit column widths.
+    // `columns_const`-style: hand-allocate two child UIs with rigid
+    // sizes. Earlier `allocate_ui_with_layout(left_to_right)` was
+    // letting children grow horizontally on some egui paths; this
+    // structure removes the ambiguity.
+    let body_size = egui::vec2(MODAL_WIDTH - 24.0, PANEL_HEIGHT);
+    ui.allocate_ui_with_layout(body_size, egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+        // Left: tab list.
+        ui.allocate_ui_with_layout(
+            egui::vec2(TAB_LIST_WIDTH, PANEL_HEIGHT),
+            egui::Layout::top_down_justified(egui::Align::Min),
+            |ui| {
+                ui.set_min_width(TAB_LIST_WIDTH);
+                ui.set_max_width(TAB_LIST_WIDTH);
+                for tab in SettingsTab::all() {
+                    let selected = state.tab == tab;
+                    let label = if selected {
+                        RichText::new(tab.label())
+                            .color(theme::ACCENT)
+                            .strong()
+                            .size(14.0)
+                    } else {
+                        RichText::new(tab.label())
+                            .color(theme::TEXT_HI)
+                            .size(14.0)
+                    };
+                    let btn = egui::Button::new(label)
+                        .frame(false)
+                        .fill(if selected {
+                            theme::ACCENT_DIM
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .min_size(egui::vec2(TAB_BUTTON_WIDTH, 26.0));
+                    if ui.add(btn).clicked() {
+                        state.tab = tab;
+                    }
+                }
+            },
+        );
+        ui.separator();
+        ui.add_space(4.0);
+        // Right: tab content. Remaining width is body - tab list -
+        // separator - spacing. Constrained so children can't reflow.
+        let content_width = body_size.x - TAB_LIST_WIDTH - 12.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(content_width, PANEL_HEIGHT),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_width(content_width);
+                ui.set_max_width(content_width);
+                egui::ScrollArea::vertical()
+                    .max_height(PANEL_HEIGHT)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(content_width - 4.0);
+                        match state.tab {
                             SettingsTab::Engine => render_engine(ui, settings),
                             SettingsTab::Cache => render_cache(ui, settings),
                             SettingsTab::KeepStrategy => render_keep_strategy(ui, settings),
@@ -162,33 +235,36 @@ pub fn show(
                             SettingsTab::Preflight => render_preflight(ui, settings),
                             #[cfg(feature = "telemetry")]
                             SettingsTab::Leaderboard => render_leaderboard(ui),
-                        });
-                },
-            );
+                        }
+                    });
+            },
+        );
+    });
 
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Reset to defaults").clicked() {
-                    *settings = ScanSettings::default();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Done").color(theme::PANEL_DEEP).strong(),
-                            )
-                            .fill(theme::ACCENT)
-                            .min_size(egui::vec2(100.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        closed = true;
-                    }
-                });
-            });
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Reset to defaults").clicked() {
+            *settings = ScanSettings::default();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Done").color(theme::PANEL_DEEP).strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(100.0, 28.0)),
+                )
+                .clicked()
+            {
+                *open = false;
+                closed = true;
+            }
         });
+    });
+
     closed
 }
 
