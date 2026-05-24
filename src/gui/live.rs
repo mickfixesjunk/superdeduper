@@ -952,17 +952,20 @@ fn run(
             } else {
                 g.unique_inodes
             };
-            if unique_inodes > 1 && !g.link_equivalent {
-                let inode_savings =
-                    g.size.saturating_mul(unique_inodes.saturating_sub(1));
-                reclaimable_inode = reclaimable_inode.saturating_add(inode_savings);
-            }
-            // Track the largest group's total bytes (size * count of
-            // members) for the leaderboard `result_summary
-            // .largest_single_group_bytes` field.
-            let group_total = g.size.saturating_mul(visible_files.len() as u64);
-            if group_total > largest_group_bytes {
-                largest_group_bytes = group_total;
+            let group_reclaim = if !g.link_equivalent && unique_inodes > 1 {
+                g.size.saturating_mul(unique_inodes.saturating_sub(1))
+            } else {
+                0
+            };
+            reclaimable_inode = reclaimable_inode.saturating_add(group_reclaim);
+            // `largest_single_group_bytes` per backend's sanity
+            // check is the largest group's RECLAIM, not its total
+            // bytes-on-disk. Backend rule: largest <= reclaim total.
+            // Using inode-aware per-group reclaim guarantees that
+            // because each per-group reclaim is a summand of the
+            // total (and there are no negative summands).
+            if group_reclaim > largest_group_bytes {
+                largest_group_bytes = group_reclaim;
             }
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
@@ -1192,12 +1195,19 @@ fn run(
         // A new run replaces any previous outcome's display state.
         submission::clear_last_outcome();
     }
+    // Use inode-aware reclaim — this is what overwrites
+    // state.totals.reclaimable_bytes at scan-end (per state.rs's
+    // ScanFinished handler). The path-aware `reclaimable` is kept
+    // for engine-internal diagnostics; the user-facing total must
+    // be inode-aware (true freeable bytes) so the header agrees
+    // with the inline EngineEvent::DuplicateFound accumulation
+    // and the leaderboard payload.
     let _ = tx.send(EngineEvent::ScanFinished {
         at: Instant::now(),
         total_files,
         total_bytes_read,
         duplicates: total_dups,
-        reclaimable_bytes: reclaimable,
+        reclaimable_bytes: reclaimable_inode,
     });
     // T2.1 phase 7 surface: tell the user how many files the tier
     // guard skipped, broken out by class. Silent when the corpus
