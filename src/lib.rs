@@ -16,6 +16,7 @@
 //! Rust API. No `unsafe` code is permitted elsewhere in the crate.
 
 pub mod cache;
+pub mod channel;
 pub mod cli;
 pub mod config;
 pub mod dedupe;
