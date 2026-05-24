@@ -27,6 +27,7 @@ use super::install::InstallState;
 /// Inputs to the submission builder. Caller provides everything the
 /// engine knows about this scan; this module wraps it into the wire
 /// payload + signs + posts.
+#[derive(Debug, Clone)]
 pub struct SubmissionInputs {
     pub run_uuid: String,
     pub sd_version: String,
@@ -47,7 +48,7 @@ pub struct ScanResults {
     pub corpus_signature_hash: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SubmitOutcome {
     /// 200 OK — backend accepted and ranked.
     Accepted {
@@ -263,6 +264,64 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ============================================================
+// Engine→GUI handoff for the most-recent scan's submission inputs.
+//
+// The engine builds [`SubmissionInputs`] at scan-end (see
+// `gui::live::run`) and stashes them here. The GUI's "Submit run"
+// button reads them on click. A single global slot is sufficient:
+// only one scan runs at a time, and only the *most recent* scan
+// is submittable from the UI. Older payloads either succeeded
+// (and the slot was cleared) or sit in the offline queue.
+//
+// Last-outcome cell follows the same pattern so the UI can render
+// "rank #4 in Win11 9950X3D / +2 achievements" inline after the
+// worker thread returns from submit().
+// ============================================================
+
+use parking_lot::Mutex;
+use std::sync::OnceLock;
+
+static PENDING: OnceLock<Mutex<Option<SubmissionInputs>>> = OnceLock::new();
+static LAST_OUTCOME: OnceLock<Mutex<Option<SubmitOutcome>>> = OnceLock::new();
+
+/// Store the freshest scan's submission inputs. Overwrites any
+/// previous value — scan-end semantics: the user can only submit
+/// the latest run.
+pub fn store_pending(inputs: SubmissionInputs) {
+    let m = PENDING.get_or_init(|| Mutex::new(None));
+    *m.lock() = Some(inputs);
+}
+
+/// Snapshot the pending inputs without removing them. Used by the
+/// GUI to decide whether to enable the Submit button + to display
+/// the run's stats next to it.
+pub fn peek_pending() -> Option<SubmissionInputs> {
+    PENDING.get().and_then(|m| m.lock().clone())
+}
+
+/// Remove + return the pending inputs. Called by the Submit worker
+/// thread; ensures the same payload can't be double-submitted by
+/// rapid clicks.
+pub fn take_pending() -> Option<SubmissionInputs> {
+    PENDING.get().and_then(|m| m.lock().take())
+}
+
+pub fn store_last_outcome(o: SubmitOutcome) {
+    let m = LAST_OUTCOME.get_or_init(|| Mutex::new(None));
+    *m.lock() = Some(o);
+}
+
+pub fn peek_last_outcome() -> Option<SubmitOutcome> {
+    LAST_OUTCOME.get().and_then(|m| m.lock().clone())
+}
+
+pub fn clear_last_outcome() {
+    if let Some(m) = LAST_OUTCOME.get() {
+        *m.lock() = None;
+    }
 }
 
 #[cfg(test)]

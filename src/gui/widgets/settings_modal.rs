@@ -729,18 +729,190 @@ fn render_leaderboard(ui: &mut egui::Ui) {
 
     ui.separator();
     ui.add_space(6.0);
+    render_submit_section(ui);
+}
+
+fn render_submit_section(ui: &mut egui::Ui) {
+    use crate::leaderboard::{install, submission};
+
     ui.label(
-        RichText::new("Submit button (G1 next slice)")
+        RichText::new("Submit last completed scan")
             .color(theme::TEXT_HI)
             .strong(),
     );
-    ui.label(
-        RichText::new(
-            "After each completed scan the engine will surface a 'Submit run' \
-             button in the post-scan view (greyed until registered + opt-in). \
-             Failed submissions queue to disk and retry on the next launch.",
-        )
-        .color(theme::TEXT_LO)
-        .small(),
-    );
+    ui.add_space(4.0);
+
+    let pending = submission::peek_pending();
+    let registered = matches!(install::load(), Ok(Some(s)) if s.registered);
+
+    match (&pending, registered) {
+        (None, _) => {
+            ui.label(
+                RichText::new("No completed scan available — run a scan first.")
+                    .color(theme::TEXT_LO)
+                    .small(),
+            );
+        }
+        (Some(p), false) => {
+            ui.label(
+                RichText::new(format!(
+                    "Run ready ({} files, {}). Register this install above to enable submission.",
+                    p.scan.files_scanned,
+                    theme::humansize(p.scan.bytes_scanned),
+                ))
+                .color(theme::WARN)
+                .small(),
+            );
+        }
+        (Some(p), true) => {
+            ui.label(
+                RichText::new(format!(
+                    "Run ready: {} files, {} read, {} groups, hash={}",
+                    p.scan.files_scanned,
+                    theme::humansize(p.scan.bytes_scanned),
+                    p.scan.duplicate_groups,
+                    p.scan.hash_algo,
+                ))
+                .color(theme::TEXT_HI)
+                .small(),
+            );
+            ui.add_space(4.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Submit run")
+                            .color(theme::PANEL_DEEP)
+                            .strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(140.0, 28.0)),
+                )
+                .on_hover_text(
+                    "POST signed payload to api.superdeduper.io/api/v1/submit. \
+                     Failed submissions queue to disk and retry on next launch.",
+                )
+                .clicked()
+            {
+                std::thread::spawn(|| {
+                    let state = match install::load() {
+                        Ok(Some(s)) if s.registered => s,
+                        _ => {
+                            submission::store_last_outcome(
+                                submission::SubmitOutcome::Rejected {
+                                    status: 0,
+                                    reason: "install not registered".into(),
+                                },
+                            );
+                            return;
+                        }
+                    };
+                    let inputs = match submission::take_pending() {
+                        Some(i) => i,
+                        None => {
+                            submission::store_last_outcome(
+                                submission::SubmitOutcome::Rejected {
+                                    status: 0,
+                                    reason: "no pending submission".into(),
+                                },
+                            );
+                            return;
+                        }
+                    };
+                    let outcome = submission::submit(&state, &inputs);
+                    // 5xx / transport failures queue for retry.
+                    if let submission::SubmitOutcome::Transient { reason } = &outcome {
+                        eprintln!("leaderboard: submit transient ({reason}); enqueueing");
+                        let body = crate::leaderboard::hmac_signer::canonical_body(
+                            &submission::build_payload(&inputs),
+                        );
+                        let signature = match state.install_key() {
+                            Some(k) => crate::leaderboard::hmac_signer::sign(&k, &body),
+                            None => String::new(),
+                        };
+                        if let Err(e) = submission::enqueue(&inputs, &signature) {
+                            eprintln!("leaderboard: enqueue failed: {e:?}");
+                        }
+                    }
+                    submission::store_last_outcome(outcome);
+                });
+            }
+        }
+    }
+
+    ui.add_space(8.0);
+    if let Some(out) = submission::peek_last_outcome() {
+        render_outcome(ui, &out);
+    }
+}
+
+fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::SubmitOutcome) {
+    use crate::leaderboard::submission::SubmitOutcome;
+    match outcome {
+        SubmitOutcome::Accepted {
+            submission_id,
+            ranks,
+            achievements_unlocked,
+            profile_url,
+        } => {
+            ui.label(
+                RichText::new("Accepted")
+                    .color(theme::ACCENT)
+                    .strong(),
+            );
+            if !submission_id.is_empty() {
+                ui.label(
+                    RichText::new(format!("submission_id:  {submission_id}"))
+                        .color(theme::TEXT_LO)
+                        .small()
+                        .monospace(),
+                );
+            }
+            for r in ranks {
+                ui.label(
+                    RichText::new(format!(
+                        "  rank #{} in {}/{} (of {})",
+                        r.rank, r.category, r.bracket, r.bucket_size,
+                    ))
+                    .color(theme::TEXT_HI)
+                    .small(),
+                );
+            }
+            for a in achievements_unlocked {
+                ui.label(
+                    RichText::new(format!("  achievement unlocked: {a}"))
+                        .color(theme::ACCENT)
+                        .small(),
+                );
+            }
+            if let Some(url) = profile_url {
+                ui.hyperlink_to(
+                    RichText::new("view profile").color(theme::ACCENT),
+                    url,
+                );
+            }
+        }
+        SubmitOutcome::DuplicateNoChange => {
+            ui.label(
+                RichText::new("Already submitted (no change)")
+                    .color(theme::TEXT_LO)
+                    .small(),
+            );
+        }
+        SubmitOutcome::Rejected { status, reason } => {
+            ui.label(
+                RichText::new(format!("Rejected ({status}): {reason}"))
+                    .color(theme::HOT)
+                    .small(),
+            );
+        }
+        SubmitOutcome::Transient { reason } => {
+            ui.label(
+                RichText::new(format!(
+                    "Transient failure: {reason} — queued for retry on next launch.",
+                ))
+                .color(theme::WARN)
+                .small(),
+            );
+        }
+    }
 }

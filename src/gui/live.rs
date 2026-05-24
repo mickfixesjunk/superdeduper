@@ -1070,6 +1070,13 @@ fn run(
                 corpus_sig.split(':').nth(1).map(|h| &h[..8]).unwrap_or(""),
             ),
         });
+        // Stash the inputs in the engine→GUI handoff slot so the
+        // post-scan "Submit run" button has something to send. The
+        // global slot is overwritten on every scan-end — only the
+        // freshest run is submittable from the UI.
+        submission::store_pending(inputs);
+        // A new run replaces any previous outcome's display state.
+        submission::clear_last_outcome();
     }
     let _ = tx.send(EngineEvent::ScanFinished {
         at: Instant::now(),
