@@ -178,7 +178,14 @@ fn render_grid(
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (i, tile) in classified.iter().enumerate() {
-                    if render_tile(ui, tile.entry, tile.granted, tile.locked, TILE_SIZE) {
+                    if render_tile(
+                        ui,
+                        tile.entry,
+                        tile.granted,
+                        tile.locked,
+                        &tile.granted_years,
+                        TILE_SIZE,
+                    ) {
                         *action = Some(BadgeWallAction::TileClicked(tile.entry.id.clone()));
                     }
                     if (i + 1) % COLS == 0 {
@@ -190,11 +197,18 @@ fn render_grid(
 }
 
 /// Render a single tile. Returns `true` if clicked this frame.
+///
+/// `granted_years` is non-empty only for recurring-annual entries
+/// (per spec §6.2): it carries every year that grant has been
+/// earned in, sorted ascending. The face label appends the most
+/// recent year ("Holiday Cleaner 2026") and the tooltip lists all
+/// of them ("Granted 2025, 2026").
 fn render_tile(
     ui: &mut egui::Ui,
     entry: &CatalogEntry,
     granted: bool,
     locked: bool,
+    granted_years: &[u16],
     size: egui::Vec2,
 ) -> bool {
     let (fill, stroke_color, text_color) = if locked {
@@ -251,8 +265,12 @@ fn render_tile(
                         .strong()
                         .size(22.0),
                 );
+                let face_label = match granted_years.last() {
+                    Some(latest) => format!("{} {}", short_name(&entry.name), latest),
+                    None => short_name(&entry.name),
+                };
                 ui.label(
-                    RichText::new(short_name(&entry.name))
+                    RichText::new(face_label)
                         .color(text_color)
                         .size(9.5),
                 );
@@ -266,7 +284,19 @@ fn render_tile(
             entry.name, entry.description,
         )
     } else if granted {
-        format!("{}\n\n{}", entry.name, entry.description)
+        if granted_years.is_empty() {
+            format!("{}\n\n{}", entry.name, entry.description)
+        } else {
+            let years_str = granted_years
+                .iter()
+                .map(|y| y.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{}\n\nGranted {}\n\n{}",
+                entry.name, years_str, entry.description,
+            )
+        }
     } else {
         format!(
             "{} (not yet earned)\n\nUnlock: {}",
@@ -282,7 +312,16 @@ fn render_tile(
     let access_label = if locked {
         format!("{}: locked", entry.name)
     } else if granted {
-        format!("{}: granted", entry.name)
+        if granted_years.is_empty() {
+            format!("{}: granted", entry.name)
+        } else {
+            let years_str = granted_years
+                .iter()
+                .map(|y| y.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}: granted {}", entry.name, years_str)
+        }
     } else {
         format!("{}: not yet earned", entry.name)
     };
@@ -323,6 +362,13 @@ pub struct GridTile<'a> {
     /// Mutually exclusive with `granted` (locked tiles can't be
     /// granted by definition; backend won't emit grants for them).
     pub locked: bool,
+    /// Years this recurring-annual achievement has been granted in,
+    /// sorted ascending. Empty for non-recurring entries and for
+    /// recurring-annual entries with zero grants yet. Drives the
+    /// per-tile year suffix ("Holiday Cleaner 2026") + the
+    /// "Granted 2026, 2027, 2028" tooltip (per design's
+    /// gamification-achievement-balance.md §6.2).
+    pub granted_years: Vec<u16>,
 }
 
 /// Achievement IDs that are part of the sd-nas-pro feature track
@@ -342,6 +388,29 @@ fn is_nas_pro_locked(id: &str) -> bool {
     NAS_PRO_LOCKED_IDS.iter().any(|nas_id| *nas_id == id)
 }
 
+/// Split a grant ID into `(base, Some(year))` if it carries the
+/// recurring-annual composite suffix `<base>#<YYYY>`, else
+/// `(id, None)`. Per design's
+/// `gamification-achievement-balance.md` §11.6 the backend writes
+/// per-year grants under composite keys (`holiday-cleaner#2026`)
+/// while the catalog row stays plain (`holiday-cleaner`); the
+/// client aggregates back to the base when rendering. Malformed
+/// suffixes (`#abc`, `#`, multi-`#`) fall through as plain IDs so
+/// a stray grant row doesn't crash the badge wall.
+fn parse_grant_id(id: &str) -> (&str, Option<u16>) {
+    let Some((base, tail)) = id.rsplit_once('#') else {
+        return (id, None);
+    };
+    // Reject empty base / multi-`#` ambiguity; treat as plain.
+    if base.is_empty() || base.contains('#') {
+        return (id, None);
+    }
+    match tail.parse::<u16>() {
+        Ok(year) => (base, Some(year)),
+        Err(_) => (id, None),
+    }
+}
+
 /// Pure helper: given a [`CatalogState`] + the catalog's achievement
 /// list, return tiles in render order (granted-first, then by
 /// `display_order` within each bucket). This is the *exact* logic
@@ -352,13 +421,32 @@ pub fn classify_grid_entries<'a>(
     state: &CatalogState,
     catalog_entries: &'a [CatalogEntry],
 ) -> Vec<GridTile<'a>> {
-    let grants: HashMap<&str, bool> = match state.profile.as_ref() {
-        Some(Ok(p)) => p
-            .achievements
-            .iter()
-            .map(|g| (g.achievement_id.as_str(), g.granted))
-            .collect(),
-        _ => HashMap::new(),
+    // Two parallel maps over the profile grants. Plain (no `#YYYY`
+    // suffix) grants populate `plain_grants`; composite recurring-
+    // annual grants get their years collected under the base ID in
+    // `years_by_base`. A base ID is "granted" iff it has at least one
+    // year — `granted_at` per row carries the per-year timestamp.
+    let (plain_grants, years_by_base) = match state.profile.as_ref() {
+        Some(Ok(p)) => {
+            let mut plain: HashMap<&str, bool> = HashMap::new();
+            let mut years: HashMap<&str, Vec<u16>> = HashMap::new();
+            for g in &p.achievements {
+                let (base, year) = parse_grant_id(g.achievement_id.as_str());
+                match year {
+                    Some(y) if g.granted => years.entry(base).or_default().push(y),
+                    Some(_) => {} // ungranted year row — ignore
+                    None => {
+                        plain.insert(base, g.granted);
+                    }
+                }
+            }
+            for v in years.values_mut() {
+                v.sort();
+                v.dedup();
+            }
+            (plain, years)
+        }
+        _ => (HashMap::new(), HashMap::new()),
     };
     let mut tiles: Vec<GridTile<'a>> = catalog_entries
         .iter()
@@ -368,8 +456,23 @@ pub fn classify_grid_entries<'a>(
             // won't emit grants for entries whose feature hasn't
             // shipped, so even if the profile somehow contains
             // one we mask it off as locked.
-            let granted = !locked && grants.get(e.id.as_str()).copied().unwrap_or(false);
-            GridTile { entry: e, granted, locked }
+            let granted_years = if locked {
+                Vec::new()
+            } else {
+                years_by_base
+                    .get(e.id.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let granted = !locked
+                && (!granted_years.is_empty()
+                    || plain_grants.get(e.id.as_str()).copied().unwrap_or(false));
+            GridTile {
+                entry: e,
+                granted,
+                locked,
+                granted_years,
+            }
         })
         .collect();
     // Sort order: granted first (visual test-friendly), then
@@ -389,11 +492,26 @@ fn count_grants(state: &CatalogState) -> (u32, u32) {
         .and_then(|r| r.as_ref().ok())
         .map(|c| c.achievements.len() as u32)
         .unwrap_or(0);
+    // Recurring-annual grants land as composite `<base>#<YYYY>`
+    // rows (spec §6.2 / §11.6); multiple year-rows under the same
+    // base must collapse to one toward the "X of N badges" headline
+    // — otherwise an install with two years of `holiday-cleaner`
+    // pushes the granted-count above the catalog total.
     let granted = state
         .profile
         .as_ref()
         .and_then(|r| r.as_ref().ok())
-        .map(|p| p.achievements.iter().filter(|g| g.granted).count() as u32)
+        .map(|p| {
+            let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for g in &p.achievements {
+                if !g.granted {
+                    continue;
+                }
+                let (base, _) = parse_grant_id(g.achievement_id.as_str());
+                bases.insert(base);
+            }
+            bases.len() as u32
+        })
         .unwrap_or(0);
     (granted, total)
 }
@@ -805,6 +923,189 @@ mod tests {
         let brisk = tiles.iter().find(|t| t.entry.id == "brisk").unwrap();
         assert!(!brisk.locked);
         assert!(brisk.granted);
+    }
+
+    #[test]
+    fn parse_grant_id_splits_recurring_annual_suffix() {
+        assert_eq!(parse_grant_id("holiday-cleaner"), ("holiday-cleaner", None));
+        assert_eq!(
+            parse_grant_id("holiday-cleaner#2026"),
+            ("holiday-cleaner", Some(2026))
+        );
+        assert_eq!(
+            parse_grant_id("new-years-resolution#2025"),
+            ("new-years-resolution", Some(2025))
+        );
+    }
+
+    #[test]
+    fn parse_grant_id_rejects_malformed_suffix() {
+        // Empty year, non-numeric year, empty base, multi-`#` — all
+        // fall back to "treat as plain id" so a stray bad row doesn't
+        // crash classify_grid_entries.
+        assert_eq!(parse_grant_id("holiday-cleaner#"), ("holiday-cleaner#", None));
+        assert_eq!(parse_grant_id("holiday-cleaner#abc"), ("holiday-cleaner#abc", None));
+        assert_eq!(parse_grant_id("#2026"), ("#2026", None));
+        // Multi-`#` is ambiguous; treat the entire thing as plain.
+        assert_eq!(
+            parse_grant_id("holiday#cleaner#2026"),
+            ("holiday#cleaner#2026", None)
+        );
+    }
+
+    #[test]
+    fn recurring_annual_grants_aggregate_under_base_id() {
+        // Catalog row is the plain base ID; profile has two
+        // per-year composite grants. Tile must aggregate them into
+        // one granted tile with granted_years = [2025, 2026].
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![
+                entry("holiday-cleaner", "Holiday Cleaner", "low", 700),
+                entry("brisk", "Brisk", "low", 200),
+            ],
+        };
+        let state = CatalogState {
+            catalog: Some(Ok(catalog.clone())),
+            profile: Some(Ok(Profile {
+                install_id: "x".into(),
+                lifetime: Default::default(),
+                achievements: vec![
+                    ProfileGrant {
+                        achievement_id: "holiday-cleaner#2025".into(),
+                        granted: true,
+                        granted_at: Some("2025-12-28T10:00:00Z".into()),
+                    },
+                    ProfileGrant {
+                        achievement_id: "holiday-cleaner#2026".into(),
+                        granted: true,
+                        granted_at: Some("2026-12-29T10:00:00Z".into()),
+                    },
+                ],
+            })),
+        };
+        let tiles = classify_grid_entries(&state, &catalog.achievements);
+        let holiday = tiles
+            .iter()
+            .find(|t| t.entry.id == "holiday-cleaner")
+            .expect("holiday-cleaner tile present");
+        assert!(holiday.granted, "two per-year grants → tile granted");
+        assert_eq!(holiday.granted_years, vec![2025, 2026]);
+        // brisk untouched.
+        let brisk = tiles.iter().find(|t| t.entry.id == "brisk").unwrap();
+        assert!(!brisk.granted);
+        assert!(brisk.granted_years.is_empty());
+    }
+
+    #[test]
+    fn recurring_annual_grants_dedupe_and_sort_years() {
+        // Backend could emit the same year twice (e.g. a re-grant
+        // after a manual server-side fix), and the order is not
+        // guaranteed. Test that we dedupe + sort.
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![entry("holiday-cleaner", "Holiday Cleaner", "low", 700)],
+        };
+        let state = CatalogState {
+            catalog: Some(Ok(catalog.clone())),
+            profile: Some(Ok(Profile {
+                install_id: "x".into(),
+                lifetime: Default::default(),
+                achievements: vec![
+                    ProfileGrant {
+                        achievement_id: "holiday-cleaner#2027".into(),
+                        granted: true,
+                        granted_at: None,
+                    },
+                    ProfileGrant {
+                        achievement_id: "holiday-cleaner#2025".into(),
+                        granted: true,
+                        granted_at: None,
+                    },
+                    ProfileGrant {
+                        achievement_id: "holiday-cleaner#2025".into(),
+                        granted: true,
+                        granted_at: None,
+                    },
+                ],
+            })),
+        };
+        let tiles = classify_grid_entries(&state, &catalog.achievements);
+        let h = tiles
+            .iter()
+            .find(|t| t.entry.id == "holiday-cleaner")
+            .unwrap();
+        assert_eq!(h.granted_years, vec![2025, 2027]);
+    }
+
+    #[test]
+    fn ungranted_year_rows_do_not_grant_the_base() {
+        // A row like `holiday-cleaner#2026` with `granted: false`
+        // must NOT cause the base tile to render as granted. This
+        // is the edge case where backend writes the row at year
+        // rollover before the predicate fires.
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![entry("holiday-cleaner", "Holiday Cleaner", "low", 700)],
+        };
+        let state = CatalogState {
+            catalog: Some(Ok(catalog.clone())),
+            profile: Some(Ok(Profile {
+                install_id: "x".into(),
+                lifetime: Default::default(),
+                achievements: vec![ProfileGrant {
+                    achievement_id: "holiday-cleaner#2026".into(),
+                    granted: false,
+                    granted_at: None,
+                }],
+            })),
+        };
+        let tiles = classify_grid_entries(&state, &catalog.achievements);
+        let h = tiles
+            .iter()
+            .find(|t| t.entry.id == "holiday-cleaner")
+            .unwrap();
+        assert!(!h.granted);
+        assert!(h.granted_years.is_empty());
+    }
+
+    #[test]
+    fn count_grants_dedupes_recurring_annual_years() {
+        // Two `holiday-cleaner` per-year grants must collapse to a
+        // single base in the "X of N" counter; otherwise X can
+        // exceed N which reads as a corrupted UI.
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![
+                entry("holiday-cleaner", "Holiday Cleaner", "low", 700),
+                entry("brisk", "Brisk", "low", 200),
+            ],
+        };
+        let state = CatalogState {
+            catalog: Some(Ok(catalog)),
+            profile: Some(Ok(Profile {
+                install_id: "x".into(),
+                lifetime: Default::default(),
+                achievements: vec![
+                    ProfileGrant {
+                        achievement_id: "holiday-cleaner#2025".into(),
+                        granted: true,
+                        granted_at: None,
+                    },
+                    ProfileGrant {
+                        achievement_id: "holiday-cleaner#2026".into(),
+                        granted: true,
+                        granted_at: None,
+                    },
+                    ProfileGrant {
+                        achievement_id: "brisk".into(),
+                        granted: true,
+                        granted_at: None,
+                    },
+                ],
+            })),
+        };
+        assert_eq!(count_grants(&state), (2, 2));
     }
 
     #[test]
