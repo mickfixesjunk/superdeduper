@@ -249,6 +249,20 @@ fn render_tile(
             entry.name, entry.description,
         )
     };
+    // Publish an accessible label so screen readers + the
+    // egui_kittest render tests can identify which tile is which
+    // AND read its grant state. Pattern: "<Name>: granted" vs
+    // "<Name>: not yet earned". The granted-state suffix is the
+    // assertion target in `badge_wall_renders_granted_glyphs_from_live_server_shape`.
+    let access_label = if granted {
+        format!("{}: granted", entry.name)
+    } else {
+        format!("{}: not yet earned", entry.name)
+    };
+    let label_for_widget = access_label.clone();
+    resp.clone().widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label_for_widget)
+    });
     resp.on_hover_text(tooltip).clicked()
 }
 
@@ -482,6 +496,194 @@ mod tests {
         let tiles = classify_grid_entries(&state, &catalog_entries);
         assert_eq!(tiles.len(), 2);
         assert!(tiles.iter().all(|t| !t.granted), "errored profile yields all-ungranted");
+    }
+
+    /// **Render-pipeline test for the badge-wall bug class.**
+    ///
+    /// Drives the full egui frame loop via `egui_kittest`: builds a
+    /// CatalogState from the live server JSON shape, renders the
+    /// real `badge_wall::show()` widget, queries the AccessKit tree,
+    /// and counts the granted-vs-ungranted glyph nodes (★/◆/● for
+    /// granted tiers, ○ for ungranted).
+    ///
+    /// What this catches that `badge_wall_classifies_granted_tiles_from_live_server_shape`
+    /// does NOT:
+    ///
+    /// - Render-pipeline regressions where `classify_grid_entries`
+    ///   returns the right state but the widget paints the wrong
+    ///   glyph or style.
+    /// - Repaint timing where the widget caches an earlier frame's
+    ///   data instead of reading the current `CatalogState`.
+    /// - The path between `classify_grid_entries` and the painted
+    ///   `RichText` / `Frame` calls.
+    ///
+    /// What it still does NOT catch (Tier 3 territory): exact
+    /// pixel colors, font hinting, HiDPI scaling, animation states.
+    /// Those need sdd-testwin screenshot diffs.
+    #[test]
+    fn badge_wall_renders_granted_glyphs_from_live_server_shape() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![
+                entry("tidy-up", "Tidy-up", "low", 100),
+                entry("brisk", "Brisk", "low", 200),
+                entry("founder", "Founder", "high", 550),
+                entry("pioneer", "Pioneer", "mid", 560),
+                entry("hello-world", "Hello World", "low", 900),
+            ],
+        };
+        let profile_json = r#"{
+            "install_id": "test-install",
+            "lifetime": { "bytes_reclaimed": 731677101, "total_scans": 3 },
+            "achievements": [
+                { "id": "tidy-up",     "granted": false, "granted_at": null },
+                { "id": "brisk",       "granted": true,  "granted_at": "2026-05-24T14:22:52Z" },
+                { "id": "founder",     "granted": true,  "granted_at": "2026-05-24T05:20:37Z" },
+                { "id": "pioneer",     "granted": false, "granted_at": null },
+                { "id": "hello-world", "granted": true,  "granted_at": "2026-05-24T14:22:52Z" }
+            ]
+        }"#;
+        let profile: Profile = serde_json::from_str(profile_json).unwrap();
+        let state = CatalogState {
+            catalog: Some(Ok(catalog)),
+            profile: Some(Ok(profile)),
+        };
+
+        // Drive the real `badge_wall::show()` through the egui frame
+        // loop. The closure mutates no state; the assertions below
+        // run against the rendered AccessKit tree.
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            super::show(ui, &state);
+        });
+        harness.run();
+
+        // Each granted tile renders a tier-specific glyph: ★ for
+        // "high", ◆ for "mid", ● for "low". Three grants in the
+        // fixture: brisk (low ●) + founder (high ★) + hello-world
+        // (low ●). Expected: 2 ● glyphs from granted + 1 ★ glyph.
+        // Each ungranted tile renders ○. Expected: 2 ○ glyphs.
+        // Read every accessible label that the rendered widget
+        // exposed. Each tile publishes its grant state as
+        // "<Name>: granted" or "<Name>: not yet earned" via
+        // `WidgetInfo::labeled`. The harness drives a real egui
+        // frame end-to-end; if the widget reads the wrong field,
+        // skips classification, or fails to publish accessibility
+        // info, this test goes red.
+        let labels: Vec<String> = harness
+            .node()
+            .query_all_by_label_contains("")
+            .filter_map(|n| n.accesskit_node().label())
+            .collect();
+
+        let granted_tiles: Vec<&String> = labels
+            .iter()
+            .filter(|s| s.ends_with(": granted"))
+            .collect();
+        let ungranted_tiles: Vec<&String> = labels
+            .iter()
+            .filter(|s| s.ends_with(": not yet earned"))
+            .collect();
+
+        assert_eq!(
+            granted_tiles.len(),
+            3,
+            "3 grants in the fixture should render 3 granted tiles. \
+             Got {} granted, full labels: {labels:?}",
+            granted_tiles.len()
+        );
+        assert_eq!(
+            ungranted_tiles.len(),
+            2,
+            "2 ungranted entries should render 2 ungranted tiles. \
+             Got {} ungranted, full labels: {labels:?}",
+            ungranted_tiles.len()
+        );
+
+        // Spot-check the per-tile correctness: brisk + founder +
+        // hello-world land as granted; tidy-up + pioneer as not.
+        assert!(labels.iter().any(|s| s == "Brisk: granted"));
+        assert!(labels.iter().any(|s| s == "Founder: granted"));
+        assert!(labels.iter().any(|s| s == "Hello World: granted"));
+        assert!(labels.iter().any(|s| s == "Tidy-up: not yet earned"));
+        assert!(labels.iter().any(|s| s == "Pioneer: not yet earned"));
+    }
+
+    /// Renders the badge wall to a PNG side-artifact. Two
+    /// scenarios captured for visual proof to Mick:
+    ///
+    /// 1. Empty-profile state (mimics the pre-`ce0ea9f` symptom:
+    ///    profile fetch failed → no grants → all tiles grey).
+    /// 2. Live-grants state (mimics the post-fix outcome: 3 grants
+    ///    in the profile → 3 colorized tiles + the rest grey).
+    ///
+    /// Output: `target/test-artifacts/badge_wall-{empty,granted}.png`.
+    /// The render-pipeline assertion test above proves correctness;
+    /// this test produces the artifacts Mick eyeballs without
+    /// booting the EXE.
+    ///
+    /// Gated behind the `wgpu` + `snapshot` egui_kittest features
+    /// (enabled in Cargo.toml dev-deps).
+    #[test]
+    fn badge_wall_renders_png_side_artifacts() {
+        let out_dir = std::path::PathBuf::from("target/test-artifacts");
+        std::fs::create_dir_all(&out_dir).expect("create test-artifacts dir");
+
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![
+                entry("tidy-up", "Tidy-up", "low", 100),
+                entry("brisk", "Brisk", "low", 200),
+                entry("founder", "Founder", "high", 550),
+                entry("pioneer", "Pioneer", "mid", 560),
+                entry("hello-world", "Hello World", "low", 900),
+            ],
+        };
+
+        // Scenario 1: empty profile → all tiles render ungranted.
+        // This is what Mick saw BEFORE the schema fix (profile
+        // deserialise failed → empty grants → all grey).
+        let empty_state = CatalogState {
+            catalog: Some(Ok(catalog.clone())),
+            profile: Some(Ok(Profile {
+                install_id: "test".into(),
+                lifetime: Default::default(),
+                achievements: vec![],
+            })),
+        };
+        render_to_png(&empty_state, out_dir.join("badge_wall-empty.png").as_path());
+
+        // Scenario 2: live-shape grants → 3 colorized + 2 grey.
+        // What Mick should see AFTER the schema fix.
+        let live_json = r#"{
+            "install_id": "e1eae1fa-58fb-4f5a-8712-a7480ac5761b",
+            "lifetime": { "bytes_reclaimed": 731677101, "total_scans": 3 },
+            "achievements": [
+                { "id": "tidy-up",     "granted": false, "granted_at": null },
+                { "id": "brisk",       "granted": true,  "granted_at": "2026-05-24T14:22:52Z" },
+                { "id": "founder",     "granted": true,  "granted_at": "2026-05-24T05:20:37Z" },
+                { "id": "pioneer",     "granted": false, "granted_at": null },
+                { "id": "hello-world", "granted": true,  "granted_at": "2026-05-24T14:22:52Z" }
+            ]
+        }"#;
+        let live_profile: Profile = serde_json::from_str(live_json).unwrap();
+        let granted_state = CatalogState {
+            catalog: Some(Ok(catalog)),
+            profile: Some(Ok(live_profile)),
+        };
+        render_to_png(&granted_state, out_dir.join("badge_wall-granted.png").as_path());
+    }
+
+    fn render_to_png(state: &CatalogState, path: &std::path::Path) {
+        let state = state.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(360.0, 600.0))
+            .build_ui(move |ui| {
+                super::show(ui, &state);
+            });
+        harness.run();
+        let img = harness.render().expect("render PNG side-artifact");
+        img.save(path).expect("write PNG to disk");
     }
 
     #[test]

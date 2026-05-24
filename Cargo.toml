@@ -44,6 +44,7 @@ bytes = "1.6"
 
 # GUI deps — optional, gated behind the `gui` feature.
 eframe = { version = "0.32", optional = true, default-features = false, features = [
+    "accesskit",
     "default_fonts",
     "glow",
     "persistence",
@@ -128,6 +129,11 @@ features = [
 [dev-dependencies]
 proptest = "1.5"
 tempfile = "3.10"
+# Headless egui harness for widget-render tests (see docs/testing/gui.md).
+# Tracks egui 0.32; bump in lockstep with the main egui pin. The `wgpu`
+# + `snapshot` features enable PNG-rendering for the side-artifact
+# Mick + design asked for.
+egui_kittest = { version = "0.32", features = ["wgpu", "snapshot"] }
 
 [profile.release]
 opt-level = 3
