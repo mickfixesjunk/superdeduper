@@ -178,7 +178,7 @@ fn render_grid(
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (i, tile) in classified.iter().enumerate() {
-                    if render_tile(ui, tile.entry, tile.granted, TILE_SIZE) {
+                    if render_tile(ui, tile.entry, tile.granted, tile.locked, TILE_SIZE) {
                         *action = Some(BadgeWallAction::TileClicked(tile.entry.id.clone()));
                     }
                     if (i + 1) % COLS == 0 {
@@ -194,9 +194,20 @@ fn render_tile(
     ui: &mut egui::Ui,
     entry: &CatalogEntry,
     granted: bool,
+    locked: bool,
     size: egui::Vec2,
 ) -> bool {
-    let (fill, stroke_color, text_color) = if granted {
+    let (fill, stroke_color, text_color) = if locked {
+        // Locked-future-feature tiles: darker fill, dimmer stroke,
+        // faded text. Reads as "exists, sealed for a reason."
+        // Visually distinct from "not yet earned" (which is a
+        // greyed-out invitation to earn it).
+        (
+            Color32::from_rgb(0x14, 0x18, 0x22),
+            Color32::from_gray(48),
+            Color32::from_gray(100),
+        )
+    } else if granted {
         match entry.tier.as_str() {
             "high" => (theme::ACCENT, theme::PANEL_DEEP, theme::PANEL_DEEP),
             "mid" => (theme::ACCENT_DIM, theme::TEXT_HI, theme::TEXT_HI),
@@ -217,14 +228,22 @@ fn render_tile(
             ui.set_min_size(size);
             ui.set_max_size(size);
             ui.vertical_centered(|ui| {
-                // Tier icon as the "badge glyph." Bronze / silver /
-                // gold per tier. Greyed when not granted (single
-                // muted icon to avoid "spoiler" of tier rank).
-                let glyph = match (granted, entry.tier.as_str()) {
-                    (true, "high") => "★",
-                    (true, "mid") => "◆",
-                    (true, _) => "●",
-                    (false, _) => "○",
+                // Tier icon as the "badge glyph." Locked tiles
+                // use a padlock; granted tiles use tier-tier
+                // (★/◆/●); ungranted use a hollow circle. The
+                // padlock for locked tiles is a stable Unicode
+                // shape — `⚿` (U+26BF) — rather than the emoji
+                // 🔒 which doesn't reliably render in egui's
+                // default font.
+                let glyph = if locked {
+                    "⚿"
+                } else {
+                    match (granted, entry.tier.as_str()) {
+                        (true, "high") => "★",
+                        (true, "mid") => "◆",
+                        (true, _) => "●",
+                        (false, _) => "○",
+                    }
                 };
                 ui.label(
                     RichText::new(glyph)
@@ -241,7 +260,12 @@ fn render_tile(
         })
         .response;
     let resp = resp.interact(egui::Sense::click());
-    let tooltip = if granted {
+    let tooltip = if locked {
+        format!(
+            "{} (locked)\n\nRequires sd-nas-pro features (Phase NP1+).\n\n{}",
+            entry.name, entry.description,
+        )
+    } else if granted {
         format!("{}\n\n{}", entry.name, entry.description)
     } else {
         format!(
@@ -251,10 +275,13 @@ fn render_tile(
     };
     // Publish an accessible label so screen readers + the
     // egui_kittest render tests can identify which tile is which
-    // AND read its grant state. Pattern: "<Name>: granted" vs
-    // "<Name>: not yet earned". The granted-state suffix is the
-    // assertion target in `badge_wall_renders_granted_glyphs_from_live_server_shape`.
-    let access_label = if granted {
+    // AND read its grant state. Pattern: "<Name>: granted" |
+    // "<Name>: not yet earned" | "<Name>: locked". The state
+    // suffix is the assertion target in the badge-wall render
+    // tests.
+    let access_label = if locked {
+        format!("{}: locked", entry.name)
+    } else if granted {
         format!("{}: granted", entry.name)
     } else {
         format!("{}: not yet earned", entry.name)
@@ -290,6 +317,29 @@ fn short_name(name: &str) -> String {
 pub struct GridTile<'a> {
     pub entry: &'a CatalogEntry,
     pub granted: bool,
+    /// `true` when the tile belongs to a feature gate that hasn't
+    /// shipped yet (currently the 5 NAS-pro entries). Renders with
+    /// a padlock glyph + locked-style fill + a different hover.
+    /// Mutually exclusive with `granted` (locked tiles can't be
+    /// granted by definition; backend won't emit grants for them).
+    pub locked: bool,
+}
+
+/// Achievement IDs that are part of the sd-nas-pro feature track
+/// (Phase NP1+). These render with a padlock until NP1 ships;
+/// design's `gamification-achievement-balance.md` §3 keeps them
+/// in the catalog with `visible: true` so users see the upcoming
+/// surface even before NP1 lands.
+const NAS_PRO_LOCKED_IDS: &[&str] = &[
+    "schedule-master",
+    "polite-citizen",
+    "multi-share-maestro",
+    "snapshot-sage",
+    "email-report-veteran",
+];
+
+fn is_nas_pro_locked(id: &str) -> bool {
+    NAS_PRO_LOCKED_IDS.iter().any(|nas_id| *nas_id == id)
 }
 
 /// Pure helper: given a [`CatalogState`] + the catalog's achievement
@@ -312,12 +362,23 @@ pub fn classify_grid_entries<'a>(
     };
     let mut tiles: Vec<GridTile<'a>> = catalog_entries
         .iter()
-        .map(|e| GridTile {
-            entry: e,
-            granted: grants.get(e.id.as_str()).copied().unwrap_or(false),
+        .map(|e| {
+            let locked = is_nas_pro_locked(&e.id);
+            // Locked tiles can't be granted by definition; backend
+            // won't emit grants for entries whose feature hasn't
+            // shipped, so even if the profile somehow contains
+            // one we mask it off as locked.
+            let granted = !locked && grants.get(e.id.as_str()).copied().unwrap_or(false);
+            GridTile { entry: e, granted, locked }
         })
         .collect();
-    tiles.sort_by_key(|t| (!t.granted, t.entry.display_order));
+    // Sort order: granted first (visual test-friendly), then
+    // ungranted-but-available, then locked tiles last (gated
+    // upcoming features cluster at the bottom of the grid).
+    tiles.sort_by_key(|t| {
+        let bucket = if t.granted { 0 } else if t.locked { 2 } else { 1 };
+        (bucket, t.entry.display_order)
+    });
     tiles
 }
 
@@ -684,6 +745,98 @@ mod tests {
         harness.run();
         let img = harness.render().expect("render PNG side-artifact");
         img.save(path).expect("write PNG to disk");
+    }
+
+    #[test]
+    fn nas_pro_ids_classify_as_locked() {
+        // The 5 NAS-pro IDs render with the locked treatment
+        // (padlock glyph + locked-style fill + locked hover) until
+        // sd-nas-pro Phase NP1 ships. Grant flag is forcibly false
+        // even if a profile claims one — the gate is in the engine,
+        // not the backend.
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![
+                entry("schedule-master", "Schedule Master", "mid", 1000),
+                entry("polite-citizen", "Polite Citizen", "low", 1010),
+                entry("multi-share-maestro", "Multi-Share Maestro", "high", 1020),
+                entry("snapshot-sage", "Snapshot Sage", "mid", 1030),
+                entry("email-report-veteran", "Email Report Veteran", "low", 1040),
+                entry("brisk", "Brisk", "low", 200),
+            ],
+        };
+        // Backend incorrectly claims a NAS-pro grant — engine
+        // must still render it as locked, not granted.
+        let state = CatalogState {
+            catalog: Some(Ok(catalog.clone())),
+            profile: Some(Ok(Profile {
+                install_id: "x".into(),
+                lifetime: Default::default(),
+                achievements: vec![
+                    ProfileGrant {
+                        achievement_id: "brisk".into(),
+                        granted: true,
+                        granted_at: None,
+                    },
+                    ProfileGrant {
+                        achievement_id: "schedule-master".into(),
+                        granted: true,  // <- engine masks this off
+                        granted_at: None,
+                    },
+                ],
+            })),
+        };
+        let tiles = classify_grid_entries(&state, &catalog.achievements);
+
+        // Every NAS-pro entry is locked.
+        for nas_id in NAS_PRO_LOCKED_IDS {
+            let tile = tiles
+                .iter()
+                .find(|t| t.entry.id == *nas_id)
+                .unwrap_or_else(|| panic!("missing tile for {nas_id}"));
+            assert!(tile.locked, "{nas_id} must classify as locked");
+            assert!(
+                !tile.granted,
+                "{nas_id} must NOT classify as granted even when profile claims a grant"
+            );
+        }
+
+        // brisk (not NAS-pro) classifies normally.
+        let brisk = tiles.iter().find(|t| t.entry.id == "brisk").unwrap();
+        assert!(!brisk.locked);
+        assert!(brisk.granted);
+    }
+
+    #[test]
+    fn locked_tiles_sort_to_bottom_of_grid() {
+        // Sort order: granted → ungranted-but-available → locked.
+        // Mick reviews badges visually, so granted tiles up top
+        // (visual smoke test) and locked tiles at the bottom
+        // (cluster of upcoming features) reads cleanly.
+        let catalog = Catalog {
+            version: "v1".into(),
+            achievements: vec![
+                entry("schedule-master", "Schedule Master", "mid", 1000),
+                entry("brisk", "Brisk", "low", 200),
+                entry("tidy-up", "Tidy-up", "low", 100),
+            ],
+        };
+        let state = CatalogState {
+            catalog: Some(Ok(catalog.clone())),
+            profile: Some(Ok(Profile {
+                install_id: "x".into(),
+                lifetime: Default::default(),
+                achievements: vec![ProfileGrant {
+                    achievement_id: "brisk".into(),
+                    granted: true,
+                    granted_at: None,
+                }],
+            })),
+        };
+        let tiles = classify_grid_entries(&state, &catalog.achievements);
+        let ordered_ids: Vec<&str> = tiles.iter().map(|t| t.entry.id.as_str()).collect();
+        // Expected: granted (brisk) → ungranted (tidy-up) → locked (schedule-master)
+        assert_eq!(ordered_ids, vec!["brisk", "tidy-up", "schedule-master"]);
     }
 
     #[test]
