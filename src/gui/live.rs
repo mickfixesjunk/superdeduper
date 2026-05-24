@@ -640,6 +640,18 @@ fn run(
     // this layer; walker-side nlink capture is a future follow-up
     // that would let us cover those too).
     let mut max_hardlink_count_in_scan: u64 = 0;
+    // G1.x esoteric metric: count of basenames that resolved to
+    // ≥2 distinct content hashes across the scan ("name-twins").
+    // Builds basename → {content_hash} as groups stream in; the
+    // final count of entries with set size ≥ 2 is the metric.
+    // Only sees basenames that appear in ≥1 dup group (singletons
+    // bypass hashing entirely + we don't have hashes for them), so
+    // the worst missed case is "same name in one dup group + one
+    // singleton of different size" — fine for an esoteric metric.
+    let mut basename_to_hashes: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -998,6 +1010,17 @@ fn run(
                     max_hardlink_count_in_scan = aliases;
                 }
             }
+            // Track basenames → content-hashes for the name-twins
+            // metric. A path may have a non-unicode basename — skip
+            // those (rare; just narrows what counts as a collision).
+            for path in visible_files.iter() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    basename_to_hashes
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(g.content_hash.clone());
+                }
+            }
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
             // sampler thread sees fresh values without us holding
@@ -1198,10 +1221,15 @@ fn run(
                 } else {
                     None
                 },
-                // TODO(G1.x follow-up): track (basename → hash)
-                // collisions across all scanned files for
-                // name_collision_count.
-                name_collision_count: None,
+                // Tally basenames whose path-resolution disagreed on
+                // content (≥2 distinct hashes for the same name).
+                name_collision_count: {
+                    let n = basename_to_hashes
+                        .values()
+                        .filter(|hs| hs.len() >= 2)
+                        .count() as u64;
+                    if n > 0 { Some(n) } else { None }
+                },
             },
             result_summary: ResultSummary {
                 duplicate_groups: total_dups,
