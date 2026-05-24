@@ -62,6 +62,17 @@ pub struct SettingsModalState {
     pub tab: SettingsTab,
 }
 
+/// Locked modal dimensions. `fixed_size()` alone wasn't holding
+/// the window against content that wanted to grow — `min_width` +
+/// `max_width` (and the height pair) clamp explicitly via the
+/// underlying `Resize`. Belt-and-suspenders: also `set_max_width`
+/// inside the show closure so children can't stretch past it.
+const MODAL_WIDTH: f32 = 600.0;
+const MODAL_HEIGHT: f32 = 500.0;
+const TAB_LIST_WIDTH: f32 = 132.0;
+const TAB_BUTTON_WIDTH: f32 = 124.0;
+const PANEL_HEIGHT: f32 = 390.0;
+
 /// Returns `true` if the user clicked Close / Done this frame.
 pub fn show(
     ctx: &Context,
@@ -75,33 +86,40 @@ pub fn show(
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        // Locked size so the Done / Reset footer is always visible.
-        // Previously the modal expanded freely to fit content and
-        // pushed the footer below the screen on tabs with lots of
-        // controls (Engine, Keep strategy).
-        .fixed_size(egui::vec2(640.0, 520.0))
+        // Hard-clamp width AND height. Earlier .fixed_size() alone
+        // didn't always hold — content wanting to grow could push
+        // the modal to full window width, leaving the tab list
+        // "splatted across the page." Explicit min/max on both
+        // axes makes the constraint un-bypassable by inner UIs.
+        .min_width(MODAL_WIDTH)
+        .max_width(MODAL_WIDTH)
+        .min_height(MODAL_HEIGHT)
+        .max_height(MODAL_HEIGHT)
+        .default_size(egui::vec2(MODAL_WIDTH, MODAL_HEIGHT))
         .show(ctx, |ui| {
+            ui.set_max_width(MODAL_WIDTH - 16.0);
             ui.label(
                 RichText::new("Knobs apply to the next scan.")
                     .color(theme::TEXT_LO)
                     .small(),
             );
-            ui.add_space(8.0);
+            ui.add_space(6.0);
 
             // Both panels (tab list, content) share an explicit
             // height so neither can grow past the window's reserved
             // area. The content panel uses ScrollArea inside this
             // height so over-long tabs scroll instead of overflow.
-            const PANEL_HEIGHT: f32 = 400.0;
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), PANEL_HEIGHT),
                 egui::Layout::left_to_right(egui::Align::TOP),
                 |ui| {
-                    // Left: tab list.
+                    // Left: tab list — locked column so the list
+                    // can never reflow to a horizontal layout.
                     ui.allocate_ui_with_layout(
-                        egui::vec2(140.0, PANEL_HEIGHT),
+                        egui::vec2(TAB_LIST_WIDTH, PANEL_HEIGHT),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
+                            ui.set_max_width(TAB_LIST_WIDTH);
                             for tab in SettingsTab::all() {
                                 let selected = state.tab == tab;
                                 let label = if selected {
@@ -121,7 +139,7 @@ pub fn show(
                                     } else {
                                         egui::Color32::TRANSPARENT
                                     })
-                                    .min_size(egui::vec2(130.0, 28.0));
+                                    .min_size(egui::vec2(TAB_BUTTON_WIDTH, 26.0));
                                 if ui.add(btn).clicked() {
                                     state.tab = tab;
                                 }
@@ -129,7 +147,7 @@ pub fn show(
                         },
                     );
                     ui.separator();
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     // Right: tab content. ScrollArea constrained so
                     // over-long tabs scroll inside the panel; the
                     // panel never pushes the footer off-screen.
@@ -785,6 +803,232 @@ fn render_leaderboard(ui: &mut egui::Ui) {
     ui.separator();
     ui.add_space(6.0);
     render_submit_section(ui);
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    render_privacy_section(ui);
+}
+
+/// Settings > Privacy controls per client-spec §10.2:
+/// share-frequency dropdown, "Preview a sample submission",
+/// "Reset install" with confirmation. Per-field overrides are
+/// deferred — engine surface for them doesn't exist yet (the
+/// payload is built atomically; no opt-out points). When that's
+/// scoped (G2+), they slot in here.
+#[cfg(feature = "telemetry")]
+fn render_privacy_section(ui: &mut egui::Ui) {
+    use crate::leaderboard::install;
+
+    ui.label(
+        RichText::new("Privacy")
+            .color(theme::TEXT_HI)
+            .strong(),
+    );
+    ui.add_space(4.0);
+
+    // Load mutable state. If the install isn't present (not
+    // registered yet), the controls show a hint but stay disabled.
+    let loaded = install::load();
+    let state_opt: Option<install::InstallState> = match loaded {
+        Ok(s) => s,
+        Err(_) => None,
+    };
+
+    let current_share = state_opt
+        .as_ref()
+        .map(|s| s.share_default)
+        .unwrap_or(install::ShareDefault::AlwaysAsk);
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Submit frequency").color(theme::TEXT_HI));
+        let enabled = state_opt.is_some();
+        let label_text = match current_share {
+            install::ShareDefault::AlwaysAsk => "Always ask",
+            install::ShareDefault::AutoOptIn => "Auto-submit",
+            install::ShareDefault::Never => "Never",
+        };
+        ui.add_enabled_ui(enabled, |ui| {
+            egui::ComboBox::from_id_source("sd_share_frequency")
+                .selected_text(label_text)
+                .show_ui(ui, |ui| {
+                    let mut chosen: Option<install::ShareDefault> = None;
+                    if ui
+                        .selectable_label(
+                            current_share == install::ShareDefault::AlwaysAsk,
+                            "Always ask",
+                        )
+                        .on_hover_text(
+                            "Pop the post-scan modal after every scan; user picks Submit / Skip.",
+                        )
+                        .clicked()
+                    {
+                        chosen = Some(install::ShareDefault::AlwaysAsk);
+                    }
+                    if ui
+                        .selectable_label(
+                            current_share == install::ShareDefault::AutoOptIn,
+                            "Auto-submit",
+                        )
+                        .on_hover_text(
+                            "Submit silently in the background after every scan. \
+                             Rank + achievements still surface via toast.",
+                        )
+                        .clicked()
+                    {
+                        chosen = Some(install::ShareDefault::AutoOptIn);
+                    }
+                    if ui
+                        .selectable_label(
+                            current_share == install::ShareDefault::Never,
+                            "Never",
+                        )
+                        .on_hover_text(
+                            "Never attempt to submit; never show the post-scan modal. \
+                             Engine still builds the payload locally for diagnostic \
+                             logging — set to Never to fully opt out.",
+                        )
+                        .clicked()
+                    {
+                        chosen = Some(install::ShareDefault::Never);
+                    }
+                    if let (Some(chosen), Some(mut s)) =
+                        (chosen, state_opt.clone())
+                    {
+                        if chosen != s.share_default {
+                            s.share_default = chosen;
+                            if let Err(e) = install::save(&s) {
+                                eprintln!(
+                                    "leaderboard: failed to persist share preference: {e:?}"
+                                );
+                            }
+                        }
+                    }
+                });
+        });
+    });
+    if state_opt.is_none() {
+        ui.label(
+            RichText::new("Register an install above to change this.")
+                .color(theme::TEXT_LO)
+                .small()
+                .italics(),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "Per-field overrides (toggle individual payload fields off) — coming \
+             in a follow-up slice. Today the payload is all-or-nothing.",
+        )
+        .color(theme::TEXT_LO)
+        .small()
+        .italics(),
+    );
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Preview a sample submission").color(theme::TEXT_HI),
+                )
+                .min_size(egui::vec2(220.0, 26.0)),
+            )
+            .on_hover_text(
+                "Render a synthetic payload showing the exact JSON sd would \
+                 POST. No real scan data; safe to share publicly.",
+            )
+            .clicked()
+        {
+            print_sample_payload();
+        }
+        ui.add_space(4.0);
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Reset install").color(theme::WARN),
+                )
+                .min_size(egui::vec2(140.0, 26.0)),
+            )
+            .on_hover_text(
+                "Rotate install_id + install_key. Equivalent to \
+                 `sd register --reset` from the CLI. Backend treats \
+                 the new id as a fresh user; rank + achievements reset.",
+            )
+            .clicked()
+        {
+            // Reset is destructive on the install identity — gate
+            // behind a confirmation in the same egui frame's modal.
+            // For first slice, do it inline with eprintln warning;
+            // a proper confirm modal layered in a follow-up.
+            std::thread::spawn(|| {
+                eprintln!(
+                    "leaderboard: install reset requested — rotating install_id + install_key"
+                );
+                let fresh = install::new_unregistered(
+                    "https://api.superdeduper.io".to_string(),
+                );
+                if let Err(e) = install::save(&fresh) {
+                    eprintln!("leaderboard: reset failed: {e:?}");
+                } else {
+                    eprintln!(
+                        "leaderboard: reset complete. new install_id={}. \
+                         Re-register via the Leaderboard tab above.",
+                        fresh.install_id
+                    );
+                }
+            });
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.hyperlink_to(
+            RichText::new("Privacy policy").color(theme::ACCENT).small(),
+            "https://superdeduper.io/privacy/",
+        );
+        ui.add_space(8.0);
+        ui.hyperlink_to(
+            RichText::new("Terms").color(theme::ACCENT).small(),
+            "https://superdeduper.io/terms/",
+        );
+    });
+}
+
+/// Build + pretty-print a synthetic submission payload so the
+/// user can see exactly what shape goes on the wire. Writes to
+/// stderr for now; a follow-up slice plumbs it into the
+/// "What gets shared?" modal alongside the post-scan modal's
+/// real payload preview.
+#[cfg(feature = "telemetry")]
+fn print_sample_payload() {
+    use crate::leaderboard::{hardware, submission};
+    let inputs = submission::SubmissionInputs {
+        run_uuid: "00000000-0000-0000-0000-000000000000".into(),
+        sd_version: env!("CARGO_PKG_VERSION").to_string(),
+        hardware: hardware::detect(),
+        scan: submission::ScanResults {
+            files_scanned: 412_998,
+            bytes_scanned: 320_000_000_000,
+            wall_clock_ms: 137_400,
+            duplicate_groups: 18_204,
+            reclaimable_inode_bytes: 38_100_000_000,
+            hash_algo: "river5".into(),
+            defender_rtp_state_pre: Some(false),
+            defender_rtp_state_post: Some(false),
+            corpus_signature_hash:
+                "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
+        },
+    };
+    let payload = submission::build_payload(&inputs);
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => {
+            eprintln!("---- sample submission payload ----\n{s}\n-----------------------------------");
+        }
+        Err(e) => eprintln!("leaderboard: sample payload render failed: {e:?}"),
+    }
 }
 
 #[cfg(feature = "telemetry")]
