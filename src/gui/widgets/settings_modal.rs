@@ -27,6 +27,8 @@ pub enum SettingsTab {
     Preflight,
     Network,
     #[cfg(feature = "telemetry")]
+    Account,
+    #[cfg(feature = "telemetry")]
     Leaderboard,
 }
 
@@ -39,6 +41,8 @@ impl SettingsTab {
             SettingsTab::Safety => "Safety",
             SettingsTab::Preflight => "Pre-flight",
             SettingsTab::Network => "Network",
+            #[cfg(feature = "telemetry")]
+            SettingsTab::Account => "Account",
             #[cfg(feature = "telemetry")]
             SettingsTab::Leaderboard => "Leaderboard",
         }
@@ -53,7 +57,10 @@ impl SettingsTab {
             SettingsTab::Network,
         ];
         #[cfg(feature = "telemetry")]
-        v.push(SettingsTab::Leaderboard);
+        {
+            v.push(SettingsTab::Account);
+            v.push(SettingsTab::Leaderboard);
+        }
         v
     }
 }
@@ -277,6 +284,8 @@ fn render_modal_body(
                             SettingsTab::Safety => render_safety(ui, settings),
                             SettingsTab::Preflight => render_preflight(ui, settings),
                             SettingsTab::Network => render_network(ui, state),
+                            #[cfg(feature = "telemetry")]
+                            SettingsTab::Account => render_account(ui),
                             #[cfg(feature = "telemetry")]
                             SettingsTab::Leaderboard => render_leaderboard(ui),
                         }
@@ -862,6 +871,173 @@ fn render_network(ui: &mut egui::Ui, state: &mut SettingsModalState) {
                 .small()
                 .italics(),
         );
+    }
+}
+
+/// Settings → Account tab — G3 OAuth surface.
+///
+/// Per `gamification-client-spec.md` §10.3 + Mick's 2026-05-24T22:14:51Z
+/// directive. Shows the current link status (Anonymous vs Linked)
+/// and exposes Link Google / Link Discord / Unlink actions. The
+/// "Login & Claim" CTA above the achievements grid + the post-scan
+/// modal sign-in CTA are separate surfaces (v1.1); this tab is the
+/// canonical management surface for both.
+///
+/// OAuth flow runs synchronously on the UI thread for simplicity:
+/// browser opens, this tab blocks until the loopback callback
+/// arrives (~5 min timeout). v1.1 can move it to a background
+/// thread + progress spinner if the UX needs it.
+#[cfg(feature = "telemetry")]
+fn render_account(ui: &mut egui::Ui) {
+    use crate::channel;
+    use crate::leaderboard::{install, oauth};
+
+    let active = channel::active_channel();
+    let status = oauth::status_for(active).ok();
+
+    ui.heading("Account");
+    ui.label(
+        RichText::new(
+            "Link this install to a Google or Discord account so \
+             your achievements roll up across machines + your public \
+             profile shows a display name. Per-channel: linking on \
+             prod doesn't transfer to dev.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+    ui.add_space(8.0);
+
+    // Status row.
+    match &status {
+        Some(oauth::AccountStatus::Anonymous) | None => {
+            let install_id = install::load()
+                .ok()
+                .flatten()
+                .map(|s| s.install_id);
+            let id_short = install_id
+                .as_deref()
+                .map(|s| s.split('-').next().unwrap_or(s).to_string())
+                .unwrap_or_else(|| "not registered".to_string());
+            ui.label(
+                RichText::new(format!(
+                    "Status: Anonymous (UUID {id_short}…)"
+                ))
+                .color(theme::TEXT_HI),
+            );
+        }
+        Some(oauth::AccountStatus::Linked {
+            provider,
+            display_name,
+            expired,
+            ..
+        }) => {
+            let exp_suffix = if *expired { " — token expired" } else { "" };
+            ui.label(
+                RichText::new(format!(
+                    "Status: Linked — {display_name} ({}){exp_suffix}",
+                    provider.display_name()
+                ))
+                .color(theme::TEXT_HI),
+            );
+        }
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!("Channel: {}", active))
+            .color(theme::TEXT_LO)
+            .small()
+            .italics(),
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    // Action row depends on link state. The actions intentionally
+    // surface BOTH providers per spec — Settings → Account is the
+    // canonical management surface that always exposes the full
+    // choice set even when the user is already linked (so they can
+    // switch providers).
+    let is_linked = matches!(status, Some(oauth::AccountStatus::Linked { .. }));
+    ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::Button::new(RichText::new("Link Google").color(theme::TEXT_HI))
+                    .min_size(egui::vec2(120.0, 28.0)),
+            )
+            .clicked()
+        {
+            link_clicked(oauth::Provider::Google, active);
+        }
+        if ui
+            .add(
+                egui::Button::new(RichText::new("Link Discord").color(theme::TEXT_HI))
+                    .min_size(egui::vec2(120.0, 28.0)),
+            )
+            .clicked()
+        {
+            link_clicked(oauth::Provider::Discord, active);
+        }
+        ui.add_space(12.0);
+        let unlink_btn = egui::Button::new(
+            RichText::new("Unlink").color(if is_linked { theme::HOT } else { theme::TEXT_LO }),
+        )
+        .min_size(egui::vec2(100.0, 28.0));
+        if ui.add_enabled(is_linked, unlink_btn).clicked() {
+            if let Err(e) = oauth::unlink_for(active) {
+                eprintln!("account: unlink failed: {e}");
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "Clicking Link opens your browser to the provider's sign-in \
+             page. After you complete OAuth there, this window resumes \
+             automatically. Use the CLI `superdeduper account link \
+             google|discord` for the same flow.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+}
+
+#[cfg(feature = "telemetry")]
+fn link_clicked(provider: crate::leaderboard::oauth::Provider, channel: crate::channel::Channel) {
+    use crate::leaderboard::{install, oauth};
+    let install_id = match install::load().ok().flatten() {
+        Some(s) => s.install_id,
+        None => {
+            eprintln!("account: not registered on channel {channel} — run `superdeduper register --channel {channel}` first");
+            return;
+        }
+    };
+    let server_url = crate::channel::server_url_for(channel);
+    // Blocks the UI thread for up to 5 minutes while the user
+    // completes OAuth. v1.1 can move this to a background thread
+    // with a progress spinner; for now the modal-blocked
+    // single-thread approach is simplest + matches the
+    // register flow's existing UX.
+    match oauth::link_via_loopback(
+        provider,
+        channel,
+        server_url,
+        &install_id,
+        oauth::DEFAULT_OAUTH_TIMEOUT,
+    ) {
+        Ok(token) => {
+            eprintln!(
+                "account: linked {} as {} on channel {}",
+                token.provider.display_name(),
+                token.display_name,
+                channel,
+            );
+        }
+        Err(e) => {
+            eprintln!("account: link failed: {e}");
+        }
     }
 }
 
