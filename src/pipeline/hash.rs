@@ -108,7 +108,15 @@ pub struct HashCounters {
 #[derive(Debug, Clone)]
 pub enum ProgressOutcome {
     Hashed { bytes: u64 },
-    Cached,
+    /// Cache hit; the engine didn't physically read the file but
+    /// processed its full size's worth of "scan work." `bytes` is the
+    /// logical file size, so callers tracking inventory/scan-progress
+    /// throughput (the GUI's MB/s graph, the submission payload's
+    /// `bytes_scanned`) can credit cache hits properly. Without this,
+    /// cache-fast-forwarded scans showed 0 MB/s + the submission
+    /// payload's `bytes_scanned` undercount tripped the backend's
+    /// `result_self_consistency` sanity check (reclaim > scanned).
+    Cached { bytes: u64 },
     Failed { error: String },
 }
 
@@ -697,7 +705,11 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(&f.entry.path, tier_index(tier), ProgressOutcome::Cached);
+                        cb(
+                            &f.entry.path,
+                            tier_index(tier),
+                            ProgressOutcome::Cached { bytes: f.entry.size },
+                        );
                     }
                     return Ok(h);
                 }
@@ -765,7 +777,11 @@ where
                 if let Some(h) = pick_hash(&cached, tier) {
                     counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     if let Some(cb) = on_file {
-                        cb(&f.entry.path, tier_index(tier), ProgressOutcome::Cached);
+                        cb(
+                            &f.entry.path,
+                            tier_index(tier),
+                            ProgressOutcome::Cached { bytes: f.entry.size },
+                        );
                     }
                     return Some(h);
                 }

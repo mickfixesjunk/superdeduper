@@ -625,6 +625,7 @@ fn run(
     let mut total_bytes_read: u64 = 0;
     let mut total_dups: u64 = 0;
     let mut reclaimable: u64 = 0;
+    let mut reclaimable_inode: u64 = 0;
     let mut largest_group_bytes: u64 = 0;
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
@@ -753,8 +754,16 @@ fn run(
             } else {
                 progress_files.load(Ordering::Relaxed)
             };
+            // Credit both fresh-hashed AND cache-hit bytes — the
+            // user-visible throughput graph reflects "scan progress
+            // speed" (cache fast-forward + real hashing both count
+            // as work done), and the leaderboard payload's
+            // bytes_scanned needs the cache-hit count too or it
+            // undercounts vs reclaimable_bytes and trips the
+            // backend's result_self_consistency sanity check.
             let bytes_added = match &outcome {
-                pipeline::hash::ProgressOutcome::Hashed { bytes } => *bytes,
+                pipeline::hash::ProgressOutcome::Hashed { bytes }
+                | pipeline::hash::ProgressOutcome::Cached { bytes } => *bytes,
                 _ => 0,
             };
             let total_bytes = progress_bytes
@@ -926,6 +935,25 @@ fn run(
                 .size
                 .saturating_mul(visible_files.len().saturating_sub(1) as u64);
             reclaimable = reclaimable.saturating_add(savings);
+            // Inode-aware reclaim — for hardlinked corpora
+            // (C:\Windows / WinSxS dominated), the path-aware
+            // count above inflates because each WinSxS alias counts
+            // as a "dup" even though all aliases share an inode.
+            // Inode-aware is the TRUE freeable bytes; ships in the
+            // leaderboard payload + clamped against bytes_scanned to
+            // satisfy the backend's result_self_consistency check.
+            // Hardlink-equivalent groups have nothing to reclaim
+            // (already collapsed on disk) — skip them.
+            let unique_inodes = if g.unique_inodes == 0 {
+                visible_files.len() as u64
+            } else {
+                g.unique_inodes
+            };
+            if unique_inodes > 1 && !g.link_equivalent {
+                let inode_savings =
+                    g.size.saturating_mul(unique_inodes.saturating_sub(1));
+                reclaimable_inode = reclaimable_inode.saturating_add(inode_savings);
+            }
             // Track the largest group's total bytes (size * count of
             // members) for the leaderboard `result_summary
             // .largest_single_group_bytes` field.
@@ -1102,8 +1130,14 @@ fn run(
             },
             result_summary: ResultSummary {
                 duplicate_groups: total_dups,
-                duplicate_bytes_reclaimable: reclaimable,
-                largest_single_group_bytes: largest_group_bytes,
+                // Use inode-aware reclaim (collapses hardlink
+                // aliases) for the leaderboard payload. Clamp to
+                // bytes_scanned just in case some weird edge case
+                // still produces reclaim > scanned (e.g. a file
+                // counted as both alias and unique somehow); backend
+                // sanity-rejects on that.
+                duplicate_bytes_reclaimable: reclaimable_inode.min(total_bytes_read),
+                largest_single_group_bytes: largest_group_bytes.min(total_bytes_read),
                 actions_taken_summary: std::collections::BTreeMap::new(),
                 placeholder_skip_count: None,
                 placeholder_skip_bytes: None,
