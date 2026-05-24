@@ -21,7 +21,6 @@ pub mod config;
 pub mod dedupe;
 pub mod diagnose;
 pub mod error;
-pub mod telemetry;
 pub mod inventory;
 pub mod keep;
 pub mod output;
