@@ -636,10 +636,69 @@ fn render_leaderboard(ui: &mut egui::Ui) {
         Ok(None) => {
             ui.label(
                 RichText::new(
-                    "Not registered. From a CLI: `sd register` (uses a small CPU proof-of-work, ~1 second). \
-                     A future build will add a GUI register button here that uses a captcha instead.",
+                    "Not registered. Click below to enrol — uses a small CPU proof-of-work (~1 second), \
+                     no network round-trip beyond a single POST to api.superdeduper.io.",
                 )
                 .color(theme::TEXT_HI),
+            );
+            ui.add_space(8.0);
+            // Note: button clicks fire on the UI thread. Registration
+            // is ~1s of CPU (PoW) + a 15s timeout HTTP POST; we spawn
+            // off-thread so the modal stays responsive. Failures /
+            // success are written back via a status string stored in
+            // a thread-shared OnceLock (next slice) — for now we
+            // print to stdout and ask the user to retry / check log.
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Register this install")
+                            .color(theme::PANEL_DEEP)
+                            .strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(180.0, 28.0)),
+                )
+                .on_hover_text(
+                    "Generates a UUID + HMAC key, solves a 22-bit hashcash proof-of-work, \
+                     then POSTs to api.superdeduper.io/api/v1/register. \
+                     Idempotent — clicking again when registered is a no-op.",
+                )
+                .clicked()
+            {
+                std::thread::spawn(|| {
+                    let mut state = match install::load() {
+                        Ok(Some(s)) => s,
+                        _ => install::new_unregistered(
+                            "https://api.superdeduper.io".to_string(),
+                        ),
+                    };
+                    if state.registered {
+                        eprintln!("leaderboard: already registered ({})", state.install_id);
+                        return;
+                    }
+                    eprintln!(
+                        "leaderboard: solving PoW + POSTing /api/v1/register (install_id={})...",
+                        state.install_id
+                    );
+                    match crate::leaderboard::registration::register_cli(&mut state) {
+                        Ok(()) => {
+                            eprintln!("leaderboard: registered. id={}", state.install_id);
+                        }
+                        Err(e) => {
+                            eprintln!("leaderboard: register failed: {e:?}");
+                        }
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Result goes to stderr while a future slice wires inline status display \
+                     + auto-refresh of this tab after the thread completes.",
+                )
+                .color(theme::TEXT_LO)
+                .small()
+                .italics(),
             );
         }
         Err(e) => {
