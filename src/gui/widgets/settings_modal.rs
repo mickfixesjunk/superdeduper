@@ -25,6 +25,8 @@ pub enum SettingsTab {
     KeepStrategy,
     Safety,
     Preflight,
+    #[cfg(feature = "telemetry")]
+    Leaderboard,
 }
 
 impl SettingsTab {
@@ -35,16 +37,21 @@ impl SettingsTab {
             SettingsTab::KeepStrategy => "Keep strategy",
             SettingsTab::Safety => "Safety",
             SettingsTab::Preflight => "Pre-flight",
+            #[cfg(feature = "telemetry")]
+            SettingsTab::Leaderboard => "Leaderboard",
         }
     }
-    fn all() -> [SettingsTab; 5] {
-        [
+    fn all() -> Vec<SettingsTab> {
+        let mut v = vec![
             SettingsTab::Engine,
             SettingsTab::Cache,
             SettingsTab::KeepStrategy,
             SettingsTab::Safety,
             SettingsTab::Preflight,
-        ]
+        ];
+        #[cfg(feature = "telemetry")]
+        v.push(SettingsTab::Leaderboard);
+        v
     }
 }
 
@@ -135,6 +142,8 @@ pub fn show(
                             SettingsTab::KeepStrategy => render_keep_strategy(ui, settings),
                             SettingsTab::Safety => render_safety(ui, settings),
                             SettingsTab::Preflight => render_preflight(ui, settings),
+                            #[cfg(feature = "telemetry")]
+                            SettingsTab::Leaderboard => render_leaderboard(ui),
                         });
                 },
             );
@@ -561,4 +570,118 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+#[cfg(feature = "telemetry")]
+fn render_leaderboard(ui: &mut egui::Ui) {
+    use crate::leaderboard::install;
+
+    ui.heading("Leaderboard participation");
+    ui.label(
+        RichText::new(
+            "Opt-in to submit anonymous run stats to superdeduper.io. \
+             Hardware bracket and dup throughput are visible on a public \
+             leaderboard; identities default to a UUID until you link a \
+             Google or Discord account at G3.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+    ui.add_space(8.0);
+
+    let path_str = install::install_path()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(install path unavailable)".to_string());
+
+    match install::load() {
+        Ok(Some(state)) => {
+            ui.group(|ui| {
+                ui.label(
+                    RichText::new("Install state")
+                        .color(theme::TEXT_HI)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("install_id:  {}", state.install_id))
+                        .color(theme::TEXT_LO)
+                        .monospace()
+                        .small(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "registered:  {}",
+                        if state.registered { "yes" } else { "no" }
+                    ))
+                    .color(if state.registered {
+                        theme::ACCENT
+                    } else {
+                        theme::WARN
+                    })
+                    .small(),
+                );
+                ui.label(
+                    RichText::new(format!("server_url:  {}", state.server_url))
+                        .color(theme::TEXT_LO)
+                        .small(),
+                );
+                ui.label(
+                    RichText::new(format!("share_default:  {:?}", state.share_default))
+                        .color(theme::TEXT_LO)
+                        .small(),
+                );
+            });
+        }
+        Ok(None) => {
+            ui.label(
+                RichText::new(
+                    "Not registered. From a CLI: `sd register` (uses a small CPU proof-of-work, ~1 second). \
+                     A future build will add a GUI register button here that uses a captcha instead.",
+                )
+                .color(theme::TEXT_HI),
+            );
+        }
+        Err(e) => {
+            ui.label(
+                RichText::new(format!(
+                    "install.json failed to load: {e}. Either corrupted or written by a newer client.",
+                ))
+                .color(theme::HOT),
+            );
+            ui.label(
+                RichText::new(
+                    "Run `sd register --reset` from a CLI to start fresh (rotates your install_id).",
+                )
+                .color(theme::TEXT_LO)
+                .small(),
+            );
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(format!("install.json:  {}", path_str))
+            .color(theme::TEXT_LO)
+            .small()
+            .monospace(),
+    );
+    ui.add_space(8.0);
+
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("Submit button (G1 next slice)")
+            .color(theme::TEXT_HI)
+            .strong(),
+    );
+    ui.label(
+        RichText::new(
+            "After each completed scan the engine will surface a 'Submit run' \
+             button in the post-scan view (greyed until registered + opt-in). \
+             Failed submissions queue to disk and retry on the next launch.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
 }

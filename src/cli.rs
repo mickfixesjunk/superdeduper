@@ -52,6 +52,19 @@ pub enum Command {
     /// (when --format json). The GUI preflight ("credit report")
     /// consumes the JSON form.
     Diagnose(DiagnoseArgs),
+
+    /// G-track: register this install for leaderboard participation.
+    /// Solves a small CPU proof-of-work (~1s) and POSTs the result
+    /// to superdeduper.io. Idempotent — already-registered installs
+    /// print "Already registered."
+    #[cfg(feature = "telemetry")]
+    Register(RegisterArgs),
+
+    /// G-track: print or update the local share preference and
+    /// install-state location.
+    #[cfg(feature = "telemetry")]
+    #[command(subcommand)]
+    Config(ConfigCommand),
 }
 
 #[derive(Debug, Args)]
@@ -282,6 +295,46 @@ pub enum KeepStrategy {
     /// Reasoning is logged so a user can audit a surprising pick.
     #[default]
     Smart,
+}
+
+/// G-track CLI args for `sd register`.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Args)]
+pub struct RegisterArgs {
+    /// Wipe install.json + re-register from scratch. Use only if
+    /// the existing install is broken or you've explicitly been
+    /// told to. Will invalidate prior submissions linked to the
+    /// old install_id.
+    #[arg(long)]
+    pub reset: bool,
+
+    /// Override the backend URL. Default `https://api.superdeduper.io`.
+    #[arg(long, value_name = "URL")]
+    pub server_url: Option<String>,
+}
+
+/// G-track CLI subcommands for `sd config`.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the current share preference, registered install_id,
+    /// and install.json path.
+    Show,
+
+    /// Set the default share behaviour. `always-ask` (default),
+    /// `auto-opt-in`, or `never`.
+    SetShare {
+        #[arg(value_enum)]
+        value: ShareValue,
+    },
+}
+
+#[cfg(feature = "telemetry")]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum ShareValue {
+    AlwaysAsk,
+    AutoOptIn,
+    Never,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

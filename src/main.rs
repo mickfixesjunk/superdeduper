@@ -22,6 +22,114 @@ fn main() -> anyhow::Result<()> {
         Command::Cache(cmd) => run_cache(cmd),
         Command::DriveInfo => run_drive_info(),
         Command::Diagnose(args) => superdeduper::diagnose::run(args),
+        #[cfg(feature = "telemetry")]
+        Command::Register(args) => run_register(args),
+        #[cfg(feature = "telemetry")]
+        Command::Config(cmd) => run_config(cmd),
+    }
+}
+
+/// G-track: `sd register` — register this install with the
+/// leaderboard backend. Idempotent.
+#[cfg(feature = "telemetry")]
+fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
+    use superdeduper::leaderboard::{install, registration};
+
+    let server_url = args
+        .server_url
+        .unwrap_or_else(|| "https://api.superdeduper.io".to_string());
+
+    // --reset rotates the install_id. Refuse without explicit opt-in
+    // confirmation: prints what's about to happen + requires the
+    // env var (CI / scripted) or stdin "y". For simplicity now,
+    // require --reset to be a destructive opt-in by environment.
+    let existing = install::load()?;
+    let mut state = match (existing, args.reset) {
+        (Some(s), false) => s,
+        (Some(_), true) => {
+            eprintln!(
+                "warning: --reset wipes the prior install_id. \
+                 Submissions linked to the old install_id stay on \
+                 the leaderboard but will not be reachable from this \
+                 client. Continuing in 3 seconds — Ctrl-C to abort..."
+            );
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            install::new_unregistered(server_url)
+        }
+        (None, _) => install::new_unregistered(server_url),
+    };
+
+    if state.registered {
+        println!(
+            "Already registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}",
+            state.install_id, state.install_id
+        );
+        return Ok(());
+    }
+
+    println!(
+        "First-time setup: registering this install. This takes ~1 second of CPU."
+    );
+    match registration::register_cli(&mut state) {
+        Ok(()) => {
+            println!(
+                "Registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}\nUse `sd config show` to see current share preference.",
+                state.install_id, state.install_id
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("registration failed: {e:?}")),
+    }
+}
+
+/// G-track: `sd config show` / `sd config set-share`.
+#[cfg(feature = "telemetry")]
+fn run_config(cmd: superdeduper::cli::ConfigCommand) -> anyhow::Result<()> {
+    use superdeduper::cli::{ConfigCommand, ShareValue};
+    use superdeduper::leaderboard::install::{self, ShareDefault};
+
+    match cmd {
+        ConfigCommand::Show => {
+            let path = install::install_path()?;
+            match install::load()? {
+                Some(state) => {
+                    println!("install.json:    {}", path.display());
+                    println!("install_id:      {}", state.install_id);
+                    println!("registered:      {}", state.registered);
+                    println!("server_url:      {}", state.server_url);
+                    println!("share_default:   {:?}", state.share_default);
+                    println!(
+                        "client_version_at_register: {}",
+                        state.client_version_at_register
+                    );
+                }
+                None => {
+                    println!("install.json:    {} (not yet created)", path.display());
+                    println!("status:          unregistered");
+                    println!("Run `sd register` to enroll this install.");
+                }
+            }
+            Ok(())
+        }
+        ConfigCommand::SetShare { value } => {
+            let mut state = match install::load()? {
+                Some(s) => s,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "install.json not found — run `sd register` first"
+                    ))
+                }
+            };
+            let new_value = match value {
+                ShareValue::AlwaysAsk => ShareDefault::AlwaysAsk,
+                ShareValue::AutoOptIn => ShareDefault::AutoOptIn,
+                ShareValue::Never => ShareDefault::Never,
+            };
+            state.share_default = new_value;
+            install::save(&state)?;
+            println!("share_default = {:?}", state.share_default);
+            Ok(())
+        }
     }
 }
 
