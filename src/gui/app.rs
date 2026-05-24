@@ -679,6 +679,10 @@ impl SuperdeduperApp {
             // the badge wall. Without this, badge tiles only update
             // on app restart.
             if let submission::SubmitOutcome::Accepted { submission_id, .. } = &outcome {
+                eprintln!(
+                    "submit: Accepted (submission_id={}); spawning ranks-poll + profile-refresh",
+                    submission_id
+                );
                 crate::leaderboard::ranks_poll::spawn_ranks_poll_worker(submission_id.clone());
                 crate::leaderboard::catalog::spawn_profile_refresh(
                     state.server_url.clone(),
@@ -724,6 +728,19 @@ impl SuperdeduperApp {
 
         if matches!(self.scan_complete_modal, ScanCompleteState::Hidden) {
             return;
+        }
+        // While the post-scan modal is up, keep the GUI repainting at
+        // 5 Hz so background workers (submit → profile-refresh → ranks-
+        // poll) can publish results into static slots and have the
+        // badge wall + modal pick them up without waiting for user
+        // input. Without this, egui idle-throttles after the modal
+        // transitions stop generating events and stale grants linger
+        // on the badge wall until a mouse-move wakes the frame loop.
+        if matches!(
+            self.scan_complete_modal,
+            ScanCompleteState::Submitting | ScanCompleteState::Done
+        ) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         // Submit worker stashes outcome via store_last_outcome; flip
         // the state when we observe one in flight from Submitting.

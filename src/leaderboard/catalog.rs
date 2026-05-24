@@ -98,12 +98,43 @@ pub fn fetch_catalog(server_url: &str) -> Result<Catalog, FetchError> {
 }
 
 pub fn fetch_profile(server_url: &str, install_id: &str) -> Result<Profile, FetchError> {
-    let url = format!(
+    fetch_profile_inner(server_url, install_id, /* cache_bust */ false)
+}
+
+/// Refresh-path variant. Forces a cache-buster query param + a
+/// no-cache request header so CDN/Cloudflare layers can't return a
+/// stale snapshot of the profile (a known footgun after a fresh
+/// achievement grant: the GET-cached response is the just-stale
+/// one). Initial app-start fetches skip the cache-bust because
+/// there's no preceding state to invalidate.
+pub fn fetch_profile_fresh(server_url: &str, install_id: &str) -> Result<Profile, FetchError> {
+    fetch_profile_inner(server_url, install_id, /* cache_bust */ true)
+}
+
+fn fetch_profile_inner(
+    server_url: &str,
+    install_id: &str,
+    cache_bust: bool,
+) -> Result<Profile, FetchError> {
+    let base = format!(
         "{}/api/v1/profile/{}",
         server_url.trim_end_matches('/'),
         urlencode_path(install_id),
     );
-    let resp = ureq::get(&url).timeout(FETCH_TIMEOUT).call();
+    let url = if cache_bust {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("{base}?_t={ts}")
+    } else {
+        base
+    };
+    let mut req = ureq::get(&url).timeout(FETCH_TIMEOUT);
+    if cache_bust {
+        req = req.set("Cache-Control", "no-cache").set("Pragma", "no-cache");
+    }
+    let resp = req.call();
     match resp {
         Ok(r) => r
             .into_json::<Profile>()
@@ -198,10 +229,27 @@ pub fn spawn_initial_fetch(server_url: String, install_id: Option<String>) {
 /// backend updates the profile but the GUI's cached snapshot is
 /// stale until we re-fetch. Catalog is untouched (its contents
 /// don't change per-submit).
+///
+/// Uses [`fetch_profile_fresh`] with a cache-buster + no-cache
+/// header so any CDN layer between client and backend is forced
+/// to revalidate against origin. Logs each step to stderr so beta
+/// testers can confirm the path executed.
 pub fn spawn_profile_refresh(server_url: String, install_id: String) {
     std::thread::spawn(move || {
-        match fetch_profile(&server_url, &install_id) {
-            Ok(p) => set_profile(Ok(p)),
+        eprintln!(
+            "catalog: profile refresh fired (install_id={}, server_url={})",
+            install_id, server_url
+        );
+        match fetch_profile_fresh(&server_url, &install_id) {
+            Ok(p) => {
+                let granted = p.achievements.iter().filter(|g| g.granted).count();
+                let total = p.achievements.len();
+                eprintln!(
+                    "catalog: profile refresh OK (granted={}, total={}, lifetime_reclaimed={})",
+                    granted, total, p.lifetime_reclaimed_bytes
+                );
+                set_profile(Ok(p));
+            }
             Err(e) => {
                 eprintln!("catalog: profile refresh failed: {e:?}");
                 // Deliberately don't overwrite a previously-good
