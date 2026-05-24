@@ -1,6 +1,6 @@
 # superdeduper
 
-The fastest duplicate file finder for Windows / NTFS.
+The fastest duplicate file finder for Windows + Linux.
 
 > ⚠️  **ALPHA SOFTWARE — USE AT YOUR OWN RISK.**
 >
@@ -27,15 +27,20 @@ The fastest duplicate file finder for Windows / NTFS.
 
 `superdeduper` is a clean-room Rust implementation built around the observation
 that most "fast" cross-platform dedupers leave significant performance on
-the table on Windows by avoiding NTFS- and Win32-specific tricks. By
-targeting Windows exclusively we can lean on direct MFT enumeration,
-LCN-ordered I/O, IOCP, the USN journal, and format-aware fingerprints to
-beat general-purpose tools — especially on HDDs and large media
-libraries.
+the table on Windows by avoiding NTFS- and Win32-specific tricks. The
+Windows build leans on direct MFT enumeration, LCN-ordered I/O, IOCP,
+the USN journal, and format-aware fingerprints. The Linux build uses the
+same scanner + hasher with platform-native dedup actions (FICLONE reflink
+on btrfs / XFS / Bcachefs / ZFS, XDG Trash for safe recycle, hardlink
+detection via `st_ino` + `st_dev`).
 
-> Status: pre-alpha. v0.1 is under active development. The current build
-> contains the CLI surface, the five-stage pipeline scaffolding, and a
-> correct (if not yet maximally fast) end-to-end scanner.
+> Status: alpha. v0.1.x is feature-active under continuous release. The
+> current build (v0.1.8+) ships:
+> - Full five-stage scan pipeline with `river5` hashing (16-byte,
+>   AES-NI hardware-accelerated)
+> - GUI with badge wall, post-scan modal, async rank toast
+> - Native Linux build with reflink + XDG Trash support
+> - Public leaderboards + achievement system (opt-in)
 
 ## Design (one-paragraph version)
 
@@ -45,7 +50,7 @@ libraries.
 3. **Resolve physical layout** via `FSCTL_GET_RETRIEVAL_POINTERS` so
    reads can be sorted by starting LCN; hardlinks and ReFS block clones
    are detected and short-circuited here.
-4. **Hash progressively** in four tiers (format-aware → 4 KiB head → head/mid/tail → full BLAKE3) so most non-duplicates are eliminated without reading the full file.
+4. **Hash progressively** in four tiers (format-aware → 4 KiB head → head/mid/tail → full content via `river5` by default, `BLAKE3` opt-in) so most non-duplicates are eliminated without reading the full file.
 5. **Confirm and emit** results, with optional `--paranoid` byte-by-byte verification.
 
 Everything I/O-heavy goes through IOCP queues sorted by LCN with
@@ -57,36 +62,45 @@ near-instant via the USN journal.
 
 Releases are at
 [github.com/mickfixesjunk/superdeduper/releases](https://github.com/mickfixesjunk/superdeduper/releases).
-Each release ships a per-architecture zip with `superdeduper.exe`,
-`superdeduper-gui.exe`, the LICENSE, and a `SHA256SUMS` manifest. All
-artifacts are reproducibly built in public CI and signed twice —
-once via [GitHub Sigstore attestations][gh-attest] (always) and once
-via Authenticode (when a code-signing cert is configured).
-
-**Always verify a download before running it.** Step-by-step
-instructions live in [SECURITY.md](SECURITY.md); the short version is:
+Each release ships standalone binaries for Windows + Linux (CLI + GUI),
+plus a `SHA256SUMS` manifest. The intent is to publish [GitHub
+Sigstore attestations][gh-attest] alongside each release once
+`release.yml` is fully green (currently in repair); manual verification
+via `SHA256SUMS` is the interim path:
 
 ```pwsh
-gh attestation verify superdeduper-x86_64-windows.zip --repo mickfixesjunk/superdeduper
+# Windows (PowerShell)
+Get-FileHash superdeduper-gui-windows-x86_64.exe -Algorithm SHA256
+# Compare against the line in SHA256SUMS
 ```
 
-If you see anything other than `verification succeeded`, do not run
-the binary — it didn't come from this repo's `release.yml`.
+```bash
+# Linux
+sha256sum -c SHA256SUMS
+```
+
+See [SECURITY.md](SECURITY.md) for the full verification flow.
 
 [gh-attest]: https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds
 
 ## Building from source
 
-```pwsh
-cargo build --release --locked
+The CLI:
+
+```bash
+cargo build --release --locked --features telemetry --bin superdeduper
 ```
 
-The release binary is a single `target\release\superdeduper.exe`. The
-optional GUI:
+The GUI:
 
-```pwsh
-cargo build --release --locked --features gui --bin superdeduper-gui
+```bash
+cargo build --release --locked --features gui,telemetry --bin superdeduper-gui
 ```
+
+The `telemetry` feature gates the leaderboard / achievement code. Drop
+it (`--no-default-features`) for a telemetry-stripped build. Both
+builds target your host platform; for cross-builds to Windows from
+Linux see the project's CI workflow (uses `cargo-zigbuild`).
 
 `rust-toolchain.toml` pins the toolchain; `--locked` enforces the
 checked-in `Cargo.lock`. Together they make local builds bit-for-bit
@@ -94,19 +108,41 @@ match the release workflow.
 
 ## Usage
 
-```pwsh
+### CLI
+
+```bash
+# Windows
 superdeduper scan D:\Media
 superdeduper scan C:\Users\me\Pictures --min-size 1M --format json --output dups.json
 superdeduper dedupe dups.json --strategy oldest --action recycle --dry-run
+
+# Linux
+superdeduper scan ~/Pictures --min-size 1M --format json --output dups.json
+superdeduper dedupe dups.json --strategy oldest --action reflink --dry-run
 ```
+
+### GUI
+
+Launch `superdeduper-gui` (Windows: `superdeduper-gui.exe`, Linux:
+`./superdeduper-gui`). Add folders in the sidebar; click Start scan;
+review groups in the central panel; pick a destructive action from
+the Go button (Recycle / Hardlink / Reflink / Archive / Safe-rename).
+
+### Achievements + leaderboard (opt-in)
+
+`sd register` to opt in; `sd achievements list` to see your grants;
+`superdeduper.io` for the public leaderboard. Default share preference
+is "ask me each time" — flip to auto-submit or never-submit in
+Settings → Leaderboard.
 
 See `superdeduper --help` for the full CLI.
 
 ## Non-goals
 
-* Linux / macOS support
-* Filename- or tag-based fuzzy matching
-* GUI in v0.1 (planned post-MVP)
+* macOS support (not on the roadmap for v0.1.x; revisit at v0.2+)
+* Filename- or tag-based fuzzy matching (sd dedupes by content, not by name)
+* Cloud / network-only sync (sd reads local filesystems; cloud-placeholder
+  files are detected + skipped by default, not hydrated)
 
 ## Acknowledgments
 
