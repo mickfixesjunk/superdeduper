@@ -59,9 +59,17 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     let nonce = compute_pow(&state.install_id, DEFAULT_POW_DIFFICULTY)
         .ok_or(RegisterError::PoWTimeout)?;
 
+    // Register is the bootstrap: the server doesn't have our
+    // install_key_hex yet, so it can't verify the X-Sd-Signature
+    // on THIS request. The body carries `install_key_hex` so the
+    // server can store the key and verify all subsequent
+    // (X-Sd-Signature-checked) requests against it. Per web's
+    // backend spec; missing this field caused register to fail
+    // server-side until a follow-up fixed it.
     let body = serde_json::json!({
         "install_id": state.install_id,
         "client_version": state.client_version_at_register,
+        "install_key_hex": state.install_key_hex,
         "registration_proof": {
             "kind": "pow",
             "challenge": state.install_id,
@@ -145,9 +153,14 @@ pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), Registe
         }
     })?;
 
+    // See `register_cli` for why install_key_hex appears in the
+    // body — bootstrap: server uses it to populate the key store
+    // so future X-Sd-Signature checks have something to verify
+    // against.
     let body = serde_json::json!({
         "install_id": state.install_id,
         "client_version": state.client_version_at_register,
+        "install_key_hex": state.install_key_hex,
         "registration_proof": {
             "kind": "captcha",
             "provider": "turnstile",
