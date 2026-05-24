@@ -714,7 +714,14 @@ fn link_via_loopback_inner(
     // loopback root path; provider redirects there with the auth
     // code in the query string.
     let state = make_nonce();
-    let redirect_uri = format!("http://127.0.0.1:{port}/oauth-callback");
+    // Redirect URI uses `localhost` (not `127.0.0.1`) because
+    // Discord requires EXACT string match against its registered
+    // allowlist and web has registered the `localhost` form. The
+    // listener still binds to `127.0.0.1` — the browser resolves
+    // `localhost` → 127.0.0.1 via the hosts file, so the connection
+    // still lands here. Confirmed against Discord client_id
+    // 1508187203053031454 (Mick 2026-05-24T23:48Z).
+    let redirect_uri = format!("http://localhost:{port}/oauth-callback");
 
     let (auth_url, code_verifier) = build_auth_url(provider, channel, &redirect_uri, &state)?;
 
