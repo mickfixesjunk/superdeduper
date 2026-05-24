@@ -631,6 +631,15 @@ fn run(
     // whose content is empty (size == 0). Used by backend to grant
     // "zero-byte hoarder". Updated on each group emission below.
     let mut zero_byte_group_max: u64 = 0;
+    // G1.x esoteric metric: highest hardlink count observed in the
+    // scan. Derived from `link_equivalent` groups — every path in
+    // such a group is a confirmed alias of one inode, so the
+    // group's member count is a tight lower bound on that inode's
+    // `nlink`. Honest under-report: singletons + partial-hardlink
+    // groups don't contribute (we don't have per-file nlink at
+    // this layer; walker-side nlink capture is a future follow-up
+    // that would let us cover those too).
+    let mut max_hardlink_count_in_scan: u64 = 0;
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -980,6 +989,15 @@ fn run(
                     zero_byte_group_max = members;
                 }
             }
+            if g.link_equivalent {
+                // Every visible path in a link-equivalent group
+                // refers to one inode → the member count is a
+                // confirmed lower bound on that inode's nlink.
+                let aliases = visible_files.len() as u64;
+                if aliases > max_hardlink_count_in_scan {
+                    max_hardlink_count_in_scan = aliases;
+                }
+            }
             total_dups += 1;
             // Keep the diagnostics counters in sync so the 10s
             // sampler thread sees fresh values without us holding
@@ -1172,9 +1190,14 @@ fn run(
                 } else {
                     None
                 },
-                // TODO(G1.x follow-up): wire walker hardlink-count
-                // tracking into max_hardlink_count_in_scan.
-                max_hardlink_count_in_scan: None,
+                // Computed from `link_equivalent` group sizes during
+                // dup-group emission above. Conservative lower bound
+                // — see the comment on the declaration.
+                max_hardlink_count_in_scan: if max_hardlink_count_in_scan > 0 {
+                    Some(max_hardlink_count_in_scan)
+                } else {
+                    None
+                },
                 // TODO(G1.x follow-up): track (basename → hash)
                 // collisions across all scanned files for
                 // name_collision_count.
