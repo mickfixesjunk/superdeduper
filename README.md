@@ -108,6 +108,10 @@ See `superdeduper --help` for the full CLI.
 * Filename- or tag-based fuzzy matching
 * GUI in v0.1 (planned post-MVP)
 
+## Acknowledgments
+
+Built by Mick and the SuperDeDuper AI dev team using [Giga-Harness](https://github.com/mickfixesjunk/giga-harness) and [Claude](https://claude.com).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
