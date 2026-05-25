@@ -782,19 +782,12 @@ enum RowItem {
     },
 }
 
-/// User-facing path display. Strips Windows verbatim-path prefix
-/// (`\\?\`) so dup-table rows + tooltips show `C:\Foo\bar` instead of
-/// `\\?\C:\Foo\bar`. UNC verbatim form (`\\?\UNC\srv\share`) is
-/// rewritten back to `\\srv\share`.
+/// User-facing path display for dup-table rows + tooltips.
+/// Delegates to the crate-root `path_display::for_user_display`;
+/// per #73 the `\\?\` strip behaviour lives in exactly one place
+/// across the GUI surfaces (groups-table, Log, preview-header).
 fn format_path(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        if let Some(unc) = rest.strip_prefix("UNC\\") {
-            return format!(r"\\{unc}");
-        }
-        return rest.to_string();
-    }
-    s.into_owned()
+    crate::path_display::for_user_display(p)
 }
 
 fn group_passes_filter(

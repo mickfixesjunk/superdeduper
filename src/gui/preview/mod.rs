@@ -206,19 +206,13 @@ pub fn show(ui: &mut Ui, path: &Path, state: &mut PreviewState) -> Option<Previe
     action
 }
 
-/// User-facing path display. Strips Windows verbatim-path prefix
-/// (`\\?\`). Mirrors the same helper in `groups_table` — duplicated
-/// rather than re-exported because this module is a leaf and we
-/// don't want a `pub` knot.
+/// User-facing path display. Delegates to the crate-root
+/// `path_display::for_user_display` so the `\\?\` strip rules
+/// stay aligned across every UI surface (groups-table, Log,
+/// preview-header). Per #73 — was previously a duplicate of
+/// the helper in `groups_table` + `live.rs`.
 fn display_path(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        if let Some(unc) = rest.strip_prefix("UNC\\") {
-            return format!(r"\\{unc}");
-        }
-        return rest.to_string();
-    }
-    s.into_owned()
+    crate::path_display::for_user_display(p)
 }
 
 /// Side-by-side preview of two files. Render `left` next to `right`
