@@ -526,6 +526,11 @@ impl UiState {
                 // (pops the post-archive summary modal). UiState
                 // doesn't store the rollup; the modal owns it.
             }
+            EngineEvent::DedupeActionSummary(_) => {
+                // #79 — handled in app.rs::drain_events (pops the
+                // action-summary modal + drives the PATCH client).
+                // UiState doesn't store the rollup; the modal owns it.
+            }
             EngineEvent::FileActionCompleted { src, outcome } => {
                 let matched = duplicates_contain_path(&self.duplicates, &src);
                 apply_file_action_to_duplicates(&mut self.duplicates, &src, outcome);

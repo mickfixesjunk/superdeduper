@@ -813,6 +813,14 @@ use std::sync::OnceLock;
 
 static PENDING: OnceLock<Mutex<Option<SubmissionInputs>>> = OnceLock::new();
 static LAST_OUTCOME: OnceLock<Mutex<Option<SubmitOutcome>>> = OnceLock::new();
+/// #79 — submission_id of the most-recently-Accepted submission
+/// for the in-memory scan. Set by the submit worker on
+/// `SubmitOutcome::Accepted`; cleared when a fresh scan starts.
+/// Read by the post-Go `action_submission` PATCH client so it
+/// knows which submission row to credit. Lives as a static slot
+/// (not on `SuperdeduperApp`) because the submit worker thread
+/// has only `&self` access to the App, which can't mutate fields.
+static PENDING_SUBMISSION_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Store the freshest scan's submission inputs. Overwrites any
 /// previous value — scan-end semantics: the user can only submit
@@ -847,6 +855,31 @@ pub fn peek_last_outcome() -> Option<SubmitOutcome> {
 
 pub fn clear_last_outcome() {
     if let Some(m) = LAST_OUTCOME.get() {
+        *m.lock() = None;
+    }
+}
+
+/// #79 — Store the submission_id from the most recent Accepted
+/// /api/v1/submit response so the post-Go PATCH credits the
+/// right row. Overwrites any previous value (scan-end semantic;
+/// a fresh scan supersedes the old submission_id).
+pub fn store_pending_submission_id(id: String) {
+    let m = PENDING_SUBMISSION_ID.get_or_init(|| Mutex::new(None));
+    *m.lock() = Some(id);
+}
+
+/// #79 — Read the submission_id stashed by the most recent
+/// Accepted submission. `None` ⇒ the user hasn't submitted yet
+/// (anonymous flow, or pre-Go state), so PATCH should not fire.
+pub fn peek_pending_submission_id() -> Option<String> {
+    PENDING_SUBMISSION_ID.get().and_then(|m| m.lock().clone())
+}
+
+/// #79 — Wipe the pending submission_id. Called when a fresh
+/// scan starts so an action taken AFTER the new scan doesn't
+/// credit the OLD scan's submission.
+pub fn clear_pending_submission_id() {
+    if let Some(m) = PENDING_SUBMISSION_ID.get() {
         *m.lock() = None;
     }
 }
