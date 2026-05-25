@@ -47,6 +47,10 @@ enum ResultsTab {
     /// `crate::scan_history`. Future v2 will add resubmit + delete
     /// affordances per-row; the tab slot is the same.
     History,
+    /// #27 v1 — in-app file preview pane. Set via the 👁 button on a
+    /// Groups-table row; falls through to a "no file selected" state
+    /// when `app.previewed_file` is None.
+    Preview,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -96,6 +100,14 @@ pub struct SuperdeduperApp {
     /// fresh scan) / RevertToPaused (adopt checkpoint roots+settings,
     /// then launch — the real "resume") / Cancel.
     pending_drift_modal: Option<crate::gui::checkpoint::CheckpointSummary>,
+    /// #27 v1 — file currently shown in the Preview tab. Set by the
+    /// 👁 button on a groups-table row + cleared by the panel's
+    /// Close button. `None` ⇒ Preview tab renders an empty state.
+    previewed_file: Option<PathBuf>,
+    /// Sticky preview-mode override (Text vs Hex) across renders.
+    /// Reset to None whenever `previewed_file` changes — handled
+    /// at the set site.
+    preview_state: crate::gui::preview::PreviewState,
     /// #41 — App-start "Resubmit N pending scans?" modal. Populated
     /// in `new()` with rows whose `submission_state == Pending` AND
     /// whose most-recent activity is older than the 5-minute
@@ -256,6 +268,8 @@ impl SuperdeduperApp {
             drive_render_overrides: hashbrown::HashMap::new(),
             pending_resume,
             pending_drift_modal: None,
+            previewed_file: None,
+            preview_state: crate::gui::preview::PreviewState::default(),
             #[cfg(feature = "telemetry")]
             pending_resubmit_prompt: None,
             scan_mode: crate::cli::ScanMode::Exact,
@@ -1806,6 +1820,7 @@ impl SuperdeduperApp {
                 | GroupAction::OpenFile(_)
                 | GroupAction::OpenFolder(_)
                 | GroupAction::PromoteKeeper { .. }
+                | GroupAction::Preview(_)
         ) {
             return self.dispatch_group_action_unchecked(action);
         }
@@ -1861,6 +1876,21 @@ impl SuperdeduperApp {
                         g.files.swap(0, member_idx);
                     }
                 }
+            }
+            GroupAction::Preview(path) => {
+                // Reset the mode-override whenever the previewed
+                // file changes so a "Force Hex" choice on file A
+                // doesn't leak to file B.
+                let path_changed = self
+                    .previewed_file
+                    .as_ref()
+                    .map(|p| p != &path)
+                    .unwrap_or(true);
+                if path_changed {
+                    self.preview_state = crate::gui::preview::PreviewState::default();
+                }
+                self.previewed_file = Some(path);
+                self.persisted.results_tab = ResultsTab::Preview;
             }
         }
     }
@@ -2893,6 +2923,7 @@ impl eframe::App for SuperdeduperApp {
                     pick("Groups", ResultsTab::Groups);
                     pick("Log", ResultsTab::Log);
                     pick("History", ResultsTab::History);
+                    pick("Preview", ResultsTab::Preview);
                     // Filter chip — visible whenever a drive is selected.
                     if let Some(id) = self.selected_drive {
                         let label = self
@@ -2946,6 +2977,40 @@ impl eframe::App for SuperdeduperApp {
                     ResultsTab::Log => log_panel::show(ui, &self.state),
                     ResultsTab::History => {
                         crate::gui::widgets::scan_history_panel::show(ui);
+                    }
+                    ResultsTab::Preview => {
+                        if let Some(path) = self.previewed_file.clone() {
+                            if let Some(action) =
+                                crate::gui::preview::show(ui, &path, &mut self.preview_state)
+                            {
+                                use crate::gui::preview::PreviewAction;
+                                match action {
+                                    PreviewAction::Close => {
+                                        self.previewed_file = None;
+                                    }
+                                    PreviewAction::ForceHex | PreviewAction::ForceText => {
+                                        // Mode override already stored by the widget.
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new("No file selected")
+                                        .color(theme::TEXT_LO)
+                                        .heading(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Click 👁 on any duplicate group's keeper row \
+                                         to preview it here.",
+                                    )
+                                    .color(theme::TEXT_LO)
+                                    .size(12.0),
+                                );
+                            });
+                        }
                     }
                 }
                 if let Some(a) = group_action {
@@ -3074,6 +3139,9 @@ fn describe_destructive_action(action: &GroupAction) -> String {
         }
         GroupAction::PromoteKeeper { .. } => {
             "(internal: Promote-keeper reached the destructive modal — this is a bug)".into()
+        }
+        GroupAction::Preview(_) => {
+            "(internal: Preview reached the destructive modal — this is a bug)".into()
         }
     }
 }
