@@ -156,6 +156,30 @@ fn run(
         level: LogLevel::Info,
         message: format!("Hash impl: {hash_impl}"),
     });
+
+    // #15 L2 — surface mount-info warnings per scan root on Linux.
+    // Pool-dedup-capable filesystems, network mounts, and dm-mapped
+    // volumes (LUKS) each have their own gotchas — log them once at
+    // scan-start so they appear in the GUI Log panel before any
+    // dup-find event lands.
+    #[cfg(target_os = "linux")]
+    {
+        for root in &roots {
+            if let Some(info) = crate::platform::linux::mount_info::for_path(&root.path) {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Info,
+                    message: format!("mount: {}", info.summary_line()),
+                });
+                for w in info.warnings() {
+                    let _ = tx.send(EngineEvent::Log {
+                        level: LogLevel::Warn,
+                        message: w,
+                    });
+                }
+            }
+        }
+    }
+
     let cfg = build_config(&roots, &settings)?;
     let reference_set: hashbrown::HashSet<PathBuf> = roots
         .iter()

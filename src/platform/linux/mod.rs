@@ -4,6 +4,7 @@
 //! public fn in `src/platform/mod.rs`; cfg-routing happens in mod.rs,
 //! impls land in submodules here.
 
+pub mod mount_info;
 pub mod reflink;
 pub mod trash;
 

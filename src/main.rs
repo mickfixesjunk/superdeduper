@@ -722,6 +722,25 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         hash_impl,
         "starting scan",
     );
+
+    // #15 L2 — surface mount-info warnings per scan root on Linux.
+    // Pool-dedup-capable filesystems (zfs / btrfs), network mounts
+    // (nfs / cifs / sshfs), and dm-mapped volumes (LUKS) each have
+    // their own gotchas — warn the user once at scan-start so they
+    // can read the reclaim numbers with the right frame.
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write as _;
+        let mut stderr = io::stderr().lock();
+        for root in &cfg.roots {
+            if let Some(info) = superdeduper::platform::linux::mount_info::for_path(root) {
+                let _ = writeln!(stderr, "mount: {}", info.summary_line());
+                for w in info.warnings() {
+                    let _ = writeln!(stderr, "  ⚠ {w}");
+                }
+            }
+        }
+    }
     // Also surface it in the stderr timing block (which lands at WARN
     // level by default) so users running with --quiet still see it.
     eprintln!("hash impl: {hash_impl}");
