@@ -28,6 +28,7 @@ pub mod keep;
 pub mod output;
 pub mod pipeline;
 pub mod platform;
+pub mod scan_history;
 pub mod winapi_wrappers;
 
 #[cfg(feature = "gui")]
