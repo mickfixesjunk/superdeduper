@@ -638,13 +638,63 @@ impl SuperdeduperApp {
     #[cfg(feature = "telemetry")]
     fn spawn_leaderboard_submit_worker(&self) {
         std::thread::spawn(|| {
-            use crate::leaderboard::{install, submission};
+            use crate::leaderboard::{install, registration, submission};
+            // Auto-register if needed: clicking Submit means the user
+            // has decided to participate (same logic as the OAuth
+            // chain). Same worker thread runs the PoW + POST
+            // /api/v1/register inline (~1s); user sees the existing
+            // "Submitting..." spinner for one extra second instead
+            // of a "not registered" error. Per Mick 2026-05-25T03:15Z.
             let state = match install::load() {
                 Ok(Some(s)) if s.registered => s,
-                _ => {
+                Ok(Some(mut s)) => {
+                    eprintln!(
+                        "submit: install present but not registered on web; \
+                         auto-registering before submit"
+                    );
+                    match registration::register_cli(&mut s) {
+                        Ok(()) => s,
+                        Err(e) => {
+                            submission::store_last_outcome(
+                                submission::SubmitOutcome::Rejected {
+                                    status: 0,
+                                    reason: format!(
+                                        "auto-register before submit failed: {e:?}"
+                                    ),
+                                },
+                            );
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "submit: no install state on disk; auto-registering before submit"
+                    );
+                    let server_url = crate::channel::server_url_for(
+                        crate::channel::active_channel(),
+                    )
+                    .to_string();
+                    let mut s = install::new_unregistered(server_url);
+                    match registration::register_cli(&mut s) {
+                        Ok(()) => s,
+                        Err(e) => {
+                            submission::store_last_outcome(
+                                submission::SubmitOutcome::Rejected {
+                                    status: 0,
+                                    reason: format!(
+                                        "auto-register before submit failed: {e:?}"
+                                    ),
+                                },
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
                     submission::store_last_outcome(submission::SubmitOutcome::Rejected {
                         status: 0,
-                        reason: "install not registered".into(),
+                        reason: format!("install state read error: {e}"),
                     });
                     return;
                 }
