@@ -27,8 +27,8 @@ use crate::leaderboard::{install, oauth};
 /// above the badge grid, and the Settings → Account status row.
 pub fn provider_icon(provider: oauth::Provider) -> egui::ImageSource<'static> {
     match provider {
-        oauth::Provider::Google => egui::include_image!("../../../../assets/48x48-google.png"),
-        oauth::Provider::Discord => egui::include_image!("../../../../assets/48x48-discord.png"),
+        oauth::Provider::Google => egui::include_image!("../../../assets/48x48-google.png"),
+        oauth::Provider::Discord => egui::include_image!("../../../assets/48x48-discord.png"),
     }
 }
 
