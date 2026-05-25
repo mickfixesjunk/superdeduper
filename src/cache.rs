@@ -1,6 +1,18 @@
 //! Per-machine persistent cache, keyed by `(volume_guid, file_ref)` and
 //! invalidated whenever `(size, mtime, usn)` changes for a record.
 //!
+//! `file_ref` is the inode-equivalent identifier — `GetFileInformationByHandle`'s
+//! `nFileIndex` on Windows, `st_ino` on Linux/macOS. `volume_guid` is
+//! the volume identity — the `\\?\Volume{…}` GUID on Windows,
+//! `"linux-dev-{st_dev}"` on Unix. The keying is intentionally
+//! filesystem-identity-based, NOT path-based: if a file is renamed,
+//! moved, or hardlinked to a new path, the cache still hits. If a
+//! file is replaced with a fresh inode (e.g. `rm + cp -a`, or
+//! restoring a backup), the cache MISSES even when path + mtime +
+//! size all match — fresh inode → fresh hash. See
+//! [`tests/cache_corpus_reset`] for the regression that pins this
+//! (#36).
+//!
 //! The cache lives at `%LOCALAPPDATA%\superdeduper\cache.db` on Windows
 //! and `$XDG_CACHE_HOME/superdeduper/cache.db` (or `~/.cache/superdeduper/`)
 //! elsewhere — the non-Windows path exists only so the cross-platform
