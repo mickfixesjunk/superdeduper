@@ -18,7 +18,7 @@
 //! reachable through the browser URL we opened, which is private to
 //! the user's session.
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
