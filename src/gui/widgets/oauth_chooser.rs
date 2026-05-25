@@ -138,36 +138,49 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
 /// step.
 fn start_link(provider: oauth::Provider, channel: Channel) {
     let install_id_opt = install::load().ok().flatten().map(|s| s.install_id);
-    match install_id_opt {
-        Some(install_id) => {
-            let server_url = crate::channel::server_url_for(channel);
-            if oauth::try_start_session(
-                provider,
-                channel,
-                server_url,
-                &install_id,
-                oauth::DEFAULT_OAUTH_TIMEOUT,
-            )
+    let server_url = crate::channel::server_url_for(channel);
+
+    // Fresh-install path (Mick 2026-05-25T03:00Z): kick the
+    // register session in parallel with the OAuth flow instead of
+    // sequentially. PoW takes ~1s; the user takes ~10s to sign in
+    // with the provider; by the time engine reaches `exchange_code`
+    // the register has long since saved install.{channel}.json.
+    // The exchange step has a brief wait-loop guarding the rare
+    // fast-signin race.
+    //
+    // The browser opens immediately on click — no "did anything
+    // happen?" gap.
+    if install_id_opt.is_none() {
+        oauth::log_oauth_event(&format!(
+            "fresh_install_chain: kicking register + OAuth in PARALLEL for \
+             {provider} on {channel}",
+        ));
+        oauth::set_pending_retry_provider(provider);
+        if crate::leaderboard::registration::try_start_register_session(channel)
             .is_err()
-            {
-                eprintln!(
-                    "oauth-chooser: another OAuth flow is already in flight; ignoring"
-                );
-            }
+        {
+            eprintln!(
+                "oauth-chooser: register session already in flight (continuing with parallel OAuth)"
+            );
         }
-        None => {
-            oauth::log_oauth_event(&format!(
-                "fresh_install_chain: no install state on {channel}; \
-                 registering first, then auto-retrying with {provider}",
-            ));
-            oauth::set_pending_retry_provider(provider);
-            if crate::leaderboard::registration::try_start_register_session(channel)
-                .is_err()
-            {
-                eprintln!(
-                    "oauth-chooser: register session already in flight; can't auto-chain"
-                );
-            }
-        }
+    }
+
+    // OAuth flow always kicks — `link_via_loopback_inner` ignores
+    // its `install_id` argument (see the `let _ = install_id;` at
+    // its top); the value matters only at exchange time, where
+    // `exchange_code` reads install state from disk directly.
+    let install_id_for_session = install_id_opt.unwrap_or_default();
+    if oauth::try_start_session(
+        provider,
+        channel,
+        server_url,
+        &install_id_for_session,
+        oauth::DEFAULT_OAUTH_TIMEOUT,
+    )
+    .is_err()
+    {
+        eprintln!(
+            "oauth-chooser: another OAuth flow is already in flight; ignoring"
+        );
     }
 }

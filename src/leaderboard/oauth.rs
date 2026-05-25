@@ -1020,14 +1020,42 @@ fn exchange_code(
     // 2026-05-24T23:42Z dev log). Same signing the rest of the
     // leaderboard endpoints use; see `submission.rs` /
     // `registration.rs::register_cli`.
-    let state = crate::leaderboard::install::load()
-        .map_err(|e| OauthError::BadCallback(format!("load install for signing: {e}")))?
-        .ok_or_else(|| {
-            OauthError::BadCallback(
-                "install state missing — run `superdeduper register --channel <name>` first"
-                    .to_string(),
-            )
-        })?;
+    //
+    // **Wait-for-install-state loop**: per Mick 2026-05-25T03:00Z,
+    // the fresh-install path kicks register + OAuth in parallel
+    // so the browser opens immediately. By the time exchange_code
+    // runs, register has typically completed + saved
+    // install.{channel}.json. But if the user signed in unusually
+    // fast (~1s), the register thread may still be running — wait
+    // up to 10s for the file to land before giving up.
+    let state = {
+        let start = Instant::now();
+        let poll_step = Duration::from_millis(100);
+        let max_wait = Duration::from_secs(10);
+        loop {
+            match crate::leaderboard::install::load() {
+                Ok(Some(s)) => break s,
+                Ok(None) => {
+                    if start.elapsed() >= max_wait {
+                        log_oauth_event(
+                            "exchange: install state still missing after 10s wait \
+                             — register may have failed",
+                        );
+                        return Err(OauthError::BadCallback(
+                            "install state missing — register did not complete in time"
+                                .to_string(),
+                        ));
+                    }
+                    std::thread::sleep(poll_step);
+                }
+                Err(e) => {
+                    return Err(OauthError::BadCallback(format!(
+                        "load install for signing: {e}"
+                    )));
+                }
+            }
+        }
+    };
     let key = state.install_key().ok_or_else(|| {
         OauthError::BadCallback("install_key_hex malformed".to_string())
     })?;

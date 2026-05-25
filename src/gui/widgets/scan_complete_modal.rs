@@ -465,41 +465,37 @@ fn start_signin(
     channel: crate::channel::Channel,
 ) {
     use crate::leaderboard::{install, oauth, registration};
-    // Fresh-install path mirrors oauth_chooser::start_link: if
-    // there's no install state on this channel yet, stash the
-    // provider + kick off register; the auto-retry chain in
-    // poll_register_session restarts OAuth with this provider
-    // once register lands.
     let install_id_opt = install::load().ok().flatten().map(|s| s.install_id);
-    match install_id_opt {
-        Some(install_id) => {
-            let server_url = crate::channel::server_url_for(channel);
-            if oauth::try_start_session(
-                provider,
-                channel,
-                server_url,
-                &install_id,
-                oauth::DEFAULT_OAUTH_TIMEOUT,
-            )
-            .is_err()
-            {
-                eprintln!(
-                    "post-scan-cta: another OAuth flow is already in flight; ignoring"
-                );
-            }
+    let server_url = crate::channel::server_url_for(channel);
+    // Fresh-install path: kick register IN PARALLEL with the OAuth
+    // flow (see oauth_chooser::start_link for the rationale). The
+    // PoW + register save complete during the ~10s the user spends
+    // signing in on the provider page.
+    if install_id_opt.is_none() {
+        oauth::log_oauth_event(&format!(
+            "fresh_install_chain (post-scan): kicking register + OAuth in \
+             PARALLEL for {provider} on {channel}",
+        ));
+        oauth::set_pending_retry_provider(provider);
+        if registration::try_start_register_session(channel).is_err() {
+            eprintln!(
+                "post-scan-cta: register already in flight (continuing with parallel OAuth)"
+            );
         }
-        None => {
-            oauth::log_oauth_event(&format!(
-                "fresh_install_chain (post-scan): no install on {channel}; \
-                 registering then auto-retrying with {provider}",
-            ));
-            oauth::set_pending_retry_provider(provider);
-            if registration::try_start_register_session(channel).is_err() {
-                eprintln!(
-                    "post-scan-cta: register already in flight; can't auto-chain"
-                );
-            }
-        }
+    }
+    let install_id_for_session = install_id_opt.unwrap_or_default();
+    if oauth::try_start_session(
+        provider,
+        channel,
+        server_url,
+        &install_id_for_session,
+        oauth::DEFAULT_OAUTH_TIMEOUT,
+    )
+    .is_err()
+    {
+        eprintln!(
+            "post-scan-cta: another OAuth flow is already in flight; ignoring"
+        );
     }
 }
 
