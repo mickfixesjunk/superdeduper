@@ -72,6 +72,31 @@ where
             });
             return Err(crate::Error::PathNotFound(root.clone()));
         }
+        // #32: a positional CLI arg can be a single file, not just
+        // a directory. `scan some_dir some_file.txt` should treat
+        // both as first-class inventory entries so cross-source
+        // duplicate detection can match them. Without this branch,
+        // walk() would try to read_dir(file) and return zero
+        // entries — `some_file.txt` never makes it into the
+        // inventory and the cross-source group never forms.
+        //
+        // The check is metadata-based rather than path-string-based
+        // so a symlink-to-file root with `--follow-links` does the
+        // right thing too.
+        let root_metadata = match fs::metadata(root) {
+            Ok(m) => m,
+            Err(e) => {
+                callback(WalkEvent::DirError {
+                    path: root,
+                    message: format!("metadata failed: {e}"),
+                });
+                return Err(crate::Error::PathNotFound(root.clone()));
+            }
+        };
+        if root_metadata.is_file() {
+            push_single_file_root(root, &root_metadata, cfg, &mut out, &mut callback);
+            continue;
+        }
         // Convert the root to a verbatim (\\?\C:\...) path on
         // Windows so child enumeration bypasses Win32's path-name
         // normalization. Without this, filenames with trailing dots
@@ -92,6 +117,89 @@ where
         walk(&root_for_walk, cfg, &mut out, &mut callback, 0, cancel)?;
     }
     Ok(out)
+}
+
+/// Single-file positional root path — mirror the filter logic from
+/// `walk()` (min-size / max-size / globs / exclusions) so a file
+/// passed as a CLI arg goes through the same gates a file the walker
+/// found inside a directory would. Side-effects emit the same
+/// WalkEvent::FileFound / EntrySkipped callbacks so progress UIs
+/// don't notice the difference.
+///
+/// Reparse + placeholder classification matches walk()'s path so a
+/// recall-on-open file passed as a positional arg gets the same
+/// "skipped" treatment it would have got inside a dir.
+fn push_single_file_root<F>(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    cfg: &ScanConfig,
+    out: &mut Vec<FileEntry>,
+    callback: &mut F,
+) where
+    F: FnMut(WalkEvent<'_>),
+{
+    let size = metadata.len();
+    if size < cfg.min_size {
+        callback(WalkEvent::EntrySkipped {
+            path,
+            reason: "below min-size",
+        });
+        return;
+    }
+    if let Some(max) = cfg.max_size {
+        if size > max {
+            callback(WalkEvent::EntrySkipped {
+                path,
+                reason: "above max-size",
+            });
+            return;
+        }
+    }
+    if dropped_by_exclusions(path, size, cfg) {
+        callback(WalkEvent::EntrySkipped {
+            path,
+            reason: "Settings → Exclusions",
+        });
+        return;
+    }
+    if !path_passes_globs(path, cfg) {
+        callback(WalkEvent::EntrySkipped {
+            path,
+            reason: "filtered by include/exclude",
+        });
+        return;
+    }
+    callback(WalkEvent::FileFound { path, size });
+
+    // Reparse-tag for cloud-placeholder classification matches the
+    // dir-walker path. On Linux + macOS this is always 0 / None; on
+    // Windows the metadata extension yields the actual reparse tag.
+    #[cfg(windows)]
+    let (attributes, reparse_tag) = {
+        use std::os::windows::fs::MetadataExt;
+        let attrs = metadata.file_attributes();
+        let tag = if attrs & 0x400 != 0 {
+            Some(metadata.reparse_tag())
+        } else {
+            None
+        };
+        (attrs, tag)
+    };
+    #[cfg(not(windows))]
+    let (attributes, reparse_tag) = (0u32, None);
+
+    let (file_ref, volume_guid) = inode_identity(metadata);
+    out.push(FileEntry {
+        path: path.to_path_buf(),
+        size,
+        mtime: filetime_ticks(metadata),
+        file_ref,
+        parent_ref: 0,
+        usn: 0,
+        attributes,
+        volume_guid,
+        placeholder: crate::inventory::placeholder::classify(attributes, reparse_tag),
+    });
 }
 
 // Note: emitted paths intentionally keep the `\\?\` prefix when the
