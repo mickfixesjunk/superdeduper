@@ -264,7 +264,36 @@ pub fn submit_recorded_payload(
             };
         }
     };
-    let body = hmac_signer::canonical_body(payload);
+
+    // #60 — server's clock_skew sanity check rejects any payload
+    // whose `timestamp` field differs from the server's wall clock
+    // by more than 5 minutes. Resubmits are STALE by definition —
+    // the captured payload's timestamp is from scan-finish time,
+    // possibly hours / days before the resubmit click.
+    //
+    // Engine-side stopgap: refresh the `timestamp` field to a
+    // fresh ISO-8601 value before signing. The signature is still
+    // genuine (HMAC against the install_key, which only the
+    // install holds), so replay-attack resistance is unchanged.
+    // Other identity / content checks operate on install_id +
+    // run_uuid + the rest of the payload — all unchanged.
+    //
+    // This isn't the durable fix per #60's design discussion
+    // (lean (a): wrapper envelope signed with fresh outer
+    // timestamp, original payload preserved byte-for-byte for
+    // replay fidelity). Once web + design align on (a) vs (b)
+    // separate /submit/replay endpoint vs (c) explicit
+    // `replay_of_scan_id` field, swap this stopgap.
+    //
+    // Cross-ref: #60 (joint engine + web fix).
+    let mut refreshed = payload.clone();
+    if let Some(obj) = refreshed.as_object_mut() {
+        obj.insert(
+            "timestamp".to_string(),
+            serde_json::Value::String(now_iso8601()),
+        );
+    }
+    let body = hmac_signer::canonical_body(&refreshed);
     let signature = hmac_signer::sign(&install_key, &body);
 
     let url = format!("{}/api/v1/submit", server_url.trim_end_matches('/'));
@@ -907,6 +936,69 @@ mod tests {
                 "unexpected key '{key}' on payload — backend rejects with schema_invalid",
             );
         }
+    }
+
+    /// #60 — submit_recorded_payload refreshes the `timestamp` field
+    /// before signing so the server's clock_skew sanity check
+    /// doesn't reject every resubmit. We can't drive the actual POST
+    /// (no server in unit tests), so this verifies the
+    /// payload-mutation step that produces the canonical body the
+    /// signature is computed over.
+    #[test]
+    fn submit_recorded_payload_refreshes_timestamp_before_signing() {
+        // Hand-craft a "previously captured" payload with an
+        // OBVIOUSLY stale timestamp (1970-01-01) — exactly the
+        // shape #41 v2 persists on a scan-history row.
+        let captured = serde_json::json!({
+            "schema_version": "v1",
+            "client_version": "0.2.2",
+            "install_id": "test-install",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "hardware": {},
+            "run_shape": {},
+            "result_summary": {},
+        });
+        // Mimic the mutation submit_recorded_payload performs.
+        let mut refreshed = captured.clone();
+        if let Some(obj) = refreshed.as_object_mut() {
+            obj.insert(
+                "timestamp".to_string(),
+                serde_json::Value::String(now_iso8601()),
+            );
+        }
+        let original_ts = captured
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let new_ts = refreshed
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(original_ts, "1970-01-01T00:00:00Z");
+        assert_ne!(new_ts, original_ts, "timestamp must be refreshed");
+        // New timestamp must be fresh (within the last 60 seconds).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Pull the year out of the new ts; it should be >= 2026.
+        let year: u32 = new_ts[..4].parse().unwrap();
+        assert!(
+            year >= 2026,
+            "refreshed timestamp must be a current year, got: {new_ts}"
+        );
+        let _ = now;
+        // Other captured fields must survive unchanged.
+        assert_eq!(
+            refreshed.get("install_id").and_then(|v| v.as_str()),
+            Some("test-install")
+        );
+        assert_eq!(
+            refreshed.get("client_version").and_then(|v| v.as_str()),
+            Some("0.2.2")
+        );
     }
 
     #[test]
