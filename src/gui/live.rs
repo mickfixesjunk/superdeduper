@@ -721,6 +721,12 @@ fn run(
     let mut total_dups: u64 = 0;
     let mut reclaimable: u64 = 0;
     let mut reclaimable_inode: u64 = 0;
+    // #49 — per-SimilarityKind group counts; incremented every time
+    // we bump `total_dups`. Persisted in the scan-history record at
+    // ScanFinished so the History tab can show "32 perceptual + 30
+    // byte-identical" rather than "62 groups total."
+    let mut groups_by_similarity_kind: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     let mut largest_group_bytes: u64 = 0;
     // G1.x esoteric metric: largest dup-group (by member count)
     // whose content is empty (size == 0). Used by backend to grant
@@ -1111,6 +1117,9 @@ fn run(
                 }
             }
             total_dups += 1;
+            *groups_by_similarity_kind
+                .entry("byte-identical".to_string())
+                .or_insert(0) += 1;
             // Keep the diagnostics counters in sync so the 10s
             // sampler thread sees fresh values without us holding
             // a lock.
@@ -1407,6 +1416,9 @@ fn run(
             let n_groups = tier4_groups.len();
             for g in tier4_groups {
                 total_dups += 1;
+                *groups_by_similarity_kind
+                    .entry("perceptual-image".to_string())
+                    .or_insert(0) += 1;
                 // Tier-4 group reclaim = (unique_inodes - 1) * size, same
                 // shape as the byte-identical accumulator. Saturating
                 // arithmetic so a pathological count can't overflow.
@@ -1452,6 +1464,9 @@ fn run(
             let n_groups = tier4_groups.len();
             for g in tier4_groups {
                 total_dups += 1;
+                *groups_by_similarity_kind
+                    .entry("perceptual-audio".to_string())
+                    .or_insert(0) += 1;
                 let group_reclaim = g.unique_inodes.saturating_sub(1).saturating_mul(g.size);
                 reclaimable_inode = reclaimable_inode.saturating_add(group_reclaim);
                 reclaimable = reclaimable.saturating_add(group_reclaim);
@@ -1512,6 +1527,7 @@ fn run(
             total_bytes_read,
             total_dups,
             reclaimable_inode,
+            groups_by_similarity_kind.clone(),
         );
         if let Err(e) = crate::scan_history::record_completed(&record) {
             tracing::warn!(error = %e, "scan_history: record_completed failed (non-fatal)");
