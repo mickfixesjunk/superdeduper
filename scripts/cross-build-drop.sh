@@ -119,6 +119,29 @@ done
   superdeduper-gui-windows-x86_64.exe > SHA256SUMS)
 cp -v "$ARCHIVE_DIR/SHA256SUMS" "$LATEST_DIR/SHA256SUMS"
 
+# LATEST.txt sidecar — `cat /mnt/c/.../LATEST.txt` answers
+# "what version is this drop?" in one command. Single file
+# per drop, no filename clutter, no GC needed. Per Mick
+# directive 2026-05-25T19:46Z.
+VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
+GIT_DESCRIBE="$(git describe --tags --dirty --always 2>/dev/null || echo "$SHA")"
+BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$ARCHIVE_DIR/LATEST.txt" <<EOF
+version: $VERSION
+git: $GIT_DESCRIBE (sha: $SHA)
+branch: $BRANCH
+built_at: $BUILT_AT
+targets:
+  - x86_64-unknown-linux-musl
+  - x86_64-pc-windows-gnu
+binaries:
+  - superdeduper-linux-x86_64
+  - superdeduper-gui-linux-x86_64
+  - superdeduper-windows-x86_64.exe
+  - superdeduper-gui-windows-x86_64.exe
+EOF
+cp -v "$ARCHIVE_DIR/LATEST.txt" "$LATEST_DIR/LATEST.txt"
+
 echo "==> drop complete"
 echo "archive: ${ARCHIVE_DIR}"
 ls -la "$ARCHIVE_DIR"
