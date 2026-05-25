@@ -225,6 +225,15 @@ pub enum EngineEvent {
         src: PathBuf,
         outcome: FileActionOutcome,
     },
+    /// #79 — Per-action rollup emitted by the non-archive workers
+    /// (Recycle / Remove / Hardlink / Reflink / SafeRename). The
+    /// GUI's action-summary modal renders this; the #79 PATCH
+    /// client reads it as the canonical input for the
+    /// `actions_taken_summary` map. Archive has its own
+    /// `ArchiveActionSummary` because it tracks failure buckets
+    /// per #80 Bug C; this variant covers the simpler shape where
+    /// only success/fail counts + bytes matter.
+    DedupeActionSummary(crate::dedupe::DedupeActionSummary),
 }
 
 /// #83 — Disposition of a single file after a Go-action worker

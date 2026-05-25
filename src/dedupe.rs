@@ -52,6 +52,129 @@ pub struct Outcome {
     pub bytes_reclaimed: u64,
 }
 
+/// #79 — Per-action rollup emitted by the GUI's Go workers. Captures
+/// the success-only byte total that #79's PATCH submits as the
+/// reclaim credit, plus the failure counters for the summary modal.
+/// Archive has its own richer `gui::archive::ArchiveActionSummary`
+/// (with failure-bucket breakdown per #80 Bug C); this is the
+/// simpler shape used by Recycle / Remove / Hardlink / Reflink /
+/// SafeRename.
+///
+/// Mapped to the web-side LOCKED_ACTION_KEYS via `locked_action_key`:
+/// * Recycle → `deleted_to_recycle_bytes`
+/// * Remove → `deleted_permanently_bytes`
+/// * Hardlink → `hardlink_replaced_bytes`
+/// * Reflink → `reflink_replaced_bytes`
+/// * SafeRename → `None` (not credited; non-destructive per #79 spec)
+#[derive(Debug, Clone)]
+pub struct DedupeActionSummary {
+    pub action: crate::cli::DedupeAction,
+    pub ok_count: u64,
+    /// The figure that gets credited to the leaderboard as the
+    /// action's `actions_taken_summary` value via #79 PATCH. Sum of
+    /// `size` for every file the worker successfully processed.
+    pub ok_bytes: u64,
+    pub failed_count: u64,
+    pub failed_bytes: u64,
+    pub user_stopped: bool,
+}
+
+impl DedupeActionSummary {
+    /// #79 — Map the action variant to its server-side
+    /// LOCKED_ACTION_KEYS slot. `None` ⇒ this action isn't
+    /// credited (currently only SafeRename).
+    pub fn locked_action_key(&self) -> Option<&'static str> {
+        match self.action {
+            crate::cli::DedupeAction::Recycle => Some("deleted_to_recycle_bytes"),
+            crate::cli::DedupeAction::Remove => Some("deleted_permanently_bytes"),
+            crate::cli::DedupeAction::Hardlink => Some("hardlink_replaced_bytes"),
+            crate::cli::DedupeAction::Reflink => Some("reflink_replaced_bytes"),
+            crate::cli::DedupeAction::SafeRename => None,
+        }
+    }
+}
+
+/// #79 — Single source-of-truth list of LOCKED_ACTION_KEYS as
+/// committed with web (the 5 byte-credit keys + archive's
+/// `archived_bytes` come through `gui::archive::ArchiveActionSummary`).
+/// Held verbatim so the boundary test below pins this list against
+/// the per-variant mapping; a future engine edit that adds a new
+/// DedupeAction or renames a key without updating the other side
+/// fails the test immediately. Mirrors web's cc6c5e74 invariant
+/// pattern per design 2026-05-25T21:36Z.
+pub const LOCKED_ACTION_KEYS: &[&str] = &[
+    "deleted_to_recycle_bytes",
+    "deleted_permanently_bytes",
+    "hardlink_replaced_bytes",
+    "reflink_replaced_bytes",
+    "archived_bytes",
+];
+
+#[cfg(test)]
+mod dedupe_action_summary_tests {
+    use super::*;
+    use crate::cli::DedupeAction;
+
+    /// #79 boundary test — every credited DedupeAction variant
+    /// maps to a key in LOCKED_ACTION_KEYS, and every key in
+    /// LOCKED_ACTION_KEYS is reachable from either a DedupeAction
+    /// variant or archive's `archived_bytes`. Anyone editing one
+    /// side without the other surfaces here.
+    #[test]
+    fn locked_action_key_mapping_matches_locked_action_keys_list() {
+        let credited: std::collections::HashSet<&'static str> = [
+            DedupeAction::Recycle,
+            DedupeAction::Remove,
+            DedupeAction::Hardlink,
+            DedupeAction::Reflink,
+        ]
+        .iter()
+        .map(|a| {
+            let s = DedupeActionSummary {
+                action: *a,
+                ok_count: 0,
+                ok_bytes: 0,
+                failed_count: 0,
+                failed_bytes: 0,
+                user_stopped: false,
+            };
+            s.locked_action_key()
+                .expect("credited action must have a locked key")
+        })
+        .collect();
+        let from_list: std::collections::HashSet<&'static str> =
+            LOCKED_ACTION_KEYS.iter().copied().collect();
+        // Archive's key is carried via ArchiveActionSummary, not
+        // the DedupeAction enum — but it IS in LOCKED_ACTION_KEYS.
+        // So the engine-credited set is credited ∪ {archived_bytes}.
+        let mut engine_emit = credited.clone();
+        engine_emit.insert("archived_bytes");
+        assert_eq!(
+            engine_emit, from_list,
+            "DedupeAction::locked_action_key + archive's archived_bytes \
+             must cover LOCKED_ACTION_KEYS exactly. If you renamed a key \
+             or added a new credited action, update both the per-variant \
+             mapping AND this list."
+        );
+    }
+
+    #[test]
+    fn safe_rename_is_not_credited() {
+        let s = DedupeActionSummary {
+            action: DedupeAction::SafeRename,
+            ok_count: 5,
+            ok_bytes: 5_000_000,
+            failed_count: 0,
+            failed_bytes: 0,
+            user_stopped: false,
+        };
+        assert!(
+            s.locked_action_key().is_none(),
+            "SafeRename is reversible, so no leaderboard credit"
+        );
+    }
+}
+
 /// Run the dedupe planner against `args`. Returns a tally of what was
 /// touched and what was skipped, plus per-action log lines via
 /// `tracing`.

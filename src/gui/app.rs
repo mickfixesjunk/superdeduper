@@ -752,6 +752,11 @@ impl SuperdeduperApp {
         self.is_scanning = true;
         self.cancel.store(false, Ordering::Relaxed);
         self.can_resume = false;
+        // #79 — fresh scan invalidates the previous submission_id;
+        // an action taken AFTER the new scan must NOT credit the
+        // old submission row.
+        #[cfg(feature = "telemetry")]
+        crate::leaderboard::submission::clear_pending_submission_id();
         let mut effective_settings = self.persisted.settings.clone();
         if !self.persisted.settings.always_use_cache
             && !self.state.cache_volume_summaries.is_empty()
@@ -886,6 +891,67 @@ impl SuperdeduperApp {
         }
     }
 
+    /// #79 — spawn the PATCH /actions worker for a finished archive
+    /// run. Skips when there's no pending submission_id (anonymous,
+    /// or scan-only no-submission flow), no install registration,
+    /// or zero reclaimed bytes (`moved_bytes == 0`).
+    #[cfg(feature = "telemetry")]
+    fn spawn_action_patch_for_archive(
+        &self,
+        summary: crate::gui::archive::ArchiveActionSummary,
+    ) {
+        let submission_id = match crate::leaderboard::submission::peek_pending_submission_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("#79: archive PATCH skipped — no pending submission_id");
+                return;
+            }
+        };
+        let actions = match crate::leaderboard::action_submission::actions_summary_from_archive(
+            &summary,
+        ) {
+            Some(m) => m,
+            None => return, // zero bytes; nothing to credit
+        };
+        let state = match crate::leaderboard::install::load() {
+            Ok(Some(s)) if s.registered => s,
+            _ => {
+                eprintln!("#79: archive PATCH skipped — install not registered");
+                return;
+            }
+        };
+        crate::leaderboard::action_submission::spawn_submit_worker(state, submission_id, actions);
+    }
+
+    /// #79 — spawn the PATCH /actions worker for a finished non-
+    /// archive Go-action. SafeRename is non-credited and
+    /// short-circuits via `actions_summary_from_dedupe` returning
+    /// None.
+    #[cfg(feature = "telemetry")]
+    fn spawn_action_patch_for_dedupe(&self, summary: crate::dedupe::DedupeActionSummary) {
+        let submission_id = match crate::leaderboard::submission::peek_pending_submission_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("#79: dedupe PATCH skipped — no pending submission_id");
+                return;
+            }
+        };
+        let actions = match crate::leaderboard::action_submission::actions_summary_from_dedupe(
+            &summary,
+        ) {
+            Some(m) => m,
+            None => return,
+        };
+        let state = match crate::leaderboard::install::load() {
+            Ok(Some(s)) if s.registered => s,
+            _ => {
+                eprintln!("#79: dedupe PATCH skipped — install not registered");
+                return;
+            }
+        };
+        crate::leaderboard::action_submission::spawn_submit_worker(state, submission_id, actions);
+    }
+
     /// Spawn the submit worker thread. Reads `take_pending()` (so a
     /// rapid double-click can't double-submit), POSTs the payload,
     /// stashes the outcome via `store_last_outcome`. The render
@@ -983,6 +1049,8 @@ impl SuperdeduperApp {
                     state.server_url.clone(),
                     state.install_id.clone(),
                 );
+                // #79 — stash for the post-Go PATCH client.
+                submission::store_pending_submission_id(submission_id.clone());
             }
             // Clear the pending slot only when the server accepted
             // the payload (or has it on file via 409). Rejected /
@@ -1604,6 +1672,50 @@ impl SuperdeduperApp {
                             // hands the rollup off to the next-frame
                             // render so the modal opens automatically.
                             self.pending_archive_summary = Some(summary.clone());
+                            // #79 — credit the reclaim bytes via PATCH
+                            // /api/v1/submit/{id}/actions. Runs only
+                            // when we have a signed-in install AND an
+                            // in-flight submission_id from the scan;
+                            // skips silently otherwise (anonymous user
+                            // or no submission yet → no credit path).
+                            #[cfg(feature = "telemetry")]
+                            self.spawn_action_patch_for_archive(summary.clone());
+                        }
+                        EngineEvent::DedupeActionSummary(summary) => {
+                            // #79 — same credit path for non-archive
+                            // actions (Recycle / Remove / Hardlink /
+                            // Reflink). SafeRename is non-credited
+                            // (locked_action_key returns None) so it
+                            // short-circuits inside the helper.
+                            #[cfg(feature = "telemetry")]
+                            self.spawn_action_patch_for_dedupe(summary.clone());
+                            // Log the rollup so the user sees
+                            // something even without a Phase 3 modal
+                            // (which is coming as a follow-up; for
+                            // now the credit-vs-no-credit answer is
+                            // visible via this log line + the
+                            // leaderboard profile).
+                            let key = summary.locked_action_key();
+                            let _ = self.tx.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Info,
+                                message: match key {
+                                    Some(k) => format!(
+                                        "action complete · {:?}: {} ok / {} bytes ({k}); {} failed / {} bytes",
+                                        summary.action,
+                                        summary.ok_count,
+                                        crate::gui::theme::humansize(summary.ok_bytes),
+                                        summary.failed_count,
+                                        crate::gui::theme::humansize(summary.failed_bytes),
+                                    ),
+                                    None => format!(
+                                        "action complete · {:?}: {} ok / {} bytes (not credited; reversible action); {} failed",
+                                        summary.action,
+                                        summary.ok_count,
+                                        crate::gui::theme::humansize(summary.ok_bytes),
+                                        summary.failed_count,
+                                    ),
+                                },
+                            });
                         }
                         EngineEvent::DriveDiscovered(info) => {
                             // Restore any saved override for this
@@ -2100,16 +2212,21 @@ impl SuperdeduperApp {
                     ),
                     total: Some(total),
                 });
-                let mut done = 0u64;
-                let mut failed = 0u64;
+                let mut action_summary = crate::dedupe::DedupeActionSummary {
+                    action: DedupeAction::SafeRename,
+                    ok_count: 0,
+                    ok_bytes: 0,
+                    failed_count: 0,
+                    failed_bytes: 0,
+                    user_stopped: false,
+                };
                 let mut skipped = 0u64;
                 let mut renamed_paths: Vec<PathBuf> = Vec::new();
                 let mut processed = 0u64;
-                let mut user_stopped = false;
                 'outer: for (_keeper, dupes) in &groups {
                     for d in dupes {
                         if cancel.load(Ordering::Relaxed) {
-                            user_stopped = true;
+                            action_summary.user_stopped = true;
                             break 'outer;
                         }
                         // Emit progress before each file so the
@@ -2119,9 +2236,11 @@ impl SuperdeduperApp {
                             done: processed,
                             current: Some(d.display().to_string()),
                         });
+                        let size = measure_action_size(d);
                         match crate::dedupe::action_safe_rename(d) {
                             Ok(()) => {
-                                done += 1;
+                                action_summary.ok_count += 1;
+                                action_summary.ok_bytes += size;
                                 renamed_paths.push(d.clone());
                                 // #83 — emit per-file completion so
                                 // the groups table updates in place.
@@ -2136,7 +2255,8 @@ impl SuperdeduperApp {
                                 if msg.contains("already exists") {
                                     skipped += 1;
                                 } else {
-                                    failed += 1;
+                                    action_summary.failed_count += 1;
+                                    action_summary.failed_bytes += size;
                                     let _ = tx.send(EngineEvent::Log {
                                         level: crate::gui::events::LogLevel::Warn,
                                         message: format!(
@@ -2150,6 +2270,9 @@ impl SuperdeduperApp {
                         processed += 1;
                     }
                 }
+                let user_stopped = action_summary.user_stopped;
+                let done = action_summary.ok_count;
+                let failed = action_summary.failed_count;
                 // Persist the renamed set so a restart picks up where
                 // we left off without re-scanning.
                 if !renamed_paths.is_empty() {
@@ -2181,6 +2304,7 @@ impl SuperdeduperApp {
                     ),
                 });
                 let _ = tx.send(EngineEvent::ActionFinished { summary });
+                let _ = tx.send(EngineEvent::DedupeActionSummary(action_summary));
             })
             .expect("spawn safe-rename-all thread");
     }
@@ -2358,20 +2482,26 @@ impl SuperdeduperApp {
                     name: action_label,
                     total: Some(total),
                 });
-                let mut done = 0u64;
-                let mut failed = 0u64;
+                let mut summary = crate::dedupe::DedupeActionSummary {
+                    action,
+                    ok_count: 0,
+                    ok_bytes: 0,
+                    failed_count: 0,
+                    failed_bytes: 0,
+                    user_stopped: false,
+                };
                 let mut processed = 0u64;
-                let mut user_stopped = false;
                 'outer: for dupes in &groups {
                     for d in dupes {
                         if cancel.load(Ordering::Relaxed) {
-                            user_stopped = true;
+                            summary.user_stopped = true;
                             break 'outer;
                         }
                         let _ = tx.send(EngineEvent::ActionProgress {
                             done: processed,
                             current: Some(d.display().to_string()),
                         });
+                        let size = measure_action_size(d);
                         let r = match action {
                             DedupeAction::Recycle => crate::dedupe::action_recycle(d),
                             DedupeAction::Remove => crate::dedupe::action_remove(d),
@@ -2386,7 +2516,8 @@ impl SuperdeduperApp {
                         };
                         match r {
                             Ok(()) => {
-                                done += 1;
+                                summary.ok_count += 1;
+                                summary.ok_bytes += size;
                                 // #83 — bulk-destructive only runs
                                 // Recycle / Remove; both vanish the
                                 // source path. Hardlink/Reflink/etc.
@@ -2398,7 +2529,8 @@ impl SuperdeduperApp {
                                 });
                             }
                             Err(e) => {
-                                failed += 1;
+                                summary.failed_count += 1;
+                                summary.failed_bytes += size;
                                 let _ = tx.send(EngineEvent::Log {
                                     level: crate::gui::events::LogLevel::Warn,
                                     message: format!(
@@ -2411,10 +2543,13 @@ impl SuperdeduperApp {
                         processed += 1;
                     }
                 }
-                let label = if user_stopped { "stopped" } else { "complete" };
+                let label = if summary.user_stopped { "stopped" } else { "complete" };
+                let done = summary.ok_count;
+                let failed = summary.failed_count;
                 let _ = tx.send(EngineEvent::ActionFinished {
                     summary: format!("{label_emoji} {label} · {done} done, {failed} failed.",),
                 });
+                let _ = tx.send(EngineEvent::DedupeActionSummary(summary));
             })
             .expect("spawn bulk-destructive thread");
     }
@@ -2426,8 +2561,14 @@ impl SuperdeduperApp {
         std::thread::Builder::new()
             .name("superdeduper-action".into())
             .spawn(move || {
-                let mut done = 0u64;
-                let mut failed = 0u64;
+                let mut summary = crate::dedupe::DedupeActionSummary {
+                    action,
+                    ok_count: 0,
+                    ok_bytes: 0,
+                    failed_count: 0,
+                    failed_bytes: 0,
+                    user_stopped: false,
+                };
                 let mut renamed_paths: Vec<PathBuf> = Vec::new();
                 let total = dupes.len() as u64;
                 let _ = tx.send(EngineEvent::ActionStarted {
@@ -2442,16 +2583,23 @@ impl SuperdeduperApp {
                     ),
                     total: Some(total),
                 });
-                let mut user_stopped = false;
                 for (i, d) in dupes.iter().enumerate() {
                     if cancel.load(Ordering::Relaxed) {
-                        user_stopped = true;
+                        summary.user_stopped = true;
                         break;
                     }
                     let _ = tx.send(EngineEvent::ActionProgress {
                         done: i as u64,
                         current: Some(d.display().to_string()),
                     });
+                    // #79 — measure size BEFORE the action so we
+                    // still have it for Recycle/Remove (the file is
+                    // gone after). Hardlink / Reflink / SafeRename
+                    // could measure after, but the BEFORE pattern
+                    // is the same across all variants and the cost
+                    // is one stat call per file. fs::metadata fail
+                    // ⇒ size 0; logged but doesn't abort the action.
+                    let size = measure_action_size(d);
                     let r = match action {
                         DedupeAction::Recycle => crate::dedupe::action_recycle(d),
                         DedupeAction::Hardlink => crate::dedupe::action_hardlink(d, &keeper),
@@ -2461,7 +2609,8 @@ impl SuperdeduperApp {
                     };
                     match r {
                         Ok(()) => {
-                            done += 1;
+                            summary.ok_count += 1;
+                            summary.ok_bytes += size;
                             if matches!(action, DedupeAction::SafeRename) {
                                 renamed_paths.push(d.clone());
                             }
@@ -2491,7 +2640,8 @@ impl SuperdeduperApp {
                             }
                         }
                         Err(e) => {
-                            failed += 1;
+                            summary.failed_count += 1;
+                            summary.failed_bytes += size;
                             let _ = tx.send(EngineEvent::Log {
                                 level: crate::gui::events::LogLevel::Error,
                                 message: format!("{}: {e}", d.display()),
@@ -2505,10 +2655,16 @@ impl SuperdeduperApp {
                         let _ = crate::gui::results_store::save(&state);
                     }
                 }
-                let label = if user_stopped { "stopped" } else { "complete" };
+                let label = if summary.user_stopped { "stopped" } else { "complete" };
                 let _ = tx.send(EngineEvent::ActionFinished {
-                    summary: format!("Action {label} · {} done, {} failed.", done, failed),
+                    summary: format!(
+                        "Action {label} · {} done, {} failed.",
+                        summary.ok_count, summary.failed_count,
+                    ),
                 });
+                // #79 — emit the rollup AFTER ActionFinished so the
+                // modal opens with the status line already settled.
+                let _ = tx.send(EngineEvent::DedupeActionSummary(summary));
             })
             .expect("spawn dedupe thread");
     }
@@ -3463,6 +3619,15 @@ fn reveal_in_explorer(_path: &std::path::Path) {}
 fn open_file_default_app(_path: &std::path::Path) {}
 #[cfg(not(windows))]
 fn open_enclosing_folder(_path: &std::path::Path) {}
+
+/// #79 — Stat the file to learn its size for action-bytes accounting.
+/// Returns 0 on failure (and emits no warning here — the caller's
+/// action will fail anyway and surface the issue via its own
+/// error log). Called BEFORE the action so Recycle/Remove can be
+/// credited correctly even though the file is gone afterwards.
+fn measure_action_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
 
 /// #83 — Compute the post-SafeRename path for `src`. Mirrors the
 /// rule `crate::dedupe::safe_rename_unguarded` uses (append the

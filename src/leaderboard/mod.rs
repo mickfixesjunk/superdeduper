@@ -23,6 +23,7 @@
 
 pub mod account_badge_summary;
 pub mod account_privacy;
+pub mod action_submission;
 pub mod captcha;
 pub mod catalog;
 pub mod hardware;
