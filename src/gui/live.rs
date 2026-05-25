@@ -50,6 +50,7 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
         None,
         crate::cli::ScanMode::Exact,
         5,
+        5.0,
     )
 }
 
@@ -62,6 +63,7 @@ pub fn spawn_with_settings(
     defender_rtp_pre: Option<bool>,
     scan_mode: crate::cli::ScanMode,
     image_similarity_threshold: u32,
+    audio_similarity_threshold: f64,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("superdeduper-engine".into())
@@ -74,6 +76,7 @@ pub fn spawn_with_settings(
                 defender_rtp_pre,
                 scan_mode,
                 image_similarity_threshold,
+                audio_similarity_threshold,
             ) {
                 let _ = tx.send(EngineEvent::Log {
                     level: LogLevel::Error,
@@ -94,6 +97,7 @@ fn run(
     _defender_rtp_pre: Option<bool>,
     scan_mode: crate::cli::ScanMode,
     image_similarity_threshold: u32,
+    audio_similarity_threshold: f64,
 ) -> crate::Result<()> {
     let _scan_started_at = Instant::now();
     // Wall-clock start, separate from the Instant above (Instant is
@@ -1427,18 +1431,18 @@ fn run(
     let _ = (scan_mode, image_similarity_threshold);
 
     // #26 T1.3 GUI Tier-4 wiring. Audio analog of the image branch
-    // above; runs when user picked `--mode audio`. No user-facing
-    // threshold flag yet (uses czkawka's calibrated 5-bits/chunk
-    // default per `audio_hash::tier4::DEFAULT_THRESHOLD`); the
-    // image-mode --image-similarity-threshold control gets its
-    // audio twin when the GUI settings widget for both lands.
+    // above; runs when user picked `--mode audio`. Threshold comes
+    // from the new --audio-similarity-threshold flag (GH #53)
+    // threaded through ScanSettings on the CLI side; GUI hardcodes
+    // czkawka's calibrated 5.0 bits/chunk default at the
+    // app::launch_scan call site until the Settings widget for both
+    // image + audio thresholds lands.
     #[cfg(feature = "similar-audio")]
     if matches!(scan_mode, crate::cli::ScanMode::Audio) {
         if let Some(inv) = inventory_for_tier4_audio.as_deref() {
             use crate::pipeline::audio_hash::tier4 as audio_tier4;
             let t_tier4 = std::time::Instant::now();
-            let tier4_groups =
-                audio_tier4::find_similar_groups(inv, audio_tier4::DEFAULT_THRESHOLD);
+            let tier4_groups = audio_tier4::find_similar_groups(inv, audio_similarity_threshold);
             let n_groups = tier4_groups.len();
             for g in tier4_groups {
                 total_dups += 1;
@@ -1459,12 +1463,14 @@ fn run(
                 level: LogLevel::Info,
                 message: format!(
                     "Tier-4 acoustic: {n_groups} group(s) within {} bits/chunk avg ({} ms)",
-                    audio_tier4::DEFAULT_THRESHOLD,
+                    audio_similarity_threshold,
                     t_tier4.elapsed().as_millis()
                 ),
             });
         }
     }
+    #[cfg(not(feature = "similar-audio"))]
+    let _ = audio_similarity_threshold;
 
     // Use inode-aware reclaim — this is what overwrites
     // state.totals.reclaimable_bytes at scan-end (per state.rs's

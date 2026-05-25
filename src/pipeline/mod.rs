@@ -59,15 +59,16 @@ impl SkippedFile {
 /// What kind of similarity grouping produced a [`DuplicateGroup`].
 ///
 /// `ByteIdentical` is the long-standing default (T0–T3 pipeline).
-/// `PerceptualImage` is the T1.2 / #25 Tier-4 output. Audio mode
-/// (#26) will add `PerceptualAudio` when it lands. Serialised as
-/// the lowercase-kebab string the spec §3.3 step 5 names.
+/// `PerceptualImage` is the T1.2 / #25 Tier-4 output. `PerceptualAudio`
+/// is the T1.3 / #26 Tier-4 output. Serialised as the lowercase-kebab
+/// string the spec §3.3 step 5 names.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SimilarityKind {
     #[default]
     ByteIdentical,
     PerceptualImage,
+    PerceptualAudio,
 }
 
 /// A confirmed set of byte-identical files OR a Tier-4 perceptual

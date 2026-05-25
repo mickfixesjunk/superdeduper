@@ -167,12 +167,13 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> Vec<Dupli
             files,
             link_equivalent: false,
             unique_inodes: indices.len() as u64,
-            // V1 reuses the PerceptualImage variant so the GUI's
-            // groups-table marker still surfaces "this isn't byte-
-            // identical, review carefully." A dedicated
-            // PerceptualAudio variant lands when web's leaderboard
-            // schema for audio groups gets locked in.
-            similarity_kind: SimilarityKind::PerceptualImage,
+            // GH #54 — was `PerceptualImage` in the v1 placeholder
+            // (so the GUI marker still surfaced "review carefully");
+            // testrunner's AT6 caught the inconsistency between
+            // content_hash's `perceptual-audio-` prefix + the kind
+            // field. Audio groups now correctly emit
+            // PerceptualAudio.
+            similarity_kind: SimilarityKind::PerceptualAudio,
         });
     }
     groups

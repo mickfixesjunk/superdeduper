@@ -451,25 +451,56 @@ pub fn show_filtered(
                             });
                             row.col(|ui| {
                                 use crate::pipeline::SimilarityKind;
-                                if matches!(g.similarity_kind, SimilarityKind::PerceptualImage) {
-                                    // Tier-4 perceptual group — bytes
-                                    // differ but the images LOOK alike.
-                                    // Surface that distinctly so the
-                                    // user knows to review carefully
-                                    // before deleting.
-                                    ui.label(
-                                        RichText::new("🖼 perceptual image")
-                                            .color(theme::WARN)
-                                            .small()
-                                            .strong(),
+                                match g.similarity_kind {
+                                    SimilarityKind::PerceptualImage => {
+                                        // Tier-4 perceptual image group —
+                                        // bytes differ but the images LOOK
+                                        // alike. Surface distinctly so
+                                        // the user reviews carefully.
+                                        ui.label(
+                                            RichText::new("🖼 perceptual image")
+                                                .color(theme::WARN)
+                                                .small()
+                                                .strong(),
+                                        )
+                                        .on_hover_text(
+                                            "These files look perceptually similar (resize, \
+                                             format-conversion, light-edit twins) but their \
+                                             bytes differ. Review side-by-side before deleting \
+                                             — perceptual-similar isn't byte-identical.",
+                                        );
+                                    }
+                                    SimilarityKind::PerceptualAudio => {
+                                        // Tier-4 perceptual audio (#26 v2) — same
+                                        // 'review carefully' framing but with the
+                                        // music-note glyph + audio-flavoured tooltip.
+                                        ui.label(
+                                            RichText::new("🎵 perceptual audio")
+                                                .color(theme::WARN)
+                                                .small()
+                                                .strong(),
+                                        )
+                                        .on_hover_text(
+                                            "These files sound acoustically similar (re-encode, \
+                                             bitrate / codec change, modest editing) but their \
+                                             bytes differ. Listen to a few seconds of each \
+                                             before deleting — perceptual-similar isn't \
+                                             byte-identical.",
+                                        );
+                                    }
+                                    SimilarityKind::ByteIdentical => {
+                                        // No special marker — falls through
+                                        // to the link-equivalent / acted /
+                                        // keeper-button branches below.
+                                    }
+                                }
+                                if g.link_equivalent
+                                    && !matches!(
+                                        g.similarity_kind,
+                                        SimilarityKind::PerceptualImage
+                                            | SimilarityKind::PerceptualAudio
                                     )
-                                    .on_hover_text(
-                                        "These files look perceptually similar (resize, \
-                                         format-conversion, light-edit twins) but their \
-                                         bytes differ. Review side-by-side before deleting \
-                                         — perceptual-similar isn't byte-identical.",
-                                    );
-                                } else if g.link_equivalent {
+                                {
                                     // Already-hardlinked groups have no
                                     // reclaimable space — surface that
                                     // distinctly so the user knows
