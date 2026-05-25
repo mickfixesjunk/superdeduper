@@ -1275,7 +1275,13 @@ impl SuperdeduperApp {
                 Ok(ev) => {
                     match &ev {
                         EngineEvent::ScanStarted { .. } => self.is_scanning = true,
-                        EngineEvent::ScanFinished { .. } => {
+                        EngineEvent::ScanFinished {
+                            total_files,
+                            total_bytes_read,
+                            duplicates,
+                            reclaimable_bytes,
+                            ..
+                        } => {
                             self.is_scanning = false;
                             self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
@@ -1301,6 +1307,12 @@ impl SuperdeduperApp {
                                 *duplicates,
                                 *reclaimable_bytes,
                             );
+                            // Non-telemetry build: explicitly discard so
+                            // the destructure isn't flagged unused.
+                            #[cfg(not(feature = "telemetry"))]
+                            {
+                                let _ = (total_files, total_bytes_read, duplicates, reclaimable_bytes);
+                            }
                         }
                         EngineEvent::ScanPaused { .. } => {
                             self.is_scanning = false;

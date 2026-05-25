@@ -1199,10 +1199,12 @@ fn run(
         };
         // Discard the defender post probe; current backend schema
         // doesn't carry defender state. Keep the call commented in
-        // case a future schema reinstates it.
-        let _ = defender_rtp_pre;
-        // Wall-clock as seconds (number) per schema.
-        let wall_clock_seconds = scan_started_at.elapsed().as_secs_f64();
+        // case a future schema reinstates it. Sig param is
+        // `_`-prefixed because it's unused in non-telemetry builds.
+        let _ = _defender_rtp_pre;
+        // Wall-clock as seconds (number) per schema. Same `_`-prefix
+        // reasoning as the param above.
+        let wall_clock_seconds = _scan_started_at.elapsed().as_secs_f64();
         let hash_algorithm = match settings.hash_algo {
             crate::pipeline::hash::HashAlgo::Blake3 => "blake3",
             crate::pipeline::hash::HashAlgo::River5 => "river5-aes-ni",
