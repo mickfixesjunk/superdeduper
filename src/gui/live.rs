@@ -602,6 +602,13 @@ fn run(
     } else {
         None
     };
+    // Audio mirror — same clone-only-when-needed shape.
+    #[cfg(feature = "similar-audio")]
+    let inventory_for_tier4_audio = if matches!(scan_mode, crate::cli::ScanMode::Audio) {
+        Some(files.clone())
+    } else {
+        None
+    };
     let mut size_groups = pipeline::grouping::group_by_size(files);
     // Resolve inode ids only on files that survived size grouping —
     // singletons can't be hardlinks within this scan and don't need
@@ -1418,6 +1425,46 @@ fn run(
     }
     #[cfg(not(feature = "similar-images"))]
     let _ = (scan_mode, image_similarity_threshold);
+
+    // #26 T1.3 GUI Tier-4 wiring. Audio analog of the image branch
+    // above; runs when user picked `--mode audio`. No user-facing
+    // threshold flag yet (uses czkawka's calibrated 5-bits/chunk
+    // default per `audio_hash::tier4::DEFAULT_THRESHOLD`); the
+    // image-mode --image-similarity-threshold control gets its
+    // audio twin when the GUI settings widget for both lands.
+    #[cfg(feature = "similar-audio")]
+    if matches!(scan_mode, crate::cli::ScanMode::Audio) {
+        if let Some(inv) = inventory_for_tier4_audio.as_deref() {
+            use crate::pipeline::audio_hash::tier4 as audio_tier4;
+            let t_tier4 = std::time::Instant::now();
+            let tier4_groups =
+                audio_tier4::find_similar_groups(inv, audio_tier4::DEFAULT_THRESHOLD);
+            let n_groups = tier4_groups.len();
+            for g in tier4_groups {
+                total_dups += 1;
+                let group_reclaim = g.unique_inodes.saturating_sub(1).saturating_mul(g.size);
+                reclaimable_inode = reclaimable_inode.saturating_add(group_reclaim);
+                reclaimable = reclaimable.saturating_add(group_reclaim);
+                let summary = DuplicateGroupSummary {
+                    size: g.size,
+                    content_hash: g.content_hash,
+                    files: g.files,
+                    link_equivalent: g.link_equivalent,
+                    unique_inodes: g.unique_inodes,
+                    similarity_kind: g.similarity_kind,
+                };
+                let _ = tx.send(EngineEvent::DuplicateFound(summary));
+            }
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Tier-4 acoustic: {n_groups} group(s) within {} bits/chunk avg ({} ms)",
+                    audio_tier4::DEFAULT_THRESHOLD,
+                    t_tier4.elapsed().as_millis()
+                ),
+            });
+        }
+    }
 
     // Use inode-aware reclaim — this is what overwrites
     // state.totals.reclaimable_bytes at scan-end (per state.rs's

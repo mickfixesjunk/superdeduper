@@ -770,6 +770,16 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     } else {
         None
     };
+    // #26 v2 — same clone-for-tier4 dance for the audio-similarity
+    // mode. Separate variable + cfg gate (similar-audio is its own
+    // feature) so a binary with only one of the two features built
+    // in still works.
+    #[cfg(feature = "similar-audio")]
+    let inventory_for_tier4_audio = if matches!(mode, superdeduper::cli::ScanMode::Audio) {
+        Some(inventory.clone())
+    } else {
+        None
+    };
     tracing::info!(
         count = inventory.len(),
         skipped = skipped.len(),
@@ -988,6 +998,33 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         }
         all
     };
+    // #26 T1.3 Tier-4 — acoustic audio similarity. Parallel to the
+    // image branch above; runs ONLY when `--mode audio` was set +
+    // the `similar-audio` feature is on. czkawka's default 5-bits-
+    // per-chunk threshold is the per-pair average; not user-tunable
+    // via CLI today (add `--audio-similarity-threshold` flag when
+    // the next sub-deliverable lands).
+    #[cfg(feature = "similar-audio")]
+    let duplicates = {
+        use superdeduper::cli::ScanMode;
+        use superdeduper::pipeline::audio_hash::tier4;
+        let mut all = duplicates;
+        if matches!(mode, ScanMode::Audio) {
+            if let Some(inv) = inventory_for_tier4_audio.as_deref() {
+                let t_tier4 = std::time::Instant::now();
+                let groups = tier4::find_similar_groups(inv, tier4::DEFAULT_THRESHOLD);
+                let _ = writeln!(
+                    io::stderr(),
+                    "stage 4 acoustic: {} group(s) within {} bits/chunk avg ({} ms)",
+                    groups.len(),
+                    tier4::DEFAULT_THRESHOLD,
+                    t_tier4.elapsed().as_millis(),
+                );
+                all.extend(groups);
+            }
+        }
+        all
+    };
     #[cfg(not(feature = "similar-images"))]
     {
         if matches!(mode, superdeduper::cli::ScanMode::Image) {
@@ -1192,24 +1229,16 @@ fn run_dedupe(args: DedupeArgs) -> anyhow::Result<()> {
     // so the user knows their mode wasn't honoured. Removing the
     // warning is part of the integration sub-deliverable (per spec
     // §3.3 + §3.7).
-    use superdeduper::cli::ScanMode;
-    match args.mode {
-        ScanMode::Exact => {}
-        ScanMode::Image => {
-            eprintln!(
-                "warning: --mode image is parsed but not yet wired \
-                 — falling through to exact (byte-identical) dedup. \
-                 Track #25 for the Tier-4 perceptual-image pipeline."
-            );
-        }
-        ScanMode::Audio => {
-            eprintln!(
-                "warning: --mode audio is parsed but not yet wired \
-                 — falling through to exact (byte-identical) dedup. \
-                 Track #26 for acoustic fingerprinting."
-            );
-        }
-    }
+    //
+    // `--mode` on `dedupe` is a pass-through hint — the actual
+    // similarity grouping happens in `scan`, and the groups in
+    // results.json carry their own `similarity_kind`. We accept
+    // the flag to keep the CLI surface symmetric with `scan` (so
+    // users don't have to remember "mode is only on scan") but
+    // don't gate behavior on it. Mismatches between the scan's
+    // mode and dedupe's --mode aren't surfaced; the results file's
+    // similarity_kind discriminator is the authoritative signal.
+    let _ = args.mode;
 
     let outcome = dedupe::run(&args).context("dedupe failed")?;
     let mut stderr = io::stderr().lock();
