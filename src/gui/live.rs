@@ -80,6 +80,14 @@ fn run(
     _defender_rtp_pre: Option<bool>,
 ) -> crate::Result<()> {
     let _scan_started_at = Instant::now();
+    // Wall-clock start, separate from the Instant above (Instant is
+    // monotonic + opaque; we need a UNIX timestamp the scan_history
+    // persistence layer can sort + display). One reading, threaded
+    // through to the ScanFinished hook below.
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     // Diagnostics report file — fresh per scan. Failure to open it
     // doesn't kill the scan; we just lose self-debug telemetry.
     let diag = DiagnosticsLog::open();
@@ -1351,6 +1359,31 @@ fn run(
         duplicates: total_dups,
         reclaimable_bytes: reclaimable_inode,
     });
+
+    // #38 v1: persist this scan to local history. Failure to write
+    // doesn't kill the scan — log + continue. Resubmit + restore
+    // are v2 territory; v1 just leaves a row the History panel can
+    // surface to the user.
+    {
+        let channel_slug = crate::channel::active_channel().as_slug();
+        let root_strings: Vec<String> = roots
+            .iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        let record = crate::scan_history::ScanRecord::new_finished(
+            crate::scan_history::new_scan_id(),
+            started_at_unix,
+            channel_slug,
+            root_strings,
+            total_files,
+            total_bytes_read,
+            total_dups,
+            reclaimable_inode,
+        );
+        if let Err(e) = crate::scan_history::record_completed(&record) {
+            tracing::warn!(error = %e, "scan_history: record_completed failed (non-fatal)");
+        }
+    }
     // T2.1 phase 7 surface: tell the user how many files the tier
     // guard skipped, broken out by class. Silent when the corpus
     // had no placeholders (typical for non-OneDrive / non-WSL roots),

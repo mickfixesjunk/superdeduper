@@ -42,6 +42,10 @@ enum ResultsTab {
     Treemap,
     Groups,
     Log,
+    /// #38 v1 — read-only listing of past scans persisted by
+    /// `crate::scan_history`. Future v2 will add resubmit + delete
+    /// affordances per-row; the tab slot is the same.
+    History,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -2671,6 +2675,7 @@ impl eframe::App for SuperdeduperApp {
                     pick("Treemap", ResultsTab::Treemap);
                     pick("Groups", ResultsTab::Groups);
                     pick("Log", ResultsTab::Log);
+                    pick("History", ResultsTab::History);
                     // Filter chip — visible whenever a drive is selected.
                     if let Some(id) = self.selected_drive {
                         let label = self
@@ -2722,6 +2727,9 @@ impl eframe::App for SuperdeduperApp {
                         );
                     }
                     ResultsTab::Log => log_panel::show(ui, &self.state),
+                    ResultsTab::History => {
+                        crate::gui::widgets::scan_history_panel::show(ui);
+                    }
                 }
                 if let Some(a) = group_action {
                     self.dispatch_group_action(a);

@@ -20,6 +20,7 @@ pub mod resume_modal;
 pub mod roots_panel;
 #[cfg(feature = "telemetry")]
 pub mod scan_complete_modal;
+pub mod scan_history_panel;
 pub mod settings_modal;
 pub mod toast;
 pub mod treemap;
