@@ -1311,7 +1311,8 @@ impl SuperdeduperApp {
                             // the destructure isn't flagged unused.
                             #[cfg(not(feature = "telemetry"))]
                             {
-                                let _ = (total_files, total_bytes_read, duplicates, reclaimable_bytes);
+                                let _ =
+                                    (total_files, total_bytes_read, duplicates, reclaimable_bytes);
                             }
                         }
                         EngineEvent::ScanPaused { .. } => {
