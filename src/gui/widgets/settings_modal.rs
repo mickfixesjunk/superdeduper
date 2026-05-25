@@ -744,6 +744,54 @@ fn render_safety(ui: &mut egui::Ui, settings: &mut ScanSettings) {
          so it doesn't appear on next launch. The warning still \
          appears once per fresh install.",
     );
+    ui.add_space(12.0);
+
+    // #41 — Scan history retention. Lives in Safety tab rather than
+    // Privacy (which is telemetry-gated) so it's reachable on
+    // telemetry-off builds too — scan_history is a local-storage
+    // concept independent of leaderboard submission.
+    ui.heading("Scan history retention");
+    ui.label(
+        RichText::new(
+            "How long to keep local scan-history rows before \
+             auto-pruning on app start. Forever (default) matches v1 \
+             behaviour — nothing is auto-deleted. The History tab's \
+             Delete button is always available regardless of this \
+             setting.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Keep history for:").color(theme::TEXT_HI));
+        let label = match settings.history_retention_days {
+            0 => "Forever".to_string(),
+            30 => "30 days".to_string(),
+            90 => "90 days".to_string(),
+            365 => "1 year".to_string(),
+            n => format!("{n} days (custom)"),
+        };
+        egui::ComboBox::from_id_salt("history-retention-days")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut settings.history_retention_days, 0, "Forever");
+                ui.selectable_value(&mut settings.history_retention_days, 30, "30 days");
+                ui.selectable_value(&mut settings.history_retention_days, 90, "90 days");
+                ui.selectable_value(&mut settings.history_retention_days, 365, "1 year");
+            });
+    });
+    if settings.history_retention_days > 0 {
+        ui.label(
+            RichText::new(format!(
+                "Rows older than {} days will be removed on next app launch.",
+                settings.history_retention_days
+            ))
+            .color(theme::TEXT_LO)
+            .small()
+            .italics(),
+        );
+    }
 }
 
 fn render_preflight(ui: &mut egui::Ui, settings: &mut ScanSettings) {

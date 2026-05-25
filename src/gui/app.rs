@@ -96,6 +96,16 @@ pub struct SuperdeduperApp {
     /// fresh scan) / RevertToPaused (adopt checkpoint roots+settings,
     /// then launch — the real "resume") / Cancel.
     pending_drift_modal: Option<crate::gui::checkpoint::CheckpointSummary>,
+    /// #41 — App-start "Resubmit N pending scans?" modal. Populated
+    /// in `new()` with rows whose `submission_state == Pending` AND
+    /// whose most-recent activity is older than the 5-minute
+    /// threshold (so a row that just finished THIS session doesn't
+    /// trigger a nag). `Some(_)` shows the modal; user picks
+    /// [Resubmit all] / [Open History] / [Not now]. Telemetry-off
+    /// builds don't populate or render this — the field is
+    /// cfg-gated to avoid a "never read" warning under that combo.
+    #[cfg(feature = "telemetry")]
+    pending_resubmit_prompt: Option<Vec<crate::scan_history::ScanRecord>>,
     /// Scan-mode dropdown selection per spec §3.8: Exact (default)
     /// / Image (Tier-4 perceptual) / Audio (T1.3 placeholder).
     /// Lives on `SuperdeduperApp` rather than `PersistedAppState`
@@ -246,6 +256,8 @@ impl SuperdeduperApp {
             drive_render_overrides: hashbrown::HashMap::new(),
             pending_resume,
             pending_drift_modal: None,
+            #[cfg(feature = "telemetry")]
+            pending_resubmit_prompt: None,
             scan_mode: crate::cli::ScanMode::Exact,
             current_project_path: None,
             current_project_created_at: 0,
@@ -290,6 +302,47 @@ impl SuperdeduperApp {
         // still triggers for *interrupted* scans (paused checkpoints
         // are separate from saved projects) and the user can pick
         // Start Fresh from that modal to clear it.
+
+        // #41 — App-start scan-history maintenance.
+        //
+        // 1. Retention pruning. `history_retention_days == 0` means
+        //    "forever" (default + v1 behavior); any other value
+        //    auto-deletes rows older than the threshold so a
+        //    privacy-conscious user can configure "purge after 30
+        //    days" once + forget about it.
+        let retention_days = app.persisted.settings.history_retention_days;
+        if retention_days > 0 {
+            let retention_secs = (retention_days as u64).saturating_mul(86_400);
+            match crate::scan_history::prune_older_than(retention_secs) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    pruned = n,
+                    days = retention_days,
+                    "scan_history: pruned per retention setting"
+                ),
+                Err(e) => tracing::warn!(error = %e, "scan_history: prune failed"),
+            }
+        }
+
+        // 2. Crash-detect modal. Anything still in `Pending` whose
+        //    most recent activity is more than 5 minutes old is a
+        //    candidate for "resubmit on next launch" — the live
+        //    submission flow would have flipped it to Submitted /
+        //    Failed if it had reached the server. 5min ≫ a typical
+        //    submit RTT, so we won't nag about a row that just
+        //    finished this session.
+        #[cfg(feature = "telemetry")]
+        {
+            const STALE_PENDING_SECS: u64 = 300;
+            match crate::scan_history::list_pending_older_than(STALE_PENDING_SECS) {
+                Ok(rows) if !rows.is_empty() => {
+                    app.pending_resubmit_prompt = Some(rows);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "scan_history: pending sweep failed"),
+            }
+        }
+
         app
     }
 
@@ -2314,6 +2367,42 @@ impl eframe::App for SuperdeduperApp {
                     SettingsDriftChoice::ContinueWithNew => self.accept_drift_continue(),
                     SettingsDriftChoice::RevertToPaused => self.accept_drift_revert(),
                     SettingsDriftChoice::Cancel => {}
+                }
+            }
+        }
+
+        // #41 — App-start resubmit-prompt modal. Non-blocking. The
+        // pending list was populated in `new()`; the user picks
+        // [Resubmit all] / [Open History] / [Not now] and the modal
+        // dismisses. Telemetry-off builds never reach this code path
+        // (field doesn't exist + widget module is cfg-gated).
+        #[cfg(feature = "telemetry")]
+        if let Some(rows) = self.pending_resubmit_prompt.clone() {
+            if let Some(choice) = crate::gui::widgets::resubmit_prompt_modal::show(ctx, &rows) {
+                self.pending_resubmit_prompt = None;
+                use crate::gui::widgets::resubmit_prompt_modal::ResubmitPromptChoice;
+                match choice {
+                    ResubmitPromptChoice::ResubmitAll => {
+                        // Kick the first row through the worker;
+                        // History panel surfaces per-row state +
+                        // (when v2.1 lands) auto-chains the rest.
+                        // For now, the user can click Resubmit on
+                        // the History tab for any rows the worker
+                        // didn't get to.
+                        if let Some(first) = rows.first() {
+                            if let Err(e) = crate::gui::resubmit::request_resubmit(&first.scan_id) {
+                                self.state.push_log(
+                                    crate::gui::events::LogLevel::Warn,
+                                    format!("Couldn't start resubmit: {e}"),
+                                );
+                            }
+                        }
+                        self.persisted.results_tab = ResultsTab::History;
+                    }
+                    ResubmitPromptChoice::OpenHistory => {
+                        self.persisted.results_tab = ResultsTab::History;
+                    }
+                    ResubmitPromptChoice::NotNow => {}
                 }
             }
         }

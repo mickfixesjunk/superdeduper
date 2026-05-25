@@ -62,7 +62,29 @@ use crate::pipeline::{DuplicateGroup, SimilarityKind};
 /// map just lands empty. The version bump is informational; future
 /// loaders that want to display the breakdown only when present
 /// can check `schema_version >= 2`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+///
+/// v3: #41 — added the resubmit-pipeline state. New fields:
+///   * `submission_payload: Option<Value>` — captured HMAC-ready
+///     JSON at scan-finish so resubmit is a single POST against
+///     the recorded payload (not a rebuild — drift across
+///     install-rotate would invalidate the signature).
+///   * `built_with_install_id: Option<String>` — install_id at
+///     payload-build time. Used to detect "user reset their
+///     install between scan + resubmit" (HMAC would mismatch);
+///     resubmit surfaces this as a clear error rather than
+///     silently failing on the server side.
+///   * `last_attempt_at_unix: Option<u64>` + `attempt_count: u32`
+///     — drives the crash-detection modal's "older than N
+///     minutes" filter + the user-visible "retried 3 times"
+///     display.
+///   * `submission_channel: Option<String>` — channel slug at
+///     scan time, captured separately from the live channel so
+///     channel-aware resubmit can route the POST against the
+///     ORIGINAL channel even after the user switched. Cross-
+///     channel resubmit is blocked with a surfaced error.
+///
+/// All v3 fields are `#[serde(default)]`; v1/v2 rows still load.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Submission state at the time the row was last touched.
 /// v1 only ever writes `Pending`; v2 will transition through the
@@ -120,6 +142,37 @@ pub struct ScanRecord {
     /// composition.
     #[serde(default)]
     pub groups_by_similarity_kind: BTreeMap<String, u64>,
+    /// #41 — captured HMAC-ready submission JSON at scan-finish.
+    /// `Some(_)` ⇒ the row is resubmittable (POST this body with
+    /// the install's key + the recorded \[X-Sd-Signature\] header
+    /// the resubmitter computes from \[built_with_install_id\]).
+    /// `None` ⇒ v1/v2 row from before the payload was persisted,
+    /// or the build failed at scan time (telemetry off etc.).
+    #[serde(default)]
+    pub submission_payload: Option<serde_json::Value>,
+    /// #41 — install_id captured at payload-build time so the
+    /// resubmitter can detect "user reset their install between
+    /// scan + resubmit." If `current install_id != built_with_install_id`,
+    /// the HMAC under the new key would mismatch + the server
+    /// would 401; better to surface that BEFORE the POST.
+    #[serde(default)]
+    pub built_with_install_id: Option<String>,
+    /// #41 — channel slug at scan time, captured separately from
+    /// the live channel. Resubmit routes against this channel
+    /// rather than the live one — cross-channel resubmit is
+    /// blocked with a surfaced error.
+    #[serde(default)]
+    pub submission_channel: Option<String>,
+    /// #41 — unix seconds of the most recent resubmit attempt.
+    /// `None` ⇒ no attempt yet (just-finished row). Drives the
+    /// crash-detection modal's "older than N minutes" filter.
+    #[serde(default)]
+    pub last_attempt_at_unix: Option<u64>,
+    /// #41 — total resubmit attempts so far. Surface in the
+    /// History panel after `attempt_count >= 2` so the user
+    /// knows the row has been retried.
+    #[serde(default)]
+    pub attempt_count: u32,
 }
 
 /// Build the `groups_by_similarity_kind` map for a finished scan's
@@ -157,12 +210,18 @@ impl ScanRecord {
         reclaimable_bytes: u64,
         groups_by_similarity_kind: BTreeMap<String, u64>,
     ) -> Self {
+        let channel_string = channel.into();
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             scan_id,
             started_at_unix,
             completed_at_unix: Some(unix_now()),
-            channel: channel.into(),
+            // submission_channel mirrors channel at construction
+            // time so the v3 resubmit pipeline has a stable
+            // routing target even if the user switches channels
+            // between scan + resubmit.
+            submission_channel: Some(channel_string.clone()),
+            channel: channel_string,
             roots,
             total_files,
             total_bytes_read,
@@ -170,7 +229,28 @@ impl ScanRecord {
             reclaimable_bytes,
             submission_state: SubmissionState::Pending,
             groups_by_similarity_kind,
+            submission_payload: None,
+            built_with_install_id: None,
+            last_attempt_at_unix: None,
+            attempt_count: 0,
         }
+    }
+
+    /// #41 — attach a freshly-built HMAC-ready submission body
+    /// (`Some(value)`) and the install_id under which it was
+    /// built. Called after `new_finished` once the leaderboard
+    /// module has assembled the payload. Telemetry-off builds
+    /// skip this step and leave both fields `None`; the History
+    /// panel renders the row but the Resubmit button stays
+    /// disabled.
+    pub fn with_submission_payload(
+        mut self,
+        payload: serde_json::Value,
+        install_id: impl Into<String>,
+    ) -> Self {
+        self.submission_payload = Some(payload);
+        self.built_with_install_id = Some(install_id.into());
+        self
     }
 }
 
@@ -296,6 +376,96 @@ pub fn delete(scan_id: &str) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// #41 — load the row, transition its `submission_state` (+ bump
+/// `last_attempt_at_unix` + `attempt_count`), write it back atomically.
+/// Used by the resubmit pipeline after each POST attempt and by the
+/// app-start interrupted-scan reaper.
+///
+/// Returns `Ok(false)` if the row doesn't exist (race against the
+/// user clicking Delete while a resubmit was in flight) — caller
+/// treats that as a no-op, not an error. Bubbles up real IO/parse
+/// errors.
+pub fn update_submission_state(
+    scan_id: &str,
+    state: SubmissionState,
+    increment_attempt: bool,
+) -> io::Result<bool> {
+    let mut record = match load(scan_id)? {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    record.submission_state = state;
+    if increment_attempt {
+        record.last_attempt_at_unix = Some(unix_now());
+        record.attempt_count = record.attempt_count.saturating_add(1);
+    }
+    record_completed(&record)?;
+    Ok(true)
+}
+
+/// #41 — list every row whose `submission_state == Pending` and
+/// whose most recent activity is older than `threshold_secs` from
+/// `now`. "Most recent activity" = `last_attempt_at_unix` when
+/// present, else `completed_at_unix`, else `started_at_unix`.
+///
+/// Drives the app-start "Resubmit N pending scans?" modal — we
+/// don't want to nag the user about a Pending row that just
+/// finished 30 seconds ago in this session.
+pub fn list_pending_older_than(threshold_secs: u64) -> io::Result<Vec<ScanRecord>> {
+    let now = unix_now();
+    let cutoff = now.saturating_sub(threshold_secs);
+    let mut out: Vec<ScanRecord> = list()?
+        .into_iter()
+        .filter(|r| r.submission_state == SubmissionState::Pending)
+        .filter(|r| {
+            let latest = r
+                .last_attempt_at_unix
+                .or(r.completed_at_unix)
+                .unwrap_or(r.started_at_unix);
+            latest <= cutoff
+        })
+        .collect();
+    // list() already sorts newest-first; keep that ordering so the
+    // modal renders the most-recent pending entry first.
+    out.sort_by(|a, b| {
+        b.started_at_unix
+            .cmp(&a.started_at_unix)
+            .then_with(|| a.scan_id.cmp(&b.scan_id))
+    });
+    Ok(out)
+}
+
+/// #41 — delete every row whose `started_at_unix` is older than
+/// `retention_secs` from `now`. Best-effort: failures on individual
+/// files are logged + swallowed so one corrupt row can't block
+/// retention enforcement on the rest. Returns the count of rows
+/// actually removed.
+///
+/// Pass `0` to disable retention (returns 0 without touching any
+/// file). The GUI's Settings → Privacy widget treats "forever" as
+/// `retention_secs == 0`.
+pub fn prune_older_than(retention_secs: u64) -> io::Result<u64> {
+    if retention_secs == 0 {
+        return Ok(0);
+    }
+    let now = unix_now();
+    let cutoff = now.saturating_sub(retention_secs);
+    let mut pruned = 0u64;
+    for record in list()? {
+        if record.started_at_unix < cutoff {
+            match delete(&record.scan_id) {
+                Ok(()) => pruned += 1,
+                Err(e) => tracing::warn!(
+                    scan_id = %record.scan_id,
+                    error = %e,
+                    "scan_history: prune failed (ignored, will retry next pass)",
+                ),
+            }
+        }
+    }
+    Ok(pruned)
 }
 
 pub fn history_dir() -> io::Result<PathBuf> {
@@ -551,6 +721,178 @@ mod tests {
         assert!(
             out.is_empty(),
             "empty groups → empty map (avoids zero-padded keys)"
+        );
+    }
+
+    /// #41 — update_submission_state flips the state + bumps
+    /// last_attempt_at_unix + attempt_count, then writes back.
+    #[test]
+    fn update_submission_state_round_trips() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _td = isolate("update-state");
+        let id = new_scan_id();
+        let r = ScanRecord::new_finished(
+            id.clone(),
+            1_700_000_000,
+            "prod",
+            vec![],
+            1,
+            1,
+            0,
+            0,
+            BTreeMap::new(),
+        );
+        record_completed(&r).unwrap();
+
+        let touched = update_submission_state(&id, SubmissionState::Failed, true).unwrap();
+        assert!(touched, "row existed, so update should report true");
+        let after = load(&id).unwrap().expect("row still loadable");
+        assert_eq!(after.submission_state, SubmissionState::Failed);
+        assert_eq!(after.attempt_count, 1);
+        assert!(after.last_attempt_at_unix.is_some());
+
+        // Another transition, no attempt bump.
+        update_submission_state(&id, SubmissionState::Submitted, false).unwrap();
+        let again = load(&id).unwrap().unwrap();
+        assert_eq!(again.submission_state, SubmissionState::Submitted);
+        assert_eq!(
+            again.attempt_count, 1,
+            "second update with increment_attempt=false should not bump"
+        );
+
+        // Missing row → Ok(false), not error.
+        let missing = update_submission_state("does-not-exist", SubmissionState::Failed, true)
+            .expect("missing row is not an error");
+        assert!(!missing);
+    }
+
+    /// #41 — `prune_older_than(0)` is a no-op (used by GUI when the
+    /// retention setting is "forever").
+    #[test]
+    fn prune_older_than_zero_is_noop() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _td = isolate("prune-zero");
+        let id = new_scan_id();
+        let r = ScanRecord::new_finished(
+            id.clone(),
+            1_000,
+            "prod",
+            vec![],
+            1,
+            1,
+            0,
+            0,
+            BTreeMap::new(),
+        );
+        record_completed(&r).unwrap();
+        let pruned = prune_older_than(0).unwrap();
+        assert_eq!(pruned, 0);
+        assert!(load(&id).unwrap().is_some(), "row should survive");
+    }
+
+    /// #41 — `prune_older_than` removes rows whose started_at is
+    /// older than the cutoff and leaves fresher rows alone.
+    #[test]
+    fn prune_older_than_removes_only_aged_rows() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _td = isolate("prune-aged");
+        let old = ScanRecord::new_finished(
+            new_scan_id(),
+            1_000, // ancient
+            "prod",
+            vec![],
+            1,
+            1,
+            0,
+            0,
+            BTreeMap::new(),
+        );
+        let fresh = ScanRecord::new_finished(
+            new_scan_id(),
+            unix_now(), // right now
+            "prod",
+            vec![],
+            1,
+            1,
+            0,
+            0,
+            BTreeMap::new(),
+        );
+        let old_id = old.scan_id.clone();
+        let fresh_id = fresh.scan_id.clone();
+        record_completed(&old).unwrap();
+        record_completed(&fresh).unwrap();
+        // 1-day cutoff = anything older than 24h must go.
+        let pruned = prune_older_than(86_400).unwrap();
+        assert_eq!(pruned, 1, "only the ancient row should be pruned");
+        assert!(load(&old_id).unwrap().is_none(), "ancient row was removed");
+        assert!(load(&fresh_id).unwrap().is_some(), "fresh row survived");
+    }
+
+    /// #41 — `list_pending_older_than` filters by state AND age.
+    #[test]
+    fn list_pending_older_than_filters_state_and_age() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _td = isolate("pending-sweep");
+        // Three rows: aged-pending (should match), fresh-pending
+        // (should not — under threshold), aged-submitted (should
+        // not — wrong state).
+        let now = unix_now();
+        let aged_pending = ScanRecord {
+            started_at_unix: now.saturating_sub(3_600),
+            completed_at_unix: Some(now.saturating_sub(3_500)),
+            ..ScanRecord::new_finished(
+                new_scan_id(),
+                now.saturating_sub(3_600),
+                "prod",
+                vec![],
+                1,
+                1,
+                0,
+                0,
+                BTreeMap::new(),
+            )
+        };
+        let aged_pending_id = aged_pending.scan_id.clone();
+        let fresh_pending = ScanRecord::new_finished(
+            new_scan_id(),
+            now,
+            "prod",
+            vec![],
+            1,
+            1,
+            0,
+            0,
+            BTreeMap::new(),
+        );
+        let mut aged_submitted = ScanRecord {
+            started_at_unix: now.saturating_sub(3_600),
+            completed_at_unix: Some(now.saturating_sub(3_500)),
+            ..ScanRecord::new_finished(
+                new_scan_id(),
+                now.saturating_sub(3_600),
+                "prod",
+                vec![],
+                1,
+                1,
+                0,
+                0,
+                BTreeMap::new(),
+            )
+        };
+        aged_submitted.submission_state = SubmissionState::Submitted;
+
+        record_completed(&aged_pending).unwrap();
+        record_completed(&fresh_pending).unwrap();
+        record_completed(&aged_submitted).unwrap();
+
+        let rows = list_pending_older_than(300).unwrap();
+        let matched: Vec<&str> = rows.iter().map(|r| r.scan_id.as_str()).collect();
+        assert_eq!(
+            matched,
+            vec![aged_pending_id.as_str()],
+            "only aged + pending should match (fresh-pending excluded by age; \
+             aged-submitted excluded by state)"
         );
     }
 

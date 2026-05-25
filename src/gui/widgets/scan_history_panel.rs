@@ -1,9 +1,19 @@
-//! Read-only History tab — #38 v1.
+//! History tab — #38 v1 + #41 v2.
 //!
-//! Lists past scans from `crate::scan_history`, newest first.
-//! Resubmit button + crash-detection prompt are v2 work; this panel
-//! is purely "look at what you've scanned." Empty state shows a
-//! pointer to running a first scan.
+//! Lists past scans from `crate::scan_history`, newest first. v1 was
+//! read-only; v2 adds:
+//!
+//!   * Resubmit button per row (telemetry-gated). Worker lives in
+//!     [`crate::gui::resubmit`]; this panel just dispatches +
+//!     surfaces the outcome inline.
+//!   * Delete button per row, wired to `scan_history::delete`.
+//!   * Last-resubmit-outcome banner pinned above the grid until
+//!     the user clicks Dismiss (one banner global; the most recent
+//!     outcome wins).
+//!
+//! App-start crash-detection modal + retention enforcement live in
+//! `gui::app` (the panel only sees fresh state via `scan_history::list`
+//! per frame).
 
 #![cfg(feature = "gui")]
 
@@ -13,6 +23,18 @@ use crate::gui::theme;
 use crate::scan_history::{self, ScanRecord, SubmissionState};
 
 pub fn show(ui: &mut Ui) {
+    // #41 — drain the resubmit worker's last outcome (if any) into
+    // a panel-local cache so successive frames keep showing it
+    // until the user dismisses it. The drain is one-shot per
+    // outcome — successive calls return None until the next
+    // resubmit finishes.
+    #[cfg(feature = "telemetry")]
+    {
+        if let Some((scan_id, outcome)) = crate::gui::resubmit::drain_outcome() {
+            store_last_outcome(scan_id, outcome);
+        }
+    }
+    show_last_outcome_banner(ui);
     // Per-frame disk read. Cost is small (one read_dir + N file
     // reads, where N is rows; typical user has <100 scans), well
     // under a frame budget. Keeps the panel always-fresh — no
@@ -58,20 +80,56 @@ pub fn show(ui: &mut Ui) {
     );
     ui.add_space(4.0);
 
+    // Collect rows to act on AFTER rendering — `ui.button` returns
+    // Response on click but we want to drive the resubmit worker
+    // and scan_history::delete OUTSIDE the per-row borrow. Simple
+    // pattern: capture (scan_id, action) tuples and dispatch after
+    // the grid closes.
+    let mut pending_actions: Vec<RowAction> = Vec::new();
+
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("scan_history_grid")
-                .num_columns(5)
+                .num_columns(6)
                 .spacing([12.0, 6.0])
                 .striped(true)
                 .show(ui, |ui| {
                     header_row(ui);
                     for record in &records {
-                        record_row(ui, record);
+                        if let Some(act) = record_row(ui, record) {
+                            pending_actions.push(act);
+                        }
                     }
                 });
         });
+
+    for act in pending_actions {
+        match act {
+            RowAction::Resubmit(_scan_id) => {
+                #[cfg(feature = "telemetry")]
+                if let Err(e) = crate::gui::resubmit::request_resubmit(&_scan_id) {
+                    store_inline_error(_scan_id, e);
+                }
+            }
+            RowAction::Delete(scan_id) => {
+                // Idempotent; failures only matter if filesystem
+                // blew up. Log + move on so the grid refreshes
+                // cleanly on next frame.
+                if let Err(e) = scan_history::delete(&scan_id) {
+                    tracing::warn!(scan_id = %scan_id, error = %e, "scan_history delete failed");
+                }
+            }
+        }
+    }
+}
+
+/// Action requested by a History row, dispatched after the grid
+/// closes so the panel can re-borrow `scan_history` freely.
+#[derive(Debug, Clone)]
+enum RowAction {
+    Resubmit(String),
+    Delete(String),
 }
 
 fn header_row(ui: &mut Ui) {
@@ -83,10 +141,11 @@ fn header_row(ui: &mut Ui) {
     hdr(ui, "Files");
     hdr(ui, "Duplicates");
     hdr(ui, "Status");
+    hdr(ui, "Actions");
     ui.end_row();
 }
 
-fn record_row(ui: &mut Ui, record: &ScanRecord) {
+fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
     // Date — UTC-ish formatting (we store unix seconds; the GUI is
     // not timezone-aware yet). Same date helper that
     // platform::linux::trash uses for trashinfo files, inlined here
@@ -139,21 +198,208 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) {
         SubmissionState::Failed => ("⚠ failed", theme::HOT),
         SubmissionState::Interrupted => ("🛑 interrupted", theme::HOT),
     };
-    ui.label(
+    let status_label = ui.label(
         RichText::new(status_text)
             .color(status_color)
             .monospace()
             .small(),
     );
+    // Surface attempt history on hover for any row that's been
+    // retried — quiet for the first attempt so the tooltip stays
+    // signal-only.
+    if record.attempt_count >= 2 {
+        status_label.on_hover_text(format!(
+            "Retried {}× (most recent: {})",
+            record.attempt_count,
+            record
+                .last_attempt_at_unix
+                .map(format_unix_local)
+                .unwrap_or_else(|| "—".into())
+        ));
+    }
+
+    // #41 — Actions column: Resubmit + Delete. The Resubmit button
+    // is enabled only when (a) the row carries a captured payload
+    // and (b) the submission_state allows another attempt, and (c)
+    // no resubmit is currently in flight elsewhere.
+    let mut action: Option<RowAction> = None;
+    ui.horizontal(|ui| {
+        // Resubmit visibility/enablement rules:
+        //  • State must be Pending / Failed / Interrupted
+        //    (Submitted means the server already has it; clicking
+        //     again would just 409).
+        //  • Row must have a captured payload (older v1/v2 rows
+        //    don't, and unregistered scans don't either).
+        //  • No global resubmit currently running (we serialise
+        //    to keep the worker simple + the user's mental model
+        //    "one click at a time").
+        let resubmittable_state = matches!(
+            record.submission_state,
+            SubmissionState::Pending | SubmissionState::Failed | SubmissionState::Interrupted
+        );
+        let has_payload = record.submission_payload.is_some();
+        let in_flight_elsewhere = {
+            #[cfg(feature = "telemetry")]
+            {
+                crate::gui::resubmit::in_flight_scan_id().is_some()
+            }
+            #[cfg(not(feature = "telemetry"))]
+            {
+                false
+            }
+        };
+        let am_in_flight = {
+            #[cfg(feature = "telemetry")]
+            {
+                crate::gui::resubmit::in_flight_scan_id().as_deref() == Some(&record.scan_id)
+            }
+            #[cfg(not(feature = "telemetry"))]
+            {
+                false
+            }
+        };
+        let resubmit_enabled =
+            resubmittable_state && has_payload && (!in_flight_elsewhere || am_in_flight);
+        let resubmit_btn_text = if am_in_flight {
+            "⏳ submitting…"
+        } else {
+            "↻ Resubmit"
+        };
+        let resubmit_response = ui.add_enabled(
+            resubmit_enabled,
+            egui::Button::new(RichText::new(resubmit_btn_text).color(theme::TEXT_HI))
+                .min_size(egui::vec2(110.0, 22.0)),
+        );
+        let tooltip = if am_in_flight {
+            "Resubmit in flight…".to_string()
+        } else if !has_payload {
+            "This row was recorded before payload-capture (v1/v2); rescan to get a resubmittable row.".to_string()
+        } else if !resubmittable_state {
+            format!("State `{:?}` — server already has this submission.", record.submission_state)
+        } else if in_flight_elsewhere {
+            "Another resubmit is in flight; click again once it completes.".to_string()
+        } else {
+            format!(
+                "Resubmit to {} (channel: {}).",
+                record
+                    .submission_channel
+                    .as_deref()
+                    .unwrap_or(record.channel.as_str()),
+                record.channel,
+            )
+        };
+        let resubmit_response = resubmit_response.on_hover_text(tooltip);
+        if resubmit_response.clicked() && resubmit_enabled && !am_in_flight {
+            action = Some(RowAction::Resubmit(record.scan_id.clone()));
+        }
+
+        let delete_response = ui
+            .add(
+                egui::Button::new(RichText::new("✕ Delete").color(theme::TEXT_LO))
+                    .min_size(egui::vec2(80.0, 22.0)),
+            )
+            .on_hover_text("Permanently remove this row from local history. No server delete.");
+        if delete_response.clicked() {
+            action = Some(RowAction::Delete(record.scan_id.clone()));
+        }
+    });
 
     ui.end_row();
+    action
+}
+
+// ============================================================
+// Panel-local "last resubmit outcome" cache.
+// ============================================================
+
+/// Cached banner state. Stored process-globally rather than threaded
+/// through `show()` so the App doesn't need to know about it.
+fn last_outcome_slot() -> &'static parking_lot::Mutex<Option<LastOutcome>> {
+    use std::sync::OnceLock;
+    static SLOT: OnceLock<parking_lot::Mutex<Option<LastOutcome>>> = OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+#[derive(Debug, Clone)]
+struct LastOutcome {
+    scan_id: String,
+    message: String,
+    color: egui::Color32,
+}
+
+#[cfg(feature = "telemetry")]
+fn store_last_outcome(scan_id: String, outcome: crate::leaderboard::submission::SubmitOutcome) {
+    use crate::leaderboard::submission::SubmitOutcome;
+    let (message, color) = match outcome {
+        SubmitOutcome::Accepted { submission_id, .. } => {
+            (format!("Resubmit accepted ({submission_id})."), theme::COOL)
+        }
+        SubmitOutcome::DuplicateNoChange => (
+            "Resubmit: server already had this submission (no change).".to_string(),
+            theme::COOL,
+        ),
+        SubmitOutcome::Rejected { status, reason } => (
+            format!("Resubmit rejected ({status}): {reason}"),
+            theme::HOT,
+        ),
+        SubmitOutcome::Transient { reason } => (
+            format!("Resubmit transient failure (will stay Pending): {reason}"),
+            theme::WARN,
+        ),
+        SubmitOutcome::FlaggedForReview { .. } => (
+            "Resubmit flagged for review (uncommon path).".to_string(),
+            theme::WARN,
+        ),
+    };
+    *last_outcome_slot().lock() = Some(LastOutcome {
+        scan_id,
+        message,
+        color,
+    });
+}
+
+/// Pre-resubmit-dispatch error (e.g. cross-install, no payload).
+/// Renders in the same banner as outcomes.
+#[cfg(feature = "telemetry")]
+fn store_inline_error(scan_id: String, message: String) {
+    *last_outcome_slot().lock() = Some(LastOutcome {
+        scan_id,
+        message: format!("Couldn't start resubmit: {message}"),
+        color: theme::HOT,
+    });
+}
+
+fn show_last_outcome_banner(ui: &mut Ui) {
+    let slot = last_outcome_slot();
+    let outcome = slot.lock().clone();
+    let Some(outcome) = outcome else { return };
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(&outcome.message)
+                .color(outcome.color)
+                .monospace()
+                .small(),
+        );
+        if ui
+            .add(
+                egui::Button::new(RichText::new("✕").color(theme::TEXT_LO))
+                    .min_size(egui::vec2(20.0, 18.0)),
+            )
+            .on_hover_text("Dismiss this banner.")
+            .clicked()
+        {
+            *slot.lock() = None;
+        }
+    });
+    let _ = outcome.scan_id; // reserved for future "scroll to that row" UX
+    ui.add_space(4.0);
 }
 
 /// Render a Unix timestamp as `YYYY-MM-DD HH:MM`. Local-time intent
 /// but we're not pulling chrono for v1 — emit UTC and let the user
 /// mentally adjust. v2 can swap in chrono or jiff once we adopt it
 /// elsewhere.
-fn format_unix_local(secs: u64) -> String {
+pub(crate) fn format_unix_local(secs: u64) -> String {
     // Convert seconds since 1970 to date components. Same arithmetic
     // as `iso8601_local_seconds` in src/platform/linux/trash.rs, kept
     // local here to avoid pulling a Linux-only path into a Windows

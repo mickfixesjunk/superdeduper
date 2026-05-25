@@ -20,6 +20,8 @@ pub mod live;
 pub mod particles;
 pub mod preflight;
 pub mod project;
+#[cfg(feature = "telemetry")]
+pub mod resubmit;
 pub mod results_store;
 #[cfg(feature = "audio")]
 pub mod sound;

@@ -1241,6 +1241,16 @@ fn run(
             total_dups,
         ),
     });
+    // #41 v3 — scan_history v2 persists the canonical payload so the
+    // History tab's Resubmit button has something ready-to-POST. Built
+    // inside the telemetry cfg block below (alongside the existing
+    // pending-slot wiring) + threaded out via this Option so the
+    // scan_history record-write site can attach it. Telemetry-off
+    // builds leave this None; the row still writes, just without a
+    // payload (Resubmit button stays disabled).
+    #[cfg(feature = "telemetry")]
+    let mut submission_payload_for_history: Option<(serde_json::Value, String)> = None;
+
     // G1: build the leaderboard payload from this scan's results
     // and log its size. We don't auto-submit — that's the GUI
     // "Submit run" button's job. This step proves the integration
@@ -1378,6 +1388,33 @@ fn run(
         // submit-time body will include install_id.
         let payload = submission::build_payload(&inputs, "");
         let body = hmac_signer::canonical_body(&payload);
+
+        // #41 — build the FULL submittable payload (with the real
+        // install_id from the active install state) + stash it for
+        // the scan_history record-write site below. Resubmit replays
+        // this verbatim so the signature stays valid against the
+        // install_id captured at build time. If the install state
+        // can't load (unregistered, missing file), we leave the
+        // History row without a payload — Resubmit stays disabled
+        // + the user has a clear "register first" surface.
+        if let Ok(Some(install_state)) = crate::leaderboard::install::load() {
+            let full_payload = submission::build_payload(&inputs, &install_state.install_id);
+            submission_payload_for_history = Some((full_payload, install_state.install_id));
+        }
+
+        // #41 — build the FULL submittable payload (with the real
+        // install_id from the active install state) + stash it for
+        // the scan_history record-write site below. Resubmit replays
+        // this verbatim so the signature stays valid against the
+        // install_id captured at build time. If the install state
+        // can't load (unregistered, missing file), we just leave
+        // the History row without a payload — Resubmit stays
+        // disabled, the user has a clear "register first" surface.
+        if let Ok(Some(install_state)) = crate::leaderboard::install::load() {
+            let full_payload = submission::build_payload(&inputs, &install_state.install_id);
+            submission_payload_for_history = Some((full_payload, install_state.install_id));
+        }
+
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
             message: format!(
@@ -1518,7 +1555,8 @@ fn run(
             .iter()
             .map(|r| r.path.to_string_lossy().into_owned())
             .collect();
-        let record = crate::scan_history::ScanRecord::new_finished(
+        #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))]
+        let mut record = crate::scan_history::ScanRecord::new_finished(
             crate::scan_history::new_scan_id(),
             started_at_unix,
             channel_slug,
@@ -1529,6 +1567,15 @@ fn run(
             reclaimable_inode,
             groups_by_similarity_kind.clone(),
         );
+        // #41 — attach the canonical submission payload (built in
+        // the telemetry block above) if it's available. The row
+        // still persists when telemetry is off or install state
+        // can't load — Resubmit stays disabled rather than the
+        // row being absent from History.
+        #[cfg(feature = "telemetry")]
+        if let Some((payload, install_id)) = submission_payload_for_history.take() {
+            record = record.with_submission_payload(payload, install_id);
+        }
         if let Err(e) = crate::scan_history::record_completed(&record) {
             tracing::warn!(error = %e, "scan_history: record_completed failed (non-fatal)");
         }
