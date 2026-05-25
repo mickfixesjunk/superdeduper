@@ -404,21 +404,33 @@ pub struct DedupeArgs {
     #[arg(value_name = "RESULTS_FILE", required = true)]
     pub results_file: PathBuf,
 
-    /// Which file in each group to keep.
-    #[arg(long, value_enum, default_value_t = KeepStrategy::Oldest)]
+    /// Which file in each group to keep. Smart (default) applies a
+    /// scored heuristic that prefers files in organised locations
+    /// (avoid Recycle Bin / temp / Downloads), prefers files
+    /// without "Copy of …" / "(1)" suffix markers, and breaks ties
+    /// on the newest mtime. Same picker the GUI uses for its
+    /// destructive actions — keeping the CLI default aligned
+    /// eliminates the data-loss divergence where
+    /// `superdeduper dedupe --action recycle` (no `--strategy`)
+    /// could keep a different file than the GUI's "Recycle"
+    /// button on the same group. Per Mick approval 2026-05-25
+    /// (F1 in design's quality sweep).
+    #[arg(long, value_enum, default_value_t = KeepStrategy::Smart)]
     pub strategy: KeepStrategy,
 
     /// What to do with the losers in each group.
     #[arg(long, value_enum, default_value_t = DedupeAction::Recycle)]
     pub action: DedupeAction,
 
-    /// Similarity mode. `exact` (default) is byte-identical dedup
-    /// — the only behaviour available today. `image` and `audio`
-    /// are placeholders for T1.2 + T1.3 (#25 / #26); the CLI
-    /// accepts them but the Tier-4 (perceptual) pipeline integration
-    /// isn't wired yet, so non-`exact` modes emit a stderr warning
-    /// and fall through to exact behaviour. Per Mick directive:
-    /// single shared dropdown across image + audio modes.
+    /// Similarity mode. `exact` (default) is byte-identical dedup.
+    /// `image` runs the Tier-4 perceptual-image pipeline (#25
+    /// shipped v0.2.x; engine-side similar-images feature must be
+    /// on); `audio` runs Tier-4 acoustic similarity (#26 shipped
+    /// v0.2.x; similar-audio feature must be on). When the binary
+    /// is built without the relevant feature, non-`exact` modes
+    /// log a stderr warning + fall through to exact behaviour. Per
+    /// Mick directive: single shared dropdown across image + audio
+    /// modes.
     #[arg(long, value_enum, default_value_t = ScanMode::Exact)]
     pub mode: ScanMode,
 
