@@ -273,7 +273,6 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     if state.registered {
         return Err(RegisterError::AlreadyRegistered);
     }
-    let key = state.install_key().ok_or(RegisterError::MalformedKey)?;
     let nonce =
         compute_pow(&state.install_id, DEFAULT_POW_DIFFICULTY).ok_or(RegisterError::PoWTimeout)?;
 
@@ -295,42 +294,7 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
             "difficulty": DEFAULT_POW_DIFFICULTY,
         }
     });
-    let canonical = hmac_signer::canonical_body(&body);
-    let signature = hmac_signer::sign(&key, &canonical);
-
-    let url = format!("{}/api/v1/register", state.server_url.trim_end_matches('/'));
-    let resp = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .set("X-Sd-Signature", &signature)
-        .timeout(std::time::Duration::from_secs(15))
-        .send_bytes(&canonical);
-
-    match resp {
-        Ok(_) => {
-            state.registered = true;
-            install::save(state)
-                .map_err(|e| RegisterError::SaveFailedAfterServerAck(format!("{e}")))?;
-            Ok(())
-        }
-        Err(ureq::Error::Status(429, _)) => Err(RegisterError::RateLimited),
-        Err(ureq::Error::Status(code, resp)) => {
-            let body_text = resp.into_string().unwrap_or_default();
-            let reason = serde_json::from_str::<serde_json::Value>(&body_text)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")
-                        .or_else(|| v.get("reason"))
-                        .and_then(|r| r.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or(body_text);
-            Err(RegisterError::ServerRejected {
-                status: code,
-                reason,
-            })
-        }
-        Err(ureq::Error::Transport(t)) => Err(RegisterError::Network(format!("{t}"))),
-    }
+    submit_registration(state, &body)
 }
 
 /// GUI registration via loopback HTTP server. Opens the system
@@ -344,7 +308,6 @@ pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), Registe
     if state.registered {
         return Err(RegisterError::AlreadyRegistered);
     }
-    let key = state.install_key().ok_or(RegisterError::MalformedKey)?;
     let token = super::captcha::await_captcha_token(
         &state.server_url,
         &state.install_id,
@@ -381,7 +344,26 @@ pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), Registe
             "token": token,
         }
     });
-    let canonical = hmac_signer::canonical_body(&body);
+    submit_registration(state, &body)
+}
+
+/// #72 — shared body-sign-and-POST core for both
+/// [`register_cli`] (PoW proof) and [`register_gui_via_loopback`]
+/// (captcha proof). Was 30 lines of character-for-character
+/// identical match arms duplicated across both call sites; a
+/// future server-error-category change would land in only one
+/// path otherwise.
+///
+/// F11 folded in: response-body read failure now surfaces in the
+/// error reason instead of degrading to an empty-string
+/// `ServerRejected { status: 500, reason: "" }`. Easy diagnosis
+/// when a 5xx returns truncated.
+fn submit_registration(
+    state: &mut InstallState,
+    body: &serde_json::Value,
+) -> Result<(), RegisterError> {
+    let key = state.install_key().ok_or(RegisterError::MalformedKey)?;
+    let canonical = hmac_signer::canonical_body(body);
     let signature = hmac_signer::sign(&key, &canonical);
 
     let url = format!("{}/api/v1/register", state.server_url.trim_end_matches('/'));
@@ -400,7 +382,11 @@ pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), Registe
         }
         Err(ureq::Error::Status(429, _)) => Err(RegisterError::RateLimited),
         Err(ureq::Error::Status(code, resp)) => {
-            let body_text = resp.into_string().unwrap_or_default();
+            // F11 — preserve mid-stream read errors in the
+            // reason rather than silently emptying the string.
+            let body_text = resp
+                .into_string()
+                .unwrap_or_else(|e| format!("<read error: {e}>"));
             let reason = serde_json::from_str::<serde_json::Value>(&body_text)
                 .ok()
                 .and_then(|v| {
