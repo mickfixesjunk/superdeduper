@@ -50,7 +50,7 @@ pub fn show(ui: &mut Ui, state: &UiState) {
     }
 
     ScrollArea::vertical()
-        .id_source("log-panel")
+        .id_salt("log-panel")
         .stick_to_bottom(true)
         .show(ui, |ui| {
             for entry in state.logs.iter().rev().take(500).rev() {

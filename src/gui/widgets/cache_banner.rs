@@ -41,10 +41,10 @@ pub fn show(ui: &mut Ui, state: &mut UiState, always_use_cache: bool) {
     // glance, calm enough not to read as an error.
     let fill = Color32::from_rgba_unmultiplied(180, 150, 50, 26);
     let stroke = Color32::from_rgba_unmultiplied(180, 150, 50, 140);
-    Frame::none()
+    Frame::new()
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke))
-        .rounding(6.0)
+        .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {

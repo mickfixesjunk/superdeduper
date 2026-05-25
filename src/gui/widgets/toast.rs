@@ -92,10 +92,10 @@ pub fn show(ctx: &Context) {
             .fixed_pos(pos)
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(bg)
                     .stroke(egui::Stroke::new(1.0, stroke_col))
-                    .rounding(6.0)
+                    .corner_radius(6.0)
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
                         ui.set_min_width(toast_width - 24.0);

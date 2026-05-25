@@ -121,10 +121,10 @@ fn draw_drive_panel(
     } else {
         Stroke::new(1.0, Color32::from_rgb(0x1f, 0x28, 0x36))
     };
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::new()
         .fill(theme::PANEL_DEEP)
         .inner_margin(8.0)
-        .rounding(6.0)
+        .corner_radius(6.0)
         .stroke(stroke);
 
     let _inner = frame.show(ui, |ui| {

@@ -2423,7 +2423,7 @@ impl eframe::App for SuperdeduperApp {
         TopBottomPanel::top("menubar")
             .frame(Frame::default().fill(theme::PANEL_DEEP).inner_margin(egui::vec2(8.0, 2.0)))
             .show(ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("File", |ui| {
                         if ui
                             .button("New scan")
@@ -2431,7 +2431,7 @@ impl eframe::App for SuperdeduperApp {
                             .clicked()
                         {
                             menu_action = Some(MenuAction::New);
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         ui.separator();
                         if ui
@@ -2440,7 +2440,7 @@ impl eframe::App for SuperdeduperApp {
                             .clicked()
                         {
                             menu_action = Some(MenuAction::OpenProject);
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         let save_label = match &self.current_project_path {
                             Some(p) => format!(
@@ -2457,7 +2457,7 @@ impl eframe::App for SuperdeduperApp {
                             .clicked()
                         {
                             menu_action = Some(MenuAction::Save);
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         if ui
                             .button("Save Project As…")
@@ -2465,7 +2465,7 @@ impl eframe::App for SuperdeduperApp {
                             .clicked()
                         {
                             menu_action = Some(MenuAction::SaveAs);
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         ui.separator();
                         if ui
@@ -2474,7 +2474,7 @@ impl eframe::App for SuperdeduperApp {
                             .clicked()
                         {
                             menu_action = Some(MenuAction::OpenArchiveManifest);
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         ui.separator();
                         // Recent projects submenu — most-recently-
@@ -2491,7 +2491,7 @@ impl eframe::App for SuperdeduperApp {
                                         if ui.button(label).clicked() {
                                             menu_action =
                                                 Some(MenuAction::OpenRecent(r.path.clone()));
-                                            ui.close_menu();
+                                            ui.close_kind(egui::UiKind::Menu);
                                         }
                                     }
                                 }
@@ -2507,7 +2507,7 @@ impl eframe::App for SuperdeduperApp {
                         ui.separator();
                         if ui.button("Quit").clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     });
                 });
@@ -2638,7 +2638,7 @@ impl eframe::App for SuperdeduperApp {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         egui::ScrollArea::vertical()
-                            .id_source("drive-scope")
+                            .id_salt("drive-scope")
                             .show(ui, |ui| {
                                 let frozen = (!self.is_scanning)
                                     .then_some(self.state.scan_finished_at)
