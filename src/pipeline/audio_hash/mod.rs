@@ -38,6 +38,8 @@
 
 #![cfg(feature = "similar-audio")]
 
+pub mod tier4;
+
 use std::path::Path;
 
 /// Audio extensions Tier-4 will fingerprint. Matches spec §3 v1
