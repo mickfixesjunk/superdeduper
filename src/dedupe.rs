@@ -846,7 +846,19 @@ pub fn is_system_path(path: &Path) -> bool {
     }
     #[cfg(not(windows))]
     {
-        s.starts_with("/etc/") || s.starts_with("/usr/") || s.starts_with("/bin/")
+        // `/var/lib` added 2026-05-25 per testdesign CST3 finding +
+        // Mick approval: holds package-manager state (dpkg/rpm/apt
+        // databases), systemd unit files, container layer storage,
+        // and SQLite databases for many system services. Moving or
+        // deduplicating these breaks the OS in subtle ways that
+        // typically only surface on next boot or service restart.
+        // Matches the v0.2.7 exclusions-preset pattern that lists
+        // `/var/lib/dpkg/info/**` under OsSystemTrees — this
+        // block-list catch is the cli/non-exclusions safety net.
+        s.starts_with("/etc/")
+            || s.starts_with("/usr/")
+            || s.starts_with("/bin/")
+            || s.starts_with("/var/lib/")
     }
 }
 
@@ -1017,6 +1029,21 @@ mod tests {
             "real file must not be touched when group is skipped"
         );
         fs::remove_dir_all(&d).ok();
+    }
+
+    /// /var/lib added to the system-path block list 2026-05-25 (per
+    /// testdesign CST3 finding). Catches OS-state directories like
+    /// dpkg databases, systemd unit files, container layer storage —
+    /// deduplicating them breaks the OS in subtle "only on reboot"
+    /// ways.
+    #[cfg(not(windows))]
+    #[test]
+    fn var_lib_is_blocked_by_default() {
+        let p = PathBuf::from("/var/lib/dpkg/info/coreutils.list");
+        assert!(
+            is_system_path(&p),
+            "/var/lib paths must be blocked from CLI dedupe by default"
+        );
     }
 
     #[test]
