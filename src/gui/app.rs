@@ -414,13 +414,67 @@ impl SuperdeduperApp {
     /// started — the user clicks the "Resume scan" button in the
     /// roots panel when they're ready to actually continue.
     fn accept_resume(&mut self) {
+        // #64 Phase 1 — diagnostic instrumentation around the
+        // user-clicked Resume path. accept_resume previously
+        // returned silently on path/load failure; now each branch
+        // logs why so Mick can read the Log tab + see whether the
+        // checkpoint actually got adopted into UiState before
+        // start_live spawns the engine.
+        //
+        // Symptom 3 (UI hang on Resume click) hypothesis: the file
+        // I/O on this function (checkpoint::load + later
+        // auto_restore_results_state) is sync on the UI thread.
+        // Wall-clock-tag the load so Mick can confirm whether
+        // a multi-MB saved_inventory is the source of the 1-2s
+        // pause. Phase 2 would thread it off the UI per the
+        // OauthSession pattern.
+        let resume_started_at = std::time::Instant::now();
         let path = match crate::gui::checkpoint::default_checkpoint_path() {
             Ok(p) => p,
-            Err(_) => return,
+            Err(e) => {
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Warn,
+                    format!("resume diag: cannot resolve checkpoint path: {e}"),
+                );
+                return;
+            }
         };
         let cp = match crate::gui::checkpoint::load(&path) {
-            Ok(Some(c)) => c,
-            _ => return,
+            Ok(Some(c)) => {
+                let size_hint = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Info,
+                    format!(
+                        "resume diag: accept_resume loaded {} ({} bytes); cp.roots.len={}, cp.prev_dups={}, cp.saved_inventory={}",
+                        path.display(),
+                        size_hint,
+                        c.roots.len(),
+                        c.previous_duplicates.len(),
+                        c.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
+                    ),
+                );
+                c
+            }
+            Ok(None) => {
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Warn,
+                    format!(
+                        "resume diag: accept_resume found no checkpoint at {} — Resume click is a no-op",
+                        path.display()
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                self.state.push_log(
+                    crate::gui::events::LogLevel::Warn,
+                    format!(
+                        "resume diag: accept_resume load failed at {}: {e} — Resume click is a no-op",
+                        path.display()
+                    ),
+                );
+                return;
+            }
         };
         // Adopt the checkpoint's roots + settings so the Roots panel
         // matches the paused state.
@@ -468,6 +522,20 @@ impl SuperdeduperApp {
         // again in the roots panel was a pointless second click.
         // can_resume=true is set above, so start_live() will skip
         // pre-flight and call launch_scan() directly.
+        //
+        // #64 Phase 1 — close out the diag log with total wall-clock
+        // spent on the sync resume path (checkpoint load + state
+        // hydration + auto_restore_results_state). Symptom 3's
+        // "1-2s hang on Resume click" should land here if the
+        // hypothesis is right.
+        self.state.push_log(
+            crate::gui::events::LogLevel::Info,
+            format!(
+                "resume diag: accept_resume sync work took {} ms (target <100ms; >500ms → \
+                 Phase 2 needs to thread the load off the UI)",
+                resume_started_at.elapsed().as_millis(),
+            ),
+        );
         self.start_live();
     }
 

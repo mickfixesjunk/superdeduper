@@ -189,13 +189,85 @@ fn run(
     let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
     let checkpoint_path = checkpoint::default_checkpoint_path().ok();
     let mut checkpoint_state = Checkpoint::new(roots.clone(), settings.clone());
-    // If a checkpoint already exists from a prior interrupted scan
-    // against THESE EXACT roots and settings, fold its previous
-    // duplicates in so we don't re-report them or lose them.
-    let prior = checkpoint_path
-        .as_ref()
-        .and_then(|p| checkpoint::load(p).ok().flatten())
-        .filter(|cp| cp.roots == roots && cp.settings == settings);
+
+    // #64 Phase 1 — diagnostic instrumentation around the resume
+    // load path. Every fail mode previously fell through silently
+    // ("no checkpoint found" indistinguishable from "load failed"
+    // from "settings drifted" from "roots drifted"). Now each
+    // step logs WHY it took the branch it did, so when Mick reports
+    // "resume restarted from 0%" we can read his log + see whether
+    // the checkpoint loaded at all, or matched, or had real state.
+    let prior: Option<Checkpoint> = match &checkpoint_path {
+        None => {
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Warn,
+                message: "resume diag: default_checkpoint_path() failed; cannot resume any state"
+                    .into(),
+            });
+            None
+        }
+        Some(p) => match checkpoint::load(p) {
+            Ok(Some(cp)) => {
+                let size_hint = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "resume diag: checkpoint loaded from {} ({} bytes); prev_dups={}, saved_inventory={}",
+                        p.display(),
+                        size_hint,
+                        cp.previous_duplicates.len(),
+                        cp.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
+                    ),
+                });
+                // Filter — surface the mismatch axis when rejected.
+                let roots_match = cp.roots == roots;
+                let settings_match = cp.settings == settings;
+                if roots_match && settings_match {
+                    Some(cp)
+                } else {
+                    let mismatch_axes = match (roots_match, settings_match) {
+                        (false, false) => "BOTH roots + settings differ",
+                        (false, true) => "roots differ",
+                        (true, false) => "settings differ",
+                        (true, true) => unreachable!(),
+                    };
+                    let _ = tx.send(EngineEvent::Log {
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "resume diag: checkpoint rejected — {mismatch_axes}; \
+                             cp.roots.len={}, current.roots.len={}; \
+                             cp.prev_dups={}, cp.saved_inventory={} (NOT carried forward)",
+                            cp.roots.len(),
+                            roots.len(),
+                            cp.previous_duplicates.len(),
+                            cp.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
+                        ),
+                    });
+                    None
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "resume diag: no checkpoint file at {} (fresh scan)",
+                        p.display()
+                    ),
+                });
+                None
+            }
+            Err(e) => {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "resume diag: checkpoint load failed at {}: {e} (treating as fresh scan)",
+                        p.display()
+                    ),
+                });
+                None
+            }
+        },
+    };
     // Inventory state carried over from a prior pause: lets us skip
     // Stage 1 entirely and jump straight to size-grouping. Empty
     // (None) ⇒ no saved inventory; do a fresh walk.
