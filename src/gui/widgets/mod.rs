@@ -22,6 +22,7 @@ pub mod roots_panel;
 pub mod scan_complete_modal;
 pub mod scan_history_panel;
 pub mod scan_mode_picker;
+pub mod settings_drift_modal;
 pub mod settings_modal;
 pub mod toast;
 pub mod treemap;

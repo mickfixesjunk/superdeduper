@@ -30,9 +30,10 @@ use crate::gui::state::{RootEntry, ScanSettings, UiState};
 use crate::gui::widgets::groups_table::GroupAction;
 use crate::gui::widgets::resume_modal::ResumeChoice;
 use crate::gui::widgets::roots_panel::RootsAction;
+use crate::gui::widgets::settings_drift_modal::SettingsDriftChoice;
 use crate::gui::widgets::{
     drive_scope, funnel, groups_table, header, log_panel, overall_bar, resume_modal, roots_panel,
-    settings_modal, treemap,
+    settings_drift_modal, settings_modal, treemap,
 };
 use crate::gui::{live, theme};
 
@@ -88,6 +89,13 @@ pub struct SuperdeduperApp {
     /// user to pick. While this is `Some`, the rest of the UI stays
     /// behind the modal so Start Fresh can safely wipe state.
     pending_resume: Option<crate::gui::checkpoint::CheckpointSummary>,
+    /// #51 — Mid-session "Settings changed since the paused scan"
+    /// modal. Populated by `start_live` when a checkpoint exists on
+    /// disk but its roots/settings differ from what the user is
+    /// about to launch. The user picks ContinueWithNew (archive +
+    /// fresh scan) / RevertToPaused (adopt checkpoint roots+settings,
+    /// then launch — the real "resume") / Cancel.
+    pending_drift_modal: Option<crate::gui::checkpoint::CheckpointSummary>,
     /// Scan-mode dropdown selection per spec §3.8: Exact (default)
     /// / Image (Tier-4 perceptual) / Audio (T1.3 placeholder).
     /// Lives on `SuperdeduperApp` rather than `PersistedAppState`
@@ -237,6 +245,7 @@ impl SuperdeduperApp {
             selected_drive: None,
             drive_render_overrides: hashbrown::HashMap::new(),
             pending_resume,
+            pending_drift_modal: None,
             scan_mode: crate::cli::ScanMode::Exact,
             current_project_path: None,
             current_project_created_at: 0,
@@ -495,6 +504,23 @@ impl SuperdeduperApp {
         if self.preflight.is_active() {
             return;
         }
+        // #51 — guard against silent settings-drift restarts.
+        // A checkpoint sitting on disk whose roots+settings don't
+        // match what the user is about to launch with would be
+        // dropped by the engine's resume filter (`live.rs::run`),
+        // silently restarting from scratch. Pop a modal so the user
+        // can pick: continue-with-new (archive checkpoint + fresh),
+        // revert-to-paused (adopt checkpoint's roots+settings, then
+        // launch), or cancel. Skipped when `can_resume` is already
+        // true (the launch-time Resume modal path adopted the
+        // checkpoint, so settings already match) and when no
+        // checkpoint exists at all.
+        if !self.can_resume && self.pending_drift_modal.is_none() {
+            if let Some(drift) = self.detect_settings_drift() {
+                self.pending_drift_modal = Some(drift);
+                return;
+            }
+        }
         // Skip preflight when:
         // * user has flipped the persistent "Skip pre-flight modal" setting
         // * this is a Resume (checkpoint already adopted; user already chose
@@ -510,6 +536,59 @@ impl SuperdeduperApp {
             .map(|r| r.path.clone())
             .collect();
         self.preflight = crate::gui::preflight::spawn_probe(roots);
+    }
+
+    /// Returns a `CheckpointSummary` iff a checkpoint exists on disk
+    /// whose `(roots, settings)` DIFFER from the user's current
+    /// `persisted` state. Used by `start_live` to pop the #51
+    /// settings-drift modal before the engine silently throws the
+    /// checkpoint away.
+    fn detect_settings_drift(&self) -> Option<crate::gui::checkpoint::CheckpointSummary> {
+        use crate::gui::checkpoint;
+        let path = checkpoint::default_checkpoint_path().ok()?;
+        let cp = checkpoint::load(&path).ok().flatten()?;
+        if cp.roots == self.persisted.roots && cp.settings == self.persisted.settings {
+            return None;
+        }
+        Some(checkpoint::CheckpointSummary {
+            created_at_unix: cp.created_at_unix,
+            roots: cp.roots,
+            duplicate_count: cp.previous_duplicates.len(),
+            has_saved_inventory: cp.saved_inventory.is_some(),
+        })
+    }
+
+    /// #51 — user picked "Continue with new settings" on the drift
+    /// modal. Archive the existing checkpoint (never delete) so the
+    /// fresh scan has a clean slate, then route back through
+    /// `start_live` to honour preflight / skip-preflight settings.
+    fn accept_drift_continue(&mut self) {
+        if let Ok(path) = crate::gui::checkpoint::default_checkpoint_path() {
+            match crate::gui::checkpoint::archive(&path) {
+                Ok(Some(archived)) => self.state.push_log(
+                    crate::gui::events::LogLevel::Info,
+                    format!(
+                        "Previous checkpoint archived to {} — settings changed since pause.",
+                        archived.display()
+                    ),
+                ),
+                Ok(None) => {}
+                Err(e) => self.state.push_log(
+                    crate::gui::events::LogLevel::Warn,
+                    format!("Couldn't archive previous checkpoint: {e}"),
+                ),
+            }
+        }
+        self.can_resume = false;
+        self.start_live();
+    }
+
+    /// #51 — user picked "Revert to paused settings" on the drift
+    /// modal. Mirrors `accept_resume`: hydrate state from the
+    /// checkpoint and auto-launch. Engine's resume filter sees a
+    /// match → real resume from prior progress.
+    fn accept_drift_revert(&mut self) {
+        self.accept_resume();
     }
 
     /// Spawn the actual scan worker. Called by `start_live` only
@@ -2220,6 +2299,22 @@ impl eframe::App for SuperdeduperApp {
                 }
             }
             return;
+        }
+
+        // #51 — Settings-drift modal. Rendered as a non-blocking
+        // window over the regular UI; the user can still see their
+        // edited Roots/Settings panel while reading the prompt,
+        // which makes "did I really mean to change this?" easier to
+        // answer. start_live() refuses to launch while this is Some.
+        if let Some(summary) = self.pending_drift_modal.clone() {
+            if let Some(choice) = settings_drift_modal::show(ctx, &summary) {
+                self.pending_drift_modal = None;
+                match choice {
+                    SettingsDriftChoice::ContinueWithNew => self.accept_drift_continue(),
+                    SettingsDriftChoice::RevertToPaused => self.accept_drift_revert(),
+                    SettingsDriftChoice::Cancel => {}
+                }
+            }
         }
 
         // Archive-restore confirmation: rendered as a non-blocking
