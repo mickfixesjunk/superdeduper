@@ -290,6 +290,20 @@ fn render_signin_cta(ui: &mut egui::Ui) {
         }
     }
 
+    // Drain register session so the fresh-install auto-chain
+    // fires here too (post-scan CTA may be the surface visible
+    // when register completes). The poll's internal logic
+    // auto-kicks OAuth via the stashed retry provider.
+    if let Some(result) =
+        crate::leaderboard::registration::poll_register_session()
+    {
+        match &result {
+            Ok(id) => eprintln!("post-scan-cta: register OK, install_id={id}"),
+            Err(e) => eprintln!("post-scan-cta: register failed: {e:?}"),
+        }
+        ui.ctx().request_repaint();
+    }
+
     // Render any recent OAuth result toast so the user gets
     // immediate visible feedback. Same widget the above-grid
     // CTA uses; only one toast exists at a time across surfaces.

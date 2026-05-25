@@ -85,6 +85,21 @@ fn render_login_cta(ui: &mut egui::Ui) {
         }
     }
 
+    // Also drain register session so the auto-register chain
+    // (fresh-install path: click Google → register → OAuth retry)
+    // fires regardless of which CTA the user is looking at. The
+    // poll's internal logic auto-kicks OAuth via the stashed
+    // retry provider when register lands Ok.
+    if let Some(result) =
+        crate::leaderboard::registration::poll_register_session()
+    {
+        match &result {
+            Ok(id) => eprintln!("login-cta: register OK, install_id={id}"),
+            Err(e) => eprintln!("login-cta: register failed: {e:?}"),
+        }
+        ui.ctx().request_repaint();
+    }
+
     // Render any recent toast (success or failure) below the CTA
     // area. Clicking Dismiss clears it; starting a new flow also
     // clears it via try_start_session.
