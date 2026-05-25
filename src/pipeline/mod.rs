@@ -2,6 +2,7 @@
 //!
 //! See the module-level docs on each submodule for what stage it owns.
 
+pub mod audio_hash;
 pub mod confirm;
 pub mod grouping;
 pub mod hash;
