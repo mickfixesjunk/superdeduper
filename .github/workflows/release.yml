@@ -34,13 +34,20 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # `VERSION_TAG` ends up baked into every artifact filename
+    # (`superdeduper-v0.2.0-windows-x86_64.zip`). On tag pushes
+    # `github.ref_name` is the tag (`v0.2.0`); on manual
+    # workflow_dispatch the caller supplies it as an input. Spec ref:
+    # GH issue #11.
+    env:
+      VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: superdeduper-x86_64-windows
+            platform: windows-x86_64
           # aarch64-pc-windows-msvc temporarily removed: the river5
           # crate's AES-NI C source uses x86-only intrinsics
           # (`__m128i`, `_mm_aesenc_si128`) which the ARM64 MSVC
@@ -68,7 +75,7 @@ jobs:
       - name: Stage artifacts
         shell: pwsh
         run: |
-          $stage = "stage/${{ matrix.artifact }}"
+          $stage = "stage/superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target/${{ matrix.target }}/release/superdeduper.exe $stage/
           Copy-Item target/${{ matrix.target }}/release/superdeduper-gui.exe $stage/
@@ -90,7 +97,7 @@ jobs:
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CODE_SIGN_PFX_BASE64))
           $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
                        Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1).FullName
-          $stage = "stage/${{ matrix.artifact }}"
+          $stage = "stage/superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}"
           & $signtool sign /fd SHA256 /f $pfx /p $env:PFX_PASSWORD `
             /tr "http://timestamp.digicert.com" /td SHA256 `
             "$stage\superdeduper.exe" "$stage\superdeduper-gui.exe"
@@ -104,7 +111,7 @@ jobs:
           # Materialise the file list eagerly so the pipeline doesn't
           # try to hash SHA256SUMS itself while Out-File still holds
           # the write handle.
-          $stage = "stage/${{ matrix.artifact }}"
+          $stage = "stage/superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}"
           $files = @(Get-ChildItem $stage -File | Where-Object { $_.Name -ne 'SHA256SUMS' })
           $lines = foreach ($f in $files) {
             $hash = (Get-FileHash -Algorithm SHA256 -Path $f.FullName).Hash.ToLower()
@@ -114,12 +121,14 @@ jobs:
           Get-Content "$stage/SHA256SUMS"
 
       - name: Zip artifact
+        # Per-file `.zip.sha256` sidecar was retired in #11. Tarball /
+        # zip integrity now flows through the canonical SHA256SUMS
+        # produced by the `checksums` finalize job below — one
+        # file at the release root covering every uploaded artifact.
         shell: pwsh
         run: |
-          $stage = "stage/${{ matrix.artifact }}"
-          Compress-Archive -Path "$stage/*" -DestinationPath "${{ matrix.artifact }}.zip"
-          (Get-FileHash -Algorithm SHA256 "${{ matrix.artifact }}.zip").Hash.ToLower() + "  ${{ matrix.artifact }}.zip" `
-            | Out-File -Encoding ascii "${{ matrix.artifact }}.zip.sha256"
+          $stage = "stage/superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}"
+          Compress-Archive -Path "$stage/*" -DestinationPath "superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}.zip"
 
       # Sigstore-backed attestation. Proves these specific bytes came
       # from this commit on this workflow run, signed by GitHub's OIDC
@@ -140,8 +149,7 @@ jobs:
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: |
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.zip.sha256
+            superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}.zip
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -150,8 +158,7 @@ jobs:
           draft: true
           generate_release_notes: true
           files: |
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.zip.sha256
+            superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}.zip
 
   build-linux:
     # Linux side of the release. Kept as a separate job (rather than
@@ -160,6 +167,8 @@ jobs:
     # them shell-agnostic would dwarf the duplication.
     name: build (linux-x86_64)
     runs-on: ubuntu-latest
+    env:
+      VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -192,7 +201,7 @@ jobs:
 
       - name: Stage artifacts
         run: |
-          stage="stage/superdeduper-x86_64-linux"
+          stage="stage/superdeduper-${VERSION_TAG}-linux-x86_64"
           mkdir -p "$stage"
           cp target/x86_64-unknown-linux-musl/release/superdeduper "$stage/"
           cp target/x86_64-unknown-linux-musl/release/superdeduper-gui "$stage/"
@@ -211,19 +220,24 @@ jobs:
             exit 1
           fi
 
-      - name: Compute SHA-256 checksums
+      - name: Compute inside-tarball SHA-256 checksums
+        # Side-channel SHA file lives INSIDE the tarball so a consumer
+        # who extracts can verify the binaries match the recorded
+        # hashes. Top-level integrity (zip/tarball against tampering)
+        # is covered by the `checksums` finalize job's release-root
+        # SHA256SUMS — this one is for post-extract integrity.
         run: |
-          stage="stage/superdeduper-x86_64-linux"
+          stage="stage/superdeduper-${VERSION_TAG}-linux-x86_64"
           ( cd "$stage" && sha256sum * > SHA256SUMS && cat SHA256SUMS )
 
       - name: Tar artifact
         # `.tar.gz` matches the typical Linux release shape; doesn't
         # need the Compress-Archive PowerShell shenanigans the Windows
-        # job has to do. SHA hash of the tarball goes alongside so a
-        # consumer can verify integrity without extracting.
+        # job has to do. Per-file `.tar.gz.sha256` sidecar was retired
+        # in #11 — see Windows job's `Zip artifact` step comment.
         run: |
-          tar -czf superdeduper-x86_64-linux.tar.gz -C stage superdeduper-x86_64-linux
-          sha256sum superdeduper-x86_64-linux.tar.gz | tee superdeduper-x86_64-linux.tar.gz.sha256
+          tar -czf "superdeduper-${VERSION_TAG}-linux-x86_64.tar.gz" \
+            -C stage "superdeduper-${VERSION_TAG}-linux-x86_64"
 
       - name: Attest build provenance
         if: ${{ github.event.repository.visibility != 'private' || github.event.repository.owner.type == 'Organization' }}
@@ -231,8 +245,7 @@ jobs:
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: |
-            superdeduper-x86_64-linux.tar.gz
-            superdeduper-x86_64-linux.tar.gz.sha256
+            superdeduper-${{ env.VERSION_TAG }}-linux-x86_64.tar.gz
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -241,5 +254,56 @@ jobs:
           draft: true
           generate_release_notes: true
           files: |
-            superdeduper-x86_64-linux.tar.gz
-            superdeduper-x86_64-linux.tar.gz.sha256
+            superdeduper-${{ env.VERSION_TAG }}-linux-x86_64.tar.gz
+
+  checksums:
+    # Finalize job that computes the canonical release-root
+    # SHA256SUMS file. Runs after every build leg finishes so it
+    # can download all uploaded zips + tarballs from the draft
+    # release, hash them, and re-upload SHA256SUMS to the same
+    # draft. Per #11 spec, one canonical file at the release root
+    # is the source-of-truth for download-integrity verification.
+    name: checksums
+    needs: [build, build-linux]
+    runs-on: ubuntu-latest
+    env:
+      VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts from draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `gh release download` against a draft release works as
+        # long as the token has `contents: write` on this repo —
+        # softprops/action-gh-release uploads land on the draft
+        # the moment each build job finishes, so by the time the
+        # `needs:` gate releases this job, all per-platform
+        # artifacts are already attached and downloadable.
+        run: |
+          mkdir -p release-files
+          gh release download "$VERSION_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "superdeduper-${VERSION_TAG}-*.zip" \
+            --pattern "superdeduper-${VERSION_TAG}-*.tar.gz" \
+            --dir release-files
+          ls -la release-files
+
+      - name: Compute canonical SHA256SUMS
+        run: |
+          cd release-files
+          # `sha256sum *.zip *.tar.gz` keeps a stable order across runs:
+          # zips first then tarballs, lexically within each group. The
+          # consumer-facing format (`<hash>  <filename>`) matches what
+          # `sha256sum -c SHA256SUMS` expects.
+          sha256sum *.zip *.tar.gz 2>/dev/null > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: false
+          files: |
+            release-files/SHA256SUMS
