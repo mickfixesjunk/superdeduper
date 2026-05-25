@@ -1992,15 +1992,7 @@ fn chunk_groups(
 /// is jarring. Keeps UNC shares (`\\?\UNC\server\share`) intact —
 /// only the local-drive verbatim form is normalized.
 fn display_path(p: &std::path::Path) -> String {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        if let Some(unc) = rest.strip_prefix("UNC\\") {
-            // \\?\UNC\server\share -> \\server\share
-            return format!(r"\\{unc}");
-        }
-        return rest.to_string();
-    }
-    s.into_owned()
+    crate::path_display::for_user_display(p)
 }
 
 /// Map roots → `run_shape.scope` enum:

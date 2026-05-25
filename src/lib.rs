@@ -28,6 +28,7 @@ pub mod exclusions;
 pub mod inventory;
 pub mod keep;
 pub mod output;
+pub mod path_display;
 pub mod pipeline;
 pub mod platform;
 pub mod scan_history;
