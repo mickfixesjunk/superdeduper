@@ -66,7 +66,14 @@ fn build_themed_harness(
 /// frame 1 was correct (theme::install just ran); a later frame's
 /// system-theme detection flipped Visuals to Light. A single-frame
 /// PNG snapshot can't see that decay. This one can.
+// Skipped on CI: needs a wgpu adapter to render PNGs.
+// ubuntu-latest runners are headless without a GPU device, so
+// `egui_kittest::Harness::render()` aborts with
+// `CustomNativeAdapterSelectionError("No adapter found")`. Run
+// locally with `cargo test -- --ignored` — WSL exposes a software
+// adapter that satisfies wgpu.
 #[test]
+#[ignore = "wgpu render — no adapter on headless CI runners"]
 fn theme_remains_dark_across_multiple_frames() {
     let mut harness = build_themed_harness(egui::vec2(200.0, 80.0), |ui| {
         let _ = ui.button("Sentinel button");
@@ -101,6 +108,7 @@ fn theme_remains_dark_across_multiple_frames() {
 /// (`<= 0x40` per RGB channel for the base bg). A LIGHT fill on
 /// any button is the regression.
 #[test]
+#[ignore = "wgpu render — no adapter on headless CI runners"]
 fn theme_snapshot_buttons_panel() {
     let mut harness = build_themed_harness(egui::vec2(400.0, 200.0), |ui| {
         ui.heading("Theme regression sentinels");
@@ -151,6 +159,7 @@ fn theme_snapshot_buttons_panel() {
 /// buttons panel, reviewers can compare this swatch sheet against
 /// the broken render to localise which token drifted.
 #[test]
+#[ignore = "wgpu render — no adapter on headless CI runners"]
 fn theme_snapshot_palette_sheet() {
     let mut harness = build_themed_harness(egui::vec2(360.0, 360.0), |ui| {
         ui.heading("theme palette");
