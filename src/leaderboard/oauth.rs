@@ -181,6 +181,17 @@ pub struct OauthToken {
     /// load as `None` after this field lands.
     #[serde(default)]
     pub discord_avatar_hash: Option<String>,
+    /// #47 — Vanity slug for the public profile URL. Engine
+    /// generates a candidate from `display_name` at claim time +
+    /// POSTs it to the server for uniqueness check + storage.
+    /// `None` until the claim flow has run (older tokens; tokens
+    /// for users whose display_name didn't yield a legal slug;
+    /// network failure during claim — none of these block the
+    /// OAuth flow). Caller-visible at
+    /// `https://app.superdeduper.io/profile/{slug}` once web's
+    /// resolver ships.
+    #[serde(default)]
+    pub vanity_slug: Option<String>,
 }
 
 /// Errors surfaced by the OAuth flow. Each variant carries the
@@ -882,7 +893,7 @@ fn link_via_loopback_inner(
     // flow (web 2026-05-24T23:12Z spec); web does the
     // code↔token round-trip with the provider on its side so the
     // client never holds the client_secret.
-    let token = match exchange_code(
+    let mut token = match exchange_code(
         provider,
         server_url,
         &code,
@@ -903,6 +914,48 @@ fn link_via_loopback_inner(
             return Err(e);
         }
     };
+    // #47 — Derive + claim a vanity slug for this account against
+    // the server. Best-effort: any failure (network blip, server
+    // 5xx, no legal slug from display_name) leaves `vanity_slug =
+    // None` on the token and is just logged. The OAuth link itself
+    // already succeeded — losing the slug would be a UX nuisance,
+    // not a regression in account state, so we explicitly don't
+    // surface failure as an OauthError.
+    //
+    // Server route, response shape, and uniqueness semantics are
+    // owned by web (see `vanity_slug::claim` doc). When web's
+    // resolver lands, the slug populated here is what
+    // `/profile/{slug}` will route to.
+    match crate::leaderboard::install::load_for(channel) {
+        Ok(Some(install_state)) => {
+            match crate::leaderboard::vanity_slug::derive_and_claim(
+                &install_state,
+                &token.account_id,
+                server_url,
+                &token.display_name,
+                3, // max_retries — server tie-break suffixes converge fast.
+            ) {
+                Ok(slug) => {
+                    log_oauth_event(&format!("vanity slug claimed: `{slug}`"));
+                    token.vanity_slug = Some(slug);
+                }
+                Err(reason) => {
+                    log_oauth_event(&format!("vanity slug claim skipped: {reason}"));
+                }
+            }
+        }
+        Ok(None) => {
+            log_oauth_event(
+                "vanity slug claim skipped: no install state on disk (register first?)",
+            );
+        }
+        Err(e) => {
+            log_oauth_event(&format!(
+                "vanity slug claim skipped: install_state load failed: {e}"
+            ));
+        }
+    }
+
     save_for(channel, &token).map_err(|e| {
         log_oauth_event(&format!("save_failed: {e}"));
         OauthError::SaveFailed(format!("{e}"))
@@ -1567,6 +1620,12 @@ pub fn parse_callback_body(provider: Provider, body: &str) -> Result<OauthToken,
         account_id: parsed.account_id,
         linked_install_id: parsed.linked_install_id,
         discord_avatar_hash: parsed.discord_avatar_hash,
+        // #47 — server doesn't issue a slug at OAuth callback time;
+        // engine derives + claims it via the dedicated vanity-slug
+        // endpoint afterwards. Leave `None` here so callers know
+        // they need to call `claim_vanity_slug_for_token` to
+        // populate it.
+        vanity_slug: None,
     })
 }
 
@@ -1719,6 +1778,7 @@ mod tests {
             account_id: "acct-123".into(),
             linked_install_id: "fec94a96-...".into(),
             discord_avatar_hash: None,
+            vanity_slug: Some("mick".into()),
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: OauthToken = serde_json::from_str(&s).unwrap();

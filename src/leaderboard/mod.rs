@@ -31,6 +31,7 @@ pub mod predicates;
 pub mod ranks_poll;
 pub mod registration;
 pub mod submission;
+pub mod vanity_slug;
 
 // G2-G4 modules slot in here as the phases land:
 // pub mod achievements;  // G2
