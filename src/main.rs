@@ -1075,6 +1075,8 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+        let groups_by_similarity_kind =
+            superdeduper::scan_history::similarity_kind_breakdown(&duplicates);
         let record = superdeduper::scan_history::ScanRecord::new_finished(
             superdeduper::scan_history::new_scan_id(),
             started_at_unix,
@@ -1084,6 +1086,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
             history_total_bytes_read,
             total_dups,
             reclaimable_bytes,
+            groups_by_similarity_kind,
         );
         if let Err(e) = superdeduper::scan_history::record_completed(&record) {
             tracing::warn!(error = %e, "scan_history: record_completed failed (non-fatal)");

@@ -42,6 +42,7 @@
 //! (logs a warning) rather than crashing — forward compat for
 //! sd installs that downgrade.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -49,11 +50,19 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pipeline::{DuplicateGroup, SimilarityKind};
+
 /// Bump on every incompatible schema change. v2's resubmit work
 /// will add the submission payload + receipts fields — those fields
 /// will be `#[serde(default)]` so v1 → v2 reads cleanly without
 /// version bump; bump only when removing/renaming a v1 field.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: added `groups_by_similarity_kind` (#49). The new field has
+/// `#[serde(default)]` so v1 rows on disk still deserialise — the
+/// map just lands empty. The version bump is informational; future
+/// loaders that want to display the breakdown only when present
+/// can check `schema_version >= 2`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Submission state at the time the row was last touched.
 /// v1 only ever writes `Pending`; v2 will transition through the
@@ -98,6 +107,37 @@ pub struct ScanRecord {
     /// finished modal show).
     pub reclaimable_bytes: u64,
     pub submission_state: SubmissionState,
+    /// #49 — per-`SimilarityKind` group counts for the scan.
+    /// Keys are the lowercase-kebab serialisation of `SimilarityKind`
+    /// (e.g. `"byte-identical"`, `"perceptual-image"`,
+    /// `"perceptual-audio"`); values are group counts. Empty when
+    /// the scan produced no groups, and ALWAYS empty on v1 rows
+    /// loaded from disk (the field is `#[serde(default)]`).
+    ///
+    /// Lets the GUI History tab display "32 perceptual + 30
+    /// byte-identical" instead of "62 groups total", and lets the
+    /// resubmit semantics in #41 v2 reconcile against the original
+    /// composition.
+    #[serde(default)]
+    pub groups_by_similarity_kind: BTreeMap<String, u64>,
+}
+
+/// Build the `groups_by_similarity_kind` map for a finished scan's
+/// duplicate-group vec. Empty map for empty input. Used by both the
+/// CLI + GUI scan-finish sites; centralised here so the slug strings
+/// stay in lock-step with whatever `#[serde(rename_all = "kebab-case")]`
+/// emits for `SimilarityKind`.
+pub fn similarity_kind_breakdown(groups: &[DuplicateGroup]) -> BTreeMap<String, u64> {
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+    for g in groups {
+        let slug = match g.similarity_kind {
+            SimilarityKind::ByteIdentical => "byte-identical",
+            SimilarityKind::PerceptualImage => "perceptual-image",
+            SimilarityKind::PerceptualAudio => "perceptual-audio",
+        };
+        *out.entry(slug.to_string()).or_insert(0) += 1;
+    }
+    out
 }
 
 impl ScanRecord {
@@ -115,6 +155,7 @@ impl ScanRecord {
         total_bytes_read: u64,
         total_dups: u64,
         reclaimable_bytes: u64,
+        groups_by_similarity_kind: BTreeMap<String, u64>,
     ) -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -128,6 +169,7 @@ impl ScanRecord {
             total_dups,
             reclaimable_bytes,
             submission_state: SubmissionState::Pending,
+            groups_by_similarity_kind,
         }
     }
 }
@@ -364,6 +406,7 @@ mod tests {
             12345,
             5,
             999,
+            BTreeMap::new(),
         );
         let path = record_completed(&record).expect("write");
         assert!(path.exists(), "history file should exist at {path:?}");
@@ -389,6 +432,7 @@ mod tests {
                 1,
                 1,
                 1,
+                BTreeMap::new(),
             );
             record_completed(&record).unwrap();
         }
@@ -402,8 +446,17 @@ mod tests {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let _td = isolate("skip-bad");
         // Write one good + one garbage file.
-        let good =
-            ScanRecord::new_finished(new_scan_id(), 1_700_000_000, "prod", vec![], 1, 1, 0, 0);
+        let good = ScanRecord::new_finished(
+            new_scan_id(),
+            1_700_000_000,
+            "prod",
+            vec![],
+            1,
+            1,
+            0,
+            0,
+            BTreeMap::new(),
+        );
         record_completed(&good).unwrap();
         let bad_path = history_dir().unwrap().join("notajson.json");
         fs::write(&bad_path, b"{ not valid json at all }").unwrap();
@@ -443,8 +496,17 @@ mod tests {
         let _td = isolate("delete-idempotent");
         // Deleting a non-existent record is a no-op, not an error.
         delete("does-not-exist").unwrap();
-        let record =
-            ScanRecord::new_finished(new_scan_id(), 1_700_000_000, "prod", vec![], 1, 1, 0, 0);
+        let record = ScanRecord::new_finished(
+            new_scan_id(),
+            1_700_000_000,
+            "prod",
+            vec![],
+            1,
+            1,
+            0,
+            0,
+            BTreeMap::new(),
+        );
         record_completed(&record).unwrap();
         delete(&record.scan_id).unwrap();
         delete(&record.scan_id).unwrap(); // again — still no error
@@ -456,5 +518,67 @@ mod tests {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let _td = isolate("load-missing");
         assert!(load("does-not-exist").unwrap().is_none());
+    }
+
+    /// #49 — `similarity_kind_breakdown` slugs in lock-step with
+    /// `SimilarityKind`'s `#[serde(rename_all = "kebab-case")]`,
+    /// and the per-variant tally is correct.
+    #[test]
+    fn similarity_kind_breakdown_counts_each_variant() {
+        use crate::pipeline::{DuplicateGroup, SimilarityKind};
+        let g = |kind: SimilarityKind| DuplicateGroup {
+            similarity_kind: kind,
+            ..Default::default()
+        };
+        let groups = vec![
+            g(SimilarityKind::ByteIdentical),
+            g(SimilarityKind::ByteIdentical),
+            g(SimilarityKind::ByteIdentical),
+            g(SimilarityKind::PerceptualImage),
+            g(SimilarityKind::PerceptualImage),
+            g(SimilarityKind::PerceptualAudio),
+        ];
+        let out = similarity_kind_breakdown(&groups);
+        assert_eq!(out.get("byte-identical").copied(), Some(3));
+        assert_eq!(out.get("perceptual-image").copied(), Some(2));
+        assert_eq!(out.get("perceptual-audio").copied(), Some(1));
+        assert_eq!(out.len(), 3, "no extra keys: {out:?}");
+    }
+
+    #[test]
+    fn similarity_kind_breakdown_empty_input() {
+        let out = similarity_kind_breakdown(&[]);
+        assert!(
+            out.is_empty(),
+            "empty groups → empty map (avoids zero-padded keys)"
+        );
+    }
+
+    /// #49 — v1 rows on disk (no `groups_by_similarity_kind` field)
+    /// still deserialise cleanly under v2's struct; the new field
+    /// defaults to an empty map.
+    #[test]
+    fn deserialises_v1_record_with_empty_kind_breakdown() {
+        // Hand-crafted v1 JSON — no `groups_by_similarity_kind` key.
+        let v1 = r#"{
+            "schema_version": 1,
+            "scan_id": "v1-row",
+            "started_at_unix": 1700000000,
+            "completed_at_unix": 1700000100,
+            "channel": "prod",
+            "roots": ["/tmp/c"],
+            "total_files": 12,
+            "total_bytes_read": 4096,
+            "total_dups": 3,
+            "reclaimable_bytes": 1024,
+            "submission_state": "pending"
+        }"#;
+        let rec: ScanRecord = serde_json::from_str(v1).expect("v1 JSON must parse under v2 schema");
+        assert_eq!(rec.schema_version, 1);
+        assert!(
+            rec.groups_by_similarity_kind.is_empty(),
+            "missing field defaults to empty map: {:?}",
+            rec.groups_by_similarity_kind
+        );
     }
 }
