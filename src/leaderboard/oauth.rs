@@ -1318,10 +1318,11 @@ impl Drop for OauthSession {
 
 /// Borrow target for `OauthSession::state()`'s pending branch.
 /// Used to hand back a `&SessionState` without leaking memory.
-/// (`state()` is currently unused by callers — use `is_pending()`
-/// + `try_take_result()` instead, which both have ergonomic
-/// semantics. Keeping `state()` here for future API symmetry +
-/// because the SessionState enum is the conceptual model.)
+///
+/// `state()` is currently unused by callers — use `is_pending()`
+/// or `try_take_result()` instead, which both have ergonomic
+/// semantics. Keeping `state()` here for future API symmetry, since
+/// the SessionState enum is the conceptual model.
 static SESSION_STATE_PENDING: SessionState = SessionState::Pending;
 
 // =====================================================================
@@ -1333,20 +1334,21 @@ static SESSION_STATE_PENDING: SessionState = SessionState::Pending;
 
 static CURRENT_SESSION: parking_lot::Mutex<Option<OauthSession>> = parking_lot::Mutex::new(None);
 
-/// Attempt to start an OAuth flow. Returns `Err(())` if a flow is
-/// already in flight — the caller should keep showing the existing
-/// "Waiting for browser sign-in…" UI rather than starting a second
-/// flow against the same loopback port.
+/// Attempt to start an OAuth flow. Returns
+/// `Err(SessionAlreadyRunning)` if a flow is already in flight —
+/// the caller should keep showing the existing "Waiting for
+/// browser sign-in…" UI rather than starting a second flow
+/// against the same loopback port.
 pub fn try_start_session(
     provider: Provider,
     channel: Channel,
     server_url: &str,
     install_id: &str,
     timeout: Duration,
-) -> Result<(), ()> {
+) -> Result<(), crate::leaderboard::registration::SessionAlreadyRunning> {
     let mut slot = CURRENT_SESSION.lock();
     if slot.is_some() {
-        return Err(());
+        return Err(crate::leaderboard::registration::SessionAlreadyRunning);
     }
     *slot = Some(OauthSession::start(
         provider, channel, server_url, install_id, timeout,

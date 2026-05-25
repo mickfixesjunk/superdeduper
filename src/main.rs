@@ -477,10 +477,7 @@ fn print_achievements(
                 }
             );
             println!();
-            println!(
-                "{:<28}  {:<6}  {:<22}  {}",
-                "ID", "TIER", "GRANTED_AT", "NAME"
-            );
+            println!("{:<28}  {:<6}  {:<22}  NAME", "ID", "TIER", "GRANTED_AT");
             for e in entries {
                 let grant = grants.get(e.id.as_str());
                 let granted = grant.map(|g| g.granted).unwrap_or(false);

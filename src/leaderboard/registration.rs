@@ -49,21 +49,15 @@ pub enum RegisterError {
 /// SHA-256 iterations in the worst case, average 2^21 = 2M).
 pub const DEFAULT_POW_DIFFICULTY: u8 = 22;
 
-/// CLI registration flow. Mutates `state` to set `registered = true`
-/// + persists, on a successful round-trip.
-/// **Note on the register response body:** the server's `/register`
-/// response MAY include a `submit_url` hint (see web's
-/// `register.ts:140`). Engine deliberately IGNORES it — per
-/// dev-channel-spec.md post-#7 add-on (design 20:09Z, option 2),
-/// client-side URL resolution via [`crate::channel::server_url_for`]
-/// is the single source of truth. This guarantees a stale hardcoded
-/// URL on the server can never leak a dev install onto prod
-/// telemetry. Same rule applies to [`register_gui_via_loopback`].
 // =====================================================================
 // Background-thread register session — matches the OauthSession
 // pattern in oauth.rs so the GUI can fire register without blocking
 // the egui render loop. Same constraints (single in-flight session
 // at a time, cancel-friendly poll-tick).
+//
+// The synchronous `register_cli` + `register_gui_via_loopback` paths
+// live further down in this file; see their doc comments for the
+// "server's submit_url hint is IGNORED" rationale.
 // =====================================================================
 
 /// Process-wide slot for an in-flight register session.
@@ -172,12 +166,30 @@ impl Drop for RegisterSession {
     }
 }
 
-/// Attempt to start a register session. `Err(())` if one is
-/// already in flight.
-pub fn try_start_register_session(channel: crate::channel::Channel) -> Result<(), ()> {
+/// Zero-data error returned when a register or OAuth session is
+/// already in flight and the caller tried to start another. Carries
+/// no payload; the only signal is "busy, try again later." Defined
+/// here so [`try_start_register_session`] doesn't return
+/// `Result<_, ()>` (clippy's `result_unit_err` lint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAlreadyRunning;
+
+impl std::fmt::Display for SessionAlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a leaderboard session is already in flight")
+    }
+}
+
+impl std::error::Error for SessionAlreadyRunning {}
+
+/// Attempt to start a register session. `Err(SessionAlreadyRunning)`
+/// if one is already in flight.
+pub fn try_start_register_session(
+    channel: crate::channel::Channel,
+) -> Result<(), SessionAlreadyRunning> {
     let mut slot = CURRENT_REGISTER_SESSION.lock();
     if slot.is_some() {
-        return Err(());
+        return Err(SessionAlreadyRunning);
     }
     *slot = Some(RegisterSession::start(channel));
     Ok(())
@@ -246,6 +258,17 @@ pub fn poll_register_session() -> Option<Result<String, RegisterError>> {
     Some(result)
 }
 
+/// CLI registration flow. Mutates `state` to set `registered = true`
+/// + persists, on a successful round-trip.
+///
+/// Note on the register response body: the server's `/register`
+/// response MAY include a `submit_url` hint (see web's
+/// `register.ts:140`). Engine deliberately IGNORES it — per
+/// dev-channel-spec.md post-#7 add-on (design 20:09Z, option 2),
+/// client-side URL resolution via [`crate::channel::server_url_for`]
+/// is the single source of truth. This guarantees a stale hardcoded
+/// URL on the server can never leak a dev install onto prod
+/// telemetry. Same rule applies to [`register_gui_via_loopback`].
 pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     if state.registered {
         return Err(RegisterError::AlreadyRegistered);
@@ -426,10 +449,8 @@ fn has_leading_zero_bits(digest: &[u8], bits: u8) -> bool {
     if digest.len() < full_bytes + 1 {
         return false;
     }
-    for i in 0..full_bytes {
-        if digest[i] != 0 {
-            return false;
-        }
+    if digest.iter().take(full_bytes).any(|&b| b != 0) {
+        return false;
     }
     if remaining_bits > 0 {
         let mask = 0xFFu8 << (8 - remaining_bits);

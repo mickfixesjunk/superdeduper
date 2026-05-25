@@ -766,7 +766,6 @@ pub fn update_last_outcome_ranks(fresh: Vec<RankEntry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::leaderboard::hardware::HardwareFingerprint;
 
     fn sample_inputs() -> SubmissionInputs {
         SubmissionInputs {

@@ -1008,13 +1008,15 @@ fn render_account(ui: &mut egui::Ui) {
                         provider.display_name()
                     );
                     let server_url = crate::channel::server_url_for(active);
-                    if let Err(()) = oauth::try_start_session(
+                    if oauth::try_start_session(
                         provider,
                         active,
                         server_url,
                         id,
                         oauth::DEFAULT_OAUTH_TIMEOUT,
-                    ) {
+                    )
+                    .is_err()
+                    {
                         eprintln!("account: couldn't auto-retry OAuth (session already in flight)");
                     }
                 }
@@ -1517,11 +1519,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
 
     // Load mutable state. If the install isn't present (not
     // registered yet), the controls show a hint but stay disabled.
-    let loaded = install::load();
-    let state_opt: Option<install::InstallState> = match loaded {
-        Ok(s) => s,
-        Err(_) => None,
-    };
+    let state_opt: Option<install::InstallState> = install::load().unwrap_or_default();
 
     let current_share = state_opt
         .as_ref()
@@ -1819,15 +1817,15 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
 
 /// Shorten a long string for inline display (the original-error
 /// line on the FlaggedForReview outcome). Trims to ≤`cap` bytes
-/// + adds an ellipsis when truncated; otherwise returns the
+/// and adds an ellipsis when truncated; otherwise returns the
 /// original.
 ///
 /// Safe against UTF-8 multi-byte boundaries: backs up to the
-///   previous char boundary if `cap` lands mid-codepoint. Without
-///   this guard, a rejection reason carrying e.g. an em-dash (3-byte
-///   UTF-8) could panic with `byte index N is not a char boundary`
-///   — and rejection messages come from network input we don't
-///   control, so a hostile backend could crash the GUI.
+/// previous char boundary if `cap` lands mid-codepoint. Without
+/// this guard, a rejection reason carrying e.g. an em-dash (3-byte
+/// UTF-8) could panic with `byte index N is not a char boundary`
+/// — and rejection messages come from network input we don't
+/// control, so a hostile backend could crash the GUI.
 #[cfg(feature = "telemetry")]
 fn truncate_for_display(s: &str, cap: usize) -> String {
     if s.len() <= cap {

@@ -72,18 +72,13 @@ pub struct InstallState {
     pub counters: InstallCounters,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShareDefault {
+    #[default]
     AlwaysAsk,
     AutoOptIn,
     Never,
-}
-
-impl Default for ShareDefault {
-    fn default() -> Self {
-        Self::AlwaysAsk
-    }
 }
 
 impl InstallState {
@@ -95,9 +90,8 @@ impl InstallState {
             return None;
         }
         let mut out = [0u8; 32];
-        for i in 0..32 {
-            let byte = u8::from_str_radix(&self.install_key_hex[i * 2..i * 2 + 2], 16).ok()?;
-            out[i] = byte;
+        for (i, byte_slot) in out.iter_mut().enumerate() {
+            *byte_slot = u8::from_str_radix(&self.install_key_hex[i * 2..i * 2 + 2], 16).ok()?;
         }
         Some(out)
     }
