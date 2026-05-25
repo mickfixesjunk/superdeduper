@@ -21,6 +21,7 @@
 
 #![cfg(feature = "telemetry")]
 
+pub mod account_badge_summary;
 pub mod account_privacy;
 pub mod captcha;
 pub mod catalog;

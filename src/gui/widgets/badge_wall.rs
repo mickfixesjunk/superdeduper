@@ -37,6 +37,16 @@ pub enum BadgeWallAction {
     /// User clicked the "Register" link in the empty-state panel.
     /// Caller pops the Settings modal at the Leaderboard tab.
     OpenRegister,
+    /// #77 — User clicked a badge tile that has a cross-machine
+    /// multiplier overlay (×N, N ≥ 2). App opens the per-install
+    /// detail panel listing which installs earned it + when.
+    /// Distinct from `TileClicked` so the app can route to a
+    /// different modal (the install-list panel vs the standard
+    /// grant-detail popup); when the achievement has count = 1,
+    /// fall through to `TileClicked` semantics.
+    TileClickedMultiplier {
+        achievement_id: String,
+    },
 }
 
 /// Render the badge wall inside the caller's UI region. Returns
@@ -385,15 +395,28 @@ fn render_grid(ui: &mut egui::Ui, state: &CatalogState, action: &mut Option<Badg
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (i, tile) in classified.iter().enumerate() {
+                    let multiplier = state.multiplier_for(&tile.entry.id);
                     if render_tile(
                         ui,
                         tile.entry,
                         tile.granted,
                         tile.locked,
                         &tile.granted_years,
+                        multiplier,
                         TILE_SIZE,
                     ) {
-                        *action = Some(BadgeWallAction::TileClicked(tile.entry.id.clone()));
+                        // #77 — route to the install-list panel
+                        // when the multiplier is ≥2; otherwise
+                        // fall through to the standard detail
+                        // popup (TileClicked) the App already
+                        // handles.
+                        *action = if multiplier >= 2 {
+                            Some(BadgeWallAction::TileClickedMultiplier {
+                                achievement_id: tile.entry.id.clone(),
+                            })
+                        } else {
+                            Some(BadgeWallAction::TileClicked(tile.entry.id.clone()))
+                        };
                     }
                     if (i + 1) % COLS == 0 {
                         ui.end_row();
@@ -416,6 +439,7 @@ fn render_tile(
     granted: bool,
     locked: bool,
     granted_years: &[u16],
+    multiplier: u32,
     size: egui::Vec2,
 ) -> bool {
     // Shield-based tile rendering (Mick 2026-05-25T03:30Z):
@@ -478,6 +502,30 @@ fn render_tile(
         })
         .response;
     let resp = resp.interact(egui::Sense::click());
+
+    // #77 — Cross-machine multiplier overlay. Draws "×N" in the
+    // bottom-right corner of the tile when the user has earned
+    // this badge on N ≥ 2 of their linked installs. Painter
+    // approach lets us position the text absolutely in the tile
+    // rect without affecting the layout of the shield + name
+    // label inside the Frame.
+    if multiplier >= 2 && !locked {
+        let painter = ui.painter_at(resp.rect);
+        let tile_rect = resp.rect;
+        let label = format!("×{multiplier}");
+        // Position: bottom-right corner with a 4px inset. The
+        // accent color is the same one used for granted-tile
+        // strokes; reads as a celebration marker rather than a
+        // warning.
+        let pos = tile_rect.right_bottom() + egui::vec2(-6.0, -6.0);
+        painter.text(
+            pos,
+            egui::Align2::RIGHT_BOTTOM,
+            label,
+            egui::FontId::proportional(14.0),
+            theme::ACCENT,
+        );
+    }
     let tooltip = if locked {
         format!(
             "{} (locked)\n\nRequires sd-nas-pro features (Phase NP1+).\n\n{}",
@@ -766,6 +814,7 @@ mod tests {
                 achievements: vec![entry("a", "A", "low", 1)],
             })),
             profile: None,
+            account_badge_summary: None,
         };
         assert_eq!(count_grants(&state), (0, 1));
     }
@@ -819,6 +868,7 @@ mod tests {
         let state = CatalogState {
             catalog: Some(Ok(catalog.clone())),
             profile: Some(Ok(profile)),
+            account_badge_summary: None,
         };
 
         let tiles = classify_grid_entries(&state, &catalog.achievements);
@@ -880,6 +930,7 @@ mod tests {
                 achievements: catalog_entries.clone(),
             })),
             profile: Some(Err("schema mismatch: missing field `achievement_id`".into())),
+            account_badge_summary: None,
         };
         let tiles = classify_grid_entries(&state, &catalog_entries);
         assert_eq!(tiles.len(), 2);
@@ -939,6 +990,7 @@ mod tests {
         let state = CatalogState {
             catalog: Some(Ok(catalog)),
             profile: Some(Ok(profile)),
+            account_badge_summary: None,
         };
 
         // Drive the real `badge_wall::show()` through the egui frame
@@ -1039,6 +1091,7 @@ mod tests {
                 lifetime: Default::default(),
                 achievements: vec![],
             })),
+            account_badge_summary: None,
         };
         render_to_png(&empty_state, out_dir.join("badge_wall-empty.png").as_path());
 
@@ -1059,6 +1112,7 @@ mod tests {
         let granted_state = CatalogState {
             catalog: Some(Ok(catalog)),
             profile: Some(Ok(live_profile)),
+            account_badge_summary: None,
         };
         render_to_png(
             &granted_state,
@@ -1116,6 +1170,7 @@ mod tests {
                     },
                 ],
             })),
+            account_badge_summary: None,
         };
         let tiles = classify_grid_entries(&state, &catalog.achievements);
 
@@ -1202,6 +1257,7 @@ mod tests {
                     },
                 ],
             })),
+            account_badge_summary: None,
         };
         let tiles = classify_grid_entries(&state, &catalog.achievements);
         let holiday = tiles
@@ -1248,6 +1304,7 @@ mod tests {
                     },
                 ],
             })),
+            account_badge_summary: None,
         };
         let tiles = classify_grid_entries(&state, &catalog.achievements);
         let h = tiles
@@ -1278,6 +1335,7 @@ mod tests {
                     granted_at: None,
                 }],
             })),
+            account_badge_summary: None,
         };
         let tiles = classify_grid_entries(&state, &catalog.achievements);
         let h = tiles
@@ -1323,6 +1381,7 @@ mod tests {
                     },
                 ],
             })),
+            account_badge_summary: None,
         };
         assert_eq!(count_grants(&state), (2, 2));
     }
@@ -1352,6 +1411,7 @@ mod tests {
                     granted_at: None,
                 }],
             })),
+            account_badge_summary: None,
         };
         let tiles = classify_grid_entries(&state, &catalog.achievements);
         let ordered_ids: Vec<&str> = tiles.iter().map(|t| t.entry.id.as_str()).collect();
@@ -1382,6 +1442,7 @@ mod tests {
                     },
                 ],
             })),
+            account_badge_summary: None,
         };
         assert_eq!(count_grants(&state), (1, 2));
     }
