@@ -215,6 +215,12 @@ pub enum OauthError {
     /// clear the binding) before re-linking. Recoverable with
     /// clear user guidance.
     InstallAlreadyBound,
+    /// Web's 403 `install_unknown_or_banned` — this install_id
+    /// isn't in web's `installs` table (e.g. after a dev wipe,
+    /// fresh laptop, or pre-registration). User runs
+    /// `superdeduper register --channel <name>` to register, then
+    /// retries the OAuth link.
+    InstallNotRegistered,
 }
 
 impl std::fmt::Display for OauthError {
@@ -245,6 +251,12 @@ impl std::fmt::Display for OauthError {
                 "This machine is already linked to another account. Run \
                  `superdeduper register --reset --channel <name>` to rotate \
                  the install identity, then retry sign-in."
+            ),
+            Self::InstallNotRegistered => write!(
+                f,
+                "This machine isn't registered with the leaderboard yet. Run \
+                 `superdeduper register --channel <name>` (no --reset needed), \
+                 then retry sign-in."
             ),
         }
     }
@@ -1071,11 +1083,14 @@ fn exchange_code(
                 "exchange_response_error_status: status={code} body={}",
                 truncate_for_log(&body, 1024)
             ));
-            // Recognise web's 409 `install_bound_elsewhere` as a
-            // specific actionable case — the GUI toast renders it
-            // with clear remediation instead of the raw JSON dump.
+            // Recognise web's structured error codes for actionable
+            // remediation toasts. Raw JSON falls through to
+            // BackendRejected for unknown shapes.
             if code == 409 && body.contains("install_bound_elsewhere") {
                 return Err(OauthError::InstallAlreadyBound);
+            }
+            if code == 403 && body.contains("install_unknown_or_banned") {
+                return Err(OauthError::InstallNotRegistered);
             }
             Err(OauthError::BackendRejected { status: code, body })
         }
