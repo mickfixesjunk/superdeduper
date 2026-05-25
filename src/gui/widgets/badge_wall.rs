@@ -55,13 +55,6 @@ pub fn show(ui: &mut egui::Ui, state: &CatalogState) -> Option<BadgeWallAction> 
     action
 }
 
-/// Process-wide flag for the "Login & Claim" provider chooser
-/// modal dialog. `true` once the user clicks the CTA — the next
-/// frame renders an `egui::Window` provider chooser on top of
-/// the badge wall. Cleared when the user picks a provider OR
-/// closes the dialog. Same Mutex-static pattern the settings
-/// modal uses for its sample-preview popup.
-static LOGIN_CTA_CHOOSER_OPEN: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
 
 /// Render the "Login & Claim" CTA + provider chooser, when the
 /// active channel's install is anonymous. No-op when linked.
@@ -154,102 +147,14 @@ fn render_login_cta(ui: &mut egui::Ui) {
             "Sign in to permanently keep your achievements across all your machines",
         );
     if resp.clicked() {
-        *LOGIN_CTA_CHOOSER_OPEN.lock() = true;
+        crate::gui::widgets::oauth_chooser::open();
     }
     ui.add_space(6.0);
 
-    // Modal provider-chooser dialog. Renders on top of the badge
-    // wall when the user has clicked Login & Claim. Per Mick's
-    // 2026-05-25T01:20Z preference, this is a modal dialog (not
-    // an inline chooser row) so the user's attention focuses on
-    // the provider choice; picking one starts the OAuth flow +
-    // closes the dialog.
-    render_provider_chooser_dialog(ui.ctx(), active);
-}
-
-/// Provider-chooser modal: rendered when the global
-/// `LOGIN_CTA_CHOOSER_OPEN` flag is set. Picking Google or
-/// Discord kicks off the OAuth flow + dismisses the modal; the
-/// inflight spinner then renders on the next frame via the
-/// CTA's `current_session_snapshot` branch.
-fn render_provider_chooser_dialog(
-    ctx: &egui::Context,
-    channel: crate::channel::Channel,
-) {
-    let mut open = LOGIN_CTA_CHOOSER_OPEN.lock();
-    if !*open {
-        return;
-    }
-    let mut close_after_render = false;
-    let mut start_provider: Option<crate::leaderboard::oauth::Provider> = None;
-    egui::Window::new(
-        RichText::new("Sign in to claim")
-            .color(theme::TEXT_HI)
-            .heading(),
-    )
-    .collapsible(false)
-    .resizable(false)
-    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-    .default_width(360.0)
-    .show(ctx, |ui| {
-        ui.label(
-            RichText::new(
-                "Pick a provider to sign in with. Your achievements \
-                 will roll up under one account across all your machines.",
-            )
-            .color(theme::TEXT_LO)
-            .small(),
-        );
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("Sign in with Google")
-                            .color(theme::PANEL_DEEP)
-                            .strong(),
-                    )
-                    .fill(theme::ACCENT)
-                    .min_size(egui::vec2(150.0, 32.0)),
-                )
-                .clicked()
-            {
-                start_provider = Some(crate::leaderboard::oauth::Provider::Google);
-                close_after_render = true;
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Sign in with Discord").color(theme::TEXT_HI))
-                        .min_size(egui::vec2(150.0, 32.0)),
-                )
-                .clicked()
-            {
-                start_provider = Some(crate::leaderboard::oauth::Provider::Discord);
-                close_after_render = true;
-            }
-        });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("Cancel").color(theme::TEXT_LO))
-                            .min_size(egui::vec2(80.0, 28.0)),
-                    )
-                    .clicked()
-                {
-                    close_after_render = true;
-                }
-            });
-        });
-    });
-    if close_after_render {
-        *open = false;
-    }
-    drop(open);
-    if let Some(p) = start_provider {
-        start_link(p, channel);
-    }
+    // Modal provider-chooser. Shared with the Settings → Account
+    // tab; rendered against the global egui context so it shows
+    // above whichever surface invoked it.
+    crate::gui::widgets::oauth_chooser::show(ui.ctx(), active);
 }
 
 /// Render the most-recent OAuth toast inline below the CTA. Goes
@@ -295,38 +200,6 @@ fn render_oauth_toast(ui: &mut egui::Ui) {
         }
     });
     ui.add_space(4.0);
-}
-
-/// Kick off an OAuth flow on the background worker. Caller stays
-/// responsive — per-frame `poll_session()` drains the result when
-/// the worker finishes. Per issue #2 fix.
-fn start_link(
-    provider: crate::leaderboard::oauth::Provider,
-    channel: crate::channel::Channel,
-) {
-    use crate::leaderboard::{install, oauth};
-    let install_id = match install::load().ok().flatten() {
-        Some(s) => s.install_id,
-        None => {
-            eprintln!(
-                "login-cta: not registered on channel {channel} — \
-                 run `superdeduper register --channel {channel}` first"
-            );
-            return;
-        }
-    };
-    let server_url = crate::channel::server_url_for(channel);
-    if oauth::try_start_session(
-        provider,
-        channel,
-        server_url,
-        &install_id,
-        oauth::DEFAULT_OAUTH_TIMEOUT,
-    )
-    .is_err()
-    {
-        eprintln!("login-cta: another OAuth flow is already in flight; ignoring");
-    }
 }
 
 /// Compact alternative for narrow windows (per §10.5). Same

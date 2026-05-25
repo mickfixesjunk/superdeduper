@@ -300,6 +300,34 @@ fn set_owner_only_perms(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Back up the existing install.{channel}.json file (if any) by
+/// renaming it to `install.{channel}.json.bak.<unix_ts>`. Called
+/// before destructive install-state operations (reset, fresh
+/// register from the GUI) so the prior identity is recoverable
+/// from disk if needed. Per Mick's 2026-05-25T01:20Z preference.
+///
+/// Returns `Ok(Some(backup_path))` if a backup was created,
+/// `Ok(None)` if no source file existed (so nothing to back up),
+/// `Err` on I/O failure.
+pub fn back_up_for(channel: Channel) -> io::Result<Option<PathBuf>> {
+    let src = install_path_for(channel)?;
+    if !src.exists() {
+        return Ok(None);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut backup = src.clone();
+    let fname = backup
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    backup.set_file_name(format!("{fname}.bak.{ts}"));
+    fs::rename(&src, &backup)?;
+    Ok(Some(backup))
+}
+
 /// Build a fresh InstallState with a new UUID + random HMAC key.
 /// Does NOT persist; caller calls `save(&state)` after a successful
 /// registration response.

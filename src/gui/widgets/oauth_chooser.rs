@@ -1,0 +1,151 @@
+//! Provider-chooser modal for OAuth link flows.
+//!
+//! Single source of truth for the "Sign in with Google / Discord"
+//! provider-pick dialog. Reused by:
+//!
+//! - `badge_wall::show()` — the "Login & Claim" CTA above the
+//!   achievements grid (always anonymous-only).
+//! - `settings_modal::render_account()` — the Account tab's single
+//!   `Link…` button (when anonymous on the active channel).
+//!
+//! Per Mick's 2026-05-25T01:20Z preference, the chooser is a
+//! centered modal `egui::Window` instead of an inline button row
+//! so the user's attention focuses on the provider choice. Picking
+//! a provider closes the dialog + starts the OAuth flow on the
+//! shared background-session manager (`oauth::try_start_session`).
+
+#![cfg(feature = "gui")]
+
+use egui::RichText;
+
+use crate::channel::Channel;
+use crate::gui::theme;
+use crate::leaderboard::{install, oauth};
+
+/// Process-wide flag — `true` while the chooser modal is showing.
+/// Set by any CTA's "open chooser" click; cleared on pick/Cancel.
+static CHOOSER_OPEN: parking_lot::Mutex<bool> =
+    parking_lot::Mutex::new(false);
+
+pub fn open() {
+    *CHOOSER_OPEN.lock() = true;
+}
+
+pub fn is_open() -> bool {
+    *CHOOSER_OPEN.lock()
+}
+
+pub fn close() {
+    *CHOOSER_OPEN.lock() = false;
+}
+
+/// Render the modal if `CHOOSER_OPEN` is set. No-op otherwise.
+/// Picking Google or Discord kicks off the OAuth flow against
+/// `channel` (typically the active channel) + dismisses the
+/// modal. Inflight spinner then renders on the next frame via
+/// each CTA's `current_session_snapshot` branch.
+pub fn show(ctx: &egui::Context, channel: Channel) {
+    if !is_open() {
+        return;
+    }
+    let mut close_after_render = false;
+    let mut start_provider: Option<oauth::Provider> = None;
+    egui::Window::new(
+        RichText::new("Sign in to claim")
+            .color(theme::TEXT_HI)
+            .heading(),
+    )
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .default_width(360.0)
+    .show(ctx, |ui| {
+        ui.label(
+            RichText::new(
+                "Pick a provider to sign in with. Your achievements \
+                 will roll up under one account across all your machines.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Sign in with Google")
+                            .color(theme::PANEL_DEEP)
+                            .strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(150.0, 32.0)),
+                )
+                .clicked()
+            {
+                start_provider = Some(oauth::Provider::Google);
+                close_after_render = true;
+            }
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Sign in with Discord").color(theme::TEXT_HI),
+                    )
+                    .min_size(egui::vec2(150.0, 32.0)),
+                )
+                .clicked()
+            {
+                start_provider = Some(oauth::Provider::Discord);
+                close_after_render = true;
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Cancel").color(theme::TEXT_LO))
+                            .min_size(egui::vec2(80.0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    close_after_render = true;
+                }
+            });
+        });
+    });
+    if close_after_render {
+        close();
+    }
+    if let Some(p) = start_provider {
+        start_link(p, channel);
+    }
+}
+
+/// Kick off an OAuth flow on the background worker. Caller stays
+/// responsive — per-frame `oauth::poll_session()` drains the
+/// result when the worker finishes. Used by both the badge-wall
+/// CTA + the Settings Account tab.
+fn start_link(provider: oauth::Provider, channel: Channel) {
+    let install_id = match install::load().ok().flatten() {
+        Some(s) => s.install_id,
+        None => {
+            eprintln!(
+                "oauth-chooser: not registered on channel {channel} — \
+                 run `superdeduper register --channel {channel}` first"
+            );
+            return;
+        }
+    };
+    let server_url = crate::channel::server_url_for(channel);
+    if oauth::try_start_session(
+        provider,
+        channel,
+        server_url,
+        &install_id,
+        oauth::DEFAULT_OAUTH_TIMEOUT,
+    )
+    .is_err()
+    {
+        eprintln!("oauth-chooser: another OAuth flow is already in flight; ignoring");
+    }
+}

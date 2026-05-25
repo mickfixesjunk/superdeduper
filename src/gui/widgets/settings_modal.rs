@@ -1051,40 +1051,27 @@ fn render_account(ui: &mut egui::Ui) {
         return;
     }
 
-    // Action row. Single-provider-per-install policy (Mick
-    // 2026-05-25T01:05Z): when linked, only the linked provider
-    // is named + Unlink is the only action. When anonymous, both
-    // Link buttons are active; Unlink stays visible but greyed
-    // so the row layout doesn't jump between states.
+    // Action row. Single Link/Unlink pair per Mick's
+    // 2026-05-25T01:20Z preference — Link… opens the modal
+    // provider chooser (shared with the above-grid CTA);
+    // Unlink stays visible but greyed when anonymous so the
+    // row layout doesn't jump between states.
     let is_linked = matches!(status, Some(oauth::AccountStatus::Linked { .. }));
     ui.horizontal(|ui| {
-        // Link Google: enabled only when anonymous (single-
-        // provider-per-install). Hidden when linked to keep the
-        // row tidy on the linked-state.
-        if !is_linked {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Link Google").color(theme::TEXT_HI))
-                        .min_size(egui::vec2(120.0, 28.0)),
-                )
-                .clicked()
-            {
-                start_link(oauth::Provider::Google, active);
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Link Discord").color(theme::TEXT_HI))
-                        .min_size(egui::vec2(120.0, 28.0)),
-                )
-                .clicked()
-            {
-                start_link(oauth::Provider::Discord, active);
-            }
-            ui.add_space(12.0);
+        // Link button — enabled only when anonymous. Opens the
+        // shared chooser modal; picking a provider there starts
+        // the OAuth flow.
+        let link_text = if is_linked {
+            RichText::new("Link…").color(theme::TEXT_LO)
+        } else {
+            RichText::new("Link…").color(theme::TEXT_HI)
+        };
+        let link_btn = egui::Button::new(link_text).min_size(egui::vec2(120.0, 28.0));
+        if ui.add_enabled(!is_linked, link_btn).clicked() {
+            crate::gui::widgets::oauth_chooser::open();
         }
-        // Unlink: always visible, enabled only when linked.
-        // Greyed in anonymous state per Mick's 2026-05-25T01:20Z
-        // preference — keeps the action surface consistent.
+        ui.add_space(12.0);
+        // Unlink button — enabled only when linked.
         let unlink_text = if is_linked {
             RichText::new("Unlink").color(theme::HOT)
         } else {
@@ -1102,10 +1089,10 @@ fn render_account(ui: &mut egui::Ui) {
     if is_linked {
         ui.label(
             RichText::new(
-                "To switch providers, click Unlink first then choose \
-                 the other provider. Note: Unlink only clears the \
-                 local link record — the server-side binding stays \
-                 until the v1.1 unlink endpoint ships.",
+                "To switch providers, click Unlink first then click Link…. \
+                 Note: Unlink only clears the local link record — the \
+                 server-side binding stays until the v1.1 unlink endpoint \
+                 ships.",
             )
             .color(theme::TEXT_LO)
             .small(),
@@ -1113,15 +1100,19 @@ fn render_account(ui: &mut egui::Ui) {
     } else {
         ui.label(
             RichText::new(
-                "Clicking Link opens your browser to the provider's sign-in \
-                 page. The Cancel button stays available while you sign in; \
-                 this window updates automatically when the flow finishes. \
-                 CLI: `superdeduper account link google|discord`.",
+                "Click Link… to pick a provider (Google or Discord). \
+                 Your browser opens to the provider's sign-in page; \
+                 this window updates when the flow finishes. \
+                 CLI equivalent: `superdeduper account link google|discord`.",
             )
             .color(theme::TEXT_LO)
             .small(),
         );
     }
+
+    // Render the shared chooser modal — no-op unless the Link…
+    // button (or the above-grid CTA) has set the flag.
+    crate::gui::widgets::oauth_chooser::show(ui.ctx(), active);
 }
 
 /// Spawn a background OAuth session. The Settings → Account tab
@@ -1515,33 +1506,101 @@ fn render_privacy_section(ui: &mut egui::Ui) {
                 .min_size(egui::vec2(140.0, 26.0)),
             )
             .on_hover_text(
-                "Rotate install_id + install_key. Equivalent to \
-                 `superdeduper register --reset` from the CLI. Backend treats \
-                 the new id as a fresh user; rank + achievements reset.",
+                "Back up the current install file to `.bak.<ts>`, then \
+                 rotate install_id + install_key locally. After reset, \
+                 click Register below to push the new identity to the \
+                 leaderboard server. Backend treats the new id as a \
+                 fresh user; rank + achievements start from zero.",
             )
             .clicked()
         {
-            // Reset is destructive on the install identity — gate
-            // behind a confirmation in the same egui frame's modal.
-            // For first slice, do it inline with eprintln warning;
-            // a proper confirm modal layered in a follow-up.
-            std::thread::spawn(|| {
+            // Reset is destructive but Mick's 2026-05-25T01:20Z
+            // preference is "back up the file, then rotate" — the
+            // .bak gives a recovery path if the rotation was
+            // accidental. Reset itself doesn't hit web; the
+            // separate Register button below pushes the new
+            // identity to the leaderboard server.
+            let active = crate::channel::active_channel();
+            std::thread::spawn(move || {
                 eprintln!(
-                    "leaderboard: install reset requested — rotating install_id + install_key"
+                    "leaderboard: install reset requested — backing up + rotating install_id"
                 );
-                let fresh = install::new_unregistered(
-                    "https://api.superdeduper.io".to_string(),
-                );
-                if let Err(e) = install::save(&fresh) {
+                match install::back_up_for(active) {
+                    Ok(Some(path)) => eprintln!(
+                        "leaderboard: prior install backed up to {}",
+                        path.display()
+                    ),
+                    Ok(None) => eprintln!("leaderboard: no prior install to back up"),
+                    Err(e) => eprintln!("leaderboard: backup failed: {e}"),
+                }
+                let server_url = crate::channel::server_url_for(active).to_string();
+                let fresh = install::new_unregistered(server_url);
+                if let Err(e) = install::save_for(active, &fresh) {
                     eprintln!("leaderboard: reset failed: {e:?}");
                 } else {
                     eprintln!(
                         "leaderboard: reset complete. new install_id={}. \
-                         Re-register via the Leaderboard tab above.",
+                         Click Register to push it to the leaderboard server.",
                         fresh.install_id
                     );
                 }
             });
+        }
+        ui.add_space(4.0);
+        // GUI Register — runs the same proof-of-work + POST
+        // `/api/v1/register` flow as the CLI `superdeduper
+        // register`, but as a background-threaded session so the
+        // egui render loop stays responsive. Per Mick's
+        // 2026-05-25T01:20Z ask — the OAuth flow already covers
+        // the "machine doesn't exist server-side" case via the
+        // `InstallNotRegistered` toast which now has an inline
+        // Register link; this button is the canonical surface.
+        let in_flight = crate::leaderboard::registration::register_session_in_flight();
+        if let Some(result) = crate::leaderboard::registration::poll_register_session() {
+            match result {
+                Ok(id) => {
+                    eprintln!(
+                        "leaderboard: register OK, install_id={id}"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("leaderboard: register failed: {e:?}");
+                }
+            }
+        }
+        if in_flight {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.add_space(4.0);
+                let elapsed = crate::leaderboard::registration::register_session_elapsed()
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                ui.label(
+                    RichText::new(format!("Registering ({elapsed}s)…"))
+                        .color(theme::TEXT_HI),
+                );
+            });
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        } else if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Register").color(theme::PANEL_DEEP).strong(),
+                )
+                .fill(theme::ACCENT)
+                .min_size(egui::vec2(140.0, 26.0)),
+            )
+            .on_hover_text(
+                "Push the current install identity (or a freshly-reset \
+                 one) to the leaderboard server. Solves a small CPU \
+                 proof-of-work (~1s). Equivalent to `superdeduper register` \
+                 from the CLI.",
+            )
+            .clicked()
+        {
+            let active = crate::channel::active_channel();
+            if crate::leaderboard::registration::try_start_register_session(active).is_err() {
+                eprintln!("leaderboard: another register flow is already in flight");
+            }
         }
     });
 

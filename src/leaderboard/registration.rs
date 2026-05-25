@@ -59,6 +59,159 @@ pub const DEFAULT_POW_DIFFICULTY: u8 = 22;
 /// is the single source of truth. This guarantees a stale hardcoded
 /// URL on the server can never leak a dev install onto prod
 /// telemetry. Same rule applies to [`register_gui_via_loopback`].
+// =====================================================================
+// Background-thread register session — matches the OauthSession
+// pattern in oauth.rs so the GUI can fire register without blocking
+// the egui render loop. Same constraints (single in-flight session
+// at a time, cancel-friendly poll-tick).
+// =====================================================================
+
+/// Process-wide slot for an in-flight register session.
+static CURRENT_REGISTER_SESSION: parking_lot::Mutex<Option<RegisterSession>> =
+    parking_lot::Mutex::new(None);
+
+/// One background-threaded register flow.
+pub struct RegisterSession {
+    started_at: std::time::Instant,
+    rx: std::sync::mpsc::Receiver<Result<String, RegisterError>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    cached: Option<Result<String, RegisterError>>,
+}
+
+impl RegisterSession {
+    /// Spawn a worker that runs `register_cli` on a fresh
+    /// `InstallState`. Holds the install state inside the thread;
+    /// on success the new install_id is sent back through the
+    /// mpsc + the file is already saved. Per Mick's
+    /// 2026-05-25T01:20Z preference, this also backs up the
+    /// existing install.{channel}.json to `.bak.<ts>` before
+    /// generating the fresh state.
+    pub fn start(channel: crate::channel::Channel) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, RegisterError>>();
+        let join = std::thread::spawn(move || {
+            // Backup old file if present.
+            let backup_result = crate::leaderboard::install::back_up_for(channel);
+            if let Err(e) = &backup_result {
+                eprintln!("register: backup failed: {e} (continuing anyway)");
+            }
+            // Generate fresh install state for this channel.
+            let server_url =
+                crate::channel::server_url_for(channel).to_string();
+            let mut state = crate::leaderboard::install::new_unregistered(server_url);
+            match register_cli(&mut state) {
+                Ok(()) => {
+                    // register_cli already saves via the active
+                    // channel. Force a save through the per-channel
+                    // helper so a non-active-channel register
+                    // (Settings tab on dev while main is prod, etc.)
+                    // also lands at the right path.
+                    if let Err(e) =
+                        crate::leaderboard::install::save_for(channel, &state)
+                    {
+                        let _ = tx.send(Err(RegisterError::SaveFailedAfterServerAck(
+                            format!("{e}"),
+                        )));
+                        return;
+                    }
+                    let _ = tx.send(Ok(state.install_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        });
+        RegisterSession {
+            started_at: std::time::Instant::now(),
+            rx,
+            join: Some(join),
+            cached: None,
+        }
+    }
+
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    pub fn is_pending(&mut self) -> bool {
+        if self.cached.is_some() {
+            return false;
+        }
+        match self.rx.try_recv() {
+            Ok(r) => {
+                self.cached = Some(r);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.cached = Some(Err(RegisterError::Network(
+                    "register worker thread died".into(),
+                )));
+                false
+            }
+        }
+    }
+
+    pub fn try_take_result(&mut self) -> Option<Result<String, RegisterError>> {
+        if self.cached.is_none() {
+            match self.rx.try_recv() {
+                Ok(r) => self.cached = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.cached = Some(Err(RegisterError::Network(
+                        "register worker thread died".into(),
+                    )));
+                }
+            }
+        }
+        self.cached.take()
+    }
+}
+
+impl Drop for RegisterSession {
+    fn drop(&mut self) {
+        // No cancel signal yet — register_cli's PoW completes in
+        // ~1s typically, so just detach the JoinHandle and let
+        // the thread exit on its own.
+        let _ = self.join.take();
+    }
+}
+
+/// Attempt to start a register session. `Err(())` if one is
+/// already in flight.
+pub fn try_start_register_session(
+    channel: crate::channel::Channel,
+) -> Result<(), ()> {
+    let mut slot = CURRENT_REGISTER_SESSION.lock();
+    if slot.is_some() {
+        return Err(());
+    }
+    *slot = Some(RegisterSession::start(channel));
+    Ok(())
+}
+
+/// True while a register flow is in flight.
+pub fn register_session_in_flight() -> bool {
+    CURRENT_REGISTER_SESSION.lock().is_some()
+}
+
+/// Elapsed time since the current register session started.
+/// `None` when no session is running.
+pub fn register_session_elapsed() -> Option<std::time::Duration> {
+    CURRENT_REGISTER_SESSION.lock().as_ref().map(|s| s.elapsed())
+}
+
+/// Drain the current register session if it has completed.
+/// Returns `Some(_)` exactly once per session.
+pub fn poll_register_session() -> Option<Result<String, RegisterError>> {
+    let mut slot = CURRENT_REGISTER_SESSION.lock();
+    let session = slot.as_mut()?;
+    if let Some(result) = session.try_take_result() {
+        *slot = None;
+        return Some(result);
+    }
+    None
+}
+
 pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     if state.registered {
         return Err(RegisterError::AlreadyRegistered);

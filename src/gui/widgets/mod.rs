@@ -5,6 +5,8 @@ pub mod action_progress;
 pub mod alpha_warning;
 pub mod cache_banner;
 pub mod channel_banner;
+#[cfg(feature = "telemetry")]
+pub mod oauth_chooser;
 pub mod drive_scope;
 pub mod funnel;
 pub mod groups_table;
