@@ -1643,11 +1643,16 @@ fn render_privacy_section(ui: &mut egui::Ui) {
         );
     }
 
+    ui.add_space(12.0);
+    render_public_profile_visibility(ui, state_opt.as_ref());
+
     ui.add_space(8.0);
     ui.label(
         RichText::new(
-            "Per-field overrides (toggle individual payload fields off) — coming \
-             in a follow-up slice. Today the payload is all-or-nothing.",
+            "Per-field overrides (toggle individual SUBMISSION payload fields off) — \
+             coming in a follow-up slice. Today the leaderboard payload itself is \
+             all-or-nothing; the toggles above control PUBLIC PROFILE visibility \
+             only.",
         )
         .color(theme::TEXT_LO)
         .small()
@@ -1788,6 +1793,211 @@ fn render_privacy_section(ui: &mut egui::Ui) {
 /// stderr for now; a follow-up slice plumbs it into the
 /// "What gets shared?" modal alongside the post-scan modal's
 /// real payload preview.
+/// Render the 6-toggle "Public profile visibility" section
+/// (#67). Each toggle drives one privacy flag on the
+/// account-level rollup; toggling fires an async PATCH against
+/// `/api/v1/account/privacy`. Local state is cached so the UI
+/// doesn't flicker between clicks; the canonical server-side
+/// state replaces the cache when the PATCH returns.
+#[cfg(feature = "telemetry")]
+fn render_public_profile_visibility(
+    ui: &mut egui::Ui,
+    install_state: Option<&crate::leaderboard::install::InstallState>,
+) {
+    use crate::leaderboard::account_privacy::PrivacyFlags;
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+
+    // Process-wide cache so the toggles render the same state
+    // across opens of the Settings modal. None = haven't fetched
+    // yet (and unregistered installs stay None forever).
+    fn cache() -> &'static Mutex<Option<PrivacyFlags>> {
+        static SLOT: OnceLock<Mutex<Option<PrivacyFlags>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+    /// True while a PATCH worker is in flight; gates concurrent
+    /// updates to a single one at a time.
+    fn in_flight() -> &'static Mutex<bool> {
+        static SLOT: OnceLock<Mutex<bool>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(false))
+    }
+    /// Most-recent outcome surfaced inline.
+    fn last_outcome() -> &'static Mutex<Option<String>> {
+        static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    ui.label(
+        RichText::new("Public profile visibility")
+            .color(theme::TEXT_HI)
+            .strong(),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(
+            "What anonymous visitors see on your public profile page at \
+             superdeduper.io/profile/<slug>. All default OFF — your achievement \
+             grid + aggregate stats are always visible; everything else is \
+             opt-in.",
+        )
+        .color(theme::TEXT_LO)
+        .small()
+        .italics(),
+    );
+    ui.add_space(6.0);
+
+    if install_state.is_none() {
+        ui.label(
+            RichText::new("Register + link an account above to manage these.")
+                .color(theme::TEXT_LO)
+                .small()
+                .italics(),
+        );
+        return;
+    }
+
+    // First render after install becomes available: kick a fetch.
+    if cache().lock().is_none() && !*in_flight().lock() {
+        if let Some(state) = install_state {
+            *in_flight().lock() = true;
+            let state_owned = state.clone();
+            let server_url = state.server_url.clone();
+            std::thread::Builder::new()
+                .name("superdeduper-privacy-fetch".into())
+                .spawn(move || {
+                    use crate::leaderboard::account_privacy::{self, PrivacyOutcome};
+                    let outcome = account_privacy::fetch(&state_owned, &server_url);
+                    match outcome {
+                        PrivacyOutcome::Ok(flags) => {
+                            *cache().lock() = Some(flags);
+                            *last_outcome().lock() = None;
+                        }
+                        PrivacyOutcome::Unauthorised(reason) => {
+                            *last_outcome().lock() = Some(format!("auth: {reason}"));
+                        }
+                        PrivacyOutcome::Rejected(reason) => {
+                            *last_outcome().lock() = Some(format!("rejected: {reason}"));
+                        }
+                        PrivacyOutcome::Transient(reason) => {
+                            *last_outcome().lock() = Some(format!("transient: {reason}"));
+                        }
+                    }
+                    *in_flight().lock() = false;
+                })
+                .ok();
+        }
+    }
+
+    let mut current = cache().lock().clone().unwrap_or_default();
+    let busy = *in_flight().lock();
+
+    let mut changed = false;
+    let toggle =
+        |ui: &mut egui::Ui, field: &mut bool, label: &str, hover: &str, changed: &mut bool| {
+            let resp = ui.checkbox(field, RichText::new(label).color(theme::TEXT_HI));
+            if resp.on_hover_text(hover).changed() {
+                *changed = true;
+            }
+        };
+
+    ui.add_enabled_ui(!busy, |ui| {
+        toggle(
+            ui,
+            &mut current.show_display_name,
+            "Display name",
+            "Show your display name (e.g., \"MickFixesJunk\") on the public profile.",
+            &mut changed,
+        );
+        toggle(
+            ui,
+            &mut current.show_provider,
+            "Linked-provider badge",
+            "Show the Google / Discord badge next to your display name.",
+            &mut changed,
+        );
+        toggle(
+            ui,
+            &mut current.show_avatar,
+            "Discord avatar",
+            "Show your Discord avatar at the top of the public profile.",
+            &mut changed,
+        );
+        toggle(
+            ui,
+            &mut current.show_install_breakdown,
+            "Per-install grant breakdown",
+            "Show which of your linked installs earned each achievement \
+             (e.g., \"Storage Crusader x3 from MacBook + Desktop + Laptop\").",
+            &mut changed,
+        );
+        toggle(
+            ui,
+            &mut current.show_hardware_history,
+            "Hardware history table",
+            "Show the per-install hardware-class table (CPU model, threads, \
+             drive type, RAM tier). Hardware-bracket leaderboard ranks are \
+             always anonymous and not affected by this toggle.",
+            &mut changed,
+        );
+        toggle(
+            ui,
+            &mut current.show_recent_runs,
+            "Recent runs table",
+            "Show recent scan timings + scope on the public profile. Timing \
+             patterns can be identifying; default OFF.",
+            &mut changed,
+        );
+    });
+
+    if busy {
+        ui.label(
+            RichText::new("syncing…")
+                .color(theme::TEXT_LO)
+                .small()
+                .italics(),
+        );
+    }
+    if let Some(outcome) = last_outcome().lock().clone() {
+        ui.label(RichText::new(outcome).color(theme::WARN).small().italics());
+    }
+
+    // Optimistic update + async PATCH.
+    if changed && !busy {
+        *cache().lock() = Some(current.clone());
+        *last_outcome().lock() = None;
+        if let Some(state) = install_state {
+            *in_flight().lock() = true;
+            let state_owned = state.clone();
+            let server_url = state.server_url.clone();
+            let flags_to_patch = current.clone();
+            std::thread::Builder::new()
+                .name("superdeduper-privacy-patch".into())
+                .spawn(move || {
+                    use crate::leaderboard::account_privacy::{self, PrivacyOutcome};
+                    let outcome =
+                        account_privacy::update(&state_owned, &server_url, &flags_to_patch);
+                    match outcome {
+                        PrivacyOutcome::Ok(canonical) => {
+                            *cache().lock() = Some(canonical);
+                            *last_outcome().lock() = None;
+                        }
+                        PrivacyOutcome::Unauthorised(reason) => {
+                            *last_outcome().lock() = Some(format!("auth: {reason}"));
+                        }
+                        PrivacyOutcome::Rejected(reason) => {
+                            *last_outcome().lock() = Some(format!("rejected: {reason}"));
+                        }
+                        PrivacyOutcome::Transient(reason) => {
+                            *last_outcome().lock() = Some(format!("transient: {reason}"));
+                        }
+                    }
+                    *in_flight().lock() = false;
+                })
+                .ok();
+        }
+    }
+}
+
 /// Render a secondary modal showing the sample submission JSON.
 /// Floats over the Settings modal. Close button clears the slot.
 #[cfg(feature = "telemetry")]
