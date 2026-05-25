@@ -527,6 +527,9 @@ impl SuperdeduperApp {
             effective_settings,
             self.cancel.clone(),
             defender_rtp_pre,
+            self.scan_mode,
+            5, // image_similarity_threshold — TODO add a Settings input
+               // when v3 ships the GUI threshold control.
         );
     }
 
