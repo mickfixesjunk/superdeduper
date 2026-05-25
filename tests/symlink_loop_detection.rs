@@ -35,6 +35,7 @@ fn cfg_with(roots: Vec<PathBuf>, follow_links: bool) -> ScanConfig {
         reference_roots: vec![],
         min_size: 1,
         max_size: None,
+        tier1_bytes: 4096,
         include: None,
         exclude: None,
         format: superdeduper::cli::OutputFormat::Text,
@@ -42,13 +43,16 @@ fn cfg_with(roots: Vec<PathBuf>, follow_links: bool) -> ScanConfig {
         use_cache: false,
         use_format_aware: false,
         threads: 2,
-        queue_depth: None,
+        io_threads: 4,
         output: None,
         follow_links,
         allow_system_paths: false,
         allow_recall_on_read: false,
-        io_threads: 4,
         hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
+        exclusion_policy: superdeduper::exclusions::ExclusionPolicy::disabled(),
+        exclusion_counters: std::sync::Arc::new(
+            superdeduper::exclusions::ExclusionCounters::default(),
+        ),
     }
 }
 
