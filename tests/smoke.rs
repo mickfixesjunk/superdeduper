@@ -145,3 +145,71 @@ fn empty_directory_yields_no_groups() {
     assert!(groups.is_empty());
     fs::remove_dir_all(&root).ok();
 }
+
+/// GH #32 regression test. `scan some_dir some_file.bin` should
+/// build one inventory that contains BOTH the file walked out of
+/// the dir AND the single-file positional arg, so size + content
+/// grouping can pair them. Before the fix, walk() called read_dir
+/// on the file root and silently produced zero entries — the
+/// cross-source pair never formed.
+#[test]
+fn single_file_positional_arg_combines_with_dir_root() {
+    let root = temp_root();
+    let dir = root.join("corpus");
+    let external = root.join("external_dup.bin");
+    fs::create_dir_all(&dir).unwrap();
+
+    let payload = vec![0xEF; 512];
+    fs::write(dir.join("inside.bin"), &payload).unwrap();
+    fs::write(&external, &payload).unwrap();
+
+    let cfg = ScanConfig {
+        // Mixed positional roots: one dir + one file. The bug is at
+        // this exact shape; both `dir` then `external`, OR `external`
+        // then `dir`, should yield the same 2-file inventory.
+        roots: vec![dir.clone(), external.clone()],
+        reference_roots: vec![],
+        min_size: 0,
+        max_size: None,
+        tier1_bytes: superdeduper::pipeline::hash::TIER1_BYTES,
+        include: None,
+        exclude: None,
+        format: OutputFormat::Text,
+        paranoid: false,
+        use_cache: false,
+        use_format_aware: false,
+        threads: 1,
+        queue_depth: None,
+        output: None,
+        follow_links: false,
+        allow_system_paths: false,
+        allow_recall_on_read: false,
+        io_threads: 4,
+        hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
+        exclusion_policy: superdeduper::exclusions::ExclusionPolicy::disabled(),
+        exclusion_counters: superdeduper::exclusions::ExclusionCounters::new(),
+    };
+    let inv = superdeduper::inventory::enumerate(&cfg, None).unwrap();
+    assert_eq!(
+        inv.len(),
+        2,
+        "single-file positional arg must combine with dir root: got {} entries",
+        inv.len()
+    );
+
+    let names: std::collections::HashSet<String> = inv
+        .iter()
+        .filter_map(|e| e.path.file_name().and_then(|n| n.to_str()))
+        .map(|s| s.to_lowercase())
+        .collect();
+    assert!(
+        names.contains("inside.bin"),
+        "missing inside.bin from dir root: {names:?}"
+    );
+    assert!(
+        names.contains("external_dup.bin"),
+        "missing external_dup.bin from file root: {names:?}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
