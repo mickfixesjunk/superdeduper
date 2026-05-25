@@ -534,6 +534,21 @@ fn run(
                         skipped_below_min += 1;
                     }
                 }
+                WalkEvent::SymlinkCycleSkipped { from, target } => {
+                    // T1.7: surface in the log so users see WHICH
+                    // alias triggered the cycle-skip. Doesn't count
+                    // against entries_skipped — those are "files we
+                    // declined" while this is "a dir we already
+                    // enumerated via another path."
+                    let _ = inv_tx.send(EngineEvent::Log {
+                        level: LogLevel::Info,
+                        message: format!(
+                            "symlink cycle skipped: {} → {} (already enumerated)",
+                            from.display(),
+                            target.display()
+                        ),
+                    });
+                }
             }
         });
         files = match inv_result {
