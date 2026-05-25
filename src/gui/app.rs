@@ -1955,29 +1955,71 @@ impl SuperdeduperApp {
     /// immediately; everything else stashes into `pending_destructive`
     /// for the modal in `update()` to handle.
     fn dispatch_group_action(&mut self, action: GroupAction) {
+        let is_destructive = matches!(
+            action,
+            GroupAction::RecycleOthers { .. }
+                | GroupAction::HardlinkOthers { .. }
+                | GroupAction::SafeRenameOthers { .. }
+                | GroupAction::SafeRenameAllVisible
+                | GroupAction::ArchiveAllVisible
+                | GroupAction::RecycleAllVisible
+                | GroupAction::NukeAllVisible
+        );
         // Reveal / Open* touch nothing — bypass the modal
         // unconditionally. They're navigational, not destructive.
         // PromoteKeeper is also non-destructive (in-memory swap) and
         // skips the modal.
-        if matches!(
-            action,
-            GroupAction::Reveal(_)
-                | GroupAction::OpenFile(_)
-                | GroupAction::OpenFolder(_)
-                | GroupAction::PromoteKeeper { .. }
-                | GroupAction::Preview(_)
-        ) {
-            return self.dispatch_group_action_unchecked(action);
+        if !is_destructive {
+            return self.dispatch_group_action_unchecked(action, false);
         }
-        if self.persisted.settings.bypass_destructive_confirmation {
-            return self.dispatch_group_action_unchecked(action);
+        // P0 #N (NUKE-bypass diag, 2026-05-25) — log every
+        // destructive dispatch + the gating decision so a "delete
+        // fired without confirm" report can be triaged from the
+        // user's stderr without source access.
+        let bypass = self.persisted.settings.bypass_destructive_confirmation;
+        eprintln!(
+            "dispatch_group_action: destructive variant {} — bypass_destructive_confirmation={bypass}",
+            action_kind_label(&action),
+        );
+        if bypass {
+            return self.dispatch_group_action_unchecked(action, true);
         }
         // Stash for the modal to confirm or cancel.
         self.pending_destructive = Some(action);
         self.destructive_confirm_input.clear();
     }
 
-    fn dispatch_group_action_unchecked(&mut self, action: GroupAction) {
+    /// `confirmed_destructive` is set by the two paths that have
+    /// already gated the call: the bypass-setting path and the
+    /// modal-confirm path. The runtime guard inside catches any
+    /// future caller that forgets to thread the confirmation
+    /// through — the action's worker won't spawn without explicit
+    /// authorization. P0 defense added 2026-05-25 after Mick
+    /// reported a NUKE firing without a modal on v0.2.7.
+    fn dispatch_group_action_unchecked(
+        &mut self,
+        action: GroupAction,
+        confirmed_destructive: bool,
+    ) {
+        let is_destructive = matches!(
+            action,
+            GroupAction::RecycleOthers { .. }
+                | GroupAction::HardlinkOthers { .. }
+                | GroupAction::SafeRenameOthers { .. }
+                | GroupAction::SafeRenameAllVisible
+                | GroupAction::ArchiveAllVisible
+                | GroupAction::RecycleAllVisible
+                | GroupAction::NukeAllVisible
+        );
+        if is_destructive && !confirmed_destructive {
+            eprintln!(
+                "dispatch_group_action_unchecked: BLOCKED destructive variant {} — \
+                 caller did not pass confirmed_destructive=true. This is a bug; the \
+                 user did NOT see the type-DELETE modal. NOT dispatching.",
+                action_kind_label(&action),
+            );
+            return;
+        }
         match action {
             GroupAction::RecycleOthers { keeper, dupes } => {
                 self.run_action_threaded(DedupeAction::Recycle, keeper, dupes);
@@ -2005,6 +2047,9 @@ impl SuperdeduperApp {
                 self.run_bulk_destructive_threaded(DedupeAction::Recycle, "♻ Recycle");
             }
             GroupAction::NukeAllVisible => {
+                eprintln!(
+                    "dispatch_group_action_unchecked: NUKE authorized (confirmed_destructive=true); spawning worker"
+                );
                 self.run_bulk_destructive_threaded(DedupeAction::Remove, "💀 Nuke");
             }
             GroupAction::PromoteKeeper {
@@ -2833,9 +2878,12 @@ impl eframe::App for SuperdeduperApp {
                 });
             });
             if confirm {
+                eprintln!(
+                    "destructive-modal: user confirmed via DELETE input; dispatching action"
+                );
                 self.pending_destructive = None;
                 self.destructive_confirm_input.clear();
-                self.dispatch_group_action_unchecked(action);
+                self.dispatch_group_action_unchecked(action, true);
             } else if cancel {
                 self.pending_destructive = None;
                 self.destructive_confirm_input.clear();
@@ -3336,6 +3384,27 @@ fn check_resumable(persisted: &PersistedAppState) -> bool {
     match checkpoint::load(&path) {
         Ok(Some(cp)) => cp.roots == persisted.roots && cp.settings == persisted.settings,
         _ => false,
+    }
+}
+
+/// Short tag for log messages — names the variant without dumping
+/// its payload. Used by the P0 diagnostic eprintln in
+/// `dispatch_group_action` so the user's log shows "NUKE
+/// authorized" rather than the entire path list.
+fn action_kind_label(action: &GroupAction) -> &'static str {
+    match action {
+        GroupAction::RecycleOthers { .. } => "RecycleOthers",
+        GroupAction::HardlinkOthers { .. } => "HardlinkOthers",
+        GroupAction::SafeRenameOthers { .. } => "SafeRenameOthers",
+        GroupAction::SafeRenameAllVisible => "SafeRenameAllVisible",
+        GroupAction::ArchiveAllVisible => "ArchiveAllVisible",
+        GroupAction::RecycleAllVisible => "RecycleAllVisible",
+        GroupAction::NukeAllVisible => "NukeAllVisible",
+        GroupAction::Reveal(_) => "Reveal",
+        GroupAction::OpenFile(_) => "OpenFile",
+        GroupAction::OpenFolder(_) => "OpenFolder",
+        GroupAction::PromoteKeeper { .. } => "PromoteKeeper",
+        GroupAction::Preview(_) => "Preview",
     }
 }
 
