@@ -2175,6 +2175,12 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
             .color(theme::TEXT_HI)
             .heading(),
     )
+    // #84 — force the preview Window above the settings modal.
+    // Without the explicit Order::Foreground hint, both windows
+    // live in the default Middle layer and paint order put the
+    // settings modal on top — making "Preview Sample Submission"
+    // appear to do nothing from the user's perspective.
+    .order(egui::Order::Foreground)
     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
     .collapsible(false)
     .resizable(false)

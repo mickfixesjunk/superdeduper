@@ -4,6 +4,7 @@
 pub mod action_progress;
 pub mod alpha_warning;
 pub mod archive_summary_modal;
+pub mod exclusions_safe_defaults_banner;
 #[cfg(feature = "telemetry")]
 pub mod badge_wall;
 pub mod cache_banner;

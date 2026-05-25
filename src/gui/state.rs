@@ -111,6 +111,13 @@ pub struct ScanSettings {
     /// an `ExclusionPolicy` and plugs it into RunConfig.
     #[serde(default)]
     pub exclusion_config: crate::exclusions::ExclusionConfig,
+    /// #81 — One-shot v0.2.7 exclusions notice. Flipped to `true`
+    /// when the user dismisses the banner ("Got it" or "See what's
+    /// filtered"). Once true, the banner never reappears. New
+    /// installs start with `false` so they see the notice once;
+    /// after dismissal the value persists across launches.
+    #[serde(default)]
+    pub dismissed_v0_2_7_exclusion_banner: bool,
 }
 
 impl Default for ScanSettings {
@@ -135,6 +142,7 @@ impl Default for ScanSettings {
             keep_strategy: crate::cli::KeepStrategy::Smart,
             history_retention_days: 0,
             exclusion_config: crate::exclusions::ExclusionConfig::default(),
+            dismissed_v0_2_7_exclusion_banner: false,
         }
     }
 }

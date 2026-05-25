@@ -1341,6 +1341,20 @@ fn run(
             crate::gui::theme::humansize(reclaimable_inode)
         ),
     });
+    // #81 — Surface exclusion stats so the user sees the safe-
+    // defaults filter actually fired. Only emit when something was
+    // excluded; a "0 excluded" line on a clean corpus is noise.
+    let excl = cfg.exclusion_counters.snapshot();
+    if excl.excluded_files > 0 {
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "exclusions: skipped {} file(s) / {} (per safe-defaults filter)",
+                excl.excluded_files,
+                crate::gui::theme::humansize(excl.excluded_bytes),
+            ),
+        });
+    }
     // Cache stats so a resumed scan that *should* have fast-
     // forwarded but didn't is obvious from the log. Hit rate near
     // zero on a resume is the smoking gun for a cache-key mismatch.
