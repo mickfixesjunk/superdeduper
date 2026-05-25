@@ -359,6 +359,50 @@ pub fn show_filtered(
     });
     ui.add_space(4.0);
 
+    // #40 v2 — virtualized table body.
+    //
+    // Pre-compute a flat layout (one entry per rendered row) and
+    // its parallel heights vector so egui_extras can use the
+    // `heterogeneous_rows` virtualization path. Without this, the
+    // body's `for (i, …) in sorted` loop emitted a real
+    // `body.row()` call for every group (and per-dupe if expanded)
+    // — at 100K+ groups, frame time spiked to multiple seconds.
+    //
+    // RowItem keeps the data dispatch index-based so each visible
+    // row resolves to its render branch in O(1).
+    let mut items: Vec<RowItem> = Vec::with_capacity(sorted.len());
+    let mut row_heights: Vec<f32> = Vec::with_capacity(sorted.len());
+    {
+        let mut visible_index: usize = 0;
+        for (orig_idx, g) in sorted.iter() {
+            if table_state.hide_unreclaimable && crate::gui::state::inode_aware_savings(g) == 0 {
+                continue;
+            }
+            visible_index += 1;
+            items.push(RowItem::Group {
+                sorted_idx: *orig_idx,
+                display_idx: visible_index,
+            });
+            row_heights.push(22.0);
+            if table_state.expanded.contains(orig_idx) {
+                let n_files = g.files.len();
+                for j in 0..n_files {
+                    items.push(RowItem::Dupe {
+                        sorted_idx: *orig_idx,
+                        member_idx: j,
+                    });
+                    row_heights.push(18.0);
+                }
+            }
+        }
+    }
+    // After the items vec is built we can do an O(1) lookup of the
+    // DuplicateGroupSummary for any `sorted_idx` — items hold the
+    // ORIGINAL state.duplicates index so we don't have to re-search
+    // `sorted` on every visible row.
+    let groups_by_idx: hashbrown::HashMap<usize, &DuplicateGroupSummary> =
+        sorted.iter().map(|(idx, g)| (*idx, *g)).collect();
+
     ScrollArea::vertical()
         .id_salt("groups-table")
         .show(ui, |ui| {
@@ -399,18 +443,15 @@ pub fn show_filtered(
                         ui.label(RichText::new("Keeper path").color(theme::TEXT_LO).small());
                     });
                 })
-                .body(|mut body| {
-                    for (i, (orig_idx, g)) in sorted.iter().enumerate() {
-                        // "Hide unreclaimable" toggle: skip groups
-                        // whose inode-aware savings is 0
-                        // (link_equivalent or partial-hardlink with
-                        // unique_inodes < 2). Data still in
-                        // state.duplicates; only this view skips.
-                        if table_state.hide_unreclaimable
-                            && crate::gui::state::inode_aware_savings(g) == 0
-                        {
-                            continue;
-                        }
+                .body(|body| {
+                    body.heterogeneous_rows(row_heights.iter().copied(), |mut row| {
+                    let row_idx = row.index();
+                    let item = items[row_idx];
+                    match item {
+                        RowItem::Group { sorted_idx, display_idx } => {
+                        let orig_idx = &sorted_idx;
+                        let i = display_idx - 1;
+                        let g = groups_by_idx[&sorted_idx];
                         // Inode-aware reclaim per row — for partial-
                         // hardlink groups (some aliases of inode A +
                         // some genuine copies), counts (unique_inodes
@@ -424,7 +465,9 @@ pub fn show_filtered(
                         let keeper = g.files.first().cloned();
                         let dupes: Vec<PathBuf> = g.files.iter().skip(1).cloned().collect();
 
-                        body.row(22.0, |mut row| {
+                        // Render the group row inline (no `body.row()` —
+                        // we ARE the row).
+                        {
                             row.col(|ui| {
                                 ui.label(
                                     RichText::new(format!("{:>3}", i + 1))
@@ -619,98 +662,108 @@ pub fn show_filtered(
                                     }
                                 }
                             });
-                        });
-
-                        if is_open {
-                            for (j, p) in g.files.iter().enumerate() {
-                                body.row(18.0, |mut row| {
-                                    row.col(|_| {});
-                                    row.col(|_| {});
-                                    row.col(|_| {});
-                                    row.col(|ui| {
-                                        // Per-dupe action column: a
-                                        // "Make keeper" button on
-                                        // non-keeper rows. Lets the
-                                        // user override the smart
-                                        // picker when they know which
-                                        // copy they want to protect.
-                                        // Disabled mid-scan (Settings,
-                                        // Go etc. are too) AND when
-                                        // this group is in the
-                                        // `acted` set (action queued).
-                                        if j > 0 && !acted {
-                                            let btn = egui::Button::new(
-                                                RichText::new("👑")
-                                                    .color(theme::WARN)
-                                                    .small(),
-                                            )
-                                            .frame(false)
-                                            .min_size(egui::vec2(20.0, 16.0));
-                                            let resp = ui
-                                                .add_enabled(!is_scanning, btn)
-                                                .on_hover_text(
-                                                    "Make this the keeper — \
-                                                     promote this file to the \
-                                                     protected slot in the \
-                                                     group. The current keeper \
-                                                     becomes a dupe.",
-                                                );
-                                            if resp.clicked() {
-                                                clicked = Some(GroupAction::PromoteKeeper {
-                                                    group_idx: *orig_idx,
-                                                    member_idx: j,
-                                                });
-                                            }
-                                        }
-                                    });
-                                    row.col(|ui| {
-                                        let (tag, color) = if j == 0 {
-                                            ("keep ", Color32::from_rgb(0x9a, 0xe6, 0xb4))
-                                        } else {
-                                            ("dupe ", theme::TEXT_LO)
-                                        };
-                                        let label = ui.label(
-                                            RichText::new(tag)
-                                                .color(color)
-                                                .small()
-                                                .monospace()
-                                                .strong(),
-                                        );
-                                        let mtime =
-                                            std::fs::metadata(p).and_then(|m| m.modified()).ok();
-                                        let s = crate::keep::score_file(p, mtime);
-                                        let mut tip =
-                                            format!("Smart-keep score: {:+.1}\n", s.total);
-                                        if s.breakdown.is_empty() {
-                                            tip.push_str("  (no signals fired)\n");
-                                        } else {
-                                            for (k, v) in &s.breakdown {
-                                                tip.push_str(&format!("  {:+5.1}  {}\n", v, k));
-                                            }
-                                        }
-                                        label.on_hover_text(tip);
-                                    });
-                                    row.col(|ui| {
-                                        let color = if j == 0 {
-                                            Color32::from_rgb(0x9a, 0xe6, 0xb4)
-                                        } else {
-                                            theme::TEXT_LO
-                                        };
-                                        ui.label(
-                                            RichText::new(format_path(p))
-                                                .color(color)
-                                                .monospace()
-                                                .small(),
-                                        );
-                                    });
-                                });
-                            }
+                        }
+                        }
+                        RowItem::Dupe { sorted_idx, member_idx } => {
+                            let g = groups_by_idx[&sorted_idx];
+                            let acted = table_state.acted.contains(&sorted_idx);
+                            let j = member_idx;
+                            let p = &g.files[j];
+                            row.col(|_| {});
+                            row.col(|_| {});
+                            row.col(|_| {});
+                            row.col(|ui| {
+                                // Per-dupe action column: a "Make keeper"
+                                // button on non-keeper rows. Lets the user
+                                // override the smart picker when they
+                                // know which copy they want to protect.
+                                // Disabled mid-scan AND when the group is
+                                // already in the `acted` set.
+                                if j > 0 && !acted {
+                                    let btn = egui::Button::new(
+                                        RichText::new("👑").color(theme::WARN).small(),
+                                    )
+                                    .frame(false)
+                                    .min_size(egui::vec2(20.0, 16.0));
+                                    let resp = ui.add_enabled(!is_scanning, btn).on_hover_text(
+                                        "Make this the keeper — promote this file to the \
+                                             protected slot in the group. The current keeper \
+                                             becomes a dupe.",
+                                    );
+                                    if resp.clicked() {
+                                        clicked = Some(GroupAction::PromoteKeeper {
+                                            group_idx: sorted_idx,
+                                            member_idx: j,
+                                        });
+                                    }
+                                }
+                            });
+                            row.col(|ui| {
+                                let (tag, color) = if j == 0 {
+                                    ("keep ", Color32::from_rgb(0x9a, 0xe6, 0xb4))
+                                } else {
+                                    ("dupe ", theme::TEXT_LO)
+                                };
+                                let label = ui.label(
+                                    RichText::new(tag)
+                                        .color(color)
+                                        .small()
+                                        .monospace()
+                                        .strong(),
+                                );
+                                let mtime =
+                                    std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                                let s = crate::keep::score_file(p, mtime);
+                                let mut tip = format!("Smart-keep score: {:+.1}\n", s.total);
+                                if s.breakdown.is_empty() {
+                                    tip.push_str("  (no signals fired)\n");
+                                } else {
+                                    for (k, v) in &s.breakdown {
+                                        tip.push_str(&format!("  {:+5.1}  {}\n", v, k));
+                                    }
+                                }
+                                label.on_hover_text(tip);
+                            });
+                            row.col(|ui| {
+                                let color = if j == 0 {
+                                    Color32::from_rgb(0x9a, 0xe6, 0xb4)
+                                } else {
+                                    theme::TEXT_LO
+                                };
+                                ui.label(
+                                    RichText::new(format_path(p))
+                                        .color(color)
+                                        .monospace()
+                                        .small(),
+                                );
+                            });
                         }
                     }
+                });
                 });
         });
 
     clicked
+}
+
+/// One row in the virtualized body. Index into the parallel
+/// `Vec<RowItem>` / `Vec<f32>` built before the table renders.
+#[derive(Debug, Clone, Copy)]
+enum RowItem {
+    /// A duplicate-group header row. `sorted_idx` is the index in
+    /// `state.duplicates` (matches the GroupsTableState set
+    /// membership); `display_idx` is the 1-based ordinal among
+    /// VISIBLE rows (after the hide-unreclaimable filter).
+    Group {
+        sorted_idx: usize,
+        display_idx: usize,
+    },
+    /// A per-member row inside an expanded group. Rendered only
+    /// when `table_state.expanded.contains(&sorted_idx)`.
+    Dupe {
+        sorted_idx: usize,
+        member_idx: usize,
+    },
 }
 
 /// User-facing path display. Strips Windows verbatim-path prefix
