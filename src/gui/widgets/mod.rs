@@ -4,6 +4,8 @@
 pub mod action_progress;
 pub mod alpha_warning;
 pub mod archive_summary_modal;
+#[cfg(feature = "telemetry")]
+pub mod badge_multiplier_detail;
 pub mod exclusions_safe_defaults_banner;
 #[cfg(feature = "telemetry")]
 pub mod badge_wall;

@@ -147,6 +147,13 @@ pub struct SuperdeduperApp {
     /// until the archive worker fires `ArchiveActionSummary`;
     /// cleared by the modal's Done / View profile click.
     pending_archive_summary: Option<crate::gui::archive::ArchiveActionSummary>,
+    /// #77 v2 — currently-open badge multiplier detail modal. The
+    /// achievement_id is the lookup key; the modal reads the
+    /// installs list out of `CatalogState` each frame so a
+    /// background refresh updates the rows without closing the
+    /// modal. `None` ⇒ no modal open.
+    #[cfg(feature = "telemetry")]
+    pending_badge_multiplier_detail: Option<String>,
     /// Text the user has typed into the confirmation prompt. Must
     /// equal `"DELETE"` exactly before the Confirm button enables.
     /// Cleared every time the modal opens or closes.
@@ -283,6 +290,8 @@ impl SuperdeduperApp {
             pending_archive_restore: None,
             pending_destructive: None,
             pending_archive_summary: None,
+            #[cfg(feature = "telemetry")]
+            pending_badge_multiplier_detail: None,
             destructive_confirm_input: String::new(),
             alpha_warning_acked_session: false,
             action_cancel: Arc::new(AtomicBool::new(false)),
@@ -1183,29 +1192,11 @@ impl SuperdeduperApp {
                 eprintln!("badge-wall: tile clicked: {id}");
             }
             BadgeWallAction::TileClickedMultiplier { achievement_id } => {
-                // #77 v1 — log the click + the cross-install
-                // summary so the user can see which installs
-                // earned this badge. v2 will wire this into a
-                // proper modal widget (BadgeMultiplierDetail);
-                // v1 ships the overlay rendering + the
-                // surface-via-log so Mick can validate the
-                // multiplier value end-to-end against his
-                // two-machine setup today.
-                let state = crate::leaderboard::catalog::peek_state();
-                let installs = state.installs_for(&achievement_id);
-                eprintln!(
-                    "badge-wall: multiplier clicked: {achievement_id} ×{} ({} install(s) earned: {})",
-                    state.multiplier_for(&achievement_id),
-                    installs.len(),
-                    installs
-                        .iter()
-                        .map(|i| i
-                            .nickname
-                            .clone()
-                            .unwrap_or_else(|| i.install_id_prefix.clone()))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
+                // #77 v2 — pop the per-install detail modal next
+                // frame. The widget reads the current installs
+                // list out of CatalogState each render so a
+                // refresh-mid-open just updates the rows.
+                self.pending_badge_multiplier_detail = Some(achievement_id);
             }
             BadgeWallAction::OpenProfile => {
                 let url = match install::load() {
@@ -2730,6 +2721,40 @@ impl eframe::App for SuperdeduperApp {
                         reveal_in_explorer(&summary.destination);
                     }
                 }
+            }
+        }
+
+        // #77 v2 — Badge multiplier detail modal. Pops when the user
+        // clicks a tile with the ×N overlay; reads installs each
+        // frame out of CatalogState so a background refresh updates
+        // rows without the user needing to reopen.
+        #[cfg(feature = "telemetry")]
+        if let Some(achievement_id) = self.pending_badge_multiplier_detail.clone() {
+            let catalog_state = crate::leaderboard::catalog::peek_state();
+            let installs = catalog_state.installs_for(&achievement_id).to_vec();
+            // Resolve a human-readable name from the catalog when
+            // possible; falls back to the id verbatim if the
+            // catalog hasn't loaded yet (rare; the badge wall
+            // wouldn't have rendered without it).
+            let achievement_name = catalog_state
+                .catalog
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|c| {
+                    c.achievements
+                        .iter()
+                        .find(|e| e.id == achievement_id)
+                        .map(|e| e.name.clone())
+                })
+                .unwrap_or_else(|| achievement_id.clone());
+            if let Some(_choice) = crate::gui::widgets::badge_multiplier_detail::show(
+                ctx,
+                &achievement_name,
+                &achievement_id,
+                &installs,
+            ) {
+                // Only one variant (Close) — clear the slot.
+                self.pending_badge_multiplier_detail = None;
             }
         }
 
