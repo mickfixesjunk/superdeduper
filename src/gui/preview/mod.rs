@@ -23,7 +23,7 @@
 //!
 //! ## Module layout
 //!
-//! ```
+//! ```text
 //! src/gui/preview/
 //!   mod.rs                      — public API (this file)
 //!   classify.rs                 — extension → which viewer to use
