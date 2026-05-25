@@ -256,6 +256,97 @@ jobs:
           files: |
             superdeduper-${{ env.VERSION_TAG }}-linux-x86_64.tar.gz
 
+  build-macos:
+    # macOS side of the release. Separate job so the two arches
+    # (Intel x86_64 + Apple Silicon aarch64) build in parallel on
+    # macos-latest. macos-latest is an Apple Silicon (M-series)
+    # runner — it builds aarch64-apple-darwin natively + cross-builds
+    # x86_64-apple-darwin via the toolchain's built-in support for
+    # both Darwin targets (Apple stdlib is fat-binary-friendly).
+    #
+    # Binaries ship UNSIGNED for v0.2.x. Users will see Gatekeeper's
+    # "unidentified developer" warning on first launch; right-click →
+    # Open is the workaround. Code-signing + notarisation needs an
+    # Apple Developer Program account ($99/yr) and lives behind a
+    # separate L1 sub-deliverable per platforms-roadmap.md §L1.
+    name: build (${{ matrix.target }})
+    runs-on: macos-latest
+    env:
+      VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            platform: macos-aarch64
+          - target: x86_64-apple-darwin
+            platform: macos-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (locked, release)
+        # No external system-deps needed — the macOS SDK on
+        # macos-latest provides libSystem + frameworks. `audio`
+        # feature is OFF for the same reason it's off on Linux:
+        # rodio's alsa-sys dep doesn't play with cross-target
+        # builds cleanly. Cross-platform scan-done chime is a
+        # follow-up.
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} --bin superdeduper
+          cargo build --release --locked --target ${{ matrix.target }} --features "gui" --bin superdeduper-gui
+
+      - name: Stage artifacts
+        run: |
+          stage="stage/superdeduper-${VERSION_TAG}-${{ matrix.platform }}"
+          mkdir -p "$stage"
+          cp target/${{ matrix.target }}/release/superdeduper "$stage/"
+          cp target/${{ matrix.target }}/release/superdeduper-gui "$stage/"
+          cp LICENSE "$stage/"
+          cp README.md "$stage/"
+          chmod +x "$stage/superdeduper" "$stage/superdeduper-gui"
+          # macOS `strip` works the same as Linux for the symbol-table
+          # parts we care about. `-x` strips local symbols only,
+          # keeping the global table that crash reporters need.
+          strip -x "$stage/superdeduper" "$stage/superdeduper-gui" || true
+
+      - name: Compute inside-tarball SHA-256 checksums
+        # macOS's `shasum -a 256` produces the same format as Linux's
+        # `sha256sum`, so the inside-tarball SHA256SUMS file matches
+        # the cross-platform pattern used by build-linux.
+        run: |
+          stage="stage/superdeduper-${VERSION_TAG}-${{ matrix.platform }}"
+          ( cd "$stage" && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Tar artifact
+        run: |
+          tar -czf "superdeduper-${VERSION_TAG}-${{ matrix.platform }}.tar.gz" \
+            -C stage "superdeduper-${VERSION_TAG}-${{ matrix.platform }}"
+
+      - name: Attest build provenance
+        if: ${{ github.event.repository.visibility != 'private' || github.event.repository.owner.type == 'Organization' }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}.tar.gz
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}.tar.gz
+
   checksums:
     # Finalize job that computes the canonical release-root
     # SHA256SUMS file. Runs after every build leg finishes so it
@@ -264,7 +355,7 @@ jobs:
     # draft. Per #11 spec, one canonical file at the release root
     # is the source-of-truth for download-integrity verification.
     name: checksums
-    needs: [build, build-linux]
+    needs: [build, build-linux, build-macos]
     runs-on: ubuntu-latest
     env:
       VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
