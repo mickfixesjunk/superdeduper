@@ -526,6 +526,26 @@ impl UiState {
                 // (pops the post-archive summary modal). UiState
                 // doesn't store the rollup; the modal owns it.
             }
+            EngineEvent::FileActionCompleted { src, outcome } => {
+                let matched = duplicates_contain_path(&self.duplicates, &src);
+                apply_file_action_to_duplicates(&mut self.duplicates, &src, outcome);
+                if !matched {
+                    // Diagnostic — surfaces the rare "action
+                    // completed on path X but no group entry
+                    // matched" case. Hypotheses if this fires:
+                    // (1) the path was already culled by an earlier
+                    // event in this Go batch (benign), (2) the
+                    // worker emitted a non-canonical path that
+                    // doesn't byte-match what was put into
+                    // state.duplicates at scan time (real bug). The
+                    // log gives us the data to triage if a user
+                    // hits it. Per design 2026-05-25T21:23Z.
+                    eprintln!(
+                        "groups-table: FileActionCompleted on {} — no matching entry in any group (race or path-canonicalisation mismatch?)",
+                        src.display()
+                    );
+                }
+            }
         }
     }
 
@@ -566,6 +586,70 @@ pub fn inode_aware_savings(g: &DuplicateGroupSummary) -> u64 {
         return 0;
     }
     g.size.saturating_mul(unique - 1)
+}
+
+/// #83 — Returns `true` if `src` appears in any group's `files`
+/// vec. Used as a diagnostic-only precheck: a missed lookup is
+/// the symptom of a real bug class (worker emits a path that
+/// doesn't byte-match the scan-time path), worth logging rather
+/// than silently no-op'ing.
+fn duplicates_contain_path(
+    duplicates: &[DuplicateGroupSummary],
+    src: &std::path::Path,
+) -> bool {
+    duplicates
+        .iter()
+        .any(|g| g.files.iter().any(|p| p == src))
+}
+
+/// #83 — Update `state.duplicates` in response to a per-file action
+/// completion. Path is the join key (workers don't preserve indices
+/// back to the in-memory groups vec). Behaviour per outcome:
+///
+/// * `Renamed { new_path }` — replace the path entry in-place. Group's
+///   reclaim figure unchanged; row re-renders with the new name.
+/// * `Removed` — drop the entry from `group.files`. If the group falls
+///   below 2 files, drop the entire group.
+/// * `StorageDeduplicated` — v1 semantic: same as `Removed`. The file
+///   is still on disk but its content is now shared with the keeper,
+///   so the table's reclaim accounting should treat it as no longer
+///   contributing to the reclaimable total. A future v2 might keep
+///   the entry with a per-file "shared" badge instead of culling it
+///   so the user has visual evidence the action ran on that row.
+///
+/// Returns the number of groups removed by this call (useful for
+/// tests + for future scan-summary deltas). A group is "removed"
+/// when it falls below 2 files after a Removed/StorageDeduplicated
+/// outcome.
+pub fn apply_file_action_to_duplicates(
+    duplicates: &mut Vec<DuplicateGroupSummary>,
+    src: &std::path::Path,
+    outcome: crate::gui::events::FileActionOutcome,
+) -> usize {
+    use crate::gui::events::FileActionOutcome;
+    let mut groups_removed = 0usize;
+    let mut group_idx_to_remove: Option<usize> = None;
+    for (gi, group) in duplicates.iter_mut().enumerate() {
+        if let Some(fi) = group.files.iter().position(|p| p == src) {
+            match outcome {
+                FileActionOutcome::Renamed { new_path } => {
+                    group.files[fi] = new_path;
+                }
+                FileActionOutcome::Removed | FileActionOutcome::StorageDeduplicated => {
+                    group.files.remove(fi);
+                    if group.files.len() < 2 {
+                        group_idx_to_remove = Some(gi);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    if let Some(gi) = group_idx_to_remove {
+        duplicates.remove(gi);
+        groups_removed = 1;
+    }
+    groups_removed
 }
 
 /// Human-readable wallclock formatter shared by the header tile and
@@ -812,5 +896,117 @@ mod inode_aware_tests {
         state.apply(EngineEvent::DuplicateFound(g_b));
         assert_eq!(state.totals.duplicates, 2);
         assert_eq!(state.duplicates.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod apply_file_action_tests {
+    //! #83 — Per-file action completion mutates the in-memory
+    //! groups table immediately so the user sees post-action state
+    //! without re-scanning. Covers all three outcome shapes plus
+    //! the group-cull case (group falls below 2 files).
+
+    use super::*;
+    use crate::gui::events::FileActionOutcome;
+    use std::path::PathBuf;
+
+    fn group3() -> DuplicateGroupSummary {
+        DuplicateGroupSummary {
+            size: 4096,
+            content_hash: "test-hash".into(),
+            files: vec![
+                PathBuf::from("/keeper.bin"),
+                PathBuf::from("/dupe-1.bin"),
+                PathBuf::from("/dupe-2.bin"),
+            ],
+            link_equivalent: false,
+            unique_inodes: 3,
+            similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
+        }
+    }
+
+    #[test]
+    fn renamed_updates_path_in_place() {
+        let mut dups = vec![group3()];
+        let removed = apply_file_action_to_duplicates(
+            &mut dups,
+            &PathBuf::from("/dupe-1.bin"),
+            FileActionOutcome::Renamed {
+                new_path: PathBuf::from("/dupe-1.bin.duplicate"),
+            },
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].files.len(), 3);
+        assert_eq!(
+            dups[0].files[1],
+            PathBuf::from("/dupe-1.bin.duplicate"),
+            "renamed path should replace the original in-place",
+        );
+    }
+
+    #[test]
+    fn removed_drops_file_keeps_group_when_two_remain() {
+        let mut dups = vec![group3()];
+        let removed = apply_file_action_to_duplicates(
+            &mut dups,
+            &PathBuf::from("/dupe-1.bin"),
+            FileActionOutcome::Removed,
+        );
+        assert_eq!(removed, 0, "group still has 2 files, so it stays");
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].files.len(), 2);
+        assert_eq!(dups[0].files[0], PathBuf::from("/keeper.bin"));
+        assert_eq!(dups[0].files[1], PathBuf::from("/dupe-2.bin"));
+    }
+
+    #[test]
+    fn removed_drops_group_when_count_falls_below_two() {
+        let mut dups = vec![group3()];
+        // Remove TWO of the three; group should drop after second.
+        apply_file_action_to_duplicates(
+            &mut dups,
+            &PathBuf::from("/dupe-1.bin"),
+            FileActionOutcome::Removed,
+        );
+        let removed_groups = apply_file_action_to_duplicates(
+            &mut dups,
+            &PathBuf::from("/dupe-2.bin"),
+            FileActionOutcome::Removed,
+        );
+        assert_eq!(removed_groups, 1);
+        assert!(dups.is_empty(), "single-file group should vanish");
+    }
+
+    #[test]
+    fn storage_deduplicated_treated_as_removed_for_table() {
+        // v1 semantic — drop the deduplicated entry so the table
+        // reclaim figure drops to 0. v2 may keep the entry with a
+        // visual badge instead; this test pins the v1 behaviour
+        // so a future refactor is intentional.
+        let mut dups = vec![group3()];
+        let removed = apply_file_action_to_duplicates(
+            &mut dups,
+            &PathBuf::from("/dupe-1.bin"),
+            FileActionOutcome::StorageDeduplicated,
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(dups[0].files.len(), 2);
+    }
+
+    #[test]
+    fn unknown_path_no_op() {
+        // Workers might emit a completion for a path that's been
+        // culled by an earlier event in the same Go batch. The
+        // helper should be a silent no-op in that case rather
+        // than panicking or scrambling the table.
+        let mut dups = vec![group3()];
+        let removed = apply_file_action_to_duplicates(
+            &mut dups,
+            &PathBuf::from("/not-in-any-group.bin"),
+            FileActionOutcome::Removed,
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(dups[0].files.len(), 3, "untouched group");
     }
 }
