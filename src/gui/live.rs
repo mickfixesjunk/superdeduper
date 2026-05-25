@@ -1525,6 +1525,20 @@ fn run(
                         None
                     }
                 },
+                // #89 — count of distinct network-share roots in
+                // scope (UNC `\\server\share`, smb://, nfs://).
+                // Counted at the requested-root level so the value
+                // reflects user intent, not whether files were
+                // actually read. Backend uses this for the latent
+                // `multi-share-maestro` grant.
+                share_count_in_scope: {
+                    let n = count_distinct_share_roots(&root_paths);
+                    if n > 0 {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                },
             },
             result_summary: ResultSummary {
                 duplicate_groups: total_dups,
@@ -2062,6 +2076,62 @@ fn is_drive_root(p: &std::path::Path) -> bool {
         || (s.len() == 7 && s.starts_with("\\\\?\\") && s.ends_with('\\'))
 }
 
+#[cfg(feature = "telemetry")]
+fn is_network_share_path(p: &std::path::Path) -> bool {
+    let s = p.to_string_lossy();
+    // Windows UNC `\\server\share\...` — leading `\\` but not the
+    // verbatim-device form `\\?\` or `\\.\`. Also catches the
+    // verbatim-UNC variant `\\?\UNC\server\share\...`.
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        let prefix3 = bytes.get(2).copied();
+        if prefix3 != Some(b'?') && prefix3 != Some(b'.') {
+            return true;
+        }
+        if s.starts_with("\\\\?\\UNC\\") {
+            return true;
+        }
+    }
+    // Cross-platform URL forms surfaced by user-typed paths.
+    s.starts_with("smb://") || s.starts_with("nfs://") || s.starts_with("cifs://")
+}
+
+#[cfg(feature = "telemetry")]
+fn count_distinct_share_roots(paths: &[std::path::PathBuf]) -> u64 {
+    use std::collections::HashSet;
+    let mut shares: HashSet<String> = HashSet::new();
+    for p in paths {
+        if !is_network_share_path(p) {
+            continue;
+        }
+        let s = p.to_string_lossy();
+        // For `\\server\share\rest` (or verbatim-UNC equivalent),
+        // group by `\\server\share` so multiple roots into the same
+        // share count once. For URL forms, group by scheme+authority.
+        let key = if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+            // `server\share\rest` → `server\share`
+            let two: Vec<&str> = rest.splitn(3, '\\').take(2).collect();
+            format!("unc:{}", two.join("\\"))
+        } else if let Some(rest) = s.strip_prefix("\\\\") {
+            let two: Vec<&str> = rest.splitn(3, '\\').take(2).collect();
+            format!("unc:{}", two.join("\\"))
+        } else if let Some(rest) = s.strip_prefix("smb://") {
+            let auth = rest.splitn(2, '/').next().unwrap_or("");
+            format!("smb:{auth}")
+        } else if let Some(rest) = s.strip_prefix("nfs://") {
+            let auth = rest.splitn(2, '/').next().unwrap_or("");
+            format!("nfs:{auth}")
+        } else if let Some(rest) = s.strip_prefix("cifs://") {
+            let auth = rest.splitn(2, '/').next().unwrap_or("");
+            format!("cifs:{auth}")
+        } else {
+            s.to_string()
+        };
+        shares.insert(key);
+    }
+    shares.len() as u64
+}
+
 fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<ScanConfig> {
     let include = if settings.include_glob.is_empty() {
         None
@@ -2292,5 +2362,52 @@ mod tests {
         assert!(is_drive_root(Path::new("/")));
         assert!(!is_drive_root(Path::new(r"C:\Users")));
         assert!(!is_drive_root(Path::new("/home")));
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn is_network_share_path_detects_unc_and_url_forms() {
+        // UNC.
+        assert!(is_network_share_path(Path::new(r"\\fileserver\public")));
+        assert!(is_network_share_path(Path::new(r"\\fileserver\public\sub")));
+        assert!(is_network_share_path(Path::new(r"\\?\UNC\fileserver\public\sub")));
+        // URL forms.
+        assert!(is_network_share_path(Path::new("smb://nas.local/photos")));
+        assert!(is_network_share_path(Path::new("nfs://10.0.0.5/export")));
+        assert!(is_network_share_path(Path::new("cifs://host/share")));
+        // Verbatim-device forms must NOT count as shares.
+        assert!(!is_network_share_path(Path::new(r"\\?\C:\Users")));
+        assert!(!is_network_share_path(Path::new(r"\\.\PhysicalDrive0")));
+        // Plain local paths.
+        assert!(!is_network_share_path(Path::new(r"C:\Users\Mick")));
+        assert!(!is_network_share_path(Path::new("/home/mick")));
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn count_distinct_share_roots_dedups_by_share() {
+        let paths = vec![
+            std::path::PathBuf::from(r"\\fileserver\public\a"),
+            std::path::PathBuf::from(r"\\fileserver\public\b"),
+            std::path::PathBuf::from(r"\\fileserver\private"),
+            std::path::PathBuf::from(r"\\?\UNC\fileserver\private\sub"),
+            std::path::PathBuf::from("smb://nas.local/photos"),
+            std::path::PathBuf::from("smb://nas.local/videos"),
+            std::path::PathBuf::from(r"C:\Users\Mick"),
+        ];
+        // Distinct shares: \\fileserver\public, \\fileserver\private
+        // (UNC + verbatim-UNC collapse), smb://nas.local (one
+        // authority, two paths). Local C:\ doesn't count.
+        assert_eq!(count_distinct_share_roots(&paths), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn count_distinct_share_roots_zero_when_no_shares() {
+        let paths = vec![
+            std::path::PathBuf::from(r"C:\Users\Mick"),
+            std::path::PathBuf::from("/home/mick"),
+        ];
+        assert_eq!(count_distinct_share_roots(&paths), 0);
     }
 }
