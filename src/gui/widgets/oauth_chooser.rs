@@ -80,19 +80,20 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
         );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            // Icon + text per provider. egui::Button::image_and_text
-            // packs the logo + label into one click target so the
-            // user can hit the icon, the text, or anywhere between.
+            // Icon + text per provider. No custom .fill so the
+            // PNG's transparent background shows the natural
+            // panel color — colored Google "G" + Discord wordmark
+            // on a dark surface reads cleanly without the icon's
+            // negative space being tinted by a button fill.
             if ui
                 .add(
                     egui::Button::image_and_text(
                         egui::Image::new(provider_icon(oauth::Provider::Google))
                             .max_size(egui::vec2(20.0, 20.0)),
                         RichText::new("Sign in with Google")
-                            .color(theme::PANEL_DEEP)
+                            .color(theme::TEXT_HI)
                             .strong(),
                     )
-                    .fill(theme::ACCENT)
                     .min_size(egui::vec2(170.0, 36.0)),
                 )
                 .clicked()
@@ -105,7 +106,9 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
                     egui::Button::image_and_text(
                         egui::Image::new(provider_icon(oauth::Provider::Discord))
                             .max_size(egui::vec2(20.0, 20.0)),
-                        RichText::new("Sign in with Discord").color(theme::TEXT_HI),
+                        RichText::new("Sign in with Discord")
+                            .color(theme::TEXT_HI)
+                            .strong(),
                     )
                     .min_size(egui::vec2(170.0, 36.0)),
                 )

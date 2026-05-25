@@ -451,60 +451,65 @@ fn render_tile(
     granted_years: &[u16],
     size: egui::Vec2,
 ) -> bool {
+    // Shield-based tile rendering (Mick 2026-05-25T03:30Z):
+    // - Granted: full-color shield (`sdd-color-shield.png`)
+    // - Ungranted: black-and-white shield (`sdd-bw-shield.png`)
+    // - Locked: padlock glyph kept — different visual class
+    //
+    // Shield PNGs are transparent so the tile's PANEL_DEEP fill
+    // shows through the negative space. Achievement name renders
+    // under the shield.
     let (fill, stroke_color, text_color) = if locked {
-        // Locked-future-feature tiles: darker fill, dimmer stroke,
-        // faded text. Reads as "exists, sealed for a reason."
-        // Visually distinct from "not yet earned" (which is a
-        // greyed-out invitation to earn it).
         (
             Color32::from_rgb(0x14, 0x18, 0x22),
             Color32::from_gray(48),
             Color32::from_gray(100),
         )
     } else if granted {
-        match entry.tier.as_str() {
-            "high" => (theme::ACCENT, theme::PANEL_DEEP, theme::PANEL_DEEP),
-            "mid" => (theme::ACCENT_DIM, theme::TEXT_HI, theme::TEXT_HI),
-            _ => (theme::PANEL_DEEP, theme::ACCENT, theme::TEXT_HI),
-        }
+        // Granted: dark panel + accent stroke + bright text.
+        // The color of the shield itself is the visual reward,
+        // not a tile-background hue.
+        (theme::PANEL_DEEP, theme::ACCENT, theme::TEXT_HI)
     } else {
-        // Greyed-out: muted panel fill + faded text. Reads as
-        // "exists, not yet earned" rather than "broken / missing."
-        (theme::PANEL_DEEP, Color32::from_gray(60), Color32::from_gray(120))
+        // Ungranted: muted panel + dim stroke + faded text. Reads
+        // as "exists, not yet earned" rather than "broken."
+        (theme::PANEL_DEEP, Color32::from_gray(60), Color32::from_gray(140))
     };
 
-    let resp = egui::Frame::none()
+    let resp = egui::Frame::NONE
         .fill(fill)
         .stroke(egui::Stroke::new(1.0, stroke_color))
-        .rounding(egui::Rounding::same(6))
-        .inner_margin(egui::Margin::symmetric(6, 6))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(4, 4))
         .show(ui, |ui| {
             ui.set_min_size(size);
             ui.set_max_size(size);
             ui.vertical_centered(|ui| {
-                // Tier icon as the "badge glyph." Locked tiles
-                // use a padlock; granted tiles use tier-tier
-                // (★/◆/●); ungranted use a hollow circle. The
-                // padlock for locked tiles is a stable Unicode
-                // shape — `⚿` (U+26BF) — rather than the emoji
-                // 🔒 which doesn't reliably render in egui's
-                // default font.
-                let glyph = if locked {
-                    "⚿"
+                if locked {
+                    // Locked tiles keep the padlock glyph — visual
+                    // signal that the achievement is gated behind a
+                    // feature that hasn't shipped yet.
+                    ui.label(
+                        RichText::new("⚿")
+                            .color(text_color)
+                            .strong()
+                            .size(28.0),
+                    );
                 } else {
-                    match (granted, entry.tier.as_str()) {
-                        (true, "high") => "★",
-                        (true, "mid") => "◆",
-                        (true, _) => "●",
-                        (false, _) => "○",
-                    }
-                };
-                ui.label(
-                    RichText::new(glyph)
-                        .color(text_color)
-                        .strong()
-                        .size(22.0),
-                );
+                    let shield_src = if granted {
+                        egui::include_image!(
+                            "../../../assets/sdd-color-shield.png"
+                        )
+                    } else {
+                        egui::include_image!(
+                            "../../../assets/sdd-bw-shield.png"
+                        )
+                    };
+                    ui.add(
+                        egui::Image::new(shield_src)
+                            .fit_to_exact_size(egui::vec2(48.0, 48.0)),
+                    );
+                }
                 let face_label = match granted_years.last() {
                     Some(latest) => format!("{} {}", short_name(&entry.name), latest),
                     None => short_name(&entry.name),

@@ -2423,6 +2423,18 @@ impl eframe::App for SuperdeduperApp {
             .frame(Frame::default().fill(theme::PANEL_DEEP).inner_margin(egui::vec2(8.0, 2.0)))
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
+                    // App shield logo in the top-left. Transparent
+                    // PNG so the menubar's PANEL_DEEP shows through
+                    // the negative space. Height matches menubar
+                    // height (~28px); shield is square so the
+                    // proportions are preserved automatically.
+                    ui.add(
+                        egui::Image::new(egui::include_image!(
+                            "../../assets/sdd-color-shield.png"
+                        ))
+                        .max_size(egui::vec2(28.0, 28.0)),
+                    );
+                    ui.add_space(8.0);
                     ui.menu_button("File", |ui| {
                         if ui
                             .button("New scan")

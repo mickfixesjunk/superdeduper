@@ -429,16 +429,18 @@ fn render_signin_cta(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         use crate::gui::widgets::oauth_chooser::provider_icon;
+        // No fill on either button — lets the transparent PNG
+        // icons sit against the natural panel color so the colored
+        // logos read cleanly.
         if ui
             .add(
                 egui::Button::image_and_text(
                     egui::Image::new(provider_icon(oauth::Provider::Google))
                         .max_size(egui::vec2(20.0, 20.0)),
                     RichText::new("Connect Google")
-                        .color(theme::PANEL_DEEP)
+                        .color(theme::TEXT_HI)
                         .strong(),
                 )
-                .fill(theme::ACCENT)
                 .min_size(egui::vec2(160.0, 32.0)),
             )
             .clicked()
@@ -450,7 +452,9 @@ fn render_signin_cta(ui: &mut egui::Ui) {
                 egui::Button::image_and_text(
                     egui::Image::new(provider_icon(oauth::Provider::Discord))
                         .max_size(egui::vec2(20.0, 20.0)),
-                    RichText::new("Connect Discord").color(theme::TEXT_HI),
+                    RichText::new("Connect Discord")
+                        .color(theme::TEXT_HI)
+                        .strong(),
                 )
                 .min_size(egui::vec2(160.0, 32.0)),
             )
