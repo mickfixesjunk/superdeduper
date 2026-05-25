@@ -204,6 +204,15 @@ pub enum EngineEvent {
     /// The action thread is done. `summary` becomes the status-line
     /// message. The modal closes the next time `drain_events` runs.
     ActionFinished { summary: String },
+    /// #80 Bug C — archive run has finished, with a structured
+    /// summary the GUI uses to pop the post-archive modal showing
+    /// moved-vs-failed split by failure reason. `actually_reclaimed`
+    /// (the success-only byte total) is the figure that will be
+    /// credited to the leaderboard as `archived_bytes` once #79's
+    /// PATCH submission lands. ActionFinished still fires for the
+    /// status-line message; this carries the rollup separately so
+    /// the modal renders without needing to parse the status string.
+    ArchiveActionSummary(crate::gui::archive::ArchiveActionSummary),
 }
 
 /// Coarse "what's the engine doing right now" tag. Drives the

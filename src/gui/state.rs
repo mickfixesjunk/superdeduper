@@ -503,6 +503,11 @@ impl UiState {
                 self.action_in_progress = None;
                 self.status = summary;
             }
+            EngineEvent::ArchiveActionSummary(_) => {
+                // #80 Bug C — handled in app.rs::drain_events
+                // (pops the post-archive summary modal). UiState
+                // doesn't store the rollup; the modal owns it.
+            }
         }
     }
 

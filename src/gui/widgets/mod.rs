@@ -3,6 +3,7 @@
 
 pub mod action_progress;
 pub mod alpha_warning;
+pub mod archive_summary_modal;
 #[cfg(feature = "telemetry")]
 pub mod badge_wall;
 pub mod cache_banner;
