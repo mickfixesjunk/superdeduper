@@ -2419,22 +2419,44 @@ impl eframe::App for SuperdeduperApp {
         // status bar.
         let mut want_settings = false;
         let mut menu_action: Option<MenuAction> = None;
-        TopBottomPanel::top("menubar")
-            .frame(Frame::default().fill(theme::PANEL_DEEP).inner_margin(egui::vec2(8.0, 2.0)))
+        // Brand strip: shield logo + "SuperDeDuper" name above
+        // the menubar (Mick 2026-05-25T03:45Z). Dedicated panel
+        // so the menubar stays compact; logo runs ~84px tall, the
+        // shield's transparent PNG shows the PANEL_DEEP through
+        // its negative space.
+        TopBottomPanel::top("brand")
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL_DEEP)
+                    .inner_margin(egui::vec2(12.0, 6.0)),
+            )
             .show(ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
-                    // App shield logo in the top-left. Transparent
-                    // PNG so the menubar's PANEL_DEEP shows through
-                    // the negative space. Height matches menubar
-                    // height (~28px); shield is square so the
-                    // proportions are preserved automatically.
+                ui.horizontal(|ui| {
                     ui.add(
                         egui::Image::new(egui::include_image!(
                             "../../assets/sdd-color-shield.png"
                         ))
-                        .max_size(egui::vec2(28.0, 28.0)),
+                        .max_size(egui::vec2(84.0, 84.0)),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
+                    ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new("SuperDeDuper")
+                                    .color(theme::TEXT_HI)
+                                    .strong()
+                                    .size(36.0),
+                            );
+                        },
+                    );
+                });
+            });
+
+        TopBottomPanel::top("menubar")
+            .frame(Frame::default().fill(theme::PANEL_DEEP).inner_margin(egui::vec2(8.0, 2.0)))
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
                     ui.menu_button("File", |ui| {
                         if ui
                             .button("New scan")

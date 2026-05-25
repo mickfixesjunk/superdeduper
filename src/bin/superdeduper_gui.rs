@@ -74,7 +74,7 @@ fn main() -> eframe::Result<()> {
     // uniquely-named EXEs. SD_BUILD_SHA is set at compile-time by
     // build.rs ("dev" if git isn't available).
     let window_title = format!(
-        "superdeduper v{} · {}",
+        "SuperDeDuper v{} · {}",
         env!("CARGO_PKG_VERSION"),
         env!("SD_BUILD_SHA"),
     );
