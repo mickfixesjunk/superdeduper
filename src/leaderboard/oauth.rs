@@ -140,24 +140,22 @@ impl std::fmt::Display for ProviderParseError {
 
 impl std::error::Error for ProviderParseError {}
 
-/// What we store on disk after a successful OAuth round-trip.
-/// Backend issues the access + refresh tokens; engine treats both
-/// as opaque blobs. `account_id` is the cross-machine roll-up key
-/// (per spec §10.2): same Google/Discord identity links its
-/// per-channel install_ids together server-side.
+/// What we persist on disk after a successful OAuth round-trip.
+///
+/// Web's `POST /api/v1/account/oauth/{provider}` exchange endpoint
+/// keeps the provider's access + refresh tokens server-side (they
+/// live in the AWS secret store next to the OAuth client_secret).
+/// Engine never holds an OAuth bearer because superdeduper's API
+/// auth uses the install_key + `X-Sd-Signature` header, NOT the
+/// OAuth token. The fields here are what engine needs to RENDER
+/// the post-link state + know the cross-machine account_id.
+///
+/// Shape matches web's response (confirmed 2026-05-25T00:30Z log):
+/// `account_id`, `display_name`, `provider`, `discord_user_id`
+/// (or `google_user_id`), `linked_install_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OauthToken {
     pub provider: Provider,
-    /// Opaque bearer token sent on subsequent API calls as
-    /// `Authorization: Bearer <access_token>`.
-    pub access_token: String,
-    /// Refresh token, used to mint a fresh `access_token` after
-    /// `expires_at` passes. Empty when the provider doesn't issue
-    /// one (Discord historically; Google always does).
-    #[serde(default)]
-    pub refresh_token: String,
-    /// Unix-epoch seconds when the access token becomes invalid.
-    pub expires_at: i64,
     /// Provider-supplied user-visible name (display name, email
     /// prefix, etc.) — engine renders it but never sends it back
     /// in payloads. Mick's identity is one of these strings.
@@ -167,19 +165,12 @@ pub struct OauthToken {
     /// per-channel). Two installs that link the SAME Google account
     /// will share `account_id` server-side.
     pub account_id: String,
-}
-
-impl OauthToken {
-    /// True when the access token's `expires_at` is in the past.
-    /// Callers should refresh before sending the next API request
-    /// when this is true.
-    pub fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.expires_at <= now
-    }
+    /// The install_id this OAuth link was bound to server-side.
+    /// Engine cross-checks it matches the local install_id; a
+    /// mismatch would mean the backend linked a different install
+    /// (shouldn't happen, but the assertion guards against bugs).
+    #[serde(default)]
+    pub linked_install_id: String,
 }
 
 /// Errors surfaced by the OAuth flow. Each variant carries the
@@ -330,13 +321,12 @@ pub enum AccountStatus {
     /// install_id (UUIDv4) is the only identity.
     Anonymous,
     /// Token file present. `provider` + `display_name` come from
-    /// the stored payload; `expired` flags whether a refresh is
-    /// required before the next API call.
+    /// the stored payload. Engine doesn't track expiration because
+    /// OAuth tokens live server-side; refresh is web's concern.
     Linked {
         provider: Provider,
         display_name: String,
         account_id: String,
-        expired: bool,
     },
 }
 
@@ -348,15 +338,11 @@ pub fn status() -> io::Result<AccountStatus> {
 pub fn status_for(channel: Channel) -> io::Result<AccountStatus> {
     match load_for(channel)? {
         None => Ok(AccountStatus::Anonymous),
-        Some(t) => {
-            let expired = t.is_expired();
-            Ok(AccountStatus::Linked {
-                provider: t.provider,
-                display_name: t.display_name,
-                account_id: t.account_id,
-                expired,
-            })
-        }
+        Some(t) => Ok(AccountStatus::Linked {
+            provider: t.provider,
+            display_name: t.display_name,
+            account_id: t.account_id,
+        }),
     }
 }
 
@@ -1419,39 +1405,42 @@ pub fn clear_toast() {
 ///
 /// If web's actual surface differs, this is the single place to
 /// update — the rest of the module deals in [`OauthToken`].
+///
+/// Web's actual shape (confirmed 2026-05-25T00:30Z dev test):
+///
+/// ```json
+/// {
+///   "account_id": "d8e2e7d8-...",
+///   "display_name": "Mick",
+///   "provider": "discord",
+///   "discord_user_id": "...",
+///   "linked_install_id": "fec94a96-..."
+/// }
+/// ```
+///
+/// Engine ignores the per-provider user_id field — `account_id`
+/// is the cross-provider stable identifier; provider-specific IDs
+/// are debugging-only on web's side.
 pub fn parse_callback_body(provider: Provider, body: &str) -> Result<OauthToken, OauthError> {
     #[derive(Deserialize)]
     struct CallbackBody {
-        access_token: String,
-        #[serde(default)]
-        refresh_token: String,
-        #[serde(default)]
-        expires_in: i64,
         #[serde(default)]
         display_name: String,
         #[serde(default)]
         account_id: String,
+        #[serde(default)]
+        linked_install_id: String,
     }
     let parsed: CallbackBody = serde_json::from_str(body)
         .map_err(|e| OauthError::BadCallback(format!("json parse: {e}")))?;
-    if parsed.access_token.is_empty() {
-        return Err(OauthError::BadCallback("access_token is empty".into()));
+    if parsed.account_id.is_empty() {
+        return Err(OauthError::BadCallback("account_id is empty".into()));
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     Ok(OauthToken {
         provider,
-        access_token: parsed.access_token,
-        refresh_token: parsed.refresh_token,
-        // expires_in is seconds-from-now per OAuth2 RFC. If web
-        // omits it, default to a one-hour TTL — Google/Discord both
-        // default near that range and a too-soon refresh is cheaper
-        // than a too-late one.
-        expires_at: now + parsed.expires_in.max(3600),
         display_name: parsed.display_name,
         account_id: parsed.account_id,
+        linked_install_id: parsed.linked_install_id,
     })
 }
 
@@ -1597,56 +1586,32 @@ mod tests {
     fn token_round_trips_json() {
         let t = OauthToken {
             provider: Provider::Google,
-            access_token: "atok".into(),
-            refresh_token: "rtok".into(),
-            expires_at: 1_900_000_000,
             display_name: "Mick".into(),
             account_id: "acct-123".into(),
+            linked_install_id: "fec94a96-...".into(),
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: OauthToken = serde_json::from_str(&s).unwrap();
         assert_eq!(back.provider, Provider::Google);
         assert_eq!(back.account_id, "acct-123");
+        assert_eq!(back.display_name, "Mick");
+        assert_eq!(back.linked_install_id, "fec94a96-...");
     }
 
     #[test]
-    fn token_serialises_missing_refresh_with_default() {
-        // Discord historically omits refresh_token; engine accepts
-        // the absence + treats as empty string.
+    fn token_deserialises_legacy_shape_without_linked_install_id() {
+        // Pre-2026-05-25 token files may lack `linked_install_id`
+        // (the field was introduced after web confirmed its
+        // response shape). `#[serde(default)]` on the field means
+        // old files still load cleanly.
         let json = r#"{
             "provider": "discord",
-            "access_token": "x",
-            "expires_at": 2000000000,
             "display_name": "User#0001",
             "account_id": "acct-1"
         }"#;
         let t: OauthToken = serde_json::from_str(json).unwrap();
-        assert!(t.refresh_token.is_empty());
+        assert!(t.linked_install_id.is_empty());
         assert_eq!(t.provider, Provider::Discord);
-    }
-
-    #[test]
-    fn is_expired_flips_at_expires_at() {
-        let past = OauthToken {
-            provider: Provider::Google,
-            access_token: "".into(),
-            refresh_token: "".into(),
-            expires_at: 0,
-            display_name: "".into(),
-            account_id: "".into(),
-        };
-        assert!(past.is_expired(), "epoch 0 must be expired");
-
-        let future = OauthToken {
-            provider: Provider::Google,
-            access_token: "".into(),
-            refresh_token: "".into(),
-            // Year 2100 — definitely future.
-            expires_at: 4_102_444_800,
-            display_name: "".into(),
-            account_id: "".into(),
-        };
-        assert!(!future.is_expired());
     }
 
     #[test]
@@ -1676,24 +1641,32 @@ mod tests {
 
     #[test]
     fn parse_callback_body_happy_path() {
+        // Exact shape web returns per 2026-05-25T00:30Z dev log:
         let body = r#"{
-            "access_token": "atok",
-            "refresh_token": "rtok",
-            "expires_in": 3600,
+            "account_id": "d8e2e7d8-f3e1-4c47-a916-10d4e45f5633",
             "display_name": "Mick",
-            "account_id": "acct-1"
+            "provider": "discord",
+            "discord_user_id": "1507968343867654197",
+            "linked_install_id": "fec94a96-4489-4dbc-bba0-daf48c0416f9"
         }"#;
-        let t = parse_callback_body(Provider::Google, body).unwrap();
-        assert_eq!(t.access_token, "atok");
-        assert_eq!(t.refresh_token, "rtok");
+        let t = parse_callback_body(Provider::Discord, body).unwrap();
+        // Engine takes `provider` from the start-of-flow argument,
+        // not from the response body (defense against a spoofed
+        // response with a wrong provider field).
+        assert_eq!(t.provider, Provider::Discord);
         assert_eq!(t.display_name, "Mick");
-        assert_eq!(t.account_id, "acct-1");
-        assert!(t.expires_at > 0);
+        assert_eq!(t.account_id, "d8e2e7d8-f3e1-4c47-a916-10d4e45f5633");
+        assert_eq!(
+            t.linked_install_id,
+            "fec94a96-4489-4dbc-bba0-daf48c0416f9"
+        );
     }
 
     #[test]
-    fn parse_callback_body_rejects_missing_access_token() {
-        let body = r#"{"expires_in": 3600}"#;
+    fn parse_callback_body_rejects_missing_account_id() {
+        // account_id is the cross-machine roll-up identifier; if
+        // web omits it the link can't be persisted meaningfully.
+        let body = r#"{"display_name": "Mick"}"#;
         let err = parse_callback_body(Provider::Google, body).unwrap_err();
         match err {
             OauthError::BadCallback(_) => {}
@@ -1702,16 +1675,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_callback_body_clamps_zero_expires_to_default() {
-        // If web omits expires_in, default to 3600s so we don't
-        // immediately mark every token as expired.
-        let body = r#"{"access_token": "atok"}"#;
-        let t = parse_callback_body(Provider::Discord, body).unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        assert!(t.expires_at >= now + 3500, "default TTL ~1h applied");
+    fn parse_callback_body_tolerates_extra_provider_fields() {
+        // Web's response includes `provider`, `discord_user_id`,
+        // etc. — engine ignores them and just keys on the fields
+        // it cares about. No #[serde(deny_unknown_fields)].
+        let body = r#"{
+            "account_id": "acct-x",
+            "display_name": "User",
+            "provider": "google",
+            "google_user_id": "10293847566",
+            "linked_install_id": "inst-1",
+            "future_field_we_dont_know_about": 42
+        }"#;
+        let t = parse_callback_body(Provider::Google, body).unwrap();
+        assert_eq!(t.account_id, "acct-x");
     }
 
     #[test]

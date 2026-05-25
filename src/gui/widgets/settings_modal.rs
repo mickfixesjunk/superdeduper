@@ -946,13 +946,11 @@ fn render_account(ui: &mut egui::Ui) {
         Some(oauth::AccountStatus::Linked {
             provider,
             display_name,
-            expired,
             ..
         }) => {
-            let exp_suffix = if *expired { " — token expired" } else { "" };
             ui.label(
                 RichText::new(format!(
-                    "Status: Linked — {display_name} ({}){exp_suffix}",
+                    "Status: Linked — {display_name} ({})",
                     provider.display_name()
                 ))
                 .color(theme::TEXT_HI),

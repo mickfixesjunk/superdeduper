@@ -153,7 +153,6 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
                             provider,
                             display_name,
                             account_id,
-                            expired,
                         } => serde_json::json!({
                             "channel": active.to_string(),
                             "install_id": install_id,
@@ -161,7 +160,6 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
                             "provider": provider.as_slug(),
                             "display_name": display_name,
                             "account_id": account_id,
-                            "expired": expired,
                         }),
                     };
                     println!(
@@ -179,7 +177,6 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
                         provider,
                         display_name,
                         account_id,
-                        expired,
                     } => {
                         println!("channel:      {}", active);
                         println!("install_id:   {}", install_id);
@@ -189,11 +186,6 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
                             provider.display_name()
                         );
                         println!("account_id:   {}", account_id);
-                        if expired {
-                            println!("token:        EXPIRED (next API call will trigger refresh)");
-                        } else {
-                            println!("token:        ok");
-                        }
                     }
                 },
             }
