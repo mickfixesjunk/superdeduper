@@ -2791,6 +2791,24 @@ impl eframe::App for SuperdeduperApp {
         // at GUI startup via channel::set_active_channel.
         crate::gui::widgets::channel_banner::show(ctx, crate::channel::active_channel());
 
+        // #81 — One-shot exclusions safe-defaults banner. Renders
+        // above the menubar on first launch after the v0.2.7 update;
+        // dismissed by either button. "See what's filtered" pops
+        // Settings → Exclusions tab and also marks dismissed.
+        if !self.persisted.settings.dismissed_v0_2_7_exclusion_banner {
+            if let Some(action) =
+                crate::gui::widgets::exclusions_safe_defaults_banner::show(ctx)
+            {
+                use crate::gui::widgets::exclusions_safe_defaults_banner::BannerAction;
+                self.persisted.settings.dismissed_v0_2_7_exclusion_banner = true;
+                if matches!(action, BannerAction::OpenSettings) {
+                    self.settings_open = true;
+                    self.settings_modal_state.tab =
+                        crate::gui::widgets::settings_modal::SettingsTab::Exclusions;
+                }
+            }
+        }
+
         // File menubar — owns project lifecycle (New / Open / Save /
         // Save As / Open Archive Manifest). Rendered as a thin strip
         // above the header so it doesn't intrude on the always-visible

@@ -102,6 +102,22 @@ pub struct ScanSettings {
     /// 365 / forever as the four standard buckets.
     #[serde(default)]
     pub history_retention_days: u32,
+    /// #81 — Exclusion preset packs + custom rules. New installs
+    /// land on the safe-defaults shape (master ON, 4 footgun packs
+    /// active) via `ExclusionConfig::default()`; pre-#81 installs
+    /// without this field on disk also pick up safe-defaults via
+    /// the serde(default) backfill. Settings → Exclusions tab in
+    /// the GUI mutates this; the scan launch path compiles it into
+    /// an `ExclusionPolicy` and plugs it into RunConfig.
+    #[serde(default)]
+    pub exclusion_config: crate::exclusions::ExclusionConfig,
+    /// #81 — One-shot v0.2.7 exclusions notice. Flipped to `true`
+    /// when the user dismisses the banner ("Got it" or "See what's
+    /// filtered"). Once true, the banner never reappears. New
+    /// installs start with `false` so they see the notice once;
+    /// after dismissal the value persists across launches.
+    #[serde(default)]
+    pub dismissed_v0_2_7_exclusion_banner: bool,
 }
 
 impl Default for ScanSettings {
@@ -125,6 +141,8 @@ impl Default for ScanSettings {
             dismissed_alpha_warning: false,
             keep_strategy: crate::cli::KeepStrategy::Smart,
             history_retention_days: 0,
+            exclusion_config: crate::exclusions::ExclusionConfig::default(),
+            dismissed_v0_2_7_exclusion_banner: false,
         }
     }
 }

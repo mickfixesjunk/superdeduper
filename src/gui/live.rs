@@ -1341,6 +1341,20 @@ fn run(
             crate::gui::theme::humansize(reclaimable_inode)
         ),
     });
+    // #81 — Surface exclusion stats so the user sees the safe-
+    // defaults filter actually fired. Only emit when something was
+    // excluded; a "0 excluded" line on a clean corpus is noise.
+    let excl = cfg.exclusion_counters.snapshot();
+    if excl.excluded_files > 0 {
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "exclusions: skipped {} file(s) / {} (per safe-defaults filter)",
+                excl.excluded_files,
+                crate::gui::theme::humansize(excl.excluded_bytes),
+            ),
+        });
+    }
     // Cache stats so a resumed scan that *should* have fast-
     // forwarded but didn't is obvious from the log. Hit rate near
     // zero on a resume is the smoking gun for a cache-key mismatch.
@@ -2114,7 +2128,26 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         // can add the toggle if user feedback shows it's wanted.
         allow_recall_on_read: false,
         hash_algo: settings.hash_algo,
-        exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
+        // #81 — Compile the user's ExclusionConfig (master toggle +
+        // active preset packs + custom rules) into the runtime
+        // ExclusionPolicy that the walker consults per file. Falls
+        // back to disabled() on compile-failure so a malformed user
+        // glob doesn't sink the entire scan — the matcher error
+        // surfaces in the log instead. (New installs ship with
+        // safe-defaults ON via ExclusionConfig::default().)
+        exclusion_policy: match crate::exclusions::ExclusionPolicy::compile(
+            &settings.exclusion_config,
+            &crate::exclusions::presets::BuiltinPresets,
+        ) {
+            Ok(policy) => policy,
+            Err(e) => {
+                eprintln!(
+                    "exclusions: compile failed ({e}); scanning without exclusions for this run. \
+                     Fix the offending pattern in Settings → Exclusions."
+                );
+                crate::exclusions::ExclusionPolicy::disabled()
+            }
+        },
         exclusion_counters: crate::exclusions::ExclusionCounters::new(),
     })
 }

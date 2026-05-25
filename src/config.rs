@@ -105,14 +105,69 @@ impl ScanConfig {
             allow_system_paths: args.allow_system_paths,
             allow_recall_on_read: args.allow_recall_on_read,
             hash_algo: args.hash_algo.into(),
-            // Until the CLI's `--exclusions on` / Settings UI wires
-            // up an actual `ExclusionConfig`, the walker runs with
-            // a disabled policy (master toggle off). Behaviour
-            // matches today's "show every duplicate" default.
-            exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
+            // #81 — Wire the CLI's exclusion flags into the runtime
+            // policy. Defaults to safe-defaults ON (the new v0.2.7+
+            // baseline); --exclusions off disables entirely;
+            // --exclusion-pack / --exclusion-pack-disable modify the
+            // active-packs vector either side of the default.
+            exclusion_policy: build_cli_exclusion_policy(args)?,
             exclusion_counters: crate::exclusions::ExclusionCounters::new(),
         })
     }
+}
+
+/// #81 — Build the runtime `ExclusionPolicy` from the CLI flags.
+///
+/// Behaviour:
+/// * `--exclusions off` ⇒ disabled policy (every file scannable).
+/// * Otherwise: start from the safe-defaults shape (4 packs ON);
+///   remove any pack named in `--exclusion-pack-disable`; add any
+///   pack named in `--exclusion-pack`. Custom extension / glob CLI
+///   flags are not yet wired (deferred to a follow-up; users with
+///   custom needs can edit the GUI settings TOML).
+fn build_cli_exclusion_policy(
+    args: &ScanArgs,
+) -> Result<crate::exclusions::ExclusionPolicy> {
+    use crate::exclusions::{ExclusionConfig, ExclusionPolicy, PresetPackId};
+    if matches!(args.exclusions, cli::ExclusionsToggle::Off) {
+        return Ok(ExclusionPolicy::disabled());
+    }
+    let mut config = ExclusionConfig::default();
+    for s in &args.exclusion_pack_disable {
+        let id = parse_pack_id(s)?;
+        config.active_packs.retain(|p| *p != id);
+    }
+    for s in &args.exclusion_pack_enable {
+        let id = parse_pack_id(s)?;
+        if !config.active_packs.contains(&id) {
+            config.active_packs.push(id);
+        }
+    }
+    // Preserve canonical order so the in-memory config matches what
+    // the GUI / TOML would produce.
+    config.active_packs.sort_by_key(|p| {
+        PresetPackId::ALL
+            .iter()
+            .position(|x| x == p)
+            .unwrap_or(usize::MAX)
+    });
+    ExclusionPolicy::compile(&config, &crate::exclusions::presets::BuiltinPresets)
+        .map_err(|e| Error::other(format!("exclusion config compile failed: {e}")))
+}
+
+fn parse_pack_id(s: &str) -> Result<crate::exclusions::PresetPackId> {
+    use crate::exclusions::PresetPackId;
+    // PresetPackId serialises as kebab-case (see serde rename
+    // attribute on the enum) — accept that form on the CLI for
+    // consistency with how it appears in TOML / `--list-
+    // exclusion-packs` output.
+    let kebab = s.trim().to_ascii_lowercase();
+    let json = format!("\"{kebab}\"");
+    serde_json::from_str::<PresetPackId>(&json).map_err(|_| {
+        Error::other(format!(
+            "unknown preset pack id {s:?} — see --list-exclusion-packs"
+        ))
+    })
 }
 
 fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
@@ -175,6 +230,10 @@ mod tests {
             image_similarity_threshold: 5,
             image_hash_algorithm: crate::cli::ImageHashAlgoArg::Dhash,
             audio_similarity_threshold: 5.0,
+            exclusions: crate::cli::ExclusionsToggle::On,
+            exclusion_pack_disable: vec![],
+            exclusion_pack_enable: vec![],
+            list_exclusion_packs: false,
         }
     }
 

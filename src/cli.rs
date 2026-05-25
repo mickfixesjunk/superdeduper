@@ -191,8 +191,10 @@ pub enum SnapshotFormat {
 
 #[derive(Debug, Args)]
 pub struct ScanArgs {
-    /// One or more paths to scan.
-    #[arg(value_name = "PATHS", required = true)]
+    /// One or more paths to scan. Required for actual scans; not
+    /// required when `--list-exclusion-packs` is given (which just
+    /// prints info and exits).
+    #[arg(value_name = "PATHS", required_unless_present = "list_exclusion_packs")]
     pub paths: Vec<PathBuf>,
 
     /// Mark a path as "reference" — never deleted from during `dedupe`.
@@ -265,6 +267,35 @@ pub struct ScanArgs {
     /// Permit scanning system-critical paths (Windows, Program Files, ...).
     #[arg(long)]
     pub allow_system_paths: bool,
+
+    /// #81 — Master toggle for the safe-defaults exclusion filter
+    /// (the preset packs that skip system DLLs, .git internals,
+    /// OS-protected paths, and AV signature databases). Default ON
+    /// for v0.2.7+. Set `--exclusions off` to disable entirely
+    /// (e.g. for a pre-#81 scan-everything baseline).
+    #[arg(long, value_enum, value_name = "STATE", default_value_t = ExclusionsToggle::On)]
+    pub exclusions: ExclusionsToggle,
+
+    /// #81 — Disable a specific preset pack that would otherwise be
+    /// active. Repeatable. Example: `--exclusion-pack-disable
+    /// system-libraries` to allow scanning .dll/.sys files even
+    /// with the master toggle on. Valid IDs: see
+    /// `--list-exclusion-packs` (or the Settings → Exclusions tab).
+    #[arg(long = "exclusion-pack-disable", value_name = "ID")]
+    pub exclusion_pack_disable: Vec<String>,
+
+    /// #81 — Activate an additional preset pack beyond the safe-
+    /// defaults. Repeatable. Example: `--exclusion-pack
+    /// package-manager-caches` to also skip .cargo/registry,
+    /// .npm/_cacache, etc.
+    #[arg(long = "exclusion-pack", value_name = "ID")]
+    pub exclusion_pack_enable: Vec<String>,
+
+    /// #81 — Print every preset pack with its content (extension
+    /// list + path-pattern list) and exit. Useful when deciding
+    /// which packs to enable. Bypasses the scan entirely.
+    #[arg(long)]
+    pub list_exclusion_packs: bool,
 
     /// Skip stages 2-4 (size grouping, layout, hashing) and emit only
     /// the placeholder inventory. Use when auditing a tree for
@@ -349,6 +380,22 @@ pub struct ScanArgs {
     /// separate per testrunner's GH #53.
     #[arg(long, value_name = "BITS", default_value_t = 5.0)]
     pub audio_similarity_threshold: f64,
+}
+
+/// #81 — Master toggle for the safe-defaults exclusion filter.
+/// Surfaced as `--exclusions on|off`.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Default)]
+#[clap(rename_all = "lower")]
+pub enum ExclusionsToggle {
+    /// Apply the safe-defaults preset packs (system libraries,
+    /// VCS internals, OS system trees, AV signature databases).
+    /// Recommended for v0.2.7+ scans on user machines.
+    #[default]
+    On,
+    /// Pre-#81 behaviour: scan every file regardless of class.
+    /// Useful for baselining or for scans that intentionally
+    /// target system files.
+    Off,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

@@ -25,6 +25,9 @@ pub enum SettingsTab {
     KeepStrategy,
     Safety,
     Preflight,
+    /// #81 — Exclusion preset packs + custom rules. Master toggle,
+    /// 8 pack-row checkboxes, custom-extension / pattern textareas.
+    Exclusions,
     Network,
     #[cfg(feature = "telemetry")]
     Account,
@@ -40,6 +43,7 @@ impl SettingsTab {
             SettingsTab::KeepStrategy => "Keep strategy",
             SettingsTab::Safety => "Safety",
             SettingsTab::Preflight => "Pre-flight",
+            SettingsTab::Exclusions => "Exclusions",
             SettingsTab::Network => "Network",
             #[cfg(feature = "telemetry")]
             SettingsTab::Account => "Account",
@@ -55,6 +59,7 @@ impl SettingsTab {
             SettingsTab::KeepStrategy,
             SettingsTab::Safety,
             SettingsTab::Preflight,
+            SettingsTab::Exclusions,
             SettingsTab::Network,
         ];
         #[cfg(feature = "telemetry")]
@@ -339,6 +344,7 @@ fn render_modal_body(
                                 SettingsTab::KeepStrategy => render_keep_strategy(ui, settings),
                                 SettingsTab::Safety => render_safety(ui, settings),
                                 SettingsTab::Preflight => render_preflight(ui, settings),
+                                SettingsTab::Exclusions => render_exclusions(ui, settings),
                                 SettingsTab::Network => render_network(ui, state),
                                 #[cfg(feature = "telemetry")]
                                 SettingsTab::Account => render_account(ui),
@@ -823,6 +829,157 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// #81 — Settings → Exclusions tab.
+///
+/// Master toggle + 8 preset-pack rows + custom-extension textarea +
+/// custom-pattern textarea + Restore-safe-defaults button. All
+/// mutations land back on `settings.exclusion_config`; the scan
+/// launch path recompiles the policy each run so changes take
+/// effect on the next scan without an app restart.
+fn render_exclusions(ui: &mut egui::Ui, settings: &mut ScanSettings) {
+    use crate::exclusions::{presets::BuiltinPresets, PresetPackId, PresetSource};
+    ui.heading("Exclusions");
+    ui.label(
+        RichText::new(
+            "Skip files that are dangerous or pointless to dedupe — system libraries, \
+             OS-protected paths, .git internals, AV signature databases. Mick's directive \
+             after the v0.2.6 archive incident: stop flagging .dll / .sys / etc.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+    ui.add_space(6.0);
+
+    let cfg = &mut settings.exclusion_config;
+    ui.checkbox(&mut cfg.enabled, "Enable exclusion filter").on_hover_text(
+        "Master toggle. When OFF, no exclusions apply regardless of \
+         the pack checkboxes or custom rules below.",
+    );
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(RichText::new("Preset packs").color(theme::TEXT_HI).strong());
+    ui.add_space(4.0);
+
+    // Per-pack row. Each pack ships with a fixed extension/path set
+    // we show the counts of so users see what they're toggling.
+    let presets = BuiltinPresets;
+    for pack_id in PresetPackId::ALL {
+        let pack = presets.get(pack_id);
+        let mut active = cfg.active_packs.contains(&pack_id);
+        let n_ext = pack.extensions.len();
+        let n_paths = pack.paths.len();
+        let label = format!(
+            "{}  ({} extension{}, {} path pattern{})",
+            pack_id.label(),
+            n_ext,
+            if n_ext == 1 { "" } else { "s" },
+            n_paths,
+            if n_paths == 1 { "" } else { "s" },
+        );
+        let safe = PresetPackId::SAFE_DEFAULTS.contains(&pack_id);
+        let resp = ui.checkbox(&mut active, &label);
+        if safe {
+            resp.on_hover_text(
+                "Safe-defaults pack (on by default for new installs in v0.2.7+). \
+                 Recommended to leave ON unless you specifically want to find \
+                 duplicates among files of this kind.",
+            );
+        }
+        if active && !cfg.active_packs.contains(&pack_id) {
+            cfg.active_packs.push(pack_id);
+            // Preserve canonical order so the persisted TOML is
+            // deterministic across saves.
+            cfg.active_packs.sort_by_key(|p| {
+                PresetPackId::ALL.iter().position(|x| x == p).unwrap_or(usize::MAX)
+            });
+        }
+        if !active {
+            cfg.active_packs.retain(|p| *p != pack_id);
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(RichText::new("Custom extensions").color(theme::TEXT_HI).strong());
+    ui.label(
+        RichText::new("One per line; leading dot optional (\".tmp\" or \"tmp\" both work).")
+            .color(theme::TEXT_LO)
+            .small(),
+    );
+    let mut ext_text = cfg.custom_extensions.join("\n");
+    let ext_resp = ui.add(
+        egui::TextEdit::multiline(&mut ext_text)
+            .desired_rows(3)
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace),
+    );
+    if ext_resp.changed() {
+        cfg.custom_extensions = ext_text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+    }
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("Custom path patterns").color(theme::TEXT_HI).strong());
+    ui.label(
+        RichText::new(
+            "Glob syntax: `**/node_modules/**`, `/tmp/**`, etc. One pattern per line.",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+    let mut pat_text = cfg.custom_patterns.join("\n");
+    let pat_resp = ui.add(
+        egui::TextEdit::multiline(&mut pat_text)
+            .desired_rows(3)
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace),
+    );
+    if pat_resp.changed() {
+        cfg.custom_patterns = pat_text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+    }
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui
+            .button(RichText::new("Restore safe defaults").color(theme::TEXT_HI))
+            .on_hover_text(
+                "Reset to the v0.2.7 defaults: master ON, 4 safe packs active, \
+                 custom lists empty.",
+            )
+            .clicked()
+        {
+            *cfg = crate::exclusions::ExclusionConfig::default();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let total_ext: usize = cfg.active_packs.iter().map(|p| presets.get(*p).extensions.len()).sum::<usize>()
+                + cfg.custom_extensions.len();
+            let total_paths: usize = cfg.active_packs.iter().map(|p| presets.get(*p).paths.len()).sum::<usize>()
+                + cfg.custom_patterns.len();
+            ui.label(
+                RichText::new(format!(
+                    "Active: {} ext rules · {} path rules",
+                    if cfg.enabled { total_ext } else { 0 },
+                    if cfg.enabled { total_paths } else { 0 },
+                ))
+                .color(theme::TEXT_LO)
+                .small(),
+            );
+        });
+    });
 }
 
 /// Settings → Network tab — channel selection.
@@ -2018,6 +2175,12 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
             .color(theme::TEXT_HI)
             .heading(),
     )
+    // #84 — force the preview Window above the settings modal.
+    // Without the explicit Order::Foreground hint, both windows
+    // live in the default Middle layer and paint order put the
+    // settings modal on top — making "Preview Sample Submission"
+    // appear to do nothing from the user's perspective.
+    .order(egui::Order::Foreground)
     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
     .collapsible(false)
     .resizable(false)

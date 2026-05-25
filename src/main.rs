@@ -618,6 +618,48 @@ fn run_config(cmd: superdeduper::cli::ConfigCommand) -> anyhow::Result<()> {
 /// IOCTL result, partition + device numbers) plus the rule we used
 /// to pick HDD vs SSD. Designed to be pasted verbatim when a drive
 /// gets misclassified — the data is all in one place.
+/// #81 — Helper for `--list-exclusion-packs`. Prints every preset
+/// pack with its content so the user can decide which to enable
+/// or disable. Format: kebab-case ID (the CLI value), label,
+/// counts, then each extension + path pattern indented.
+fn print_exclusion_packs() {
+    use superdeduper::exclusions::{presets::BuiltinPresets, PresetPackId, PresetSource};
+    let presets = BuiltinPresets;
+    println!("Preset packs (CLI value: kebab-case ID):\n");
+    for id in PresetPackId::ALL {
+        let pack = presets.get(id);
+        // Re-derive the kebab-case form via serde's representation.
+        let kebab = serde_json::to_string(&id)
+            .ok()
+            .and_then(|s| s.trim_matches('"').to_string().into())
+            .unwrap_or_else(|| format!("{:?}", id).to_lowercase());
+        let safe = PresetPackId::SAFE_DEFAULTS.contains(&id);
+        let marker = if safe { " (safe-defaults ON)" } else { "" };
+        println!(
+            "  {kebab}  —  {}{marker}",
+            id.label(),
+        );
+        println!(
+            "    {} extension{}, {} path pattern{}",
+            pack.extensions.len(),
+            if pack.extensions.len() == 1 { "" } else { "s" },
+            pack.paths.len(),
+            if pack.paths.len() == 1 { "" } else { "s" },
+        );
+        if !pack.extensions.is_empty() {
+            println!("    extensions: {}", pack.extensions.join(", "));
+        }
+        for p in pack.paths {
+            println!("      path: {p}");
+        }
+        println!();
+    }
+    println!("Usage:");
+    println!("  --exclusions on|off                         master toggle (default on)");
+    println!("  --exclusion-pack <id>                       enable an additional pack");
+    println!("  --exclusion-pack-disable <id>               disable a safe-defaults pack");
+}
+
 fn run_drive_info() -> anyhow::Result<()> {
     #[cfg(not(windows))]
     {
@@ -684,6 +726,14 @@ fn run_drive_info() -> anyhow::Result<()> {
 }
 
 fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
+    // #81 — `--list-exclusion-packs` short-circuits the scan and
+    // prints every preset pack with its content so the user can
+    // see exactly what each pack covers before deciding whether to
+    // enable / disable it.
+    if args.list_exclusion_packs {
+        print_exclusion_packs();
+        return Ok(());
+    }
     let cfg = ScanConfig::from_args(&args).context("invalid scan configuration")?;
 
     // #25 T1.2 Tier-4 — perceptual image similarity. Threaded
