@@ -102,6 +102,30 @@ fn render_login_cta(ui: &mut egui::Ui) {
         return;
     }
 
+    // Auto-register chain spinner: when a register session is
+    // running (typically because the user clicked Login & Claim
+    // on a fresh install + we have to register before linking),
+    // show "Registering machine…" so the user knows something is
+    // happening. Once register lands, the auto-retry chain kicks
+    // OAuth + the next branch below takes over.
+    if let Some(elapsed) = crate::leaderboard::registration::register_session_elapsed() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Registering machine ({}s)…",
+                    elapsed.as_secs()
+                ))
+                .color(theme::TEXT_HI),
+            );
+        });
+        ui.add_space(6.0);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
+        return;
+    }
+
     // While a flow is in flight (regardless of which UI surface
     // started it), render the spinner + Cancel row from any CTA
     // the user looks at — that's the responsive feedback issue #2

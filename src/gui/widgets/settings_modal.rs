@@ -1135,6 +1135,37 @@ fn render_account(ui: &mut egui::Ui) {
         ui.add_space(8.0);
     }
 
+    // Auto-register chain spinner — shows whenever a background
+    // register session is running (fresh-install path: user
+    // clicked Link before machine was registered; engine auto-
+    // registers first then auto-retries OAuth). Render this
+    // BEFORE the OAuth spinner so the user sees the registration
+    // step distinctly from the sign-in step.
+    if let Some(elapsed) = crate::leaderboard::registration::register_session_elapsed() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Registering machine ({}s)…",
+                    elapsed.as_secs()
+                ))
+                .color(theme::TEXT_HI),
+            );
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "First-time setup. Once your machine is registered \
+                 (~1s), the sign-in flow continues automatically.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        return;
+    }
+
     // In-flight render: spinner + Cancel. While a background
     // session runs, the Link / Unlink rows are replaced with the
     // "Waiting for ${provider} sign-in (${elapsed}s)…" affordance.

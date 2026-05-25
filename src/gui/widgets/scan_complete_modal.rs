@@ -340,6 +340,29 @@ fn render_signin_cta(ui: &mut egui::Ui) {
         return;
     }
 
+    // Auto-register chain spinner — see badge_wall::render_login_cta
+    // for the same pattern. Shown when a register session is
+    // running so the user knows their click did something.
+    if let Some(elapsed) = crate::leaderboard::registration::register_session_elapsed() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Registering machine ({}s)…",
+                    elapsed.as_secs()
+                ))
+                .color(theme::TEXT_HI),
+            );
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
+        return;
+    }
+
     // In-flight render: spinner + Cancel. Shows on whichever CTA
     // surface the user looks at while a flow is running.
     if let Some((provider, elapsed)) = oauth::current_session_snapshot() {
@@ -427,28 +450,42 @@ fn start_signin(
     provider: crate::leaderboard::oauth::Provider,
     channel: crate::channel::Channel,
 ) {
-    use crate::leaderboard::{install, oauth};
-    let install_id = match install::load().ok().flatten() {
-        Some(s) => s.install_id,
-        None => {
-            eprintln!(
-                "post-scan-cta: not registered on channel {channel} — \
-                 run `superdeduper register --channel {channel}` first"
-            );
-            return;
+    use crate::leaderboard::{install, oauth, registration};
+    // Fresh-install path mirrors oauth_chooser::start_link: if
+    // there's no install state on this channel yet, stash the
+    // provider + kick off register; the auto-retry chain in
+    // poll_register_session restarts OAuth with this provider
+    // once register lands.
+    let install_id_opt = install::load().ok().flatten().map(|s| s.install_id);
+    match install_id_opt {
+        Some(install_id) => {
+            let server_url = crate::channel::server_url_for(channel);
+            if oauth::try_start_session(
+                provider,
+                channel,
+                server_url,
+                &install_id,
+                oauth::DEFAULT_OAUTH_TIMEOUT,
+            )
+            .is_err()
+            {
+                eprintln!(
+                    "post-scan-cta: another OAuth flow is already in flight; ignoring"
+                );
+            }
         }
-    };
-    let server_url = crate::channel::server_url_for(channel);
-    if oauth::try_start_session(
-        provider,
-        channel,
-        server_url,
-        &install_id,
-        oauth::DEFAULT_OAUTH_TIMEOUT,
-    )
-    .is_err()
-    {
-        eprintln!("post-scan-cta: another OAuth flow is already in flight; ignoring");
+        None => {
+            oauth::log_oauth_event(&format!(
+                "fresh_install_chain (post-scan): no install on {channel}; \
+                 registering then auto-retrying with {provider}",
+            ));
+            oauth::set_pending_retry_provider(provider);
+            if registration::try_start_register_session(channel).is_err() {
+                eprintln!(
+                    "post-scan-cta: register already in flight; can't auto-chain"
+                );
+            }
+        }
     }
 }
 

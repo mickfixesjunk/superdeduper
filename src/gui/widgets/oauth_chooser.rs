@@ -125,27 +125,49 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
 /// responsive — per-frame `oauth::poll_session()` drains the
 /// result when the worker finishes. Used by both the badge-wall
 /// CTA + the Settings Account tab.
+///
+/// **Fresh-install path** (Mick 2026-05-25T02:36Z): when no
+/// `install.{channel}.json` exists yet, the click would otherwise
+/// silently do nothing (we have no install_id to send to web).
+/// Instead we stash the provider as the pending OAuth retry +
+/// kick off a register session; once register completes the
+/// auto-retry chain (see `registration::poll_register_session`)
+/// fires OAuth with the chosen provider against the freshly-
+/// registered install_id. End-to-end this means "click Link →
+/// pick Google → wait → browser pops up" with no manual register
+/// step.
 fn start_link(provider: oauth::Provider, channel: Channel) {
-    let install_id = match install::load().ok().flatten() {
-        Some(s) => s.install_id,
-        None => {
-            eprintln!(
-                "oauth-chooser: not registered on channel {channel} — \
-                 run `superdeduper register --channel {channel}` first"
-            );
-            return;
+    let install_id_opt = install::load().ok().flatten().map(|s| s.install_id);
+    match install_id_opt {
+        Some(install_id) => {
+            let server_url = crate::channel::server_url_for(channel);
+            if oauth::try_start_session(
+                provider,
+                channel,
+                server_url,
+                &install_id,
+                oauth::DEFAULT_OAUTH_TIMEOUT,
+            )
+            .is_err()
+            {
+                eprintln!(
+                    "oauth-chooser: another OAuth flow is already in flight; ignoring"
+                );
+            }
         }
-    };
-    let server_url = crate::channel::server_url_for(channel);
-    if oauth::try_start_session(
-        provider,
-        channel,
-        server_url,
-        &install_id,
-        oauth::DEFAULT_OAUTH_TIMEOUT,
-    )
-    .is_err()
-    {
-        eprintln!("oauth-chooser: another OAuth flow is already in flight; ignoring");
+        None => {
+            oauth::log_oauth_event(&format!(
+                "fresh_install_chain: no install state on {channel}; \
+                 registering first, then auto-retrying with {provider}",
+            ));
+            oauth::set_pending_retry_provider(provider);
+            if crate::leaderboard::registration::try_start_register_session(channel)
+                .is_err()
+            {
+                eprintln!(
+                    "oauth-chooser: register session already in flight; can't auto-chain"
+                );
+            }
+        }
     }
 }
