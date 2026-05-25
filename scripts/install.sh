@@ -37,11 +37,7 @@ uname_os="$(uname -s)"
 uname_arch="$(uname -m)"
 case "$uname_os" in
   Linux)   os=linux ;;
-  Darwin)
-    echo "error: macOS install via one-liner not yet supported (L1 work)." >&2
-    echo "       Once macOS binaries ship, this script will pick them up." >&2
-    exit 3
-    ;;
+  Darwin)  os=macos ;;
   FreeBSD)
     echo "error: FreeBSD install via one-liner not yet supported (L2 work)." >&2
     exit 3
@@ -52,11 +48,18 @@ case "$uname_os" in
     ;;
 esac
 
+# Architecture detection. On macOS the matrix ships both x86_64 + aarch64
+# binaries (Intel + Apple Silicon); on Linux only x86_64 for now
+# (aarch64 Linux is a planned follow-up).
 case "$uname_arch" in
   x86_64|amd64) arch=x86_64 ;;
   aarch64|arm64)
-    echo "error: ARM64 not yet supported on $os (planned)." >&2
-    exit 3
+    if [ "$os" = "macos" ]; then
+      arch=aarch64
+    else
+      echo "error: ARM64 not yet supported on $os (planned)." >&2
+      exit 3
+    fi
     ;;
   *)
     echo "error: unsupported architecture '$uname_arch'." >&2
@@ -107,15 +110,20 @@ if ! curl -fsSL -o "$tmpdir/SHA256SUMS" "$base_url/SHA256SUMS"; then
 fi
 
 echo "==> Verifying SHA-256…"
-# `sha256sum -c` accepts either GNU coreutils or BusyBox. macOS lacks
-# it by default but we already exited above for Darwin, so this path is
-# Linux-only. Read SHA256SUMS for our specific tarball, recompute, diff.
+# macOS ships `shasum -a 256` (built-in); Linux ships `sha256sum`
+# (GNU coreutils) or BusyBox's stripped-down `sha256sum`. Both
+# produce the same `<hex>  <filename>` format that SHA256SUMS uses.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha_cmd="sha256sum"
+else
+  sha_cmd="shasum -a 256"
+fi
 expected="$(grep -E "[[:space:]]${tarball}\$" "$tmpdir/SHA256SUMS" | awk '{print $1}')"
 if [ -z "$expected" ]; then
   echo "error: ${tarball} not listed in SHA256SUMS. Aborting." >&2
   exit 2
 fi
-actual="$(sha256sum "$tmpdir/$tarball" | awk '{print $1}')"
+actual="$($sha_cmd "$tmpdir/$tarball" | awk '{print $1}')"
 if [ "$expected" != "$actual" ]; then
   echo "error: SHA-256 mismatch — refusing to install." >&2
   echo "  expected: $expected" >&2

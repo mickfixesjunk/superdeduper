@@ -60,7 +60,7 @@ near-instant via the USN journal.
 
 ## Installing a release
 
-### Linux one-liner
+### Linux + macOS one-liner
 
 ```sh
 curl -fsSL https://github.com/mickfixesjunk/superdeduper/raw/main/scripts/install.sh | sh
@@ -69,9 +69,18 @@ curl -fsSL https://github.com/mickfixesjunk/superdeduper/raw/main/scripts/instal
 Downloads the latest tagged release tarball, verifies its SHA-256
 against the release's `SHA256SUMS`, and installs `superdeduper` +
 `superdeduper-gui` to `~/.local/bin` (or `/usr/local/bin` with sudo
-if `~/.local/bin` isn't on `$PATH`). Override the install location
+if `~/.local/bin` isn't on `$PATH`). Picks the right artifact for
+your platform automatically: Linux x86_64, macOS Intel (x86_64),
+or macOS Apple Silicon (aarch64). Override the install location
 with `SUPERDEDUPER_INSTALL_DIR=...`. Pin a specific version with
 `SUPERDEDUPER_VERSION=v0.2.1`.
+
+**macOS first launch:** binaries ship unsigned for v0.2.x — macOS
+Gatekeeper will say "cannot be opened because the developer cannot
+be verified" on first launch. Either right-click → Open and confirm,
+or run `xattr -d com.apple.quarantine /usr/local/bin/superdeduper*`
+to clear the quarantine flag globally. Apple Developer Program
+signing + notarisation is a planned L1 sub-deliverable.
 
 ### Manual download
 
