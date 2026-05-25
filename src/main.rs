@@ -58,6 +58,74 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Achievements(cmd) => run_achievements(cmd),
         #[cfg(feature = "telemetry")]
         Command::Account(cmd) => run_account(cmd),
+        Command::ScanHistory(cmd) => run_scan_history(cmd),
+    }
+}
+
+/// #38 v1 — CLI for inspecting + pruning the local scan history.
+/// Cross-platform; reads the same JSON files the GUI History tab
+/// surfaces.
+fn run_scan_history(cmd: superdeduper::cli::ScanHistoryCommand) -> anyhow::Result<()> {
+    use superdeduper::cli::{OutputFormat, ScanHistoryCommand};
+    use superdeduper::scan_history;
+
+    match cmd {
+        ScanHistoryCommand::List { format } => {
+            let records = scan_history::list()?;
+            match format {
+                OutputFormat::Json => {
+                    let json = serde_json::to_string_pretty(&records)?;
+                    println!("{json}");
+                }
+                OutputFormat::Csv => {
+                    // Light-touch CSV — id, ts, channel, files,
+                    // bytes_read, dups, reclaim, state. Mirrors the
+                    // record's user-relevant fields.
+                    println!("scan_id,started_at_unix,channel,total_files,total_bytes_read,total_dups,reclaimable_bytes,submission_state");
+                    for r in &records {
+                        println!(
+                            "{},{},{},{},{},{},{},{:?}",
+                            r.scan_id,
+                            r.started_at_unix,
+                            r.channel,
+                            r.total_files,
+                            r.total_bytes_read,
+                            r.total_dups,
+                            r.reclaimable_bytes,
+                            r.submission_state,
+                        );
+                    }
+                }
+                OutputFormat::Text | OutputFormat::Report => {
+                    if records.is_empty() {
+                        println!("No scans recorded.");
+                        return Ok(());
+                    }
+                    println!(
+                        "{:32}  {:10}  {:6}  {:>8}  {:>10}  {:>10}  state",
+                        "scan_id", "channel", "files", "dups", "reclaim", "started",
+                    );
+                    for r in &records {
+                        println!(
+                            "{:32}  {:10}  {:>6}  {:>8}  {:>10}  {:>10}  {:?}",
+                            r.scan_id,
+                            r.channel,
+                            r.total_files,
+                            r.total_dups,
+                            humansize::format_size(r.reclaimable_bytes, humansize::BINARY),
+                            r.started_at_unix,
+                            r.submission_state,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        ScanHistoryCommand::Delete { scan_id } => {
+            scan_history::delete(&scan_id)?;
+            println!("scan-history: removed (or absent) {scan_id}");
+            Ok(())
+        }
     }
 }
 
@@ -483,6 +551,16 @@ fn run_config(cmd: superdeduper::cli::ConfigCommand) -> anyhow::Result<()> {
                     println!("Run `superdeduper register` to enroll this install.");
                 }
             }
+            // Per #38 v1 testrunner Gap 1 — surface the scan-history
+            // directory so cross-platform path-resolution tests have
+            // one canonical query for "where does this install write
+            // scan records?" The dir might not exist yet (first scan
+            // creates it), but the resolved path is computable
+            // unconditionally.
+            match superdeduper::scan_history::history_dir() {
+                Ok(p) => println!("scan_history:    {}", p.display()),
+                Err(e) => println!("scan_history:    <resolution error: {e}>"),
+            }
             Ok(())
         }
         ConfigCommand::SetShare { value } => {
@@ -581,6 +659,13 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let cfg = ScanConfig::from_args(&args).context("invalid scan configuration")?;
 
     let scan_started = std::time::Instant::now();
+    // Wall-clock UNIX seconds for the scan_history record — same
+    // pattern as `gui::live::run()` so CLI + GUI scans both persist
+    // history rows with comparable timestamps.
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     // Tell the user which content-hash core is actually linked. For
     // BLAKE3 this is just the compile-time crate version; for
     // River5 it's whatever the upstream lib reports via
@@ -633,6 +718,10 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let (inventory, skipped) =
         inventory::enumerate_with_skipped(&cfg, cache.as_ref()).context("inventory failed")?;
     let inventory_ms = t_inventory.elapsed().as_millis();
+    // Capture #38 v1 history totals before `inventory` is consumed
+    // by `pipeline::grouping::group_by_size(inventory)` further down.
+    let history_total_files = inventory.len() as u64;
+    let history_total_bytes_read: u64 = inventory.iter().map(|f| f.size).sum();
     tracing::info!(
         count = inventory.len(),
         skipped = skipped.len(),
@@ -829,6 +918,39 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     };
     output::write(writer.as_mut(), cfg.format, &duplicates, &skipped)?;
     writer.flush()?;
+
+    // #38 v1 — persist a scan_history record so CLI scans show up
+    // in the same History tab the GUI populates. Best-effort: a
+    // failure to write the JSON file doesn't fail the scan (the
+    // user already got the results above). Same shape as the
+    // gui::live::run() hook so both paths emit identical records.
+    {
+        let total_dups = duplicates.len() as u64;
+        let reclaimable_bytes: u64 = duplicates
+            .iter()
+            .filter(|g| !g.link_equivalent)
+            .map(|g| g.unique_inodes.saturating_sub(1) * g.size)
+            .sum();
+        let channel_slug = superdeduper::channel::active_channel().as_slug();
+        let roots: Vec<String> = cfg
+            .roots
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let record = superdeduper::scan_history::ScanRecord::new_finished(
+            superdeduper::scan_history::new_scan_id(),
+            started_at_unix,
+            channel_slug,
+            roots,
+            history_total_files,
+            history_total_bytes_read,
+            total_dups,
+            reclaimable_bytes,
+        );
+        if let Err(e) = superdeduper::scan_history::record_completed(&record) {
+            tracing::warn!(error = %e, "scan_history: record_completed failed (non-fatal)");
+        }
+    }
 
     Ok(())
 }

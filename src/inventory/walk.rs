@@ -172,14 +172,18 @@ fn push_single_file_root<F>(
     callback(WalkEvent::FileFound { path, size });
 
     // Reparse-tag for cloud-placeholder classification matches the
-    // dir-walker path. On Linux + macOS this is always 0 / None; on
-    // Windows the metadata extension yields the actual reparse tag.
+    // dir-walker path's late-stage handling. On Linux + macOS the
+    // attrs are 0 and the tag is None (no reparse points to classify).
+    // On Windows pull file_attributes() from MetadataExt + fetch the
+    // reparse tag via winapi_wrappers if FILE_ATTRIBUTE_REPARSE_POINT
+    // (0x400) is set. Mirrors the per-entry block in `walk()` at
+    // lines ~419-438.
     #[cfg(windows)]
     let (attributes, reparse_tag) = {
         use std::os::windows::fs::MetadataExt;
         let attrs = metadata.file_attributes();
-        let tag = if attrs & 0x400 != 0 {
-            Some(metadata.reparse_tag())
+        let tag = if (attrs & 0x400) != 0 {
+            crate::winapi_wrappers::fetch_reparse_tag(path)
         } else {
             None
         };

@@ -220,7 +220,17 @@ pub fn list() -> io::Result<Vec<ScanRecord>> {
         }
         out.push(record);
     }
-    out.sort_by_key(|r| std::cmp::Reverse(r.started_at_unix));
+    // Sort: started_at desc, scan_id asc as a tiebreaker. Without
+    // the secondary key, N parallel scans within the same wall-clock
+    // second sort in undefined order (testrunner #38 v1 Gap 2 — they
+    // hit this in their orchestrator's mock with five concurrent
+    // scans). scan_id is a 32-hex random string, so lexical asc
+    // gives a stable + arbitrary tiebreak.
+    out.sort_by(|a, b| {
+        b.started_at_unix
+            .cmp(&a.started_at_unix)
+            .then_with(|| a.scan_id.cmp(&b.scan_id))
+    });
     Ok(out)
 }
 

@@ -90,6 +90,30 @@ pub enum Command {
     #[cfg(feature = "telemetry")]
     #[command(subcommand)]
     Account(AccountCommand),
+
+    /// #38 v1 — inspect or maintain the local scan history. Tester
+    /// surface; cross-validates the persistence layer without
+    /// requiring filesystem spelunking.
+    #[command(subcommand)]
+    ScanHistory(ScanHistoryCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScanHistoryCommand {
+    /// List past scans, newest first. Same content as the GUI
+    /// History tab, exposed for integration testing + scripting.
+    List {
+        /// Output format. `text` (default) is a column-aligned
+        /// table; `json` emits a top-level array of records.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Delete a scan history record by scan_id. Idempotent.
+    Delete {
+        /// The 32-hex scan_id from `scan-history list`.
+        #[arg(value_name = "SCAN_ID")]
+        scan_id: String,
+    },
 }
 
 /// G-track CLI subcommands for `superdeduper account`.
