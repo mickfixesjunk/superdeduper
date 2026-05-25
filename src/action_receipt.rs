@@ -33,7 +33,10 @@ use serde::{Deserialize, Serialize};
 /// produces zero receipts doesn't leave an empty file behind.
 pub enum ReceiptWriter {
     Stdout,
-    File { path: PathBuf, handle: Option<BufWriter<File>> },
+    File {
+        path: PathBuf,
+        handle: Option<BufWriter<File>>,
+    },
     /// Silent — `--integration-test-mode` not set; emit calls
     /// short-circuit to no-op. Lets callers always invoke `emit`
     /// without checking the flag first.
@@ -98,7 +101,10 @@ impl ReceiptWriter {
 
 impl Drop for ReceiptWriter {
     fn drop(&mut self) {
-        if let ReceiptWriter::File { handle: Some(h), .. } = self {
+        if let ReceiptWriter::File {
+            handle: Some(h), ..
+        } = self
+        {
             let _ = h.flush();
         }
     }
@@ -328,13 +334,7 @@ mod tests {
 
     #[test]
     fn error_receipt_carries_message() {
-        let r = ActionReceipt::error_for(
-            "delete-to-recycle",
-            "a",
-            "b",
-            1024,
-            "permission denied",
-        );
+        let r = ActionReceipt::error_for("delete-to-recycle", "a", "b", 1024, "permission denied");
         assert_eq!(r.outcome, "error");
         assert_eq!(r.error.as_deref(), Some("permission denied"));
     }
@@ -353,7 +353,10 @@ mod tests {
     fn receipt_serialises_as_single_line_json() {
         let r = ActionReceipt::new("delete-to-recycle", "/a/b.txt", "/a/c.txt", 2048);
         let line = serde_json::to_string(&r).unwrap();
-        assert!(!line.contains('\n'), "receipt must serialise without newlines");
+        assert!(
+            !line.contains('\n'),
+            "receipt must serialise without newlines"
+        );
         assert!(line.contains("\"schema\":\"superdeduper.action_receipt.v1\""));
         assert!(line.contains("\"action\":\"delete-to-recycle\""));
         assert!(line.contains("\"source_path\":\"/a/b.txt\""));
