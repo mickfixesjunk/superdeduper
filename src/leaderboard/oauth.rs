@@ -209,6 +209,12 @@ pub enum OauthError {
     /// string instead of an auth code. User declined consent,
     /// access_denied, etc.
     ProviderRejected(String),
+    /// Web's 409 `install_bound_elsewhere` — this install_id is
+    /// already linked to a different account server-side. User
+    /// needs to reset their install identity (or have an admin
+    /// clear the binding) before re-linking. Recoverable with
+    /// clear user guidance.
+    InstallAlreadyBound,
 }
 
 impl std::fmt::Display for OauthError {
@@ -234,6 +240,12 @@ impl std::fmt::Display for OauthError {
                 channel
             ),
             Self::ProviderRejected(d) => write!(f, "OAuth provider rejected: {d}"),
+            Self::InstallAlreadyBound => write!(
+                f,
+                "This machine is already linked to another account. Run \
+                 `superdeduper register --reset --channel <name>` to rotate \
+                 the install identity, then retry sign-in."
+            ),
         }
     }
 }
@@ -1059,6 +1071,12 @@ fn exchange_code(
                 "exchange_response_error_status: status={code} body={}",
                 truncate_for_log(&body, 1024)
             ));
+            // Recognise web's 409 `install_bound_elsewhere` as a
+            // specific actionable case — the GUI toast renders it
+            // with clear remediation instead of the raw JSON dump.
+            if code == 409 && body.contains("install_bound_elsewhere") {
+                return Err(OauthError::InstallAlreadyBound);
+            }
             Err(OauthError::BackendRejected { status: code, body })
         }
         Err(ureq::Error::Transport(t)) => Err(OauthError::BadCallback(format!(
