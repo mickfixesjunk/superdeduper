@@ -25,7 +25,7 @@ use crossbeam_channel::{Receiver, Sender};
 use egui::{CentralPanel, Frame, SidePanel, TopBottomPanel};
 
 use crate::cli::DedupeAction;
-use crate::gui::events::EngineEvent;
+use crate::gui::events::{EngineEvent, FileActionOutcome};
 use crate::gui::state::{RootEntry, ScanSettings, UiState};
 use crate::gui::widgets::groups_table::GroupAction;
 use crate::gui::widgets::resume_modal::ResumeChoice;
@@ -1864,6 +1864,13 @@ impl SuperdeduperApp {
                                     content_hash: hash.clone(),
                                     size: *size,
                                 });
+                                // #83 — file moved out of source
+                                // location; drop it from the table
+                                // (same disposition as Recycle/Remove).
+                                let _ = tx.send(EngineEvent::FileActionCompleted {
+                                    src: src.clone(),
+                                    outcome: FileActionOutcome::Removed,
+                                });
                             }
                             Err(e) => {
                                 // #80 Bug C — bucket the failure by
@@ -2125,6 +2132,13 @@ impl SuperdeduperApp {
                             Ok(()) => {
                                 done += 1;
                                 renamed_paths.push(d.clone());
+                                // #83 — emit per-file completion so
+                                // the groups table updates in place.
+                                let new_path = safe_renamed_path(d);
+                                let _ = tx.send(EngineEvent::FileActionCompleted {
+                                    src: d.clone(),
+                                    outcome: FileActionOutcome::Renamed { new_path },
+                                });
                             }
                             Err(e) => {
                                 let msg = e.to_string();
@@ -2380,7 +2394,18 @@ impl SuperdeduperApp {
                             ))),
                         };
                         match r {
-                            Ok(()) => done += 1,
+                            Ok(()) => {
+                                done += 1;
+                                // #83 — bulk-destructive only runs
+                                // Recycle / Remove; both vanish the
+                                // source path. Hardlink/Reflink/etc.
+                                // go through run_action_threaded and
+                                // emit their own outcome there.
+                                let _ = tx.send(EngineEvent::FileActionCompleted {
+                                    src: d.clone(),
+                                    outcome: FileActionOutcome::Removed,
+                                });
+                            }
                             Err(e) => {
                                 failed += 1;
                                 let _ = tx.send(EngineEvent::Log {
@@ -2448,6 +2473,30 @@ impl SuperdeduperApp {
                             done += 1;
                             if matches!(action, DedupeAction::SafeRename) {
                                 renamed_paths.push(d.clone());
+                            }
+                            // #83 — emit per-file completion so the
+                            // groups table updates immediately. Map
+                            // each DedupeAction to its outcome
+                            // disposition; SafeRename carries the
+                            // new path (computed via the same suffix
+                            // rule action_safe_rename uses).
+                            let outcome = match action {
+                                DedupeAction::SafeRename => {
+                                    let new_path = safe_renamed_path(d);
+                                    Some(FileActionOutcome::Renamed { new_path })
+                                }
+                                DedupeAction::Recycle | DedupeAction::Remove => {
+                                    Some(FileActionOutcome::Removed)
+                                }
+                                DedupeAction::Hardlink | DedupeAction::Reflink => {
+                                    Some(FileActionOutcome::StorageDeduplicated)
+                                }
+                            };
+                            if let Some(outcome) = outcome {
+                                let _ = tx.send(EngineEvent::FileActionCompleted {
+                                    src: d.clone(),
+                                    outcome,
+                                });
                             }
                         }
                         Err(e) => {
@@ -3389,6 +3438,22 @@ fn reveal_in_explorer(_path: &std::path::Path) {}
 fn open_file_default_app(_path: &std::path::Path) {}
 #[cfg(not(windows))]
 fn open_enclosing_folder(_path: &std::path::Path) {}
+
+/// #83 — Compute the post-SafeRename path for `src`. Mirrors the
+/// rule `crate::dedupe::safe_rename_unguarded` uses (append the
+/// `.superdeduper` suffix to the filename) so the GUI table can
+/// pre-emit the new path before the actual rename completes
+/// without round-tripping through dedupe.rs internals. Kept
+/// separate to avoid pulling the dedupe::safe_rename_unguarded
+/// signature change into this PR.
+fn safe_renamed_path(src: &Path) -> PathBuf {
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let new_name = format!("{name}{}", crate::dedupe::SAFE_RENAME_SUFFIX);
+    src.with_file_name(new_name)
+}
 
 /// #80 — Move `src` to `archived`, falling back to copy+remove when
 /// rename fails (cross-device OR delete-on-source denied). If the

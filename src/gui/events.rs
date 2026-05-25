@@ -213,6 +213,37 @@ pub enum EngineEvent {
     /// status-line message; this carries the rollup separately so
     /// the modal renders without needing to parse the status string.
     ArchiveActionSummary(crate::gui::archive::ArchiveActionSummary),
+    /// #83 — Per-file completion event from any Go-action worker
+    /// (SafeRename / Hardlink / Reflink / Recycle / Remove /
+    /// Archive). The handler updates `state.duplicates` so the
+    /// groups table reflects the post-action state immediately
+    /// instead of waiting for a re-scan. Identified by source path
+    /// because the workers filter + reorder groups internally and
+    /// don't preserve positional indices back to the in-memory
+    /// `state.duplicates`; path is the stable join key.
+    FileActionCompleted {
+        src: PathBuf,
+        outcome: FileActionOutcome,
+    },
+}
+
+/// #83 — Disposition of a single file after a Go-action worker
+/// finished with it. The handler in `state.rs` applies the
+/// per-outcome update to the matching `DuplicateGroup` entry.
+#[derive(Clone, Debug)]
+pub enum FileActionOutcome {
+    /// SafeRename: file is at `new_path` now; the old path is gone.
+    /// Group's reclaim figure unchanged.
+    Renamed { new_path: PathBuf },
+    /// Hardlink / Reflink: file still at `src`, but the bytes are
+    /// shared with the keeper. Group's reclaim figure should drop
+    /// to 0 once every dupe is flagged; UI may surface a small
+    /// "shared" badge on the row.
+    StorageDeduplicated,
+    /// Recycle / Remove / Archive: file no longer at `src`. Drop
+    /// the entry from the group; if the group falls below 2 files,
+    /// drop the whole group.
+    Removed,
 }
 
 /// Coarse "what's the engine doing right now" tag. Drives the
