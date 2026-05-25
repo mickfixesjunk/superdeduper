@@ -69,8 +69,8 @@ jobs:
       - name: Build (locked, release)
         shell: pwsh
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} --bin superdeduper
-          cargo build --release --locked --target ${{ matrix.target }} --features "gui audio" --bin superdeduper-gui
+          cargo build --release --locked --target ${{ matrix.target }} --features "telemetry similar-images similar-audio" --bin superdeduper
+          cargo build --release --locked --target ${{ matrix.target }} --features "gui telemetry audio similar-images similar-audio" --bin superdeduper-gui
 
       - name: Stage artifacts
         shell: pwsh
@@ -196,8 +196,8 @@ jobs:
         # static-link clean against musl in practice; CLI + GUI
         # ship without the scan-done chime on Linux.
         run: |
-          cargo build --release --locked --target x86_64-unknown-linux-musl --bin superdeduper
-          cargo build --release --locked --target x86_64-unknown-linux-musl --features "gui" --bin superdeduper-gui
+          cargo build --release --locked --target x86_64-unknown-linux-musl --features "telemetry similar-images similar-audio" --bin superdeduper
+          cargo build --release --locked --target x86_64-unknown-linux-musl --features "gui telemetry similar-images similar-audio" --bin superdeduper-gui
 
       - name: Stage artifacts
         run: |
@@ -310,8 +310,8 @@ jobs:
         # builds cleanly. Cross-platform scan-done chime is a
         # follow-up.
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} --bin superdeduper
-          cargo build --release --locked --target ${{ matrix.target }} --features "gui" --bin superdeduper-gui
+          cargo build --release --locked --target ${{ matrix.target }} --features "telemetry similar-images similar-audio" --bin superdeduper
+          cargo build --release --locked --target ${{ matrix.target }} --features "gui telemetry similar-images similar-audio" --bin superdeduper-gui
 
       - name: Stage artifacts
         run: |
