@@ -330,7 +330,7 @@ mod tests {
         }
         assert_eq!(p.components().count(), 15);
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -346,7 +346,7 @@ mod tests {
         }
         assert_eq!(p.components().count(), 14);
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -360,7 +360,7 @@ mod tests {
     fn git_repo_detected_grants_on_dot_git_component() {
         let p = PathBuf::from("project/.git/objects/abc");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -373,7 +373,7 @@ mod tests {
         // Should NOT match — .gitignore is not the `.git/` dir.
         let p = PathBuf::from("project/.gitignore");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -385,7 +385,7 @@ mod tests {
     fn git_repo_detected_misses_when_no_git() {
         let p = PathBuf::from("project/src/main.rs");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -401,7 +401,7 @@ mod tests {
         let mtimes = vec![Some(1_245_024_000_i64)];
         let p = PathBuf::from("ancient.txt");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             mtimes_unix_secs: Some(&mtimes),
@@ -416,7 +416,7 @@ mod tests {
         let mtimes = vec![Some(1_420_070_400_i64)];
         let p = PathBuf::from("recent.txt");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             mtimes_unix_secs: Some(&mtimes),
@@ -429,7 +429,7 @@ mod tests {
     fn time_capsule_short_circuits_without_mtimes() {
         let p = PathBuf::from("anything.txt");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             mtimes_unix_secs: None,
@@ -494,7 +494,7 @@ mod tests {
         let mtimes = vec![Some(six_years_ago)];
         let p = PathBuf::from("/home/user/Downloads/installer.exe");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             mtimes_unix_secs: Some(&mtimes),
@@ -513,7 +513,7 @@ mod tests {
         let mtimes = vec![Some(two_years_ago)];
         let p = PathBuf::from("/home/user/Downloads/installer.exe");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             mtimes_unix_secs: Some(&mtimes),
@@ -527,7 +527,7 @@ mod tests {
         let mtimes = vec![Some(0_i64)]; // 1970
         let p = PathBuf::from("/home/user/Documents/old.txt");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             mtimes_unix_secs: Some(&mtimes),
@@ -543,7 +543,7 @@ mod tests {
         // Latin + Cyrillic + Han = 3 distinct scripts in one path.
         let p = PathBuf::from("photos/привет/世界/hello.jpg");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -556,7 +556,7 @@ mod tests {
         // Latin + Cyrillic only = 2 distinct scripts.
         let p = PathBuf::from("photos/привет/hello.jpg");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -572,7 +572,7 @@ mod tests {
         // dashes, slashes, dots). Should be 1 script = no grant.
         let p = PathBuf::from("Downloads/installer-1.2.3-x86_64.exe");
         let paths: Vec<&Path> = vec![&p];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
@@ -591,7 +591,7 @@ mod tests {
         let p1 = PathBuf::from("a/привет/世界/مرحبا/file.txt");
         let p2 = PathBuf::from("b/plain-path.txt");
         let paths: Vec<&Path> = vec![&p1, &p2];
-        let path_refs: Vec<&Path> = paths.iter().map(|x| *x).collect();
+        let path_refs: Vec<&Path> = paths.to_vec();
         let ctx = PredicateContext {
             all_paths: &path_refs,
             ..ctx_empty()
