@@ -181,6 +181,14 @@ pub struct UiState {
     pub stage_counts: HashMap<Stage, StageCounter>,
     pub drives: HashMap<DriveId, DriveLive>,
     pub duplicates: Vec<DuplicateGroupSummary>,
+    /// Identity index for `self.duplicates`. The #39 fix needs to
+    /// dedupe `DuplicateFound` events against already-known
+    /// content_hashes; a `HashSet` keeps that check O(1) per event
+    /// (vs O(n) on `self.duplicates.iter().any(...)`). Without this,
+    /// accumulating N groups becomes O(N²) — the #40 perf hit on
+    /// 26K+-group scans. Membership must stay in lockstep with the
+    /// `duplicates` Vec; every push here pushes there + vice versa.
+    pub duplicate_hashes: hashbrown::HashSet<String>,
     pub totals: Totals,
     pub logs: VecDeque<LogEntry>,
     pub overall: OverallProgress,
@@ -202,6 +210,7 @@ impl Default for UiState {
             stage_counts: HashMap::new(),
             drives: HashMap::new(),
             duplicates: Vec::new(),
+            duplicate_hashes: hashbrown::HashSet::new(),
             totals: Totals::default(),
             logs: VecDeque::new(),
             overall: OverallProgress::default(),
@@ -382,20 +391,23 @@ impl UiState {
             EngineEvent::DuplicateFound(g) => {
                 // #39 fix — on resume the App's `adopt_resume_state`
                 // populates `self.duplicates` from the on-disk
-                // checkpoint BEFORE the engine spawns; the engine then
-                // re-emits the same groups via DuplicateFound to keep
-                // the streaming-event surface uniform. Without this
-                // de-dupe check, every resumed group would be counted
-                // twice in `totals.duplicates` + appear twice in the
-                // Groups table. Content_hash is the right identity:
-                // it's the BLAKE3 hex for byte-identical groups +
-                // the synthetic `perceptual-{fp}` token for Tier-4
-                // groups; both are stable across the resume hand-off.
-                if self
-                    .duplicates
-                    .iter()
-                    .any(|prev| prev.content_hash == g.content_hash)
-                {
+                // checkpoint BEFORE the engine spawns; the engine
+                // then re-emits the same groups via DuplicateFound
+                // to keep the streaming-event surface uniform.
+                // Without de-dupe, every resumed group would be
+                // counted twice in `totals.duplicates` + appear
+                // twice in the Groups table. Content_hash is the
+                // right identity: BLAKE3 hex for byte-identical;
+                // `perceptual-{fp}` token for Tier-4. Both are
+                // stable across the resume hand-off.
+                //
+                // #40 perf — the dedupe check MUST be O(1), not the
+                // earlier O(n) `iter().any(...)` scan. With 26K+
+                // groups accumulating per scan, the linear check made
+                // state.apply O(n²) for the population phase — Mick's
+                // "sluggish during dupe population" symptom. HashSet
+                // membership is constant-time.
+                if !self.duplicate_hashes.insert(g.content_hash.clone()) {
                     return;
                 }
                 self.totals.duplicates = self.totals.duplicates.saturating_add(1);
@@ -728,10 +740,11 @@ mod inode_aware_tests {
 
         // Simulate adopt_resume_state's behaviour — push the prior
         // groups directly into state without going through apply,
-        // bumping totals as adopt does.
+        // bumping totals + the dedupe index as adopt does.
         for g in [&g_a, &g_b] {
             state.totals.duplicates += 1;
             state.totals.reclaimable_bytes += inode_aware_savings(g);
+            state.duplicate_hashes.insert(g.content_hash.clone());
             state.duplicates.push(g.clone());
         }
         assert_eq!(state.totals.duplicates, 2);

@@ -313,6 +313,12 @@ impl SuperdeduperApp {
                     .totals
                     .reclaimable_bytes
                     .saturating_add(crate::gui::state::inode_aware_savings(&g));
+                // Keep `duplicate_hashes` in lockstep with the
+                // `duplicates` Vec — the state.apply DuplicateFound
+                // dedupe path uses this index, so an out-of-band push
+                // here must register the hash too. Otherwise the
+                // engine's resume-replay would count this group again.
+                self.state.duplicate_hashes.insert(g.content_hash.clone());
                 self.state.duplicates.push(g);
             }
             self.state.push_log(
@@ -354,6 +360,9 @@ impl SuperdeduperApp {
                 .totals
                 .reclaimable_bytes
                 .saturating_add(crate::gui::state::inode_aware_savings(g));
+            // Keep duplicate_hashes synced — see #39/#40 fix in
+            // state.rs's DuplicateFound handler.
+            self.state.duplicate_hashes.insert(g.content_hash.clone());
             self.state.duplicates.push(g.clone());
         }
         self.state.push_log(
@@ -1050,6 +1059,8 @@ impl SuperdeduperApp {
                         .totals
                         .reclaimable_bytes
                         .saturating_add(crate::gui::state::inode_aware_savings(&g));
+                    // Keep duplicate_hashes synced.
+                    self.state.duplicate_hashes.insert(g.content_hash.clone());
                     self.state.duplicates.push(g);
                 }
                 self.current_project_path = Some(dir.to_path_buf());
