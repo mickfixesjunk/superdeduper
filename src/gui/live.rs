@@ -1828,10 +1828,8 @@ fn order_keeper_first(files: Vec<PathBuf>, strategy: crate::cli::KeepStrategy) -
     if matches!(strategy, First | Interactive) {
         return files;
     }
-    let mtimes: Vec<Option<std::time::SystemTime>> = files
-        .iter()
-        .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
-        .collect();
+    let mtimes: Vec<Option<std::time::SystemTime>> =
+        files.iter().map(|p| crate::keep::file_mtime(p)).collect();
     let keeper_idx = match strategy {
         Smart | InReference => crate::keep::pick_keeper(&files, &mtimes),
         Oldest => mtimes
