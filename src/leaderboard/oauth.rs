@@ -171,6 +171,16 @@ pub struct OauthToken {
     /// (shouldn't happen, but the assertion guards against bugs).
     #[serde(default)]
     pub linked_install_id: String,
+    /// Discord avatar hash from `/users/@me` (hex string; null when
+    /// the user hasn't set an avatar). Web's profile v1.5 renders
+    /// `https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png`
+    /// when present. Engine forwards whatever the leaderboard's
+    /// exchange response carries — capture is web-side. `None` for
+    /// Google links + for Discord users who haven't set an avatar.
+    /// `#[serde(default)]` so existing oauth.{channel}.json files
+    /// load as `None` after this field lands.
+    #[serde(default)]
+    pub discord_avatar_hash: Option<String>,
 }
 
 /// Errors surfaced by the OAuth flow. Each variant carries the
@@ -1538,6 +1548,11 @@ pub fn parse_callback_body(provider: Provider, body: &str) -> Result<OauthToken,
         account_id: String,
         #[serde(default)]
         linked_install_id: String,
+        /// Web's profile-v1.5 surface (2026-05-25T09:12Z): Discord
+        /// avatar hash from `/users/@me`. Absent on Google + on
+        /// Discord users with no avatar set; serde tolerates both.
+        #[serde(default)]
+        discord_avatar_hash: Option<String>,
     }
     let parsed: CallbackBody = serde_json::from_str(body)
         .map_err(|e| OauthError::BadCallback(format!("json parse: {e}")))?;
@@ -1549,6 +1564,7 @@ pub fn parse_callback_body(provider: Provider, body: &str) -> Result<OauthToken,
         display_name: parsed.display_name,
         account_id: parsed.account_id,
         linked_install_id: parsed.linked_install_id,
+        discord_avatar_hash: parsed.discord_avatar_hash,
     })
 }
 
@@ -1700,6 +1716,7 @@ mod tests {
             display_name: "Mick".into(),
             account_id: "acct-123".into(),
             linked_install_id: "fec94a96-...".into(),
+            discord_avatar_hash: None,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: OauthToken = serde_json::from_str(&s).unwrap();
