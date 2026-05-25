@@ -226,6 +226,36 @@ pub fn show_filtered(
         return clicked;
     }
 
+    // #78 — perceptual-image precision advisory. Until the BK-tree-v3
+    // + centroid-bounded merge rewrite lands (deferred to v0.3.x),
+    // Tier-4 grouping uses plain union-find over a Hamming-threshold
+    // edge graph, which chain-merges unrelated clusters via fluke
+    // edges at large corpus scale. Surface that honestly so users
+    // review groups before destructive action.
+    let has_perceptual_group = sorted.iter().any(|(_, g)| {
+        matches!(
+            g.similarity_kind,
+            crate::pipeline::SimilarityKind::PerceptualImage
+        )
+    });
+    if has_perceptual_group {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Note:")
+                    .color(theme::TEXT_LO)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(
+                    "Tier-4 perceptual similarity may produce false positives at scale; \
+                     review group contents before destructive action.",
+                )
+                .color(theme::TEXT_LO),
+            );
+        });
+        ui.add_space(4.0);
+    }
+
     // Bulk safe-rename header row — one button to safe-rename every
     // non-keeper across every visible group. Reversible via the
     // Unsuperdeduper button in the Roots panel; never deletes anything.

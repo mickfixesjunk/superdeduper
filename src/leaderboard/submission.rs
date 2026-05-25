@@ -99,6 +99,14 @@ pub struct RunShape {
     /// by backend to grant "name-collider".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name_collision_count: Option<u64>,
+    /// Count of distinct network-share roots in this scan's scope
+    /// (Windows UNC `\\server\share`, `smb://...`, `nfs://...`).
+    /// Backend uses this to grant the latent `multi-share-maestro`
+    /// achievement. Counted at root-resolution time so the value
+    /// reflects the user's *requested* scope, not whether files were
+    /// actually read from those shares.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub share_count_in_scope: Option<u64>,
 }
 
 /// `result_summary` block per backend schema.
@@ -932,6 +940,7 @@ mod tests {
                 zero_byte_group_max: None,
                 max_hardlink_count_in_scan: None,
                 name_collision_count: None,
+                share_count_in_scope: None,
             },
             result_summary: ResultSummary {
                 duplicate_groups: 42,

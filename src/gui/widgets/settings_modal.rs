@@ -2338,6 +2338,7 @@ fn build_sample_payload_json() -> String {
             zero_byte_group_max: None,
             max_hardlink_count_in_scan: None,
             name_collision_count: None,
+            share_count_in_scope: None,
         },
         result_summary: submission::ResultSummary {
             duplicate_groups: 18_204,
