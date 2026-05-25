@@ -327,6 +327,49 @@ fn run(
     }
     let seek_penalties = Arc::new(seek_penalties);
 
+    // #61 — Write a "scan in flight" marker checkpoint to disk
+    // BEFORE Stage 1 starts. Without this, a mid-inventory kill
+    // leaves NOTHING on disk for the next launch's Resume modal
+    // to detect — the engine silently re-walks from scratch and
+    // the user has no idea the prior session ever existed. The
+    // marker holds the current roots + settings + empty
+    // saved_inventory + empty previous_duplicates. On the next
+    // launch, `gui::app::SuperdeduperApp::new()` detects the
+    // marker via `checkpoint::summary` and pops the existing
+    // Resume / Start Fresh modal — the modal already renders
+    // "inventory not yet saved" gracefully when has_saved_inventory
+    // is false.
+    //
+    // User experience:
+    //   * Resume → engine relaunches; marker found but has no
+    //     saved_inventory → walker starts from scratch (no actual
+    //     state to resume to mid-inventory; the marker only buys
+    //     the modal surface). This is honest — incremental
+    //     mid-walk checkpoint saves are a separate, larger fix
+    //     (periodic saves during the walker callback).
+    //   * Start Fresh → marker archived to .bak; fresh launch.
+    //
+    // Resume from a marker is identical in code path to Start
+    // Fresh — both lead to "walker runs from scratch." The
+    // difference is purely UX: the user knows the prior session
+    // existed instead of being silently re-walked.
+    //
+    // Resume case (prior had real state): checkpoint_state was
+    // already hydrated from prior.previous_duplicates +
+    // prior.saved_inventory above. Re-saving here is idempotent
+    // — overwrites the same content, doesn't lose anything.
+    if let Some(p) = &checkpoint_path {
+        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Warn,
+                message: format!(
+                    "pre-inventory marker checkpoint save failed: {e} \
+                     (mid-inventory kills won't surface a Resume modal)"
+                ),
+            });
+        }
+    }
+
     // ---------------- Stage 1: inventory ----------------
     // Resume fast-path: if we have saved_inventory from a prior
     // run, skip the walk entirely. Pre-this-block we always walked
