@@ -715,20 +715,24 @@ fn render_safety(ui: &mut egui::Ui, settings: &mut ScanSettings) {
     let bypass_on = settings.bypass_destructive_confirmation;
     let bypass_check = ui.checkbox(
         &mut settings.bypass_destructive_confirmation,
-        RichText::new("Bypass \"type DELETE\" confirmation").color(if bypass_on {
+        RichText::new("Bypass action-confirmation prompts").color(if bypass_on {
             theme::HOT
         } else {
             theme::TEXT_HI
         }),
     );
     bypass_check.on_hover_text(
-        "OFF (default): every Recycle / Hardlink / Safe-rename action shows a \
-         modal asking you to type \"DELETE\" before it fires.\n\n\
-         ON: actions fire immediately on click — no prompt. Use only when you \
-         trust the dedup picks (eg. running Smart-keep against the same corpus \
-         repeatedly and reviewing results before clicking each action).\n\n\
-         Reveal-in-Explorer and Unsuperdeduper never prompt regardless of this \
-         setting — Reveal touches nothing, and Unsuperdeduper is a reversal.",
+        "OFF (default): every destructive action shows a modal asking you to \
+         type the matching verb before it fires (DELETE for Recycle / Nuke, \
+         RENAME for Safe-rename, ARCHIVE for Archive (Move), HARDLINK for \
+         Hardlink).\n\n\
+         ON: actions fire immediately on click — no prompt. Use only when \
+         you trust the dedup picks (eg. running Smart-keep against the same \
+         corpus repeatedly and reviewing results before clicking each \
+         action).\n\n\
+         Reveal-in-Explorer, Unsuperdeduper, and Archive (Copy) never prompt \
+         regardless of this setting — Reveal touches nothing, Unsuperdeduper \
+         is a reversal, and Archive (Copy) doesn't touch the source files.",
     );
     if settings.bypass_destructive_confirmation {
         ui.label(

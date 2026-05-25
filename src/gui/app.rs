@@ -26,6 +26,16 @@ use egui::{CentralPanel, Frame, SidePanel, TopBottomPanel};
 
 use crate::cli::DedupeAction;
 use crate::gui::events::{EngineEvent, FileActionOutcome};
+
+/// #90 — Archive mode the user picked at dispatch time. Move
+/// reclaims source bytes (same as pre-#90 behavior); Copy leaves
+/// the source file in place + skips the action-confirm modal
+/// because nothing is destroyed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ArchiveMode {
+    Move,
+    Copy,
+}
 use crate::gui::state::{RootEntry, ScanSettings, UiState};
 use crate::gui::widgets::groups_table::GroupAction;
 use crate::gui::widgets::resume_modal::ResumeChoice;
@@ -1845,7 +1855,9 @@ impl SuperdeduperApp {
     /// kick off `run_archive_dupes_threaded`. The folder picker call
     /// is blocking but cheap (a few hundred ms), and is on the UI
     /// thread on purpose so the dialog parents to the app window.
-    fn pick_archive_dest_and_run(&mut self) {
+    /// #90: `mode` distinguishes Move (reclaim source) from Copy
+    /// (leave source intact, no reclaim, no confirm gate).
+    fn pick_archive_dest_and_run(&mut self, mode: ArchiveMode) {
         if self.state.duplicates.is_empty() {
             self.state.push_log(
                 crate::gui::events::LogLevel::Warn,
@@ -1853,21 +1865,25 @@ impl SuperdeduperApp {
             );
             return;
         }
+        let title = match mode {
+            ArchiveMode::Move => "Pick a folder to archive duplicates into (Move — reclaims source)",
+            ArchiveMode::Copy => "Pick a folder to copy duplicates into (Copy — source untouched)",
+        };
         let dest = match rfd::FileDialog::new()
-            .set_title("Pick a folder to archive duplicates into")
+            .set_title(title)
             .pick_folder()
         {
             Some(p) => p,
             None => return, // user cancelled the dialog
         };
-        self.run_archive_dupes_threaded(dest);
+        self.run_archive_dupes_threaded(dest, mode);
     }
 
     /// Move every non-keeper, non-reference duplicate into `dest`,
     /// preserving its original drive-letter + folder hierarchy under
     /// `dest`. Writes a JSON manifest beside the archived files so a
     /// future restore can move them back. Runs off the UI thread.
-    fn run_archive_dupes_threaded(&self, dest: std::path::PathBuf) {
+    fn run_archive_dupes_threaded(&self, dest: std::path::PathBuf, mode: ArchiveMode) {
         self.action_cancel.store(false, Ordering::Relaxed);
         let cancel = Arc::clone(&self.action_cancel);
         let tx = self.tx.clone();
@@ -1914,9 +1930,17 @@ impl SuperdeduperApp {
         std::thread::Builder::new()
             .name("superdeduper-archive".into())
             .spawn(move || {
+                let mode_emoji = match mode {
+                    ArchiveMode::Move => "📦",
+                    ArchiveMode::Copy => "📋",
+                };
+                let mode_verb = match mode {
+                    ArchiveMode::Move => "Archive (Move)",
+                    ArchiveMode::Copy => "Archive (Copy)",
+                };
                 let _ = tx.send(EngineEvent::ActionStarted {
                     name: format!(
-                        "📦 Archive · {} file(s) from {} group(s) → {}",
+                        "{mode_emoji} {mode_verb} · {} file(s) from {} group(s) → {}",
                         total,
                         groups.len(),
                         dest.display()
@@ -1964,18 +1988,25 @@ impl SuperdeduperApp {
                         // #80: orphan-copy cleanup on delete-fail.
                         // See `try_archive_move` for the full move-
                         // or-copy-with-cleanup logic.
-                        let tx_for_cleanup = tx.clone();
-                        let archived_for_log = archived.clone();
-                        let move_result = try_archive_move(src, &archived, |cleanup_err| {
-                            let _ = tx_for_cleanup.send(EngineEvent::Log {
-                                level: crate::gui::events::LogLevel::Warn,
-                                message: format!(
-                                    "archive: orphan-copy cleanup failed · {} · {cleanup_err}",
-                                    archived_for_log.display()
-                                ),
-                            });
-                        });
-                        match move_result {
+                        // #90: ArchiveMode::Copy bypasses the
+                        // move entirely — pure copy, source kept.
+                        let archive_result = match mode {
+                            ArchiveMode::Move => {
+                                let tx_for_cleanup = tx.clone();
+                                let archived_for_log = archived.clone();
+                                try_archive_move(src, &archived, |cleanup_err| {
+                                    let _ = tx_for_cleanup.send(EngineEvent::Log {
+                                        level: crate::gui::events::LogLevel::Warn,
+                                        message: format!(
+                                            "archive: orphan-copy cleanup failed · {} · {cleanup_err}",
+                                            archived_for_log.display()
+                                        ),
+                                    });
+                                })
+                            }
+                            ArchiveMode::Copy => std::fs::copy(src, &archived).map(|_| ()),
+                        };
+                        match archive_result {
                             Ok(()) => {
                                 summary.moved_count += 1;
                                 summary.moved_bytes += *size;
@@ -1986,13 +2017,16 @@ impl SuperdeduperApp {
                                     content_hash: hash.clone(),
                                     size: *size,
                                 });
-                                // #83 — file moved out of source
-                                // location; drop it from the table
-                                // (same disposition as Recycle/Remove).
-                                let _ = tx.send(EngineEvent::FileActionCompleted {
-                                    src: src.clone(),
-                                    outcome: FileActionOutcome::Removed,
-                                });
+                                // #83 — for Move, file is gone from
+                                // source: drop from table. For Copy,
+                                // source is intact: don't drop from
+                                // the table.
+                                if matches!(mode, ArchiveMode::Move) {
+                                    let _ = tx.send(EngineEvent::FileActionCompleted {
+                                        src: src.clone(),
+                                        outcome: FileActionOutcome::Removed,
+                                    });
+                                }
                             }
                             Err(e) => {
                                 // #80 Bug C — bucket the failure by
@@ -2067,7 +2101,13 @@ impl SuperdeduperApp {
                     ),
                 });
                 let _ = tx.send(EngineEvent::ActionFinished {
-                    summary: format!("Archive {label} · {moved} moved, {failed} failed."),
+                    summary: format!(
+                        "{mode_verb} {label} · {moved} {} / {failed} failed.",
+                        match mode {
+                            ArchiveMode::Move => "moved",
+                            ArchiveMode::Copy => "copied",
+                        },
+                    ),
                 });
                 // #80 Bug C — hand the structured rollup to the GUI
                 // so the post-archive modal can show the moved-vs-
@@ -2075,14 +2115,22 @@ impl SuperdeduperApp {
                 // byte total. Sent AFTER ActionFinished so the
                 // status line is already settled when the modal
                 // opens.
-                let _ = tx.send(EngineEvent::ArchiveActionSummary(summary));
+                //
+                // #90 — Only emit for Move. ArchiveCopy's "moved
+                // bytes" aren't really reclaimed (source intact);
+                // emitting would falsely credit `archived_bytes`
+                // to the leaderboard via #79's PATCH hook.
+                if matches!(mode, ArchiveMode::Move) {
+                    let _ = tx.send(EngineEvent::ArchiveActionSummary(summary));
+                }
             })
             .expect("spawn archive thread");
     }
 
-    /// Gate destructive group actions on the "type DELETE" modal
-    /// (unless the user has explicitly opted to bypass via Settings →
-    /// Safety). Reveal-in-Explorer is non-destructive and fires
+    /// Gate destructive group actions on the action-confirmation
+    /// modal (unless the user has explicitly opted to bypass via
+    /// Settings → Safety). Reveal-in-Explorer is non-destructive
+    /// and fires
     /// immediately; everything else stashes into `pending_destructive`
     /// for the modal in `update()` to handle.
     fn dispatch_group_action(&mut self, action: GroupAction) {
@@ -2096,6 +2144,10 @@ impl SuperdeduperApp {
                 | GroupAction::RecycleAllVisible
                 | GroupAction::NukeAllVisible
         );
+        // #90 — ArchiveCopy is intentionally non-destructive: the
+        // source file stays in place + no reclaim happens. Skip
+        // the action-confirm modal because nothing's being
+        // destroyed.
         // Reveal / Open* touch nothing — bypass the modal
         // unconditionally. They're navigational, not destructive.
         // PromoteKeeper is also non-destructive (in-memory swap) and
@@ -2132,6 +2184,8 @@ impl SuperdeduperApp {
         action: GroupAction,
         confirmed_destructive: bool,
     ) {
+        // #85 / #90: ArchiveCopy is intentionally NOT in this
+        // list — it skips the type-to-confirm gate by design.
         let is_destructive = matches!(
             action,
             GroupAction::RecycleOthers { .. }
@@ -2172,7 +2226,15 @@ impl SuperdeduperApp {
                 // prompt for a destination folder, then dispatch the
                 // archive worker. `pick_archive_dest_and_run` handles
                 // the picker + the threaded run.
-                self.pick_archive_dest_and_run();
+                self.pick_archive_dest_and_run(ArchiveMode::Move);
+            }
+            GroupAction::ArchiveCopyAllVisible => {
+                // #90 — Copy-only variant: source files untouched,
+                // no reclaim, no confirm modal (handled by the
+                // dispatcher's is_destructive gate). Reuses the
+                // same picker + worker pipeline as Move with a
+                // mode flag.
+                self.pick_archive_dest_and_run(ArchiveMode::Copy);
             }
             GroupAction::RecycleAllVisible => {
                 self.run_bulk_destructive_threaded(DedupeAction::Recycle, "♻ Recycle");
@@ -3015,15 +3077,16 @@ impl eframe::App for SuperdeduperApp {
                     .small(),
                 );
                 ui.add_space(10.0);
+                let required_word = required_confirm_word(&action);
                 ui.label(
-                    egui::RichText::new("Type DELETE to confirm:")
+                    egui::RichText::new(format!("Type {required_word} to confirm:"))
                         .color(theme::TEXT_HI)
                         .strong(),
                 );
                 ui.text_edit_singleline(&mut self.destructive_confirm_input);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let can_confirm = self.destructive_confirm_input == "DELETE";
+                    let can_confirm = self.destructive_confirm_input == required_word;
                     if ui
                         .add_enabled(
                             can_confirm,
@@ -3562,6 +3625,40 @@ fn check_resumable(persisted: &PersistedAppState) -> bool {
     }
 }
 
+/// #85 — Required confirm word for the destructive-action modal.
+/// Verb-per-action: muscle-memory "DELETE" was the v0.2.8 default
+/// for every variant; v0.2.9 makes the user type the matching
+/// verb so the autopilot is broken between e.g. SafeRename and
+/// Nuke. The same helper drives both the prompt label AND the
+/// equality check so they can never drift.
+///
+/// Hardlink uses HARDLINK (literal action, not REPLACE) per the
+/// engine-picks-the-idiom note in #85's spec; if a future
+/// usability pass argues for a different word, change here and
+/// the prompt + check follow.
+fn required_confirm_word(action: &GroupAction) -> &'static str {
+    match action {
+        // Destructive: actually-deletes-from-source variants.
+        GroupAction::RecycleOthers { .. }
+        | GroupAction::RecycleAllVisible
+        | GroupAction::NukeAllVisible => "DELETE",
+        // Reversible-via-Unsuperdeduper.
+        GroupAction::SafeRenameOthers { .. } | GroupAction::SafeRenameAllVisible => "RENAME",
+        // Move-archive: reclaims source bytes (copy variant bypasses
+        // this modal entirely; see dispatch_group_action's
+        // is_destructive check).
+        GroupAction::ArchiveAllVisible => "ARCHIVE",
+        // Hardlink: replaces dupe with a hardlink to the keeper;
+        // the source path remains but its inode flips to the
+        // keeper's.
+        GroupAction::HardlinkOthers { .. } => "HARDLINK",
+        // Non-destructive variants don't reach the modal; if a
+        // refactor wires them through, fall back to the strict
+        // word so the gate fails-safe.
+        _ => "CONFIRM",
+    }
+}
+
 /// Short tag for log messages — names the variant without dumping
 /// its payload. Used by the P0 diagnostic eprintln in
 /// `dispatch_group_action` so the user's log shows "NUKE
@@ -3573,6 +3670,7 @@ fn action_kind_label(action: &GroupAction) -> &'static str {
         GroupAction::SafeRenameOthers { .. } => "SafeRenameOthers",
         GroupAction::SafeRenameAllVisible => "SafeRenameAllVisible",
         GroupAction::ArchiveAllVisible => "ArchiveAllVisible",
+        GroupAction::ArchiveCopyAllVisible => "ArchiveCopyAllVisible",
         GroupAction::RecycleAllVisible => "RecycleAllVisible",
         GroupAction::NukeAllVisible => "NukeAllVisible",
         GroupAction::Reveal(_) => "Reveal",
@@ -3615,6 +3713,16 @@ fn describe_destructive_action(action: &GroupAction) -> String {
             "Move EVERY non-keeper across EVERY currently visible duplicate group into the chosen \
              archive folder. Original directory tree is preserved under the destination; a manifest \
              JSON is written so the move can be restored later. Reference paths are never touched."
+                .to_string()
+        }
+        GroupAction::ArchiveCopyAllVisible => {
+            // ArchiveCopy bypasses this modal (it isn't classed as
+            // destructive — source files aren't touched). If a
+            // future refactor wires it through, the copy text
+            // should be neutral about \"destruction\".
+            "Copy EVERY non-keeper across EVERY currently visible duplicate group into the chosen \
+             archive folder. Source files are NOT touched (this is not a reclaim — disk usage grows). \
+             A manifest JSON is written alongside the copies."
                 .to_string()
         }
         GroupAction::RecycleAllVisible => {
