@@ -109,10 +109,52 @@ fn render_login_cta(ui: &mut egui::Ui) {
     // "anonymous" so the CTA still shows — never hide the CTA
     // because of a transient filesystem hiccup.
     let active = crate::channel::active_channel();
-    let is_anon = match oauth::status_for(active) {
-        Ok(oauth::AccountStatus::Anonymous) | Err(_) => true,
-        Ok(oauth::AccountStatus::Linked { .. }) => false,
-    };
+    let status = oauth::status_for(active).ok();
+    let is_anon = matches!(
+        status,
+        Some(oauth::AccountStatus::Anonymous) | None
+    );
+    // Linked state: render a discreet "Signed in as X (Provider)"
+    // line above the grid instead of the CTA. Gives the user a
+    // visible confirmation of the link that survives app
+    // restarts (per Mick 2026-05-25T03:20Z — previously the link
+    // status only showed via transient toast).
+    if let Some(oauth::AccountStatus::Linked {
+        provider,
+        display_name,
+        ..
+    }) = &status
+    {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "✓ Signed in as {} ({})",
+                    display_name,
+                    provider.display_name(),
+                ))
+                .color(theme::ACCENT)
+                .small(),
+            );
+            // Plain text "Sign out" link — keeps the management
+            // affordance visible without competing with the
+            // achievements grid. The full unlink + provider-
+            // switch flow lives in Settings → Account.
+            if ui
+                .link(
+                    RichText::new("Sign out")
+                        .color(theme::TEXT_LO)
+                        .small(),
+                )
+                .clicked()
+            {
+                if let Err(e) = oauth::unlink_for(active) {
+                    eprintln!("login-cta: unlink failed: {e}");
+                }
+            }
+        });
+        ui.add_space(6.0);
+        return;
+    }
     if !is_anon {
         return;
     }
