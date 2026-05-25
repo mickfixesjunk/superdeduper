@@ -72,7 +72,7 @@ fn read_default(subkey: &str) -> Option<String> {
         RegOpenKeyExW(
             HKEY_CLASSES_ROOT,
             PCWSTR(wide.as_ptr()),
-            None,
+            0,
             KEY_READ,
             &mut hkey,
         )
