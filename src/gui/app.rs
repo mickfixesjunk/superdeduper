@@ -88,6 +88,12 @@ pub struct SuperdeduperApp {
     /// user to pick. While this is `Some`, the rest of the UI stays
     /// behind the modal so Start Fresh can safely wipe state.
     pending_resume: Option<crate::gui::checkpoint::CheckpointSummary>,
+    /// Scan-mode dropdown selection per spec §3.8: Exact (default)
+    /// / Image (Tier-4 perceptual) / Audio (T1.3 placeholder).
+    /// Lives on `SuperdeduperApp` rather than `PersistedAppState`
+    /// because the spec explicitly says "sticky per session; not
+    /// persistent across runs."
+    scan_mode: crate::cli::ScanMode,
     /// Filesystem path of the currently-open .superdeduper project
     /// folder. `None` ⇒ no project loaded (default on launch, and
     /// after File → New). Save Project writes here when present;
@@ -231,6 +237,7 @@ impl SuperdeduperApp {
             selected_drive: None,
             drive_render_overrides: hashbrown::HashMap::new(),
             pending_resume,
+            scan_mode: crate::cli::ScanMode::Exact,
             current_project_path: None,
             current_project_created_at: 0,
             pending_archive_restore: None,
@@ -2596,6 +2603,16 @@ impl eframe::App for SuperdeduperApp {
                     &mut self.state,
                     self.persisted.settings.always_use_cache,
                 );
+                // #25 v2.5: scan-mode dropdown above the Roots panel
+                // per spec §3.8 ("top of scan-config panel"). Selection
+                // lives on `self.scan_mode` — session-sticky, NOT
+                // persisted across launches per spec.
+                crate::gui::widgets::scan_mode_picker::show(
+                    ui,
+                    &mut self.scan_mode,
+                    self.is_scanning,
+                );
+                ui.add_space(6.0);
                 let roots_action =
                     roots_panel::show(ui, &self.persisted.roots, self.is_scanning, self.can_resume);
                 if let Some(a) = roots_action {
