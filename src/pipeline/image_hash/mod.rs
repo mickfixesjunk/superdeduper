@@ -23,6 +23,8 @@
 
 #![cfg(feature = "similar-images")]
 
+pub mod tier4;
+
 use std::path::Path;
 
 use image_hasher::HashAlg;
@@ -32,23 +34,18 @@ use image_hasher::HashAlg;
 /// Defaults to [`DifferenceHash`](Self::DifferenceHash) for parity
 /// with czkawka's UX (good accuracy + ~10× faster than DCT-based
 /// pHash for typical phone-photo sizes).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum Algorithm {
     /// Average hash. Fastest, lowest robustness — primarily useful
     /// as a prefilter before a heavier algorithm. Spec table §2.
     AverageHash,
     /// Difference hash. Default per spec §2 "Recommendation:
     /// ship dHash as default."
+    #[default]
     DifferenceHash,
     /// Discrete-Cosine-Transform hash. Best robustness for
     /// rotation + heavy edits at higher CPU cost.
     PerceptualHash,
-}
-
-impl Default for Algorithm {
-    fn default() -> Self {
-        Self::DifferenceHash
-    }
 }
 
 impl Algorithm {

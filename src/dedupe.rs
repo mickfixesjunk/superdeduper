@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{DedupeAction, DedupeArgs, KeepStrategy};
 use crate::pipeline::DuplicateGroup;
+#[cfg(test)]
+use crate::pipeline::SimilarityKind;
 use crate::{Error, Result};
 
 /// Schema for a saved scan results file. Serialised by `output::write`
@@ -701,6 +703,7 @@ mod tests {
             files,
             link_equivalent: false,
             unique_inodes,
+            similarity_kind: SimilarityKind::ByteIdentical,
         }
     }
 

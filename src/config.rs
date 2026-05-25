@@ -174,6 +174,8 @@ mod tests {
             force_hash: false,
             allow_recall_on_read: false,
             hash_algo: HashAlgoArg::River5,
+            mode: crate::cli::ScanMode::Exact,
+            image_similarity_threshold: 5,
         }
     }
 

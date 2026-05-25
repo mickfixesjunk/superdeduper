@@ -330,7 +330,7 @@ mod summarize_tests {
     //! correctly computed.
 
     use super::summarize;
-    use crate::pipeline::DuplicateGroup;
+    use crate::pipeline::{DuplicateGroup, SimilarityKind};
     use std::path::PathBuf;
 
     fn group(size: u64, files: usize, link_equivalent: bool, unique_inodes: u64) -> DuplicateGroup {
@@ -342,6 +342,7 @@ mod summarize_tests {
                 .collect(),
             link_equivalent,
             unique_inodes,
+            similarity_kind: SimilarityKind::ByteIdentical,
         }
     }
 
