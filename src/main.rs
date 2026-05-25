@@ -692,6 +692,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     // the byte-identical pipeline state.
     let mode = args.mode;
     let image_similarity_threshold = args.image_similarity_threshold;
+    let image_hash_algorithm = args.image_hash_algorithm;
     let audio_similarity_threshold = args.audio_similarity_threshold;
 
     let scan_started = std::time::Instant::now();
@@ -978,15 +979,13 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         let mut all = duplicates;
         if matches!(mode, ScanMode::Image) {
             if let Some(inv) = inventory_for_tier4.as_deref() {
+                let algo: Algorithm = image_hash_algorithm.into();
                 let t_tier4 = std::time::Instant::now();
-                let groups = tier4::find_similar_groups(
-                    inv,
-                    Algorithm::default(),
-                    image_similarity_threshold,
-                );
+                let groups = tier4::find_similar_groups(inv, algo, image_similarity_threshold);
                 let _ = writeln!(
                     io::stderr(),
-                    "stage 4 perceptual: {} group(s) within {} bits ({} ms)",
+                    "stage 4 perceptual ({}): {} group(s) within {} bits ({} ms)",
+                    algo.as_slug(),
                     groups.len(),
                     image_similarity_threshold,
                     t_tier4.elapsed().as_millis(),
@@ -1033,7 +1032,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
                  Tier-4."
             );
         }
-        let _ = (mode, image_similarity_threshold);
+        let _ = (mode, image_similarity_threshold, image_hash_algorithm);
     }
     #[cfg(not(feature = "similar-audio"))]
     {

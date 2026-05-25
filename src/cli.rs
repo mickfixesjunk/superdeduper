@@ -332,6 +332,17 @@ pub struct ScanArgs {
     #[arg(long, value_name = "BITS", default_value_t = 5)]
     pub image_similarity_threshold: u32,
 
+    /// Perceptual-hash algorithm used by `--mode image` (#45).
+    /// Defaults to `dhash` (DifferenceHash) per spec §2's
+    /// "ship dHash as default" recommendation — fast + robust enough
+    /// for typical phone-photo / screenshot dedupe. `ahash` (mean) is
+    /// cheaper, good as a prefilter only. `phash` (DCT) is more
+    /// robust to rotation + heavy edits at higher CPU cost. Exposed
+    /// so testrunner can empirically compare precision/recall/F1
+    /// across the three algorithms against a labeled corpus.
+    #[arg(long, value_enum, default_value_t = ImageHashAlgoArg::Dhash)]
+    pub image_hash_algorithm: ImageHashAlgoArg,
+
     /// Average per-chunk Hamming-distance threshold for `--mode audio`.
     /// The Chromaprint fingerprint is a sequence of 32-bit chunks; we
     /// average the per-chunk bit-flip counts across the alignment
@@ -349,6 +360,33 @@ pub enum HashAlgoArg {
     Blake3,
     #[clap(alias = "ddh128", alias = "river128")]
     River5,
+}
+
+/// CLI shape for the image-perceptual-hash algorithm. Mirrors
+/// [`crate::pipeline::image_hash::Algorithm`] but kept separate
+/// so the pipeline module doesn't grow a `clap` dependency.
+#[derive(Copy, Clone, Debug, ValueEnum, Default, PartialEq, Eq)]
+#[clap(rename_all = "lower")]
+pub enum ImageHashAlgoArg {
+    /// Average hash — cheap, prefilter-only.
+    Ahash,
+    /// Difference hash — default, balanced.
+    #[default]
+    Dhash,
+    /// Perceptual (DCT) hash — most robust to rotation + heavy
+    /// edits, higher CPU.
+    Phash,
+}
+
+#[cfg(feature = "similar-images")]
+impl From<ImageHashAlgoArg> for crate::pipeline::image_hash::Algorithm {
+    fn from(v: ImageHashAlgoArg) -> Self {
+        match v {
+            ImageHashAlgoArg::Ahash => Self::AverageHash,
+            ImageHashAlgoArg::Dhash => Self::DifferenceHash,
+            ImageHashAlgoArg::Phash => Self::PerceptualHash,
+        }
+    }
 }
 
 impl From<HashAlgoArg> for crate::pipeline::hash::HashAlgo {
