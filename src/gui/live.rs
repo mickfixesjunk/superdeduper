@@ -48,20 +48,33 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
         ScanSettings::default(),
         Arc::new(AtomicBool::new(false)),
         None,
+        crate::cli::ScanMode::Exact,
+        5,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_with_settings(
     tx: Sender<EngineEvent>,
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
     defender_rtp_pre: Option<bool>,
+    scan_mode: crate::cli::ScanMode,
+    image_similarity_threshold: u32,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("superdeduper-engine".into())
         .spawn(move || {
-            if let Err(e) = run(tx.clone(), roots, settings, cancel, defender_rtp_pre) {
+            if let Err(e) = run(
+                tx.clone(),
+                roots,
+                settings,
+                cancel,
+                defender_rtp_pre,
+                scan_mode,
+                image_similarity_threshold,
+            ) {
                 let _ = tx.send(EngineEvent::Log {
                     level: LogLevel::Error,
                     message: format!("engine: {e}"),
@@ -72,12 +85,15 @@ pub fn spawn_with_settings(
         .expect("spawn engine thread")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     tx: Sender<EngineEvent>,
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
     _defender_rtp_pre: Option<bool>,
+    scan_mode: crate::cli::ScanMode,
+    image_similarity_threshold: u32,
 ) -> crate::Result<()> {
     let _scan_started_at = Instant::now();
     // Wall-clock start, separate from the Instant above (Instant is
@@ -576,6 +592,16 @@ fn run(
         total: 0,
         eta_secs: None,
     });
+    // #25 v3 wiring — clone the inventory before `group_by_size`
+    // consumes it, but only when Tier-4 will actually run. Default
+    // mode (Exact) skips the clone so the byte-identical path stays
+    // zero-cost.
+    #[cfg(feature = "similar-images")]
+    let inventory_for_tier4 = if matches!(scan_mode, crate::cli::ScanMode::Image) {
+        Some(files.clone())
+    } else {
+        None
+    };
     let mut size_groups = pipeline::grouping::group_by_size(files);
     // Resolve inode ids only on files that survived size grouping —
     // singletons can't be hardlinks within this scan and don't need
@@ -1345,6 +1371,52 @@ fn run(
         // A new run replaces any previous outcome's display state.
         submission::clear_last_outcome();
     }
+    // #25 v3 GUI Tier-4 wiring. If user picked `--mode image`,
+    // run perceptual-similarity grouping against the inventory
+    // we cloned pre-`group_by_size`. Emit each tier4 group as a
+    // DuplicateGroupSummary event so the GUI's groups table
+    // surfaces them alongside byte-identical groups. Also update
+    // the running totals so the ScanFinished payload (+ leaderboard
+    // submission downstream) reflect the combined counts.
+    #[cfg(feature = "similar-images")]
+    if matches!(scan_mode, crate::cli::ScanMode::Image) {
+        if let Some(inv) = inventory_for_tier4.as_deref() {
+            let t_tier4 = std::time::Instant::now();
+            let tier4_groups = crate::pipeline::image_hash::tier4::find_similar_groups(
+                inv,
+                crate::pipeline::image_hash::Algorithm::default(),
+                image_similarity_threshold,
+            );
+            let n_groups = tier4_groups.len();
+            for g in tier4_groups {
+                total_dups += 1;
+                // Tier-4 group reclaim = (unique_inodes - 1) * size, same
+                // shape as the byte-identical accumulator. Saturating
+                // arithmetic so a pathological count can't overflow.
+                let group_reclaim = g.unique_inodes.saturating_sub(1).saturating_mul(g.size);
+                reclaimable_inode = reclaimable_inode.saturating_add(group_reclaim);
+                reclaimable = reclaimable.saturating_add(group_reclaim);
+                let summary = DuplicateGroupSummary {
+                    size: g.size,
+                    content_hash: g.content_hash,
+                    files: g.files,
+                    link_equivalent: g.link_equivalent,
+                    unique_inodes: g.unique_inodes,
+                };
+                let _ = tx.send(EngineEvent::DuplicateFound(summary));
+            }
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Tier-4 perceptual: {n_groups} group(s) within {image_similarity_threshold} bits ({} ms)",
+                    t_tier4.elapsed().as_millis()
+                ),
+            });
+        }
+    }
+    #[cfg(not(feature = "similar-images"))]
+    let _ = (scan_mode, image_similarity_threshold);
+
     // Use inode-aware reclaim — this is what overwrites
     // state.totals.reclaimable_bytes at scan-end (per state.rs's
     // ScanFinished handler). The path-aware `reclaimable` is kept
