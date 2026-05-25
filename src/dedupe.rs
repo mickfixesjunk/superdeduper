@@ -360,33 +360,18 @@ fn pick_keeper(
             ));
         }
         KeepStrategy::Smart => {
-            // Score each file in the group and pick the highest.
-            // Ties broken by newest mtime (most users want the
-            // latest of two indistinguishable files).
-            let mut best_score: Option<f32> = None;
-            let mut best_mtime: Option<std::time::SystemTime> = None;
-            for (i, p) in group.files.iter().enumerate() {
-                let mtime = fs::metadata(p).and_then(|m| m.modified()).ok();
-                let score = crate::keep::score_file(p, mtime).total;
-                let take = match (best_score, score) {
-                    (None, _) => true,
-                    (Some(b), s) if s > b => true,
-                    (Some(b), s) if (s - b).abs() < f32::EPSILON => {
-                        // Tie — newer wins.
-                        match (best_mtime, mtime) {
-                            (Some(cur), Some(t)) if t > cur => true,
-                            (None, Some(_)) => true,
-                            _ => false,
-                        }
-                    }
-                    _ => false,
-                };
-                if take {
-                    idx = i;
-                    best_score = Some(score);
-                    best_mtime = mtime;
-                }
-            }
+            // #68 — single source of truth for Smart-keeper tiebreak
+            // lives in `keep::pick_keeper`. CLI flow + GUI flow
+            // (via `gui::live::order_keeper_first`) both call into
+            // it so a future tiebreak-signal addition lands in
+            // exactly one place. Pre-compute mtimes since
+            // `keep::pick_keeper` takes a parallel slice.
+            let mtimes: Vec<Option<std::time::SystemTime>> = group
+                .files
+                .iter()
+                .map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+                .collect();
+            idx = crate::keep::pick_keeper(&group.files, &mtimes);
         }
     }
     Ok(idx)

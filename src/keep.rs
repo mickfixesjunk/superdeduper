@@ -187,9 +187,36 @@ pub fn score_file(path: &Path, mtime: Option<SystemTime>) -> KeepScore {
     s
 }
 
+/// Tie tolerance used by `pick_keeper` when comparing two
+/// candidate scores. `f32::EPSILON` (~1.19e-7) is the gap between
+/// 1.0 and the next representable f32 — NOT a meaningful tolerance
+/// for sums of components in the ±100 range. The actual scoring
+/// components are integer-valued constants (-100, -50, -20, -15,
+/// -10, -8, 5, 10) and recency is the only float-valued
+/// contributor, so accumulated rounding error is normally exactly
+/// zero in practice — but a sane tolerance is required if anyone
+/// adds a second float-valued signal.
+///
+/// `1e-4` covers anything that comes from `recency = (3.0 - days /
+/// 60.0).clamp(0.0, 3.0)` because the days-since-mtime float is
+/// stable to many decimal digits + the multiplication+subtraction
+/// has bounded rounding error. The relative term `best * 1e-6`
+/// scales the tolerance up for unusually large scores; for the
+/// typical ±100 range it stays below the 1e-4 absolute floor +
+/// the floor wins.
+fn score_tie_tolerance(best: f32) -> f32 {
+    (best.abs() * 1e-6).max(1e-4)
+}
+
 /// Pick the highest-scoring index from a slice of paths. Ties on
 /// score are broken by newest `mtime`; both-`None` mtimes pick
 /// the first.
+///
+/// **Single source of truth** for the Smart-keeper tiebreak. Both
+/// the GUI flow (via `gui::live::order_keeper_first`) and the CLI
+/// flow (via `dedupe::pick_keeper`'s Smart arm) call into this
+/// fn so any future tiebreak-signal addition lands in exactly one
+/// place. See #68 (refactor to eliminate GUI↔CLI drift risk).
 pub fn pick_keeper<P: AsRef<Path>>(paths: &[P], mtimes: &[Option<SystemTime>]) -> usize {
     assert_eq!(paths.len(), mtimes.len(), "paths/mtimes length mismatch");
     let mut best_idx = 0usize;
@@ -199,7 +226,7 @@ pub fn pick_keeper<P: AsRef<Path>>(paths: &[P], mtimes: &[Option<SystemTime>]) -
         let s = score_file(p.as_ref(), *m).total;
         let take = if s > best_score {
             true
-        } else if (s - best_score).abs() < f32::EPSILON {
+        } else if (s - best_score).abs() < score_tie_tolerance(best_score) {
             // Tie — newer wins.
             match (best_mtime, *m) {
                 (Some(cur), Some(t)) if t > cur => true,
@@ -285,5 +312,50 @@ mod tests {
         ];
         let mtimes = [None, None, None];
         assert_eq!(pick_keeper(&paths, &mtimes), 0);
+    }
+
+    /// #68 — tie tolerance is `(best * 1e-6).max(1e-4)`, NOT
+    /// `f32::EPSILON` (~1.19e-7). Two paths with identical scoring
+    /// signals should tie + newest-mtime wins.
+    #[test]
+    fn pick_keeper_tie_uses_newest_mtime() {
+        // Two paths with the same `score_file` total (both in
+        // identical "user Documents" treatment + no special
+        // tokens). Mtimes differ; newest wins.
+        let paths = [
+            p(r"C:\Users\me\Documents\report-a.docx"),
+            p(r"C:\Users\me\Documents\report-b.docx"),
+        ];
+        let earlier =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700000000);
+        let later = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1779594153);
+        let mtimes = [Some(earlier), Some(later)];
+        assert_eq!(
+            pick_keeper(&paths, &mtimes),
+            1,
+            "newer mtime should win the tie"
+        );
+        // Reversed order — first should win when mtimes flipped.
+        let mtimes_rev = [Some(later), Some(earlier)];
+        assert_eq!(
+            pick_keeper(&paths, &mtimes_rev),
+            0,
+            "newer mtime should win regardless of slice order"
+        );
+    }
+
+    /// #68 — tolerance lets tiny float-rounding deltas count as
+    /// ties (was a no-op with f32::EPSILON since rounding errors
+    /// at the typical score range exceed f32::EPSILON only in
+    /// pathological inputs; this test pins the behaviour
+    /// regardless).
+    #[test]
+    fn score_tie_tolerance_absolute_floor_holds_at_typical_range() {
+        // Tolerance for best=0.0 → 1e-4 (absolute floor)
+        assert!(super::score_tie_tolerance(0.0) >= 1e-4 - 1e-9);
+        // Tolerance for best=10 → still 1e-4 (1e-6 * 10 = 1e-5 < floor)
+        assert!(super::score_tie_tolerance(10.0) >= 1e-4 - 1e-9);
+        // Tolerance for best=1_000_000 → 1.0 (1e-6 * 1e6 = 1 > floor)
+        assert!(super::score_tie_tolerance(1_000_000.0) >= 1.0 - 1e-9);
     }
 }
