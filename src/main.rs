@@ -689,6 +689,13 @@ fn run_drive_info() -> anyhow::Result<()> {
 fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let cfg = ScanConfig::from_args(&args).context("invalid scan configuration")?;
 
+    // #25 T1.2 Tier-4 — perceptual image similarity. Threaded
+    // through directly rather than added to ScanConfig because
+    // Tier-4 runs on the inventory after Tier-3, separate from
+    // the byte-identical pipeline state.
+    let mode = args.mode;
+    let image_similarity_threshold = args.image_similarity_threshold;
+
     let scan_started = std::time::Instant::now();
     // Wall-clock UNIX seconds for the scan_history record — same
     // pattern as `gui::live::run()` so CLI + GUI scans both persist
@@ -753,6 +760,16 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     // by `pipeline::grouping::group_by_size(inventory)` further down.
     let history_total_files = inventory.len() as u64;
     let history_total_bytes_read: u64 = inventory.iter().map(|f| f.size).sum();
+    // #25 T1.2 — clone the inventory ONLY in image mode so Tier-4
+    // has the full file list to filter image-extensions out of.
+    // Default mode (exact) skips the clone — no perf penalty for
+    // the byte-identical pipeline.
+    #[cfg(feature = "similar-images")]
+    let inventory_for_tier4 = if matches!(mode, superdeduper::cli::ScanMode::Image) {
+        Some(inventory.clone())
+    } else {
+        None
+    };
     tracing::info!(
         count = inventory.len(),
         skipped = skipped.len(),
@@ -940,6 +957,50 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     } else {
         duplicates
     };
+
+    // #25 T1.2 Tier-4 — perceptual image similarity. Runs ONLY when
+    // `--mode image` was set + the `similar-images` feature is on.
+    // Concatenates Tier-4 groups onto the byte-identical duplicates;
+    // each gets a `similarity_kind: PerceptualImage` marker so
+    // consumers can discriminate.
+    #[cfg(feature = "similar-images")]
+    let duplicates = {
+        use superdeduper::cli::ScanMode;
+        use superdeduper::pipeline::image_hash::{tier4, Algorithm};
+        let mut all = duplicates;
+        if matches!(mode, ScanMode::Image) {
+            if let Some(inv) = inventory_for_tier4.as_deref() {
+                let t_tier4 = std::time::Instant::now();
+                let groups = tier4::find_similar_groups(
+                    inv,
+                    Algorithm::default(),
+                    image_similarity_threshold,
+                );
+                let _ = writeln!(
+                    io::stderr(),
+                    "stage 4 perceptual: {} group(s) within {} bits ({} ms)",
+                    groups.len(),
+                    image_similarity_threshold,
+                    t_tier4.elapsed().as_millis(),
+                );
+                all.extend(groups);
+            }
+        }
+        all
+    };
+    #[cfg(not(feature = "similar-images"))]
+    {
+        if matches!(mode, superdeduper::cli::ScanMode::Image) {
+            eprintln!(
+                "warning: this binary was built without the `similar-images` \
+                 feature — `--mode image` falls through to byte-identical \
+                 dedup. Rebuild with `cargo build --features similar-images` \
+                 (or use a release binary that ships with it on) to enable \
+                 Tier-4."
+            );
+        }
+        let _ = (mode, image_similarity_threshold);
+    }
 
     let mut writer: Box<dyn Write> = match &cfg.output {
         Some(p) => Box::new(BufWriter::new(

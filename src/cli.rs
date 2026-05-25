@@ -303,6 +303,26 @@ pub struct ScanArgs {
     /// after the crate renames.
     #[arg(long, value_enum, default_value_t = HashAlgoArg::River5)]
     pub hash_algo: HashAlgoArg,
+
+    /// Similarity mode. `exact` (default) is byte-identical dedup
+    /// — the T0–T3 pipeline. `image` enables Tier-4 perceptual
+    /// image grouping (T1.2, #25). `audio` is a placeholder for
+    /// T1.3 (#26) — parses today but falls through to exact.
+    /// Per Mick directive: single shared dropdown across image +
+    /// audio modes.
+    #[arg(long, value_enum, default_value_t = ScanMode::Exact)]
+    pub mode: ScanMode,
+
+    /// Hamming-distance threshold for `--mode image`. Pairs of
+    /// images whose perceptual hashes are within this many bits
+    /// of one another group together. Per spec §2 the default 5
+    /// (~92% bit-similarity) catches resize / format-conversion /
+    /// minor color-edit twins without false-positive flood. Tighter
+    /// thresholds (1–3) are useful for high-precision triage;
+    /// looser (8–10) catches heavier edits at higher false-positive
+    /// rate.
+    #[arg(long, value_name = "BITS", default_value_t = 5)]
+    pub image_similarity_threshold: u32,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

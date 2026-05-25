@@ -36,7 +36,7 @@ use rayon::prelude::*;
 use crate::cache::{Cache, CacheKey, CachedHashes};
 use crate::config::ScanConfig;
 use crate::pipeline::layout::{LaidOutFile, LaidOutGroup};
-use crate::pipeline::DuplicateGroup;
+use crate::pipeline::{DuplicateGroup, SimilarityKind};
 use crate::{Error, Result};
 
 pub mod algo;
@@ -450,6 +450,7 @@ fn run_group(
             // treating the count as files.len() gives the "every file
             // is one inode" interpretation that's correct here.
             unique_inodes,
+            similarity_kind: SimilarityKind::ByteIdentical,
         }]);
     }
 
@@ -515,6 +516,7 @@ fn run_group(
             files: paths,
             link_equivalent: true,
             unique_inodes: 1,
+            similarity_kind: SimilarityKind::ByteIdentical,
         });
         if let Some(cb) = on_file {
             cb(&rep.entry.path, 3, ProgressOutcome::Hashed { bytes: size });
@@ -595,6 +597,7 @@ fn run_group(
             files: paths,
             link_equivalent,
             unique_inodes,
+            similarity_kind: SimilarityKind::ByteIdentical,
         });
     }
     Ok(out)
