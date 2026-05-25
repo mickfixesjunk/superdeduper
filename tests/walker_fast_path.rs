@@ -40,7 +40,6 @@ fn cfg_for(roots: Vec<PathBuf>) -> ScanConfig {
         use_cache: false,
         use_format_aware: false,
         threads: 2,
-        queue_depth: None,
         output: None,
         follow_links: false,
         allow_system_paths: false,

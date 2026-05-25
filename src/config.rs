@@ -35,7 +35,6 @@ pub struct ScanConfig {
     /// without saturating the CPU. Set explicitly via `--io-threads`
     /// to sweep where the curve flattens for a given disk + AV mix.
     pub io_threads: usize,
-    pub queue_depth: Option<usize>,
     pub output: Option<PathBuf>,
     pub follow_links: bool,
     pub allow_system_paths: bool,
@@ -101,7 +100,6 @@ impl ScanConfig {
                 args.io_threads
                     .unwrap_or(cpu_threads.saturating_mul(3).max(1))
             },
-            queue_depth: args.queue_depth,
             output: args.output.clone(),
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
@@ -166,7 +164,6 @@ mod tests {
             no_format_aware: false,
             threads: None,
             io_threads: None,
-            queue_depth: None,
             output: None,
             follow_links: false,
             allow_system_paths: false,

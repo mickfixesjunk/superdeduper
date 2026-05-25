@@ -2107,7 +2107,6 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
             });
             settings.io_threads.unwrap_or(cpu.saturating_mul(3).max(1))
         },
-        queue_depth: None,
         output: None,
         follow_links: settings.follow_links,
         allow_system_paths: settings.allow_system_paths,
