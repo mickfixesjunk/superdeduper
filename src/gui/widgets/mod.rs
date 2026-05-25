@@ -16,6 +16,8 @@ pub mod log_panel;
 pub mod oauth_chooser;
 pub mod overall_bar;
 pub mod preflight_modal;
+#[cfg(feature = "telemetry")]
+pub mod resubmit_prompt_modal;
 pub mod resume_modal;
 pub mod roots_panel;
 #[cfg(feature = "telemetry")]

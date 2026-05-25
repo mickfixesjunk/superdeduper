@@ -95,6 +95,13 @@ pub struct ScanSettings {
     /// sense in the CLI, so the GUI hides it.
     #[serde(default)]
     pub keep_strategy: crate::cli::KeepStrategy,
+    /// #41 — Settings → Privacy → Scan history retention. Number of
+    /// days to keep `scan_history` rows before auto-pruning on app
+    /// start. `0` = forever (default; matches v1 behavior — no
+    /// retention enforcement). The Privacy widget renders 30 / 90 /
+    /// 365 / forever as the four standard buckets.
+    #[serde(default)]
+    pub history_retention_days: u32,
 }
 
 impl Default for ScanSettings {
@@ -117,6 +124,7 @@ impl Default for ScanSettings {
             skip_preflight: false,
             dismissed_alpha_warning: false,
             keep_strategy: crate::cli::KeepStrategy::Smart,
+            history_retention_days: 0,
         }
     }
 }

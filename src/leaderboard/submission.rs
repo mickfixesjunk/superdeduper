@@ -208,6 +208,81 @@ pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json:
     })
 }
 
+/// #41 — re-POST a previously-recorded canonical payload. Same
+/// signing flow as [`submit`] but the body comes from the stored
+/// `scan_history::ScanRecord.submission_payload` rather than being
+/// rebuilt from a fresh `SubmissionInputs`. This guarantees the
+/// signature matches what the user actually saw at scan-finish; a
+/// rebuild would re-detect hardware, re-stamp the timestamp, etc.
+/// + potentially drift away from what the History row claims.
+///
+/// `built_with_install_id`: the install_id captured at payload-
+/// build time (stored alongside the payload in the History row).
+/// If the active install_id differs (user clicked "Reset install"
+/// between scan + resubmit), the HMAC under the new key would
+/// 401 against the server. Surfaces a clear
+/// `Rejected{ status: 0, reason: "install changed since scan" }`
+/// up-front rather than waiting for the server's 401.
+///
+/// `server_url`: the recorded channel's server URL (NOT the live
+/// channel's). Channel-aware resubmit routes against the channel
+/// the scan was captured on. The caller (GUI Resubmit button)
+/// resolves this from
+/// `scan_history::ScanRecord.submission_channel` →
+/// `channel::server_url_for`.
+pub fn submit_recorded_payload(
+    state: &InstallState,
+    payload: &serde_json::Value,
+    built_with_install_id: &str,
+    server_url: &str,
+) -> SubmitOutcome {
+    if !state.registered {
+        return SubmitOutcome::Rejected {
+            status: 0,
+            reason: "install not registered — call `superdeduper register` first".to_string(),
+        };
+    }
+    if state.install_id != built_with_install_id {
+        return SubmitOutcome::Rejected {
+            status: 0,
+            reason: format!(
+                "install changed since scan: payload was built with install_id `{}` \
+                 but current install is `{}`. Reset-install rotates the HMAC key; \
+                 the recorded signature no longer matches. Delete this row from \
+                 History — re-running the scan under the current install will \
+                 produce a fresh submittable payload.",
+                built_with_install_id, state.install_id,
+            ),
+        };
+    }
+    let install_key = match state.install_key() {
+        Some(k) => k,
+        None => {
+            return SubmitOutcome::Rejected {
+                status: 0,
+                reason: "install_key_hex malformed".to_string(),
+            };
+        }
+    };
+    let body = hmac_signer::canonical_body(payload);
+    let signature = hmac_signer::sign(&install_key, &body);
+
+    let url = format!("{}/api/v1/submit", server_url.trim_end_matches('/'));
+    let response = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("X-Sd-Signature", &signature)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_bytes(&body);
+
+    match response {
+        Ok(resp) => parse_ok(resp),
+        Err(ureq::Error::Status(code, resp)) => parse_error(code, resp),
+        Err(ureq::Error::Transport(t)) => SubmitOutcome::Transient {
+            reason: format!("transport: {t}"),
+        },
+    }
+}
+
 /// Build + sign + POST a submission. Network errors surface as
 /// `Transient`; the caller decides whether to enqueue for retry.
 /// This function never panics on network failure; it returns an
