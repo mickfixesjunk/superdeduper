@@ -212,7 +212,7 @@ fn emit_action_receipt(
     pre: Option<(String, u64)>,
     error: Option<String>,
 ) {
-    use crate::action_receipt::{action_label, ActionReceipt, read_inode_and_nlink};
+    use crate::action_receipt::{action_label, read_inode_and_nlink, ActionReceipt};
 
     let action_str = action_label(action);
     let source_str = path.display().to_string();
@@ -244,7 +244,11 @@ fn emit_action_receipt(
     if error.is_none() {
         receipt.hardlink_count_delta = match action {
             DedupeAction::Recycle | DedupeAction::Remove => {
-                if post.is_none() { -1 } else { 0 }
+                if post.is_none() {
+                    -1
+                } else {
+                    0
+                }
             }
             DedupeAction::Hardlink => 1,
             DedupeAction::Reflink | DedupeAction::SafeRename => 0,
@@ -713,6 +717,7 @@ mod tests {
             results_file: results_path,
             strategy: KeepStrategy::First,
             action,
+            mode: crate::cli::ScanMode::Exact,
             dry_run,
             allow_system_paths: false,
             allow_destructive_on_deduped: false,

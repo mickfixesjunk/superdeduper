@@ -5,6 +5,7 @@
 pub mod confirm;
 pub mod grouping;
 pub mod hash;
+pub mod image_hash;
 pub mod iocp;
 pub mod layout;
 

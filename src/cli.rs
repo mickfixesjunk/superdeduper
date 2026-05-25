@@ -335,6 +335,16 @@ pub struct DedupeArgs {
     #[arg(long, value_enum, default_value_t = DedupeAction::Recycle)]
     pub action: DedupeAction,
 
+    /// Similarity mode. `exact` (default) is byte-identical dedup
+    /// — the only behaviour available today. `image` and `audio`
+    /// are placeholders for T1.2 + T1.3 (#25 / #26); the CLI
+    /// accepts them but the Tier-4 (perceptual) pipeline integration
+    /// isn't wired yet, so non-`exact` modes emit a stderr warning
+    /// and fall through to exact behaviour. Per Mick directive:
+    /// single shared dropdown across image + audio modes.
+    #[arg(long, value_enum, default_value_t = ScanMode::Exact)]
+    pub mode: ScanMode,
+
     /// Print what would happen, do nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -527,6 +537,26 @@ pub enum ShareValue {
     AlwaysAsk,
     AutoOptIn,
     Never,
+}
+
+/// Scan-mode dropdown per #25 + #26. User picks ONE mode per scan
+/// per Mick's 2026-05-24 directive.
+///
+/// V1 only `Exact` actually drives the pipeline; `Image` and `Audio`
+/// are placeholders that surface a stderr warning + fall through to
+/// `Exact`. Lets us land the dropdown infra so the future Tier-4
+/// integration just flips the dispatch without churning the CLI.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ScanMode {
+    /// Byte-identical dedup — today's behaviour. Default.
+    #[default]
+    Exact,
+    /// Perceptual image similarity (T1.2, #25). CLI parses today;
+    /// pipeline integration ships in a follow-up.
+    Image,
+    /// Acoustic audio fingerprinting (T1.3, #26). CLI parses today;
+    /// pipeline integration ships in a follow-up.
+    Audio,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

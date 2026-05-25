@@ -84,6 +84,16 @@ uuid = { version = "1.10", optional = true, features = ["v4"] }
 # data-table only, no other deps.
 unicode-script = { version = "0.5", optional = true }
 
+# T1.2 perceptual image similarity (#25). `image` decodes JPEG / PNG /
+# WebP / GIF / BMP / TIFF / ICO; `image_hasher` provides the dHash /
+# aHash / pHash family that operates on a decoded image. Both gated
+# behind the `similar-images` cargo feature so the always-on dedup
+# pipeline doesn't pull image-codec deps it doesn't need. HEIC isn't
+# in the `image` crate yet (per spec §3.4); revisit if user demand
+# surfaces.
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico"] }
+image_hasher = { version = "3", optional = true }
+
 [features]
 default = []
 # Rendering + interaction stack. Does NOT pull rodio — see `audio`.
@@ -99,6 +109,13 @@ audio = ["dep:rodio"]
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
 telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script"]
+# T1.2 perceptual image similarity (#25). Pulls `image` for decode
+# + `image_hasher` for the dHash/aHash/pHash family. Off by default
+# while the feature lands incrementally — first slice is just the
+# algorithm wrapper module + `--mode image` CLI flag, no pipeline
+# integration yet. Release matrix will turn it on once Tier-4
+# integration ships per the spec.
+similar-images = ["dep:image", "dep:image_hasher"]
 
 [[bin]]
 name = "superdeduper-gui"

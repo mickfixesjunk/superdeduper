@@ -274,8 +274,8 @@ fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
     match cmd {
         DebugCommand::Snapshot { path, format, out } => {
             let SnapshotFormat::Json = format;
-            let snap = snapshot::capture(&path)
-                .with_context(|| format!("snapshot {:?} failed", path))?;
+            let snap =
+                snapshot::capture(&path).with_context(|| format!("snapshot {:?} failed", path))?;
             match out {
                 Some(file) => {
                     let f = std::fs::File::create(&file)
@@ -1125,6 +1125,31 @@ fn run_force_hash_mode(
 }
 
 fn run_dedupe(args: DedupeArgs) -> anyhow::Result<()> {
+    // #25 / #26 — mode dropdown stub. CLI accepts `image` and `audio`
+    // values today but the Tier-4 (perceptual) pipeline integration
+    // hasn't shipped; warn loudly + fall through to exact behaviour
+    // so the user knows their mode wasn't honoured. Removing the
+    // warning is part of the integration sub-deliverable (per spec
+    // §3.3 + §3.7).
+    use superdeduper::cli::ScanMode;
+    match args.mode {
+        ScanMode::Exact => {}
+        ScanMode::Image => {
+            eprintln!(
+                "warning: --mode image is parsed but not yet wired \
+                 — falling through to exact (byte-identical) dedup. \
+                 Track #25 for the Tier-4 perceptual-image pipeline."
+            );
+        }
+        ScanMode::Audio => {
+            eprintln!(
+                "warning: --mode audio is parsed but not yet wired \
+                 — falling through to exact (byte-identical) dedup. \
+                 Track #26 for acoustic fingerprinting."
+            );
+        }
+    }
+
     let outcome = dedupe::run(&args).context("dedupe failed")?;
     let mut stderr = io::stderr().lock();
     writeln!(
