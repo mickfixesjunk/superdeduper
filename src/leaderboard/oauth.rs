@@ -1048,15 +1048,33 @@ fn exchange_code(
         .send_bytes(&canonical);
     match resp {
         Ok(r) => {
+            let status = r.status();
             let response_body = r
                 .into_string()
                 .map_err(|e| OauthError::BadCallback(format!("read exchange response: {e}")))?;
-            parse_callback_body(provider, &response_body)
+            match parse_callback_body(provider, &response_body) {
+                Ok(token) => Ok(token),
+                Err(e) => {
+                    // Log the raw response body so the next round
+                    // of triage doesn't have to guess at web's wire
+                    // shape. Capped at 1KB so a giant html error
+                    // page can't blow up the log.
+                    log_oauth_event(&format!(
+                        "exchange_response_unparseable: status={status} body={}",
+                        truncate_for_log(&response_body, 1024)
+                    ));
+                    Err(e)
+                }
+            }
         }
-        Err(ureq::Error::Status(code, r)) => Err(OauthError::BackendRejected {
-            status: code,
-            body: r.into_string().unwrap_or_default(),
-        }),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            log_oauth_event(&format!(
+                "exchange_response_error_status: status={code} body={}",
+                truncate_for_log(&body, 1024)
+            ));
+            Err(OauthError::BackendRejected { status: code, body })
+        }
         Err(ureq::Error::Transport(t)) => Err(OauthError::BadCallback(format!(
             "exchange transport: {t}"
         ))),
@@ -1285,6 +1303,8 @@ pub fn try_start_session(
         install_id,
         timeout,
     ));
+    // Clear any prior toast — the user is starting fresh.
+    clear_toast();
     Ok(())
 }
 
@@ -1330,6 +1350,59 @@ pub fn cancel_current_session() {
         session.cancel();
     }
     *slot = None;
+}
+
+// =====================================================================
+// User-visible OAuth toast — last completed flow's result. Set by
+// poll_session callers when they drain a result; read by the three
+// CTA surfaces so the user gets a clear "linked as Mick (Google)"
+// success or a "link failed: <reason>" error in the GUI without
+// having to grep oauth.log. Cleared on next session start.
+// =====================================================================
+
+/// One of three states a CTA can render below itself when a
+/// session has just finished. Bounded — old toasts get cleared
+/// when a fresh OAuth flow starts.
+#[derive(Debug, Clone)]
+pub enum OauthToast {
+    Success {
+        provider: Provider,
+        display_name: String,
+    },
+    Failure {
+        reason: String,
+    },
+}
+
+static LAST_TOAST: parking_lot::Mutex<Option<OauthToast>> =
+    parking_lot::Mutex::new(None);
+
+/// Record the result of a just-completed OAuth flow. Called from
+/// the three CTA surfaces inside their `poll_session` drain.
+pub fn record_toast(result: &Result<OauthToken, OauthError>) {
+    let toast = match result {
+        Ok(t) => OauthToast::Success {
+            provider: t.provider,
+            display_name: t.display_name.clone(),
+        },
+        Err(e) => OauthToast::Failure {
+            reason: e.to_string(),
+        },
+    };
+    *LAST_TOAST.lock() = Some(toast);
+}
+
+/// Snapshot of the most-recent toast for render. Returns a clone
+/// (toasts are tiny) so the CTA closures can decide visibility
+/// without holding the lock.
+pub fn current_toast() -> Option<OauthToast> {
+    LAST_TOAST.lock().clone()
+}
+
+/// Clear the visible toast — called from a Dismiss button OR
+/// from `try_start_session` when a fresh flow kicks off.
+pub fn clear_toast() {
+    *LAST_TOAST.lock() = None;
 }
 
 /// Parse the JSON body web POSTs to our loopback. Expected shape:

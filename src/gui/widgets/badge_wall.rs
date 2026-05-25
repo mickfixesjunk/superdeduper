@@ -77,9 +77,15 @@ fn render_login_cta(ui: &mut egui::Ui) {
 
     // Drain any completed session BEFORE deciding visibility — if
     // the user just finished OAuth, the next frame's status reads
-    // as Linked and the CTA goes away cleanly.
+    // as Linked and the CTA goes away cleanly. Record a toast so
+    // the next render shows success/error directly to the user.
     if let Some(result) = oauth::poll_session() {
-        match result {
+        oauth::record_toast(&result);
+        // Force a repaint so the UI updates immediately instead of
+        // waiting for the next user interaction — egui won't otherwise
+        // schedule a frame when an off-thread state change lands.
+        ui.ctx().request_repaint();
+        match &result {
             Ok(token) => eprintln!(
                 "login-cta: linked {} as {}",
                 token.provider.display_name(),
@@ -88,6 +94,11 @@ fn render_login_cta(ui: &mut egui::Ui) {
             Err(e) => eprintln!("login-cta: link failed: {e}"),
         }
     }
+
+    // Render any recent toast (success or failure) below the CTA
+    // area. Clicking Dismiss clears it; starting a new flow also
+    // clears it via try_start_session.
+    render_oauth_toast(ui);
 
     // Read link status best-effort. Any I/O error reads as
     // "anonymous" so the CTA still shows — never hide the CTA
@@ -190,6 +201,51 @@ fn render_login_cta(ui: &mut egui::Ui) {
         }
     }
     ui.add_space(6.0);
+}
+
+/// Render the most-recent OAuth toast inline below the CTA. Goes
+/// green for success, red for failure. Includes a Dismiss button
+/// so the user can clear it once they've seen it.
+fn render_oauth_toast(ui: &mut egui::Ui) {
+    use crate::leaderboard::oauth;
+    let Some(toast) = oauth::current_toast() else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        match &toast {
+            oauth::OauthToast::Success {
+                provider,
+                display_name,
+            } => {
+                ui.label(
+                    RichText::new(format!(
+                        "✓ Linked: {} ({})",
+                        display_name,
+                        provider.display_name(),
+                    ))
+                    .color(theme::ACCENT)
+                    .strong(),
+                );
+            }
+            oauth::OauthToast::Failure { reason } => {
+                ui.label(
+                    RichText::new(format!("⚠ Link failed: {reason}"))
+                        .color(theme::HOT)
+                        .strong(),
+                );
+            }
+        }
+        if ui
+            .add(
+                egui::Button::new(RichText::new("Dismiss").color(theme::TEXT_LO))
+                    .min_size(egui::vec2(64.0, 22.0)),
+            )
+            .clicked()
+        {
+            oauth::clear_toast();
+        }
+    });
+    ui.add_space(4.0);
 }
 
 /// Kick off an OAuth flow on the background worker. Caller stays

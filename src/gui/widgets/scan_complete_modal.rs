@@ -278,7 +278,9 @@ fn render_signin_cta(ui: &mut egui::Ui) {
     // Drain any completed background session before deciding
     // visibility. Same pattern as badge_wall's render_login_cta.
     if let Some(result) = oauth::poll_session() {
-        match result {
+        oauth::record_toast(&result);
+        ui.ctx().request_repaint();
+        match &result {
             Ok(token) => eprintln!(
                 "post-scan-cta: linked {} as {}",
                 token.provider.display_name(),
@@ -286,6 +288,47 @@ fn render_signin_cta(ui: &mut egui::Ui) {
             ),
             Err(e) => eprintln!("post-scan-cta: link failed: {e}"),
         }
+    }
+
+    // Render any recent OAuth result toast so the user gets
+    // immediate visible feedback. Same widget the above-grid
+    // CTA uses; only one toast exists at a time across surfaces.
+    if let Some(toast) = oauth::current_toast() {
+        ui.horizontal(|ui| {
+            match &toast {
+                oauth::OauthToast::Success {
+                    provider,
+                    display_name,
+                } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "✓ Signed in: {} ({})",
+                            display_name,
+                            provider.display_name(),
+                        ))
+                        .color(theme::ACCENT)
+                        .strong(),
+                    );
+                }
+                oauth::OauthToast::Failure { reason } => {
+                    ui.label(
+                        RichText::new(format!("⚠ Sign-in failed: {reason}"))
+                            .color(theme::HOT)
+                            .strong(),
+                    );
+                }
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Dismiss").color(theme::TEXT_LO))
+                        .min_size(egui::vec2(64.0, 22.0)),
+                )
+                .clicked()
+            {
+                oauth::clear_toast();
+            }
+        });
+        ui.add_space(8.0);
     }
 
     let active = crate::channel::active_channel();

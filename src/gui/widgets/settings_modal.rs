@@ -898,7 +898,9 @@ fn render_account(ui: &mut egui::Ui) {
     // status, so the post-link "Linked: …" row shows up the same
     // frame the user finished sign-in. Issue #2 fix.
     if let Some(result) = oauth::poll_session() {
-        match result {
+        oauth::record_toast(&result);
+        ui.ctx().request_repaint();
+        match &result {
             Ok(token) => eprintln!(
                 "account: linked {} as {}",
                 token.provider.display_name(),
@@ -968,6 +970,48 @@ fn render_account(ui: &mut egui::Ui) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
+
+    // Render any recent OAuth result toast (success or failure)
+    // so the user gets immediate visible feedback without grepping
+    // oauth.log. Persists until Dismiss or until a new OAuth flow
+    // starts (which clears it via try_start_session).
+    if let Some(toast) = oauth::current_toast() {
+        ui.horizontal(|ui| {
+            match &toast {
+                oauth::OauthToast::Success {
+                    provider,
+                    display_name,
+                } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "✓ Linked: {} ({})",
+                            display_name,
+                            provider.display_name(),
+                        ))
+                        .color(theme::ACCENT)
+                        .strong(),
+                    );
+                }
+                oauth::OauthToast::Failure { reason } => {
+                    ui.label(
+                        RichText::new(format!("⚠ Link failed: {reason}"))
+                            .color(theme::HOT)
+                            .strong(),
+                    );
+                }
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Dismiss").color(theme::TEXT_LO))
+                        .min_size(egui::vec2(64.0, 22.0)),
+                )
+                .clicked()
+            {
+                oauth::clear_toast();
+            }
+        });
+        ui.add_space(8.0);
+    }
 
     // In-flight render: spinner + Cancel. While a background
     // session runs, the Link / Unlink rows are replaced with the
