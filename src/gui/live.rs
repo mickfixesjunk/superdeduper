@@ -2114,7 +2114,26 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         // can add the toggle if user feedback shows it's wanted.
         allow_recall_on_read: false,
         hash_algo: settings.hash_algo,
-        exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),
+        // #81 — Compile the user's ExclusionConfig (master toggle +
+        // active preset packs + custom rules) into the runtime
+        // ExclusionPolicy that the walker consults per file. Falls
+        // back to disabled() on compile-failure so a malformed user
+        // glob doesn't sink the entire scan — the matcher error
+        // surfaces in the log instead. (New installs ship with
+        // safe-defaults ON via ExclusionConfig::default().)
+        exclusion_policy: match crate::exclusions::ExclusionPolicy::compile(
+            &settings.exclusion_config,
+            &crate::exclusions::presets::BuiltinPresets,
+        ) {
+            Ok(policy) => policy,
+            Err(e) => {
+                eprintln!(
+                    "exclusions: compile failed ({e}); scanning without exclusions for this run. \
+                     Fix the offending pattern in Settings → Exclusions."
+                );
+                crate::exclusions::ExclusionPolicy::disabled()
+            }
+        },
         exclusion_counters: crate::exclusions::ExclusionCounters::new(),
     })
 }

@@ -102,6 +102,15 @@ pub struct ScanSettings {
     /// 365 / forever as the four standard buckets.
     #[serde(default)]
     pub history_retention_days: u32,
+    /// #81 — Exclusion preset packs + custom rules. New installs
+    /// land on the safe-defaults shape (master ON, 4 footgun packs
+    /// active) via `ExclusionConfig::default()`; pre-#81 installs
+    /// without this field on disk also pick up safe-defaults via
+    /// the serde(default) backfill. Settings → Exclusions tab in
+    /// the GUI mutates this; the scan launch path compiles it into
+    /// an `ExclusionPolicy` and plugs it into RunConfig.
+    #[serde(default)]
+    pub exclusion_config: crate::exclusions::ExclusionConfig,
 }
 
 impl Default for ScanSettings {
@@ -125,6 +134,7 @@ impl Default for ScanSettings {
             dismissed_alpha_warning: false,
             keep_strategy: crate::cli::KeepStrategy::Smart,
             history_retention_days: 0,
+            exclusion_config: crate::exclusions::ExclusionConfig::default(),
         }
     }
 }

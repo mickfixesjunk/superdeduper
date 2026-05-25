@@ -74,6 +74,23 @@ impl PresetPackId {
         PresetPackId::AvSignatureDatabases,
     ];
 
+    /// #81 — Packs that default ON for new installs. Each one is
+    /// "almost always wrong to dedupe" territory: deleting a system
+    /// DLL breaks the OS; moving .git internals corrupts the repo;
+    /// touching AV signature databases breaks the AV. The other 4
+    /// packs (PackageManagerCaches, BuildArtefacts, BrowserCaches,
+    /// AppCaches) ship OFF because some users legitimately want to
+    /// reclaim those (cache cleanup; redundant build dirs).
+    ///
+    /// Order matches `ALL`; serialisation honours this order for
+    /// deterministic config-file output.
+    pub const SAFE_DEFAULTS: [PresetPackId; 4] = [
+        PresetPackId::SystemLibraries,
+        PresetPackId::VcsInternals,
+        PresetPackId::OsSystemTrees,
+        PresetPackId::AvSignatureDatabases,
+    ];
+
     /// User-facing label for the pack. Used by the Settings UI's
     /// preset row and by the scan summary's per-pack breakdown if
     /// per-pack counters land in v2.
