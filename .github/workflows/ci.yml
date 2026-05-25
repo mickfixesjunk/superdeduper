@@ -25,6 +25,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  feature-flag-drift:
+    # #69 — fail the build if scripts/cross-build-drop.sh's feature
+    # flags drift from .github/workflows/release.yml's. v0.2.4
+    # shipped without telemetry+similarity features because the
+    # two had silently diverged; this gate catches the next
+    # divergence at PR time rather than as a published-bad-binary
+    # report.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-feature-flag-consistency.sh
+
   clippy:
     runs-on: ubuntu-latest
     steps:
