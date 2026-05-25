@@ -19,6 +19,7 @@ pub mod events;
 pub mod live;
 pub mod particles;
 pub mod preflight;
+pub mod preview;
 pub mod project;
 #[cfg(feature = "telemetry")]
 pub mod resubmit;

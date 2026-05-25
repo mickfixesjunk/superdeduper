@@ -74,6 +74,10 @@ pub enum GroupAction {
     /// position within that group's `files` vec (must be > 0; the
     /// keeper button doesn't appear on the existing keeper).
     PromoteKeeper { group_idx: usize, member_idx: usize },
+    /// #27 — user clicked the 👁 button on a row. App sets
+    /// `previewed_file = Some(path)` + switches the active tab to
+    /// `Preview`. No filesystem side-effects.
+    Preview(PathBuf),
 }
 
 /// The two bulk-action options the dropdown above the results
@@ -641,6 +645,18 @@ pub fn show_filtered(
                                             .clicked()
                                         {
                                             clicked = Some(GroupAction::Reveal(k.clone()));
+                                        }
+                                        if ui
+                                            .small_button("👁")
+                                            .on_hover_text(
+                                                "Preview the keeper inline in the Preview tab. \
+                                                 Text files render as monospace text; binaries \
+                                                 render as hex + ASCII. (#27 v1 — Windows \
+                                                 IPreviewHandler hosting is v2 work.)",
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked = Some(GroupAction::Preview(k.clone()));
                                         }
                                     });
                                 }
