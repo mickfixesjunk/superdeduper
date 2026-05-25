@@ -30,11 +30,13 @@ echo "==> cross-build for ${SHA}"
 echo "    archive: ${ARCHIVE_DIR}"
 echo "    latest:  ${LATEST_DIR}"
 
-echo "==> Linux CLI (telemetry)"
-cargo build --release --features "telemetry" --bin superdeduper
+echo "==> Linux CLI (telemetry; musl static — no glibc dependency)"
+cargo zigbuild --release --features "telemetry" --bin superdeduper \
+  --target x86_64-unknown-linux-musl
 
-echo "==> Linux GUI (gui + telemetry; no audio — alsa-sys often missing on WSL)"
-cargo build --release --features "gui telemetry" --bin superdeduper-gui
+echo "==> Linux GUI (gui + telemetry; musl static — Ubuntu 20.04+ compat)"
+cargo zigbuild --release --features "gui telemetry" --bin superdeduper-gui \
+  --target x86_64-unknown-linux-musl
 
 echo "==> Windows CLI (telemetry; cross-compile via cargo-zigbuild)"
 cargo zigbuild --release --features "telemetry" --bin superdeduper \
@@ -49,10 +51,10 @@ cargo zigbuild --release --features "gui telemetry audio" --bin superdeduper-gui
 mkdir -p "$ARCHIVE_DIR" "$LATEST_DIR"
 
 declare -a BINARIES=(
-  "target/release/superdeduper                                superdeduper-linux-x86_64"
-  "target/release/superdeduper-gui                            superdeduper-gui-linux-x86_64"
-  "target/x86_64-pc-windows-gnu/release/superdeduper.exe      superdeduper-windows-x86_64.exe"
-  "target/x86_64-pc-windows-gnu/release/superdeduper-gui.exe  superdeduper-gui-windows-x86_64.exe"
+  "target/x86_64-unknown-linux-musl/release/superdeduper           superdeduper-linux-x86_64"
+  "target/x86_64-unknown-linux-musl/release/superdeduper-gui       superdeduper-gui-linux-x86_64"
+  "target/x86_64-pc-windows-gnu/release/superdeduper.exe           superdeduper-windows-x86_64.exe"
+  "target/x86_64-pc-windows-gnu/release/superdeduper-gui.exe       superdeduper-gui-windows-x86_64.exe"
 )
 
 for entry in "${BINARIES[@]}"; do

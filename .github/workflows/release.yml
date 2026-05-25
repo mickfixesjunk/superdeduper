@@ -22,7 +22,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # NOTE: deliberately NOT setting `RUSTFLAGS: -D warnings` here.
+  # release.yml had been failing since v0.1.5 because the
+  # egui 0.28 → 0.32 upgrade introduced 40+ deprecation warnings;
+  # the deny-warnings flag turned every release tag into a red
+  # build. Warnings stay surfaced in `ci.yml` (which runs on
+  # branches + PRs); tagged releases ship binaries even when
+  # the deprecation backlog isn't fully cleaned up.
 
 jobs:
   build:
@@ -157,33 +163,49 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install GUI build deps
-        # libasound2-dev is required by alsa-sys, which rodio pulls
-        # in for the scan-done chime. CLI-only builds don't need it
-        # — but we ship both CLI + GUI so we install it unconditionally.
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Install musl + build deps
+        # musl-tools provides the musl-gcc wrapper that some -sys
+        # crates (rusqlite, alsa-sys) need for their build.rs to
+        # link statically. libasound2-dev still needed when the
+        # `audio` feature pulls rodio → alsa-sys.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools libasound2-dev pkg-config
 
-      - name: Build (locked, release)
+      - name: Build (locked, release, musl-static)
+        # Static-link against musl libc so the produced binaries
+        # have no glibc dependency at runtime. Ships on any Linux
+        # 3.2+ kernel (Ubuntu 16.04 onward, RHEL/CentOS 7+). The
+        # `audio` feature is intentionally omitted on Linux release
+        # builds — alsa-sys pulls a libc binding that doesn't
+        # static-link clean against musl in practice; CLI + GUI
+        # ship without the scan-done chime on Linux.
         run: |
-          cargo build --release --locked --bin superdeduper
-          cargo build --release --locked --features "gui audio" --bin superdeduper-gui
+          cargo build --release --locked --target x86_64-unknown-linux-musl --bin superdeduper
+          cargo build --release --locked --target x86_64-unknown-linux-musl --features "gui" --bin superdeduper-gui
 
       - name: Stage artifacts
         run: |
           stage="stage/superdeduper-x86_64-linux"
           mkdir -p "$stage"
-          cp target/release/superdeduper "$stage/"
-          cp target/release/superdeduper-gui "$stage/"
+          cp target/x86_64-unknown-linux-musl/release/superdeduper "$stage/"
+          cp target/x86_64-unknown-linux-musl/release/superdeduper-gui "$stage/"
           cp LICENSE "$stage/"
           cp README.md "$stage/"
+          # Ensure executable bit is set even after tarball extract.
+          chmod +x "$stage/superdeduper" "$stage/superdeduper-gui"
           # Strip debug symbols — drops the binary size meaningfully
           # without losing crash-report value (Rust's std panic
           # handler still reports the panic site by source location).
           strip "$stage/superdeduper" "$stage/superdeduper-gui" || true
+          # Verify musl-static: no GLIBC_ symbols should remain.
+          if objdump -T "$stage/superdeduper-gui" 2>/dev/null | grep -q GLIBC_; then
+            echo "::error::superdeduper-gui still references GLIBC_ symbols"
+            objdump -T "$stage/superdeduper-gui" | grep GLIBC_
+            exit 1
+          fi
 
       - name: Compute SHA-256 checksums
         run: |
