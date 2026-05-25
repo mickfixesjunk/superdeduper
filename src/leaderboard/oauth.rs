@@ -693,7 +693,6 @@ fn link_via_loopback_inner(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<OauthToken, OauthError> {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
 
     // `install_id` is unused in the direct-to-provider flow (the
     // exchange endpoint links it via the user's auth session on

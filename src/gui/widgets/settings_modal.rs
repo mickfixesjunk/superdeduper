@@ -1282,34 +1282,6 @@ fn render_account(ui: &mut egui::Ui) {
     crate::gui::widgets::oauth_chooser::show(ui.ctx(), active);
 }
 
-/// Spawn a background OAuth session. The Settings → Account tab
-/// (and the other CTAs) check `oauth::current_session_snapshot()`
-/// each frame to render the spinner + Cancel row, then drain via
-/// `oauth::poll_session()` once it completes. Per issue #2 fix.
-#[cfg(feature = "telemetry")]
-fn start_link(provider: crate::leaderboard::oauth::Provider, channel: crate::channel::Channel) {
-    use crate::leaderboard::{install, oauth};
-    let install_id = match install::load().ok().flatten() {
-        Some(s) => s.install_id,
-        None => {
-            eprintln!("account: not registered on channel {channel} — run `superdeduper register --channel {channel}` first");
-            return;
-        }
-    };
-    let server_url = crate::channel::server_url_for(channel);
-    if oauth::try_start_session(
-        provider,
-        channel,
-        server_url,
-        &install_id,
-        oauth::DEFAULT_OAUTH_TIMEOUT,
-    )
-    .is_err()
-    {
-        eprintln!("account: another OAuth flow is already in flight; ignoring");
-    }
-}
-
 #[cfg(feature = "telemetry")]
 fn render_leaderboard(ui: &mut egui::Ui) {
     use crate::leaderboard::install;
