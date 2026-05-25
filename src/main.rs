@@ -695,6 +695,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     // the byte-identical pipeline state.
     let mode = args.mode;
     let image_similarity_threshold = args.image_similarity_threshold;
+    let audio_similarity_threshold = args.audio_similarity_threshold;
 
     let scan_started = std::time::Instant::now();
     // Wall-clock UNIX seconds for the scan_history record — same
@@ -1001,9 +1002,8 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     // #26 T1.3 Tier-4 — acoustic audio similarity. Parallel to the
     // image branch above; runs ONLY when `--mode audio` was set +
     // the `similar-audio` feature is on. czkawka's default 5-bits-
-    // per-chunk threshold is the per-pair average; not user-tunable
-    // via CLI today (add `--audio-similarity-threshold` flag when
-    // the next sub-deliverable lands).
+    // per-chunk threshold is now user-tunable via the
+    // `--audio-similarity-threshold` flag (GH #53).
     #[cfg(feature = "similar-audio")]
     let duplicates = {
         use superdeduper::cli::ScanMode;
@@ -1012,12 +1012,12 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         if matches!(mode, ScanMode::Audio) {
             if let Some(inv) = inventory_for_tier4_audio.as_deref() {
                 let t_tier4 = std::time::Instant::now();
-                let groups = tier4::find_similar_groups(inv, tier4::DEFAULT_THRESHOLD);
+                let groups = tier4::find_similar_groups(inv, audio_similarity_threshold);
                 let _ = writeln!(
                     io::stderr(),
                     "stage 4 acoustic: {} group(s) within {} bits/chunk avg ({} ms)",
                     groups.len(),
-                    tier4::DEFAULT_THRESHOLD,
+                    audio_similarity_threshold,
                     t_tier4.elapsed().as_millis(),
                 );
                 all.extend(groups);
@@ -1037,6 +1037,19 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
             );
         }
         let _ = (mode, image_similarity_threshold);
+    }
+    #[cfg(not(feature = "similar-audio"))]
+    {
+        if matches!(mode, superdeduper::cli::ScanMode::Audio) {
+            eprintln!(
+                "warning: this binary was built without the `similar-audio` \
+                 feature — `--mode audio` falls through to byte-identical \
+                 dedup. Rebuild with `cargo build --features similar-audio` \
+                 (or use a release binary that ships with it on) to enable \
+                 Tier-4 acoustic similarity."
+            );
+        }
+        let _ = audio_similarity_threshold;
     }
 
     let mut writer: Box<dyn Write> = match &cfg.output {

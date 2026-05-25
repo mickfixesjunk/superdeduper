@@ -538,7 +538,8 @@ impl SuperdeduperApp {
             defender_rtp_pre,
             self.scan_mode,
             5, // image_similarity_threshold — TODO add a Settings input
-               // when v3 ships the GUI threshold control.
+            // when v3 ships the GUI threshold control.
+            5.0, // audio_similarity_threshold — same Settings TODO.
         );
     }
 

@@ -35,6 +35,14 @@ pub struct Cli {
     pub command: Command,
 }
 
+// `ScanArgs` legitimately carries ~270 bytes of CLI flags + the
+// other variants are small; clippy's large_enum_variant lint flags
+// the size difference. Boxing the big variant would force every
+// dispatcher arm to deref through `Box<ScanArgs>`, and the entire
+// Command enum is only ever constructed ONCE per process via
+// `Cli::parse()`, so the "stack-copy each variant" perf cost the
+// lint warns about doesn't apply. Silenced rather than Box'd.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Scan one or more paths and report duplicate groups (non-destructive).
@@ -323,6 +331,17 @@ pub struct ScanArgs {
     /// rate.
     #[arg(long, value_name = "BITS", default_value_t = 5)]
     pub image_similarity_threshold: u32,
+
+    /// Average per-chunk Hamming-distance threshold for `--mode audio`.
+    /// The Chromaprint fingerprint is a sequence of 32-bit chunks; we
+    /// average the per-chunk bit-flip counts across the alignment
+    /// window and group pairs whose average is ≤ this value. Default
+    /// 5.0 matches czkawka's calibrated default + the v1 spec §3.
+    /// Distinct unit from `--image-similarity-threshold` (which is
+    /// a flat 64-bit-hash bit count); the flags are intentionally
+    /// separate per testrunner's GH #53.
+    #[arg(long, value_name = "BITS", default_value_t = 5.0)]
+    pub audio_similarity_threshold: f64,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

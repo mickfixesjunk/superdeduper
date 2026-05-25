@@ -91,6 +91,7 @@ fn drive_engine_until_done(
         None,
         superdeduper::cli::ScanMode::Exact,
         5,
+        5.0,
     );
 
     let mut events = Vec::new();
