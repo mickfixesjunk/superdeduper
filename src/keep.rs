@@ -20,6 +20,21 @@
 use std::path::Path;
 use std::time::SystemTime;
 
+/// Fetch a file's mtime as `Option<SystemTime>`. Returns `None`
+/// when the file can't be stat'd (deleted between scan + keep
+/// decision, permission denied, etc.) so callers can treat
+/// missing-mtime as a tiebreak input rather than a hard error.
+///
+/// Single source of truth for the `fs::metadata(p).and_then(|m|
+/// m.modified()).ok()` pattern that previously lived in four
+/// keeper-strategy call sites (per quality audit F9 /
+/// #68-absorbed). Centralised here so a future refactor —
+/// e.g. cache mtime in `FileEntry` to avoid the per-row stat —
+/// has one call site to update.
+pub fn file_mtime(p: &Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
 /// One file's score with the per-component breakdown that
 /// produced it. The breakdown is shown in the GUI tooltip when
 /// the user hovers the keeper badge, and goes into logs so a

@@ -324,7 +324,7 @@ fn pick_keeper(
         KeepStrategy::Oldest | KeepStrategy::Newest => {
             let mut best_time: Option<std::time::SystemTime> = None;
             for (i, p) in group.files.iter().enumerate() {
-                let t = fs::metadata(p).and_then(|m| m.modified()).ok();
+                let t = crate::keep::file_mtime(p);
                 let take = match (best_time, t, strategy) {
                     (None, Some(_), _) => true,
                     (Some(cur), Some(t), KeepStrategy::Oldest) if t < cur => true,
@@ -369,7 +369,7 @@ fn pick_keeper(
             let mtimes: Vec<Option<std::time::SystemTime>> = group
                 .files
                 .iter()
-                .map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+                .map(|p| crate::keep::file_mtime(p))
                 .collect();
             idx = crate::keep::pick_keeper(&group.files, &mtimes);
         }

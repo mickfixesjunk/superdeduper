@@ -728,7 +728,7 @@ pub fn show_filtered(
                                         .strong(),
                                 );
                                 let mtime =
-                                    std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                                    crate::keep::file_mtime(p);
                                 let s = crate::keep::score_file(p, mtime);
                                 let mut tip = format!("Smart-keep score: {:+.1}\n", s.total);
                                 if s.breakdown.is_empty() {
