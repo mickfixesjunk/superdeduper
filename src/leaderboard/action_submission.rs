@@ -197,6 +197,11 @@ pub fn actions_summary_from_dedupe(
 /// always credits `archived_bytes` regardless of failure
 /// reasons — the bucket counters are for the UX modal, not the
 /// PATCH payload.
+///
+/// Gated on `feature = "gui"` because `ArchiveActionSummary` lives
+/// in `gui::archive`; CLI-only builds skip the archive worker
+/// entirely so the helper is unreachable in that combo.
+#[cfg(feature = "gui")]
 pub fn actions_summary_from_archive(
     s: &crate::gui::archive::ArchiveActionSummary,
 ) -> Option<BTreeMap<String, u64>> {
