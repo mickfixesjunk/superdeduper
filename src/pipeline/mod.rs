@@ -71,6 +71,97 @@ pub enum SimilarityKind {
     PerceptualAudio,
 }
 
+/// #70 — Defensive invariant check: no DuplicateGroup may contain
+/// the same path twice. A file cannot be a duplicate of ITSELF;
+/// if engine ever emits a group with two identical paths, a user
+/// who trusts the GUI + runs Recycle on the "loser" entry will
+/// destroy a unique file (data-loss class).
+///
+/// Today no code path is known to violate this; Mick's
+/// 2026-05-25 report of a same-path group turned out to be a
+/// false alarm. The assert is preventive: catches a regression
+/// before it ships. Wrapped in `debug_assert!` so release builds
+/// pay zero cost. The unit tests run in debug mode; CI's `cargo
+/// test` exercises every emit site that ships in the lib.
+pub fn assert_unique_paths(group: &DuplicateGroup) {
+    if cfg!(debug_assertions) {
+        let mut seen: std::collections::HashSet<&std::path::Path> =
+            std::collections::HashSet::with_capacity(group.files.len());
+        for p in &group.files {
+            assert!(
+                seen.insert(p.as_path()),
+                "DuplicateGroup contains duplicate path `{}` — a file cannot be a \
+                 duplicate of itself. content_hash={}, files={:?}",
+                p.display(),
+                group.content_hash,
+                group.files,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod assert_unique_paths_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn group_with_paths(paths: Vec<PathBuf>) -> DuplicateGroup {
+        DuplicateGroup {
+            size: 1024,
+            content_hash: "test-hash".to_string(),
+            files: paths,
+            link_equivalent: false,
+            unique_inodes: 0,
+            similarity_kind: SimilarityKind::ByteIdentical,
+        }
+    }
+
+    #[test]
+    fn distinct_paths_pass() {
+        let g = group_with_paths(vec![
+            PathBuf::from("/tmp/a.bin"),
+            PathBuf::from("/tmp/b.bin"),
+            PathBuf::from("/tmp/c.bin"),
+        ]);
+        assert_unique_paths(&g); // must not panic
+    }
+
+    #[test]
+    fn empty_group_passes() {
+        let g = group_with_paths(vec![]);
+        assert_unique_paths(&g);
+    }
+
+    #[test]
+    fn single_path_passes() {
+        let g = group_with_paths(vec![PathBuf::from("/tmp/lonely.bin")]);
+        assert_unique_paths(&g);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate path")]
+    fn same_path_twice_panics() {
+        let g = group_with_paths(vec![
+            PathBuf::from("/tmp/foo.bin"),
+            PathBuf::from("/tmp/foo.bin"),
+        ]);
+        assert_unique_paths(&g);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate path")]
+    fn same_path_amongst_unique_panics() {
+        // First two distinct, third repeats the first — the
+        // assertion should still fire (not just check pairs).
+        let g = group_with_paths(vec![
+            PathBuf::from("/tmp/a.bin"),
+            PathBuf::from("/tmp/b.bin"),
+            PathBuf::from("/tmp/a.bin"),
+        ]);
+        assert_unique_paths(&g);
+    }
+}
+
 /// A confirmed set of byte-identical files OR a Tier-4 perceptual
 /// similarity group (per `similarity_kind`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

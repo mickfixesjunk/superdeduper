@@ -440,7 +440,7 @@ fn run_group(
         let files: Vec<PathBuf> = group.files.into_iter().map(|f| f.entry.path).collect();
         let unique_inodes = files.len() as u64;
         let empty_hash = algo::hash_oneshot(cfg.hash_algo, &[]);
-        return Ok(vec![DuplicateGroup {
+        let g = DuplicateGroup {
             size: 0,
             content_hash: hex(&empty_hash),
             files,
@@ -451,7 +451,9 @@ fn run_group(
             // is one inode" interpretation that's correct here.
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
-        }]);
+        };
+        super::assert_unique_paths(&g);
+        return Ok(vec![g]);
     }
 
     // T0.5: dedupe by inode BEFORE the tier pipeline.
@@ -510,14 +512,16 @@ fn run_group(
         counters.tier_count[3].fetch_add(1, Ordering::Relaxed);
         let mut paths = aliases.clone();
         paths.sort();
-        out.push(DuplicateGroup {
+        let g = DuplicateGroup {
             size,
             content_hash: hex(&hash_bytes),
             files: paths,
             link_equivalent: true,
             unique_inodes: 1,
             similarity_kind: SimilarityKind::ByteIdentical,
-        });
+        };
+        super::assert_unique_paths(&g);
+        out.push(g);
         if let Some(cb) = on_file {
             cb(&rep.entry.path, 3, ProgressOutcome::Hashed { bytes: size });
         }
@@ -591,14 +595,16 @@ fn run_group(
         let unique_inodes = files.len() as u64;
         let mut paths: Vec<PathBuf> = files.iter().map(|f| f.entry.path.clone()).collect();
         paths.sort();
-        out.push(DuplicateGroup {
+        let g = DuplicateGroup {
             size,
             content_hash: hex(&hash),
             files: paths,
             link_equivalent,
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
-        });
+        };
+        super::assert_unique_paths(&g);
+        out.push(g);
     }
     Ok(out)
 }
