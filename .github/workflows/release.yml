@@ -68,6 +68,14 @@ jobs:
 
       - name: Build (locked, release)
         shell: pwsh
+        # `+crt-static` statically links the C runtime into the .exe so
+        # fresh Windows installs don't fail with "VCRUNTIME140.dll was
+        # not found." Scoped to the MSVC target only; aarch64 / gnu /
+        # other targets, if reintroduced, should set this per-step
+        # rather than workflow-wide. Adds a few hundred KB to the EXE;
+        # runtime perf unchanged.
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           cargo build --release --locked --target ${{ matrix.target }} --features "telemetry similar-images similar-audio" --bin superdeduper
           cargo build --release --locked --target ${{ matrix.target }} --features "gui telemetry audio similar-images similar-audio" --bin superdeduper-gui
