@@ -292,14 +292,15 @@ fn platform_inode_nlink_attrs(
     metadata: &fs::Metadata,
 ) -> io::Result<(u64, u32, u64)> {
     use std::os::unix::fs::MetadataExt;
-    Ok((metadata.ino(), metadata.nlink() as u32, metadata.mode() as u64))
+    Ok((
+        metadata.ino(),
+        metadata.nlink() as u32,
+        metadata.mode() as u64,
+    ))
 }
 
 #[cfg(windows)]
-fn platform_inode_nlink_attrs(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> io::Result<(u64, u32, u64)> {
+fn platform_inode_nlink_attrs(path: &Path, metadata: &fs::Metadata) -> io::Result<(u64, u32, u64)> {
     use std::os::windows::fs::MetadataExt;
     // file_attributes() is cheap + already-resolved on the metadata
     // we have; cover that path. nlink requires a separate open +
@@ -317,10 +318,9 @@ fn win_file_info(path: &Path) -> Option<(u64, u32)> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     // Wide-string nul-terminated for CreateFileW. Reuses the
     // verbatim-path convention the walker established (commit
@@ -369,7 +369,7 @@ fn platform_inode_nlink_attrs(
 #[cfg(unix)]
 fn platform_acl_hash(metadata: &fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
-    let mode = metadata.mode() as u32;
+    let mode = metadata.mode();
     let uid = metadata.uid();
     let gid = metadata.gid();
     let mut hasher = Sha256::new();
@@ -528,7 +528,11 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
         let snap = capture(dir.path()).unwrap();
         for entry in &snap.entries {
-            assert!(entry.inode.starts_with("0x"), "inode missing 0x prefix: {}", entry.inode);
+            assert!(
+                entry.inode.starts_with("0x"),
+                "inode missing 0x prefix: {}",
+                entry.inode
+            );
             assert_eq!(
                 entry.inode.len(),
                 18,
@@ -628,7 +632,10 @@ mod tests {
             .expect("symlink entry");
         assert!(matches!(link_entry.entry_type, EntryType::Symlink));
         assert!(link_entry.is_reparse_point);
-        assert_eq!(link_entry.reparse_tag.as_deref(), Some("IO_REPARSE_TAG_SYMLINK"));
+        assert_eq!(
+            link_entry.reparse_tag.as_deref(),
+            Some("IO_REPARSE_TAG_SYMLINK")
+        );
         assert!(link_entry.content_hash_sha256.is_none());
         assert!(link_entry.reparse_target.is_some());
     }
@@ -642,8 +649,16 @@ mod tests {
         std::fs::write(&a, b"shared").unwrap();
         std::fs::hard_link(&a, &b).unwrap();
         let snap = capture(dir.path()).unwrap();
-        let a_entry = snap.entries.iter().find(|e| e.path.ends_with("a.txt")).unwrap();
-        let b_entry = snap.entries.iter().find(|e| e.path.ends_with("b.txt")).unwrap();
+        let a_entry = snap
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("a.txt"))
+            .unwrap();
+        let b_entry = snap
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("b.txt"))
+            .unwrap();
         assert_eq!(a_entry.inode, b_entry.inode, "hardlinks must share inode");
         assert_eq!(a_entry.nlink, 2);
         assert_eq!(b_entry.nlink, 2);
@@ -657,7 +672,11 @@ mod tests {
         let f = dir.path().join("empty.txt");
         std::fs::File::create(&f).unwrap().flush().unwrap();
         let snap = capture(dir.path()).unwrap();
-        let entry = snap.entries.iter().find(|e| e.path.ends_with("empty.txt")).unwrap();
+        let entry = snap
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("empty.txt"))
+            .unwrap();
         // SHA-256 of the empty byte stream.
         assert_eq!(
             entry.content_hash_sha256.as_deref().unwrap(),
