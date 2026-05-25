@@ -450,7 +450,26 @@ pub fn show_filtered(
                                 );
                             });
                             row.col(|ui| {
-                                if g.link_equivalent {
+                                use crate::pipeline::SimilarityKind;
+                                if matches!(g.similarity_kind, SimilarityKind::PerceptualImage) {
+                                    // Tier-4 perceptual group — bytes
+                                    // differ but the images LOOK alike.
+                                    // Surface that distinctly so the
+                                    // user knows to review carefully
+                                    // before deleting.
+                                    ui.label(
+                                        RichText::new("🖼 perceptual image")
+                                            .color(theme::WARN)
+                                            .small()
+                                            .strong(),
+                                    )
+                                    .on_hover_text(
+                                        "These files look perceptually similar (resize, \
+                                         format-conversion, light-edit twins) but their \
+                                         bytes differ. Review side-by-side before deleting \
+                                         — perceptual-similar isn't byte-identical.",
+                                    );
+                                } else if g.link_equivalent {
                                     // Already-hardlinked groups have no
                                     // reclaimable space — surface that
                                     // distinctly so the user knows

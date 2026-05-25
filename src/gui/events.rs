@@ -121,6 +121,15 @@ pub struct DuplicateGroupSummary {
     /// `files.len()` in that case.
     #[serde(default)]
     pub unique_inodes: u64,
+    /// What sort of similarity grouped these files together. #25 v3+
+    /// addition: `byte-identical` (default) is the legacy T0–T3
+    /// pipeline; `perceptual-image` is Tier-4 image grouping (#25).
+    /// The groups table renders perceptual groups with a distinct
+    /// icon + tooltip so the user knows to review them more carefully.
+    /// `#[serde(default)]` keeps old checkpoints loadable as
+    /// ByteIdentical.
+    #[serde(default)]
+    pub similarity_kind: crate::pipeline::SimilarityKind,
 }
 
 /// Severity tag for [`EngineEvent::Log`] entries.

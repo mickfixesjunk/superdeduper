@@ -545,6 +545,7 @@ mod inode_aware_tests {
                 .collect(),
             link_equivalent,
             unique_inodes,
+            similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
         }
     }
 
