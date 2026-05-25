@@ -167,7 +167,9 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
                         serde_json::to_string_pretty(&payload).unwrap_or_default()
                     );
                 }
-                OutputFormat::Text | OutputFormat::Csv => match s {
+                // Report falls back to Text for account status —
+                // there's no markdown table shape to emit.
+                OutputFormat::Text | OutputFormat::Csv | OutputFormat::Report => match s {
                     oauth::AccountStatus::Anonymous => {
                         println!("channel:    {}", active);
                         println!("install_id: {}", install_id);
@@ -355,7 +357,9 @@ fn print_achievements(
                 serde_json::to_string_pretty(&payload).unwrap_or_default()
             );
         }
-        OutputFormat::Text | OutputFormat::Csv => {
+        // Same fallback rationale as account status — Report has no
+        // tabular shape that matches achievements list.
+        OutputFormat::Text | OutputFormat::Csv | OutputFormat::Report => {
             println!("install_id: {}", profile.install_id);
             println!(
                 "lifetime: {} bytes reclaimed across {} scans",

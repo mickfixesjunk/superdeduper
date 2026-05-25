@@ -339,6 +339,12 @@ pub enum OutputFormat {
     Text,
     Json,
     Csv,
+    /// Markdown-friendly one-page summary: total files / bytes,
+    /// group count, reclaimable bytes (path-aware + inode-aware),
+    /// top-10 largest groups by reclaimable, and a one-liner on
+    /// how to apply destructive actions. Aimed at pasting into
+    /// issues or chat. fclones-style.
+    Report,
 }
 
 #[derive(

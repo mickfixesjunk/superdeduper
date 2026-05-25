@@ -74,7 +74,115 @@ pub fn write(
             out.write_all(b"\n")?;
         }
         OutputFormat::Csv => write_csv(out, groups)?,
+        OutputFormat::Report => write_report(out, groups, skipped, &summary)?,
     }
+    Ok(())
+}
+
+/// Markdown-friendly one-page summary. fclones-style. Designed to
+/// paste cleanly into a GitHub issue, a Discord/Slack message, or a
+/// terminal block-screenshot. Stable section order; humansize is
+/// binary (KiB/MiB/GiB) per the rest of the engine's output voice.
+fn write_report(
+    out: &mut dyn Write,
+    groups: &[DuplicateGroup],
+    skipped: &[SkippedFile],
+    summary: &Summary,
+) -> Result<()> {
+    writeln!(out, "# superdeduper scan report")?;
+    writeln!(out)?;
+    writeln!(out, "- **Files scanned:** {}", summary.files)?;
+    writeln!(out, "- **Duplicate groups:** {}", summary.groups)?;
+    writeln!(
+        out,
+        "- **Reclaimable (path-aware):** {}",
+        humansize::format_size(summary.reclaimable_bytes, humansize::BINARY)
+    )?;
+    writeln!(
+        out,
+        "- **Reclaimable (inode-aware):** {}",
+        humansize::format_size(summary.reclaimable_inode_bytes, humansize::BINARY)
+    )?;
+    if summary.placeholder_skipped > 0 {
+        writeln!(
+            out,
+            "- **Placeholders skipped:** {} (cloud / reparse-point files we won't hydrate)",
+            summary.placeholder_skipped
+        )?;
+    }
+    writeln!(out)?;
+
+    if groups.is_empty() {
+        writeln!(out, "No duplicates found.")?;
+        return Ok(());
+    }
+
+    // Top 10 groups by inode-aware reclaim. Path-aware would penalise
+    // hardlink-heavy groups unfairly; the inode-aware view answers
+    // "what actually frees disk space?" which is what a triage report
+    // wants to surface first.
+    const TOP_N: usize = 10;
+    let mut ranked: Vec<(usize, u64)> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let reclaim = if g.link_equivalent {
+                0
+            } else {
+                g.unique_inodes.saturating_sub(1) * g.size
+            };
+            (i, reclaim)
+        })
+        .collect();
+    ranked.sort_by_key(|(_, reclaim)| std::cmp::Reverse(*reclaim));
+    let shown = ranked.iter().take(TOP_N).count();
+
+    writeln!(out, "## Top {shown} group(s) by reclaimable bytes")?;
+    writeln!(out)?;
+    writeln!(out, "| # | Size | Files | Reclaim | Sample path |")?;
+    writeln!(out, "|---|------|-------|---------|-------------|")?;
+    for (rank, (idx, reclaim)) in ranked.iter().take(TOP_N).enumerate() {
+        let g = &groups[*idx];
+        let sample = g.files.first().map(|p| display_path(p)).unwrap_or_default();
+        writeln!(
+            out,
+            "| {} | {} | {} | {} | `{}` |",
+            rank + 1,
+            humansize::format_size(g.size, humansize::BINARY),
+            g.files.len(),
+            humansize::format_size(*reclaim, humansize::BINARY),
+            sample,
+        )?;
+    }
+    writeln!(out)?;
+
+    if !skipped.is_empty() {
+        writeln!(
+            out,
+            "_{} placeholder(s) skipped from hashing (recall-on-open / reparse). See full JSON output for the list._",
+            skipped.len()
+        )?;
+        writeln!(out)?;
+    }
+
+    writeln!(out, "## Next step")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Save the scan result with `--format json --output results.json`, then preview destructive actions:"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "```")?;
+    writeln!(
+        out,
+        "superdeduper dedupe results.json --strategy oldest --action safe-rename --dry-run"
+    )?;
+    writeln!(out, "```")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Drop `--dry-run` to apply. Use `--action recycle` to send losers to the system trash, or `--action hardlink` to dedup in place on a single volume."
+    )?;
     Ok(())
 }
 
