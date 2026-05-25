@@ -82,6 +82,74 @@ pub struct RestoreSummary {
     pub io_errors: u64,
 }
 
+/// #80 Bug C — rollup of an archive run, broken down by outcome
+/// and by failure-reason bucket. The `moved_bytes` field is the
+/// **only** byte counter that should ever be credited as
+/// `archived_bytes` to the leaderboard (per #79). Failed-side
+/// bytes never reclaimed any disk and crediting them would be a
+/// silent leaderboard-cheating vector — see #80's spec.
+///
+/// Failure reason buckets:
+/// * `failed_access_denied_*` — rename failed, copy succeeded,
+///   `remove_file(src)` failed with PermissionDenied. This is the
+///   #80 root-cause case (TrustedInstaller-owned dirs). With the
+///   Bug A fix the orphan copy has already been removed by the
+///   time we tally this bucket.
+/// * `failed_cross_device_*` — rename and the copy fallback both
+///   failed. Most commonly: cross-device source where the copy
+///   itself fails (read denied on the source) or the destination
+///   ran out of space mid-copy.
+/// * `failed_other_*` — anything else (mkdir failed, generic IO,
+///   etc.). Bundled into a single bucket because the user-actionable
+///   guidance is the same (\"check the log\").
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveActionSummary {
+    pub moved_count: u64,
+    pub moved_bytes: u64,
+    pub failed_access_denied_count: u64,
+    pub failed_access_denied_bytes: u64,
+    pub failed_cross_device_count: u64,
+    pub failed_cross_device_bytes: u64,
+    pub failed_other_count: u64,
+    pub failed_other_bytes: u64,
+    pub user_stopped: bool,
+    pub destination: PathBuf,
+}
+
+impl ArchiveActionSummary {
+    pub fn failed_count(&self) -> u64 {
+        self.failed_access_denied_count
+            + self.failed_cross_device_count
+            + self.failed_other_count
+    }
+
+    pub fn failed_bytes(&self) -> u64 {
+        self.failed_access_denied_bytes
+            + self.failed_cross_device_bytes
+            + self.failed_other_bytes
+    }
+
+    /// Categorise an `std::io::Error` from the move/copy/remove path
+    /// into one of the three failure buckets. Used by the archive
+    /// worker as it tallies; isolated here so the categorisation
+    /// rule is unit-testable.
+    pub fn classify_error(err: &std::io::Error) -> ArchiveFailureBucket {
+        use std::io::ErrorKind::*;
+        match err.kind() {
+            PermissionDenied => ArchiveFailureBucket::AccessDenied,
+            CrossesDevices | StorageFull => ArchiveFailureBucket::CrossDevice,
+            _ => ArchiveFailureBucket::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFailureBucket {
+    AccessDenied,
+    CrossDevice,
+    Other,
+}
+
 /// Parse a manifest from disk. Errors are returned verbatim so the
 /// caller can surface the message to the user.
 pub fn load_manifest(path: &Path) -> Result<ArchiveManifest> {

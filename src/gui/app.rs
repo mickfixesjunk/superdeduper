@@ -142,6 +142,11 @@ pub struct SuperdeduperApp {
     /// Bypassed when `settings.bypass_destructive_confirmation` is
     /// true; non-destructive Reveal-in-Explorer never lands here.
     pending_destructive: Option<groups_table::GroupAction>,
+    /// #80 Bug C — rollup of the most recent archive run, waiting
+    /// to be rendered by the post-archive summary modal. `None`
+    /// until the archive worker fires `ArchiveActionSummary`;
+    /// cleared by the modal's Done / View profile click.
+    pending_archive_summary: Option<crate::gui::archive::ArchiveActionSummary>,
     /// Text the user has typed into the confirmation prompt. Must
     /// equal `"DELETE"` exactly before the Confirm button enables.
     /// Cleared every time the modal opens or closes.
@@ -277,6 +282,7 @@ impl SuperdeduperApp {
             current_project_created_at: 0,
             pending_archive_restore: None,
             pending_destructive: None,
+            pending_archive_summary: None,
             destructive_confirm_input: String::new(),
             alpha_warning_acked_session: false,
             action_cancel: Arc::new(AtomicBool::new(false)),
@@ -1598,6 +1604,16 @@ impl SuperdeduperApp {
                             // was running.
                             self.groups_state.acted.clear();
                         }
+                        EngineEvent::ArchiveActionSummary(summary) => {
+                            // #80 Bug C — pop the archive-summary
+                            // modal so the user sees the moved-vs-
+                            // failed split + the *actually reclaimed*
+                            // byte total. ActionFinished above has
+                            // already updated the status line; this
+                            // hands the rollup off to the next-frame
+                            // render so the modal opens automatically.
+                            self.pending_archive_summary = Some(summary.clone());
+                        }
                         EngineEvent::DriveDiscovered(info) => {
                             // Restore any saved override for this
                             // volume into the live HashMap so the
@@ -1785,16 +1801,18 @@ impl SuperdeduperApp {
                     ),
                     total: Some(total),
                 });
-                let mut moved = 0u64;
-                let mut failed = 0u64;
-                let mut user_stopped = false;
+                use crate::gui::archive::{ArchiveActionSummary, ArchiveFailureBucket};
+                let mut summary = ArchiveActionSummary {
+                    destination: dest.clone(),
+                    ..Default::default()
+                };
                 let mut processed = 0u64;
                 let mut manifest_entries: Vec<crate::gui::archive::ArchiveManifestEntry> =
                     Vec::new();
                 'outer: for (size, hash, keeper, dupes) in &groups {
                     for src in dupes {
                         if cancel.load(Ordering::Relaxed) {
-                            user_stopped = true;
+                            summary.user_stopped = true;
                             break 'outer;
                         }
                         let _ = tx.send(EngineEvent::ActionProgress {
@@ -1809,7 +1827,8 @@ impl SuperdeduperApp {
                         let archived = compose_archive_path(&dest, src);
                         if let Some(parent) = archived.parent() {
                             if let Err(e) = std::fs::create_dir_all(parent) {
-                                failed += 1;
+                                summary.failed_other_count += 1;
+                                summary.failed_other_bytes += *size;
                                 let _ = tx.send(EngineEvent::Log {
                                     level: crate::gui::events::LogLevel::Warn,
                                     message: format!(
@@ -1820,17 +1839,24 @@ impl SuperdeduperApp {
                                 continue;
                             }
                         }
-                        // Try rename first (fast, atomic on same
-                        // volume); if it fails with cross-device we
-                        // fall back to copy+remove.
-                        let move_result = std::fs::rename(src, &archived).or_else(|_| {
-                            std::fs::copy(src, &archived)
-                                .and_then(|_| std::fs::remove_file(src))
-                                .map(|_| ())
+                        // #80: orphan-copy cleanup on delete-fail.
+                        // See `try_archive_move` for the full move-
+                        // or-copy-with-cleanup logic.
+                        let tx_for_cleanup = tx.clone();
+                        let archived_for_log = archived.clone();
+                        let move_result = try_archive_move(src, &archived, |cleanup_err| {
+                            let _ = tx_for_cleanup.send(EngineEvent::Log {
+                                level: crate::gui::events::LogLevel::Warn,
+                                message: format!(
+                                    "archive: orphan-copy cleanup failed · {} · {cleanup_err}",
+                                    archived_for_log.display()
+                                ),
+                            });
                         });
                         match move_result {
                             Ok(()) => {
-                                moved += 1;
+                                summary.moved_count += 1;
+                                summary.moved_bytes += *size;
                                 manifest_entries.push(crate::gui::archive::ArchiveManifestEntry {
                                     original_path: src.clone(),
                                     archived_path: archived.clone(),
@@ -1840,7 +1866,25 @@ impl SuperdeduperApp {
                                 });
                             }
                             Err(e) => {
-                                failed += 1;
+                                // #80 Bug C — bucket the failure by
+                                // reason so the summary modal can
+                                // show users what actually went
+                                // wrong (access-denied is actionable;
+                                // cross-device is a different fix).
+                                match ArchiveActionSummary::classify_error(&e) {
+                                    ArchiveFailureBucket::AccessDenied => {
+                                        summary.failed_access_denied_count += 1;
+                                        summary.failed_access_denied_bytes += *size;
+                                    }
+                                    ArchiveFailureBucket::CrossDevice => {
+                                        summary.failed_cross_device_count += 1;
+                                        summary.failed_cross_device_bytes += *size;
+                                    }
+                                    ArchiveFailureBucket::Other => {
+                                        summary.failed_other_count += 1;
+                                        summary.failed_other_bytes += *size;
+                                    }
+                                }
                                 let _ = tx.send(EngineEvent::Log {
                                     level: crate::gui::events::LogLevel::Warn,
                                     message: format!(
@@ -1882,17 +1926,27 @@ impl SuperdeduperApp {
                         message: format!("archive manifest written · {}", manifest_path.display()),
                     });
                 }
-                let label = if user_stopped { "stopped" } else { "complete" };
+                let label = if summary.user_stopped { "stopped" } else { "complete" };
+                let moved = summary.moved_count;
+                let failed = summary.failed_count();
                 let _ = tx.send(EngineEvent::Log {
                     level: crate::gui::events::LogLevel::Info,
                     message: format!(
-                        "archive · moved={moved} failed={failed} stopped={user_stopped} dest={}",
+                        "archive · moved={moved} failed={failed} stopped={} dest={}",
+                        summary.user_stopped,
                         dest.display()
                     ),
                 });
                 let _ = tx.send(EngineEvent::ActionFinished {
                     summary: format!("Archive {label} · {moved} moved, {failed} failed."),
                 });
+                // #80 Bug C — hand the structured rollup to the GUI
+                // so the post-archive modal can show the moved-vs-
+                // failed split by reason + the actually-reclaimed
+                // byte total. Sent AFTER ActionFinished so the
+                // status line is already settled when the modal
+                // opens.
+                let _ = tx.send(EngineEvent::ArchiveActionSummary(summary));
             })
             .expect("spawn archive thread");
     }
@@ -2608,6 +2662,28 @@ impl eframe::App for SuperdeduperApp {
             }
         }
 
+        // #80 Bug C — post-archive summary modal. Pops the rollup
+        // when the archive worker fires `ArchiveActionSummary`.
+        // Stays open until the user clicks Done; Reveal opens the
+        // archive folder in their file manager without dismissing
+        // the modal (so they can see the contents without losing
+        // the failure breakdown).
+        if let Some(summary) = self.pending_archive_summary.clone() {
+            if let Some(choice) =
+                crate::gui::widgets::archive_summary_modal::show(ctx, &summary)
+            {
+                use crate::gui::widgets::archive_summary_modal::ArchiveSummaryChoice;
+                match choice {
+                    ArchiveSummaryChoice::Done => {
+                        self.pending_archive_summary = None;
+                    }
+                    ArchiveSummaryChoice::RevealDestination => {
+                        reveal_in_explorer(&summary.destination);
+                    }
+                }
+            }
+        }
+
         // Destructive-action confirmation modal — "type DELETE".
         // Gates Recycle / SafeRename / Hardlink / SafeRenameAll;
         // Reveal-in-Explorer and Unsuperdeduper bypass this. The
@@ -3296,6 +3372,69 @@ fn open_file_default_app(_path: &std::path::Path) {}
 #[cfg(not(windows))]
 fn open_enclosing_folder(_path: &std::path::Path) {}
 
+/// #80 — Move `src` to `archived`, falling back to copy+remove when
+/// rename fails (cross-device OR delete-on-source denied). If the
+/// copy succeeds but the source-side `remove_file` fails (the case
+/// that orphans bytes on ACL-protected paths like TrustedInstaller
+/// directories in C:\Windows), we delete the orphan copy at
+/// `archived` so the move stays atomic in the user's mental model
+/// (either both halves happen or neither does — never the half that
+/// fills the disk without freeing the source).
+///
+/// `on_cleanup_failure` is called only if the cleanup `remove_file`
+/// itself fails — surfaces a log line to the worker's event stream
+/// without making the helper depend on the EngineEvent channel.
+/// Returns the original delete-side error so the caller can attribute
+/// the failure correctly ("delete denied" not "copy failed").
+fn try_archive_move(
+    src: &Path,
+    archived: &Path,
+    on_cleanup_failure: impl FnOnce(std::io::Error),
+) -> std::io::Result<()> {
+    try_archive_move_impl(
+        src,
+        archived,
+        |a, b| std::fs::rename(a, b),
+        |a, b| std::fs::copy(a, b),
+        |p| std::fs::remove_file(p),
+        on_cleanup_failure,
+    )
+}
+
+/// Parametric core of [`try_archive_move`]. The fs primitives are
+/// passed in so unit tests can inject failures without going through
+/// chmod / cross-device dances. Production callers use the convenience
+/// wrapper above which substitutes the real `std::fs::*` ops.
+fn try_archive_move_impl<R, C, D>(
+    src: &Path,
+    archived: &Path,
+    rename_fn: R,
+    copy_fn: C,
+    remove_fn: D,
+    on_cleanup_failure: impl FnOnce(std::io::Error),
+) -> std::io::Result<()>
+where
+    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    C: FnOnce(&Path, &Path) -> std::io::Result<u64>,
+    D: Fn(&Path) -> std::io::Result<()>,
+{
+    if rename_fn(src, archived).is_ok() {
+        return Ok(());
+    }
+    match copy_fn(src, archived) {
+        Ok(_) => match remove_fn(src) {
+            Ok(()) => Ok(()),
+            Err(delete_err) => {
+                if let Err(cleanup_err) = remove_fn(archived) {
+                    on_cleanup_failure(cleanup_err);
+                }
+                Err(delete_err)
+            }
+        },
+        Err(copy_err) => Err(copy_err),
+    }
+}
+
 /// Map a source path like `C:\Users\X\foo.bin` to its archived
 /// position under `dest`, preserving the drive letter as a folder
 /// name. Drive `C:` becomes `dest/C/Users/X/foo.bin`. On non-Windows
@@ -3366,5 +3505,154 @@ fn open_url_in_browser(url: &str) {
     };
     if let Err(e) = result {
         eprintln!("failed to open browser to {url}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod try_archive_move_tests {
+    use super::try_archive_move_impl;
+    use std::cell::Cell;
+    use std::io::{Error, ErrorKind};
+    use std::path::Path;
+
+    /// Mick's #80 production symptom: rename fails (ACL on src dir),
+    /// copy succeeds, remove_file(src) fails (TrustedInstaller),
+    /// orphan copy is left at archived. With the fix, the orphan
+    /// should be removed and the delete-side error propagated.
+    #[test]
+    fn cleans_up_orphan_when_remove_src_fails() {
+        let copy_called = Cell::new(false);
+        let removed: Cell<Option<&'static str>> = Cell::new(None);
+        let cleanup_failures = Cell::new(0u32);
+        let result = try_archive_move_impl(
+            Path::new("/fake/src.bin"),
+            Path::new("/fake/archived.bin"),
+            |_, _| Err(Error::new(ErrorKind::PermissionDenied, "rename denied")),
+            |_, _| {
+                copy_called.set(true);
+                Ok(42)
+            },
+            |p| {
+                let ends = p.to_str().unwrap();
+                if ends.ends_with("src.bin") {
+                    Err(Error::new(ErrorKind::PermissionDenied, "delete denied"))
+                } else {
+                    // Cleanup of archived.bin succeeds.
+                    removed.set(Some("archived"));
+                    Ok(())
+                }
+            },
+            |_| {
+                cleanup_failures.set(cleanup_failures.get() + 1);
+            },
+        );
+        assert!(copy_called.get(), "fallback to copy should have run");
+        assert_eq!(
+            removed.get(),
+            Some("archived"),
+            "orphan at archived should have been removed"
+        );
+        let err = result.expect_err("should propagate the delete error");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("delete"),
+            "error should be the delete-side one, not the rename or copy: {err}",
+        );
+        assert_eq!(cleanup_failures.get(), 0, "cleanup itself succeeded");
+    }
+
+    /// If even the cleanup remove_file fails, the on_cleanup_failure
+    /// callback fires so the worker can log it.
+    #[test]
+    fn fires_cleanup_callback_when_cleanup_also_fails() {
+        let cleanup_failures = Cell::new(0u32);
+        let result = try_archive_move_impl(
+            Path::new("/fake/src.bin"),
+            Path::new("/fake/archived.bin"),
+            |_, _| Err(Error::new(ErrorKind::PermissionDenied, "rename denied")),
+            |_, _| Ok(42),
+            |_| Err(Error::new(ErrorKind::PermissionDenied, "everything denied")),
+            |_| {
+                cleanup_failures.set(cleanup_failures.get() + 1);
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            cleanup_failures.get(),
+            1,
+            "on_cleanup_failure must be invoked exactly once when the orphan-cleanup remove_file fails",
+        );
+    }
+
+    /// If copy itself fails, no orphan exists, no cleanup attempted.
+    #[test]
+    fn no_cleanup_when_copy_fails() {
+        let remove_called = Cell::new(0u32);
+        let cleanup_failures = Cell::new(0u32);
+        let result = try_archive_move_impl(
+            Path::new("/fake/src.bin"),
+            Path::new("/fake/archived.bin"),
+            |_, _| Err(Error::new(ErrorKind::PermissionDenied, "rename denied")),
+            |_, _| Err(Error::new(ErrorKind::PermissionDenied, "copy denied")),
+            |_| {
+                remove_called.set(remove_called.get() + 1);
+                Ok(())
+            },
+            |_| {
+                cleanup_failures.set(cleanup_failures.get() + 1);
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(remove_called.get(), 0, "remove_file should not be called when copy failed");
+        assert_eq!(cleanup_failures.get(), 0);
+    }
+
+    /// Same-volume happy path: rename succeeds, no copy/remove dance.
+    #[test]
+    fn rename_ok_short_circuits() {
+        let copy_called = Cell::new(false);
+        let remove_called = Cell::new(false);
+        let result = try_archive_move_impl(
+            Path::new("/fake/src.bin"),
+            Path::new("/fake/archived.bin"),
+            |_, _| Ok(()),
+            |_, _| {
+                copy_called.set(true);
+                Ok(42)
+            },
+            |_| {
+                remove_called.set(true);
+                Ok(())
+            },
+            |_| {},
+        );
+        assert!(result.is_ok());
+        assert!(!copy_called.get(), "rename succeeded; copy must not run");
+        assert!(!remove_called.get(), "rename succeeded; remove must not run");
+    }
+
+    /// Cross-device happy path: rename fails, copy succeeds, delete
+    /// succeeds. End state mirrors a successful rename — no orphan,
+    /// no error, no cleanup callback.
+    #[test]
+    fn cross_device_copy_and_remove_ok() {
+        let removed_paths: Cell<Vec<String>> = Cell::new(Vec::new());
+        let result = try_archive_move_impl(
+            Path::new("/fake/src.bin"),
+            Path::new("/fake/archived.bin"),
+            |_, _| Err(Error::new(ErrorKind::CrossesDevices, "EXDEV")),
+            |_, _| Ok(99),
+            |p| {
+                let mut v = removed_paths.take();
+                v.push(p.to_string_lossy().into_owned());
+                removed_paths.set(v);
+                Ok(())
+            },
+            |_| panic!("cleanup callback must not fire on happy path"),
+        );
+        assert!(result.is_ok());
+        let v = removed_paths.take();
+        assert_eq!(v.len(), 1, "remove_file should run once (on src)");
+        assert!(v[0].ends_with("src.bin"), "src should be the one removed");
     }
 }
