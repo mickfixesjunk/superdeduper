@@ -73,10 +73,7 @@ pub enum GroupAction {
     /// is the index in `UiState::duplicates`; `member_idx` is the
     /// position within that group's `files` vec (must be > 0; the
     /// keeper button doesn't appear on the existing keeper).
-    PromoteKeeper {
-        group_idx: usize,
-        member_idx: usize,
-    },
+    PromoteKeeper { group_idx: usize, member_idx: usize },
 }
 
 /// The two bulk-action options the dropdown above the results
@@ -105,10 +102,7 @@ impl BulkAction {
     /// bin, no .superdeduper rename). The destructive-confirm modal
     /// uses this to decide whether to show the "type DELETE" gate.
     pub fn is_destructive(self) -> bool {
-        matches!(
-            self,
-            BulkAction::RecycleDupes | BulkAction::NukeDupes,
-        )
+        matches!(self, BulkAction::RecycleDupes | BulkAction::NukeDupes,)
     }
 }
 
@@ -223,8 +217,7 @@ pub fn show_filtered(
     let visible_dupe_count: usize = sorted
         .iter()
         .filter(|(_, g)| {
-            !table_state.hide_unreclaimable
-                || crate::gui::state::inode_aware_savings(g) > 0
+            !table_state.hide_unreclaimable || crate::gui::state::inode_aware_savings(g) > 0
         })
         .map(|(_, g)| g.files.len().saturating_sub(1))
         .sum();
@@ -677,8 +670,8 @@ pub fn show_filtered(
 fn format_path(p: &Path) -> String {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\") {
-        if rest.starts_with("UNC\\") {
-            return format!(r"\\{}", &rest[4..]);
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return format!(r"\\{unc}");
         }
         return rest.to_string();
     }

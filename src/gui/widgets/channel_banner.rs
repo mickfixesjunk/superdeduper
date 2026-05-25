@@ -14,7 +14,7 @@
 
 #![cfg(feature = "gui")]
 
-use egui::{Align, Color32, FontId, Layout, RichText, TopBottomPanel};
+use egui::{Color32, FontId, Layout, RichText, TopBottomPanel};
 
 use crate::channel::Channel;
 
@@ -55,14 +55,17 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
                 .inner_margin(egui::Margin::symmetric(0, 0)),
         )
         .show(ctx, |ui| {
-            ui.with_layout(Layout::centered_and_justified(egui::Direction::TopDown), |ui| {
-                ui.label(
-                    RichText::new(text)
-                        .color(Color32::WHITE)
-                        .strong()
-                        .font(FontId::proportional(15.0)),
-                );
-            });
+            ui.with_layout(
+                Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    ui.label(
+                        RichText::new(text)
+                            .color(Color32::WHITE)
+                            .strong()
+                            .font(FontId::proportional(15.0)),
+                    );
+                },
+            );
         });
 }
 

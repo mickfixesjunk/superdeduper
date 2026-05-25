@@ -266,9 +266,7 @@ mod tests {
     fn pack_5_os_trees_has_13_path_patterns_post_trash_move() {
         assert_eq!(OS_SYSTEM_TREES_PATHS.len(), 13);
         assert!(
-            OS_SYSTEM_TREES_PATHS
-                .iter()
-                .any(|p| p.contains("Trash")),
+            OS_SYSTEM_TREES_PATHS.iter().any(|p| p.contains("Trash")),
             "Trash should be in OS system trees per design review"
         );
     }
@@ -319,8 +317,14 @@ mod tests {
         .iter()
         .map(|a| a.len())
         .sum();
-        assert_eq!(total_exts, 15, "matches docs/exclusions-preset-content-draft.md header");
-        assert_eq!(total_paths, 92, "matches docs/exclusions-preset-content-draft.md header");
+        assert_eq!(
+            total_exts, 15,
+            "matches docs/exclusions-preset-content-draft.md header"
+        );
+        assert_eq!(
+            total_paths, 92,
+            "matches docs/exclusions-preset-content-draft.md header"
+        );
     }
 
     #[test]
@@ -549,7 +553,9 @@ mod tests {
         };
         let policy = ExclusionPolicy::compile(&config, &BuiltinPresets).unwrap();
         assert!(matches!(
-            policy.evaluate(std::path::Path::new("home/mick/.local/share/Trash/files/old.pdf")),
+            policy.evaluate(std::path::Path::new(
+                "home/mick/.local/share/Trash/files/old.pdf"
+            )),
             crate::exclusions::Decision::Excluded(_)
         ));
     }

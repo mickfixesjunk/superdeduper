@@ -540,7 +540,9 @@ mod inode_aware_tests {
         DuplicateGroupSummary {
             size,
             content_hash: "h".into(),
-            files: (0..n_files).map(|i| PathBuf::from(format!("/p/{i}"))).collect(),
+            files: (0..n_files)
+                .map(|i| PathBuf::from(format!("/p/{i}")))
+                .collect(),
             link_equivalent,
             unique_inodes,
         }
@@ -614,7 +616,7 @@ mod inode_aware_tests {
         // tile reads `self.totals.reclaimable_bytes` which gets
         // overwritten by ScanFinished, so this test pins both
         // the accumulator path AND the wholesale overwrite path.
-        use crate::gui::events::{EngineEvent, DuplicateGroupSummary, OverallStage};
+        use crate::gui::events::{EngineEvent, OverallStage};
         let mut state = UiState::default();
 
         // Three groups: one hardlinked (link_equivalent), two
@@ -668,7 +670,7 @@ mod inode_aware_tests {
         // The invariant the backend's sanity check enforces:
         // for any set of non-link-equivalent groups, the max of
         // (per-group reclaim) <= sum of (per-group reclaim).
-        let groups = vec![
+        let groups = [
             mk_group(100, 4, false, 4),  // (4-1)*100 = 300
             mk_group(1000, 3, false, 2), // (2-1)*1000 = 1000  <- biggest
             mk_group(500, 2, false, 2),  // (2-1)*500 = 500

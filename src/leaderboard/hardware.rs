@@ -164,26 +164,52 @@ fn detect_isa_flags_impl() -> Vec<String> {
 
     if max_basic >= 1 {
         let r = unsafe { cpuid(1, 0) };
-        if (r.ecx & (1 << 19)) != 0 { flags.push("sse4-1".into()); }
-        if (r.ecx & (1 << 20)) != 0 { flags.push("sse4-2".into()); }
+        if (r.ecx & (1 << 19)) != 0 {
+            flags.push("sse4-1".into());
+        }
+        if (r.ecx & (1 << 20)) != 0 {
+            flags.push("sse4-2".into());
+        }
         // Backend catalog uses Intel marketing name "aes-ni" (not
         // the bare CPUID-convention "aes"); without this rename the
         // server-side hardware-self-consistency check rejects with
         // "claimed CPU ships with ISA flags not present in payload".
-        if (r.ecx & (1 << 25)) != 0 { flags.push("aes-ni".into()); }
-        if (r.ecx & (1 << 28)) != 0 { flags.push("avx".into()); }
-        if (r.ecx & (1 << 30)) != 0 { flags.push("rdrand".into()); }
-        if (r.edx & (1 << 26)) != 0 { flags.push("sse2".into()); }
+        if (r.ecx & (1 << 25)) != 0 {
+            flags.push("aes-ni".into());
+        }
+        if (r.ecx & (1 << 28)) != 0 {
+            flags.push("avx".into());
+        }
+        if (r.ecx & (1 << 30)) != 0 {
+            flags.push("rdrand".into());
+        }
+        if (r.edx & (1 << 26)) != 0 {
+            flags.push("sse2".into());
+        }
     }
     if max_basic >= 7 {
         let r = unsafe { cpuid(7, 0) };
-        if (r.ebx & (1 << 3))  != 0 { flags.push("bmi1".into()); }
-        if (r.ebx & (1 << 5))  != 0 { flags.push("avx2".into()); }
-        if (r.ebx & (1 << 8))  != 0 { flags.push("bmi2".into()); }
-        if (r.ebx & (1 << 16)) != 0 { flags.push("avx512f".into()); }
-        if (r.ebx & (1 << 17)) != 0 { flags.push("avx512dq".into()); }
-        if (r.ebx & (1 << 29)) != 0 { flags.push("sha".into()); }
-        if (r.ecx & (1 << 9))  != 0 { flags.push("vaes".into()); }
+        if (r.ebx & (1 << 3)) != 0 {
+            flags.push("bmi1".into());
+        }
+        if (r.ebx & (1 << 5)) != 0 {
+            flags.push("avx2".into());
+        }
+        if (r.ebx & (1 << 8)) != 0 {
+            flags.push("bmi2".into());
+        }
+        if (r.ebx & (1 << 16)) != 0 {
+            flags.push("avx512f".into());
+        }
+        if (r.ebx & (1 << 17)) != 0 {
+            flags.push("avx512dq".into());
+        }
+        if (r.ebx & (1 << 29)) != 0 {
+            flags.push("sha".into());
+        }
+        if (r.ecx & (1 << 9)) != 0 {
+            flags.push("vaes".into());
+        }
     }
     flags.sort();
     flags.dedup();
@@ -208,14 +234,24 @@ struct CpuidResult {
 #[inline]
 unsafe fn cpuid(leaf: u32, sub_leaf: u32) -> CpuidResult {
     let r = std::arch::x86_64::__cpuid_count(leaf, sub_leaf);
-    CpuidResult { eax: r.eax, ebx: r.ebx, ecx: r.ecx, edx: r.edx }
+    CpuidResult {
+        eax: r.eax,
+        ebx: r.ebx,
+        ecx: r.ecx,
+        edx: r.edx,
+    }
 }
 
 #[cfg(target_arch = "x86")]
 #[inline]
 unsafe fn cpuid(leaf: u32, sub_leaf: u32) -> CpuidResult {
     let r = std::arch::x86::__cpuid_count(leaf, sub_leaf);
-    CpuidResult { eax: r.eax, ebx: r.ebx, ecx: r.ecx, edx: r.edx }
+    CpuidResult {
+        eax: r.eax,
+        ebx: r.ebx,
+        ecx: r.ecx,
+        edx: r.edx,
+    }
 }
 
 // ============================================================
@@ -228,12 +264,7 @@ fn detect_ram_gb() -> Option<u32> {
     let f = std::fs::File::open("/proc/meminfo").ok()?;
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest
-                .trim()
-                .trim_end_matches(" kB")
-                .trim()
-                .parse()
-                .ok()?;
+            let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
             return Some((kb / (1024 * 1024)) as u32);
         }
     }
@@ -310,13 +341,21 @@ fn detect_os_version_impl() -> Option<String> {
         .arg("-productName")
         .output()
         .ok()
-        .and_then(|o| o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .and_then(|o| {
+            o.status
+                .success()
+                .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
         .unwrap_or_else(|| "macOS".to_string());
     let version = Command::new("sw_vers")
         .arg("-productVersion")
         .output()
         .ok()
-        .and_then(|o| o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()));
+        .and_then(|o| {
+            o.status
+                .success()
+                .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        });
     Some(match version {
         Some(v) if !v.is_empty() => format!("{name} {v}"),
         _ => name,
@@ -436,7 +475,11 @@ fn read_registry_string(subkey: &str, value: &str) -> Option<String> {
     let chars = (buf_bytes as usize) / 2;
     let len = buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
     let s = String::from_utf16_lossy(&buf[..len]).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 #[cfg(test)]
@@ -533,10 +576,19 @@ mod tests {
         assert_eq!(map_windows_edition_to_enum("Professional".into()), "Pro");
         assert_eq!(map_windows_edition_to_enum("Pro".into()), "Pro");
         assert_eq!(map_windows_edition_to_enum("Core".into()), "Home");
-        assert_eq!(map_windows_edition_to_enum("CoreSingleLanguage".into()), "Home");
-        assert_eq!(map_windows_edition_to_enum("Enterprise".into()), "Enterprise");
+        assert_eq!(
+            map_windows_edition_to_enum("CoreSingleLanguage".into()),
+            "Home"
+        );
+        assert_eq!(
+            map_windows_edition_to_enum("Enterprise".into()),
+            "Enterprise"
+        );
         assert_eq!(map_windows_edition_to_enum("Education".into()), "Education");
-        assert_eq!(map_windows_edition_to_enum("ServerStandard".into()), "Server");
+        assert_eq!(
+            map_windows_edition_to_enum("ServerStandard".into()),
+            "Server"
+        );
         assert_eq!(map_windows_edition_to_enum("WindowsRT".into()), "Other");
     }
 }

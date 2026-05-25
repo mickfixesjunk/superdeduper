@@ -211,18 +211,14 @@ fn download_archaeology(ctx: &PredicateContext<'_>) -> Option<&'static str> {
         .unwrap_or(0);
     let five_years_ago = now_unix - (5 * 365 * 24 * 60 * 60);
 
-    let hit = ctx
-        .all_paths
-        .iter()
-        .zip(mtimes.iter())
-        .any(|(p, mtime)| {
-            let in_downloads = p.components().any(|c| {
-                let s = c.as_os_str().to_string_lossy();
-                s.eq_ignore_ascii_case("Downloads")
-            });
-            let old_enough = mtime.map(|t| t < five_years_ago).unwrap_or(false);
-            in_downloads && old_enough
+    let hit = ctx.all_paths.iter().zip(mtimes.iter()).any(|(p, mtime)| {
+        let in_downloads = p.components().any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            s.eq_ignore_ascii_case("Downloads")
         });
+        let old_enough = mtime.map(|t| t < five_years_ago).unwrap_or(false);
+        in_downloads && old_enough
+    });
     if hit {
         Some("download-archaeology")
     } else {

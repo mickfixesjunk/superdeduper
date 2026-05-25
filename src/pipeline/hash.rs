@@ -107,7 +107,9 @@ pub struct HashCounters {
 /// dropped and the progress bar froze on its denominator.
 #[derive(Debug, Clone)]
 pub enum ProgressOutcome {
-    Hashed { bytes: u64 },
+    Hashed {
+        bytes: u64,
+    },
     /// Cache hit; the engine didn't physically read the file but
     /// processed its full size's worth of "scan work." `bytes` is the
     /// logical file size, so callers tracking inventory/scan-progress
@@ -116,8 +118,12 @@ pub enum ProgressOutcome {
     /// cache-fast-forwarded scans showed 0 MB/s + the submission
     /// payload's `bytes_scanned` undercount tripped the backend's
     /// `result_self_consistency` sanity check (reclaim > scanned).
-    Cached { bytes: u64 },
-    Failed { error: String },
+    Cached {
+        bytes: u64,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// Callback invoked once per file per attempted tier — success,
@@ -373,15 +379,14 @@ fn partition_by_inode(
     let mut by_inode: HashbrownMap<InodeKey, Vec<LaidOutFile>> = HashbrownMap::new();
     let mut next_synthetic: u64 = 1;
     for f in files {
-        let key: InodeKey =
-            if f.entry.volume_guid.is_some() && f.entry.file_ref != 0 {
-                (f.entry.volume_guid.clone(), f.entry.file_ref)
-            } else {
-                // Unique synthetic key — won't collide with anything else.
-                let k = (None, next_synthetic);
-                next_synthetic = next_synthetic.saturating_add(1);
-                k
-            };
+        let key: InodeKey = if f.entry.volume_guid.is_some() && f.entry.file_ref != 0 {
+            (f.entry.volume_guid.clone(), f.entry.file_ref)
+        } else {
+            // Unique synthetic key — won't collide with anything else.
+            let k = (None, next_synthetic);
+            next_synthetic = next_synthetic.saturating_add(1);
+            k
+        };
         by_inode.entry(key).or_default().push(f);
     }
     let mut link_equiv: Vec<(LaidOutFile, Vec<PathBuf>)> = Vec::new();
@@ -489,7 +494,9 @@ fn run_group(
                     cb(
                         &rep.entry.path,
                         3,
-                        ProgressOutcome::Failed { error: e.to_string() },
+                        ProgressOutcome::Failed {
+                            error: e.to_string(),
+                        },
                     );
                 }
                 continue;
@@ -510,11 +517,7 @@ fn run_group(
             unique_inodes: 1,
         });
         if let Some(cb) = on_file {
-            cb(
-                &rep.entry.path,
-                3,
-                ProgressOutcome::Hashed { bytes: size },
-            );
+            cb(&rep.entry.path, 3, ProgressOutcome::Hashed { bytes: size });
         }
     }
 
@@ -708,7 +711,9 @@ where
                         cb(
                             &f.entry.path,
                             tier_index(tier),
-                            ProgressOutcome::Cached { bytes: f.entry.size },
+                            ProgressOutcome::Cached {
+                                bytes: f.entry.size,
+                            },
                         );
                     }
                     return Ok(h);
@@ -780,7 +785,9 @@ where
                         cb(
                             &f.entry.path,
                             tier_index(tier),
-                            ProgressOutcome::Cached { bytes: f.entry.size },
+                            ProgressOutcome::Cached {
+                                bytes: f.entry.size,
+                            },
                         );
                     }
                     return Some(h);
@@ -1047,10 +1054,10 @@ fn tier3_hash_cancellable(
         match read_handle.join() {
             Ok(Ok(())) => Ok(hasher.finalize()),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("tier3 read thread panicked: {}", path_display),
-            )),
+            Err(_) => Err(std::io::Error::other(format!(
+                "tier3 read thread panicked: {}",
+                path_display
+            ))),
         }
     })
 }
@@ -1542,7 +1549,11 @@ mod tests {
             ],
         };
         let result = run(vec![group], &cfg()).unwrap();
-        assert_eq!(result.len(), 1, "three distinct inodes with same content group");
+        assert_eq!(
+            result.len(),
+            1,
+            "three distinct inodes with same content group"
+        );
         assert!(
             !result[0].link_equivalent,
             "different inodes → link_equivalent must be false"

@@ -231,8 +231,12 @@ pub fn load_for(channel: Channel) -> io::Result<Option<InstallState>> {
         }
         Err(e) => return Err(e),
     };
-    let state: InstallState = serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("install.json parse: {e}")))?;
+    let state: InstallState = serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("install.json parse: {e}"),
+        )
+    })?;
     if state.schema_version > CURRENT_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -272,8 +276,12 @@ pub fn save_for(channel: Channel, state: &InstallState) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("install.json encode: {e}")))?;
+    let bytes = serde_json::to_vec_pretty(state).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("install.json encode: {e}"),
+        )
+    })?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, &bytes)?;
     set_owner_only_perms(&tmp)?;
@@ -355,9 +363,7 @@ pub fn new_unregistered(server_url: String) -> InstallState {
 /// surface for genuine I/O failures (disk full, permission denied,
 /// schema-version mismatch).
 pub fn bump_exclude_pattern_edits() -> io::Result<()> {
-    bump_counter(|c| {
-        c.exclude_pattern_edits = c.exclude_pattern_edits.saturating_add(1)
-    })
+    bump_counter(|c| c.exclude_pattern_edits = c.exclude_pattern_edits.saturating_add(1))
 }
 
 /// Increment the `achievements_verify_invocations` counter by 1 +
@@ -366,8 +372,7 @@ pub fn bump_exclude_pattern_edits() -> io::Result<()> {
 /// [`bump_exclude_pattern_edits`].
 pub fn bump_achievements_verify_invocations() -> io::Result<()> {
     bump_counter(|c| {
-        c.achievements_verify_invocations =
-            c.achievements_verify_invocations.saturating_add(1)
+        c.achievements_verify_invocations = c.achievements_verify_invocations.saturating_add(1)
     })
 }
 
@@ -510,7 +515,11 @@ mod tests {
         // greppability + filesystem-tool friendliness.
         assert!(prod.file_name().unwrap().to_string_lossy().contains("prod"));
         assert!(dev.file_name().unwrap().to_string_lossy().contains("dev"));
-        assert!(local.file_name().unwrap().to_string_lossy().contains("local"));
+        assert!(local
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("local"));
     }
 
     #[test]
@@ -527,8 +536,8 @@ mod tests {
             "server_url": "https://api.superdeduper.io",
             "client_version_at_register": "0.1.8"
         }"#;
-        let state: InstallState = serde_json::from_str(legacy_json)
-            .expect("legacy install.json must deserialise");
+        let state: InstallState =
+            serde_json::from_str(legacy_json).expect("legacy install.json must deserialise");
         assert_eq!(state.counters.exclude_pattern_edits, 0);
         assert_eq!(state.counters.achievements_verify_invocations, 0);
         assert_eq!(state.share_default, ShareDefault::AlwaysAsk);

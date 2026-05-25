@@ -48,7 +48,8 @@ pub mod leaderboard;
 #[cfg(feature = "telemetry")]
 #[doc(hidden)]
 pub fn leaderboard_corpus_sig(sizes: &[u64]) -> String {
-    let mut counts: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
     for &s in sizes {
         let bucket = match s / 1024 {
             0..=9 => "<10KB",

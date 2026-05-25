@@ -77,9 +77,9 @@ fn run(
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
-    defender_rtp_pre: Option<bool>,
+    _defender_rtp_pre: Option<bool>,
 ) -> crate::Result<()> {
-    let scan_started_at = Instant::now();
+    let _scan_started_at = Instant::now();
     // Diagnostics report file — fresh per scan. Failure to open it
     // doesn't kill the scan; we just lose self-debug telemetry.
     let diag = DiagnosticsLog::open();
@@ -312,60 +312,59 @@ fn run(
         let inv_tx = tx.clone();
         let mut files_seen: u64 = 0;
         let mut last_emit = Instant::now();
-        let inv_result =
-            inventory::walk::enumerate_cancellable(&cfg, Some(&*cancel), |evt| {
-                use crate::inventory::walk::WalkEvent;
-                match evt {
-                    WalkEvent::Entered { path, depth } => {
-                        dirs_entered += 1;
-                        if last_emit.elapsed() > std::time::Duration::from_millis(250) {
-                            last_emit = Instant::now();
-                            let display = path.display().to_string();
-                            let _ = inv_tx.try_send(EngineEvent::Status(format!(
-                                "Walking: {} ({} dirs, {} files so far)",
-                                truncate_tail(&display, 60),
-                                dirs_entered,
-                                files_seen,
-                            )));
-                            let _ = inv_tx.try_send(EngineEvent::StageTick {
-                                stage: Stage::Inventory,
-                                delta: 0,
-                                total: files_seen,
-                            });
-                        }
-                        let _ = depth;
-                    }
-                    WalkEvent::FileFound { size: _, .. } => {
-                        files_seen += 1;
-                        if files_seen.is_multiple_of(200) {
-                            let _ = inv_tx.try_send(EngineEvent::StageTick {
-                                stage: Stage::Inventory,
-                                delta: 200,
-                                total: files_seen,
-                            });
-                            let _ = inv_tx.try_send(EngineEvent::OverallProgress {
-                                stage: OverallStage::Inventory,
-                                done: files_seen,
-                                total: 0,
-                                eta_secs: None,
-                            });
-                        }
-                    }
-                    WalkEvent::DirError { path, message } => {
-                        dirs_denied += 1;
-                        let _ = inv_tx.send(EngineEvent::Log {
-                            level: LogLevel::Warn,
-                            message: format!("dir {}: {}", path.display(), message),
+        let inv_result = inventory::walk::enumerate_cancellable(&cfg, Some(&*cancel), |evt| {
+            use crate::inventory::walk::WalkEvent;
+            match evt {
+                WalkEvent::Entered { path, depth } => {
+                    dirs_entered += 1;
+                    if last_emit.elapsed() > std::time::Duration::from_millis(250) {
+                        last_emit = Instant::now();
+                        let display = path.display().to_string();
+                        let _ = inv_tx.try_send(EngineEvent::Status(format!(
+                            "Walking: {} ({} dirs, {} files so far)",
+                            truncate_tail(&display, 60),
+                            dirs_entered,
+                            files_seen,
+                        )));
+                        let _ = inv_tx.try_send(EngineEvent::StageTick {
+                            stage: Stage::Inventory,
+                            delta: 0,
+                            total: files_seen,
                         });
                     }
-                    WalkEvent::EntrySkipped { reason, .. } => {
-                        entries_skipped += 1;
-                        if reason == "below min-size" {
-                            skipped_below_min += 1;
-                        }
+                    let _ = depth;
+                }
+                WalkEvent::FileFound { size: _, .. } => {
+                    files_seen += 1;
+                    if files_seen.is_multiple_of(200) {
+                        let _ = inv_tx.try_send(EngineEvent::StageTick {
+                            stage: Stage::Inventory,
+                            delta: 200,
+                            total: files_seen,
+                        });
+                        let _ = inv_tx.try_send(EngineEvent::OverallProgress {
+                            stage: OverallStage::Inventory,
+                            done: files_seen,
+                            total: 0,
+                            eta_secs: None,
+                        });
                     }
                 }
-            });
+                WalkEvent::DirError { path, message } => {
+                    dirs_denied += 1;
+                    let _ = inv_tx.send(EngineEvent::Log {
+                        level: LogLevel::Warn,
+                        message: format!("dir {}: {}", path.display(), message),
+                    });
+                }
+                WalkEvent::EntrySkipped { reason, .. } => {
+                    entries_skipped += 1;
+                    if reason == "below min-size" {
+                        skipped_below_min += 1;
+                    }
+                }
+            }
+        });
         files = match inv_result {
             Ok(v) => v,
             Err(e) => {
@@ -403,9 +402,7 @@ fn run(
             if let Some(root) = owner {
                 let guid = root_guid_cache
                     .entry(root.clone())
-                    .or_insert_with(|| {
-                        crate::winapi_wrappers::volume_for_path(root).ok()
-                    });
+                    .or_insert_with(|| crate::winapi_wrappers::volume_for_path(root).ok());
                 if let Some(g) = guid {
                     f.volume_guid = Some(g.clone());
                     stamped += 1;
@@ -453,12 +450,12 @@ fn run(
     #[cfg(not(feature = "telemetry"))]
     let corpus_sig: String = String::new();
     let _ = &corpus_sig; // used below when telemetry feature is on
-    // Write the checkpoint to disk right now, BEFORE any hashing
-    // starts. Previously the first persist happened at the end of
-    // chunk 0, which meant a hard-kill mid-chunk-0 lost the entire
-    // walk and forced a fresh re-walk on the next launch. Saving
-    // here narrows the loss window to "during the walk itself" —
-    // everything after Stage 1 completes survives a process kill.
+                         // Write the checkpoint to disk right now, BEFORE any hashing
+                         // starts. Previously the first persist happened at the end of
+                         // chunk 0, which meant a hard-kill mid-chunk-0 lost the entire
+                         // walk and forced a fresh re-walk on the next launch. Saving
+                         // here narrows the loss window to "during the walk itself" —
+                         // everything after Stage 1 completes survives a process kill.
     if let Some(p) = &checkpoint_path {
         if let Err(e) = checkpoint::save(p, &checkpoint_state) {
             let _ = tx.send(EngineEvent::Log {
@@ -532,8 +529,7 @@ fn run(
     let easter_egg_hits: Vec<String> = {
         use crate::leaderboard::install;
         use crate::leaderboard::predicates::{evaluate_all, PredicateContext};
-        let all_paths: Vec<&std::path::Path> =
-            files.iter().map(|e| e.path.as_path()).collect();
+        let all_paths: Vec<&std::path::Path> = files.iter().map(|e| e.path.as_path()).collect();
         // FILETIME (100ns ticks since 1601-01-01) → Unix seconds.
         // Inverse of inventory::walk::filetime_ticks. `mtime == 0`
         // is the walker's "unknown" sentinel; surface as None so
@@ -640,9 +636,15 @@ fn run(
     let _ = tx.send(EngineEvent::Log {
         level: LogLevel::Info,
         message: match (cfg.use_cache, cache.is_some()) {
-            (true, true) => "cache enabled — Stage 4 will fast-forward through already-hashed files".to_string(),
-            (true, false) => "cache requested but failed to open — Stage 4 will re-hash everything".to_string(),
-            (false, _) => "cache disabled in settings — Stage 4 will re-hash everything".to_string(),
+            (true, true) => {
+                "cache enabled — Stage 4 will fast-forward through already-hashed files".to_string()
+            }
+            (true, false) => {
+                "cache requested but failed to open — Stage 4 will re-hash everything".to_string()
+            }
+            (false, _) => {
+                "cache disabled in settings — Stage 4 will re-hash everything".to_string()
+            }
         },
     });
     let mut total_cache_hits: u64 = 0;
@@ -847,10 +849,7 @@ fn run(
                 if f <= 50 {
                     let _ = progress_tx.try_send(EngineEvent::Log {
                         level: LogLevel::Warn,
-                        message: format!(
-                            "hash failed · {} · {error}",
-                            display_path(path),
-                        ),
+                        message: format!("hash failed · {} · {error}", display_path(path),),
                     });
                 } else if f == 51 {
                     let _ = progress_tx.try_send(EngineEvent::Log {
@@ -970,10 +969,10 @@ fn run(
         };
         let chunk_bytes = counters.bytes_read.load(Ordering::Relaxed);
         total_bytes_read = total_bytes_read.saturating_add(chunk_bytes);
-        total_cache_hits = total_cache_hits
-            .saturating_add(counters.cache_hits.load(Ordering::Relaxed));
-        total_cache_writes = total_cache_writes
-            .saturating_add(counters.cache_writes.load(Ordering::Relaxed));
+        total_cache_hits =
+            total_cache_hits.saturating_add(counters.cache_hits.load(Ordering::Relaxed));
+        total_cache_writes =
+            total_cache_writes.saturating_add(counters.cache_writes.load(Ordering::Relaxed));
         for i in 0..4 {
             tier_micros_total[i] = tier_micros_total[i]
                 .saturating_add(counters.tier_micros[i].load(Ordering::Relaxed));
@@ -982,11 +981,8 @@ fn run(
             tier_count_total[i] =
                 tier_count_total[i].saturating_add(counters.tier_count[i].load(Ordering::Relaxed));
         }
-        placeholders_blocked_recall_total = placeholders_blocked_recall_total.saturating_add(
-            counters
-                .placeholders_blocked_recall
-                .load(Ordering::Relaxed),
-        );
+        placeholders_blocked_recall_total = placeholders_blocked_recall_total
+            .saturating_add(counters.placeholders_blocked_recall.load(Ordering::Relaxed));
         placeholders_blocked_other_reparse_total = placeholders_blocked_other_reparse_total
             .saturating_add(
                 counters
@@ -1196,10 +1192,10 @@ fn run(
         use crate::leaderboard::hardware;
         use crate::leaderboard::hmac_signer;
         use crate::leaderboard::submission::{
-            self, FEATURE_BIT_ALLOW_RECALL_ON_READ, FEATURE_BIT_ALLOW_SYSTEM_PATHS,
-            FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB, FEATURE_BIT_FOLLOW_LINKS,
-            FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB, FEATURE_BIT_PARANOID,
-            FEATURE_BIT_REFERENCE_ROOTS, ResultSummary, RunShape, SubmissionInputs,
+            self, ResultSummary, RunShape, SubmissionInputs, FEATURE_BIT_ALLOW_RECALL_ON_READ,
+            FEATURE_BIT_ALLOW_SYSTEM_PATHS, FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB,
+            FEATURE_BIT_FOLLOW_LINKS, FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB,
+            FEATURE_BIT_PARANOID, FEATURE_BIT_REFERENCE_ROOTS,
         };
         // Discard the defender post probe; current backend schema
         // doesn't carry defender state. Keep the call commented in
@@ -1220,15 +1216,33 @@ fn run(
         let corpus_kind = classify_corpus_kind(&roots);
         // Features bitmap built from the resolved settings.
         let mut features_bits: u64 = 0;
-        if settings.use_cache { features_bits |= FEATURE_BIT_CACHE; }
-        if settings.use_format_aware { features_bits |= FEATURE_BIT_FORMAT_AWARE; }
-        if settings.paranoid { features_bits |= FEATURE_BIT_PARANOID; }
-        if cfg.follow_links { features_bits |= FEATURE_BIT_FOLLOW_LINKS; }
-        if cfg.allow_system_paths { features_bits |= FEATURE_BIT_ALLOW_SYSTEM_PATHS; }
-        if cfg.allow_recall_on_read { features_bits |= FEATURE_BIT_ALLOW_RECALL_ON_READ; }
-        if !cfg.reference_roots.is_empty() { features_bits |= FEATURE_BIT_REFERENCE_ROOTS; }
-        if cfg.include.is_some() { features_bits |= FEATURE_BIT_INCLUDE_GLOB; }
-        if cfg.exclude.is_some() { features_bits |= FEATURE_BIT_EXCLUDE_GLOB; }
+        if settings.use_cache {
+            features_bits |= FEATURE_BIT_CACHE;
+        }
+        if settings.use_format_aware {
+            features_bits |= FEATURE_BIT_FORMAT_AWARE;
+        }
+        if settings.paranoid {
+            features_bits |= FEATURE_BIT_PARANOID;
+        }
+        if cfg.follow_links {
+            features_bits |= FEATURE_BIT_FOLLOW_LINKS;
+        }
+        if cfg.allow_system_paths {
+            features_bits |= FEATURE_BIT_ALLOW_SYSTEM_PATHS;
+        }
+        if cfg.allow_recall_on_read {
+            features_bits |= FEATURE_BIT_ALLOW_RECALL_ON_READ;
+        }
+        if !cfg.reference_roots.is_empty() {
+            features_bits |= FEATURE_BIT_REFERENCE_ROOTS;
+        }
+        if cfg.include.is_some() {
+            features_bits |= FEATURE_BIT_INCLUDE_GLOB;
+        }
+        if cfg.exclude.is_some() {
+            features_bits |= FEATURE_BIT_EXCLUDE_GLOB;
+        }
         // Cache hit ratio: tier-totals tracked above; ratio of
         // cache_hits to total hash ops attempted.
         let cache_hit_ratio = if total_hash_ops > 0 {
@@ -1273,7 +1287,11 @@ fn run(
                         .values()
                         .filter(|hs| hs.len() >= 2)
                         .count() as u64;
-                    if n > 0 { Some(n) } else { None }
+                    if n > 0 {
+                        Some(n)
+                    } else {
+                        None
+                    }
                 },
             },
             result_summary: ResultSummary {
@@ -1336,8 +1354,8 @@ fn run(
     // had no placeholders (typical for non-OneDrive / non-WSL roots),
     // shown prominently otherwise so dropped dup-group counts
     // make sense at a glance.
-    let placeholders_total = placeholders_blocked_recall_total
-        .saturating_add(placeholders_blocked_other_reparse_total);
+    let placeholders_total =
+        placeholders_blocked_recall_total.saturating_add(placeholders_blocked_other_reparse_total);
     if placeholders_total > 0 {
         // Only suggest the recall flag when there's actually a recall
         // placeholder to unlock — otherwise the hint misleads.
@@ -1431,10 +1449,7 @@ fn truncate_tail(s: &str, n: usize) -> String {
 /// `KeepStrategy::Smart` the implicit GUI default without changing
 /// any downstream action handlers — safe-rename, recycle and
 /// hardlink all treat files[0] as canonical.
-fn order_keeper_first(
-    files: Vec<PathBuf>,
-    strategy: crate::cli::KeepStrategy,
-) -> Vec<PathBuf> {
+fn order_keeper_first(files: Vec<PathBuf>, strategy: crate::cli::KeepStrategy) -> Vec<PathBuf> {
     if files.len() < 2 {
         return files;
     }
@@ -1609,9 +1624,9 @@ fn chunk_groups(
 fn display_path(p: &std::path::Path) -> String {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\") {
-        if rest.starts_with("UNC\\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
             // \\?\UNC\server\share -> \\server\share
-            return format!(r"\\{}", &rest[4..]);
+            return format!(r"\\{unc}");
         }
         return rest.to_string();
     }
@@ -1830,7 +1845,10 @@ mod tests {
     #[cfg(feature = "telemetry")]
     fn classify_scope_subdirectory_for_single_non_root() {
         assert_eq!(classify_scope(&[root(r"C:\Users\Mick")]), "subdirectory");
-        assert_eq!(classify_scope(&[root("/home/neomatrix/Documents")]), "subdirectory");
+        assert_eq!(
+            classify_scope(&[root("/home/neomatrix/Documents")]),
+            "subdirectory"
+        );
     }
 
     #[test]
@@ -1845,8 +1863,14 @@ mod tests {
     #[test]
     #[cfg(feature = "telemetry")]
     fn classify_corpus_kind_system_on_windows_system_paths() {
-        assert_eq!(classify_corpus_kind(&[root(r"C:\Windows\System32")]), "system");
-        assert_eq!(classify_corpus_kind(&[root(r"C:\Program Files\Foo")]), "system");
+        assert_eq!(
+            classify_corpus_kind(&[root(r"C:\Windows\System32")]),
+            "system"
+        );
+        assert_eq!(
+            classify_corpus_kind(&[root(r"C:\Program Files\Foo")]),
+            "system"
+        );
         assert_eq!(classify_corpus_kind(&[root("/usr/local/bin")]), "system");
     }
 
@@ -1854,7 +1878,10 @@ mod tests {
     #[cfg(feature = "telemetry")]
     fn classify_corpus_kind_user_data_on_user_paths() {
         assert_eq!(classify_corpus_kind(&[root(r"C:\Users\Mick")]), "user-data");
-        assert_eq!(classify_corpus_kind(&[root("/home/neomatrix/Photos")]), "user-data");
+        assert_eq!(
+            classify_corpus_kind(&[root("/home/neomatrix/Photos")]),
+            "user-data"
+        );
     }
 
     #[test]

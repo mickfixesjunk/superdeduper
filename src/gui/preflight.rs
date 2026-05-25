@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use crate::diagnose::{self, DiagnoseReport};
 
+#[derive(Default)]
 pub enum PreflightState {
+    #[default]
     Idle,
     Probing {
         started_at: Instant,
@@ -27,12 +29,6 @@ pub enum PreflightState {
         grade: Grade,
     },
     Failed(String),
-}
-
-impl Default for PreflightState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl PreflightState {
@@ -106,7 +102,9 @@ pub fn grade_report(r: &DiagnoseReport) -> Grade {
         HARDWARE_REF_MBPS,
     );
     let hash_pct = pct(
-        r.hash.river5_aggregate_mbps.max(r.hash.blake3_aggregate_mbps),
+        r.hash
+            .river5_aggregate_mbps
+            .max(r.hash.blake3_aggregate_mbps),
         HASH_REF_MBPS,
     );
 
@@ -115,7 +113,10 @@ pub fn grade_report(r: &DiagnoseReport) -> Grade {
         .iter()
         .map(|d| {
             let (tier3_mbps, percent) = match &d.tier3 {
-                Some(t) => (Some(t.aggregate_mbps), Some(pct(t.aggregate_mbps, DISK_REF_MBPS))),
+                Some(t) => (
+                    Some(t.aggregate_mbps),
+                    Some(pct(t.aggregate_mbps, DISK_REF_MBPS)),
+                ),
                 None => (None, None),
             };
             DriveScore {
@@ -142,7 +143,9 @@ pub fn grade_report(r: &DiagnoseReport) -> Grade {
     Grade {
         letter: letter_for(overall as u8),
         overall_percent: overall as u8,
-        hardware: AxisScore { percent: hardware_pct },
+        hardware: AxisScore {
+            percent: hardware_pct,
+        },
         disk: DiskAxis {
             composite_percent,
             drives,

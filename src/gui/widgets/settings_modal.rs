@@ -48,6 +48,7 @@ impl SettingsTab {
         }
     }
     fn all() -> Vec<SettingsTab> {
+        #[allow(unused_mut)]
         let mut v = vec![
             SettingsTab::Engine,
             SettingsTab::Cache,
@@ -88,15 +89,14 @@ pub struct SettingsModalState {
 /// secondary window with the JSON. OnceLock + Mutex matches the
 /// pattern used by `leaderboard::submission` for cross-frame state
 /// that doesn't fit naturally on the per-render Ui chain.
-static SAMPLE_PREVIEW: parking_lot::Mutex<Option<String>> =
-    parking_lot::Mutex::new(None);
+#[cfg(feature = "telemetry")]
+static SAMPLE_PREVIEW: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 
 /// Process-wide slot for a simple "Done" confirmation dialog —
 /// shown after register / unlink / reset completions per Mick's
 /// 2026-05-25T01:35Z preference. Anyone can write a message; the
 /// outer `show()` renders an OK-button modal until dismissed.
-static DONE_DIALOG: parking_lot::Mutex<Option<String>> =
-    parking_lot::Mutex::new(None);
+static DONE_DIALOG: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 
 pub fn show_done_dialog(message: String) {
     *DONE_DIALOG.lock() = Some(message);
@@ -115,48 +115,43 @@ fn render_done_dialog(ctx: &egui::Context) {
         return;
     };
     let mut close = false;
-    egui::Window::new(
-        RichText::new("Done")
-            .color(theme::TEXT_HI)
-            .heading(),
-    )
-    .collapsible(false)
-    .resizable(false)
-    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-    .default_width(420.0)
-    .show(ctx, |ui| {
-        ui.label(RichText::new(msg).color(theme::TEXT_HI));
-        ui.add_space(12.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("OK")
-                            .color(theme::PANEL_DEEP)
-                            .strong(),
+    egui::Window::new(RichText::new("Done").color(theme::TEXT_HI).heading())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.label(RichText::new(msg).color(theme::TEXT_HI));
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("OK").color(theme::PANEL_DEEP).strong())
+                            .fill(theme::ACCENT)
+                            .min_size(egui::vec2(100.0, 28.0)),
                     )
-                    .fill(theme::ACCENT)
-                    .min_size(egui::vec2(100.0, 28.0)),
-                )
-                .clicked()
-            {
-                close = true;
-            }
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
         });
-    });
     if close {
         clear_done_dialog();
     }
 }
 
+#[cfg(feature = "telemetry")]
 fn show_sample_preview(json: String) {
     *SAMPLE_PREVIEW.lock() = Some(json);
 }
 
+#[cfg(feature = "telemetry")]
 fn take_sample_preview() -> Option<String> {
     SAMPLE_PREVIEW.lock().clone()
 }
 
+#[cfg(feature = "telemetry")]
 fn clear_sample_preview() {
     *SAMPLE_PREVIEW.lock() = None;
 }
@@ -258,11 +253,7 @@ fn render_modal_body(
 
     // Title bar — heading + flush-right X close button.
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("⚙ Settings")
-                .color(theme::TEXT_HI)
-                .heading(),
-        );
+        ui.label(RichText::new("⚙ Settings").color(theme::TEXT_HI).heading());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(
@@ -291,72 +282,74 @@ fn render_modal_body(
     // letting children grow horizontally on some egui paths; this
     // structure removes the ambiguity.
     let body_size = egui::vec2(MODAL_WIDTH - 24.0, PANEL_HEIGHT);
-    ui.allocate_ui_with_layout(body_size, egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-        // Left: tab list.
-        ui.allocate_ui_with_layout(
-            egui::vec2(TAB_LIST_WIDTH, PANEL_HEIGHT),
-            egui::Layout::top_down_justified(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(TAB_LIST_WIDTH);
-                ui.set_max_width(TAB_LIST_WIDTH);
-                for tab in SettingsTab::all() {
-                    let selected = state.tab == tab;
-                    let label = if selected {
-                        RichText::new(tab.label())
-                            .color(theme::ACCENT)
-                            .strong()
-                            .size(14.0)
-                    } else {
-                        RichText::new(tab.label())
-                            .color(theme::TEXT_HI)
-                            .size(14.0)
-                    };
-                    let btn = egui::Button::new(label)
-                        .frame(false)
-                        .fill(if selected {
-                            theme::ACCENT_DIM
+    ui.allocate_ui_with_layout(
+        body_size,
+        egui::Layout::left_to_right(egui::Align::TOP),
+        |ui| {
+            // Left: tab list.
+            ui.allocate_ui_with_layout(
+                egui::vec2(TAB_LIST_WIDTH, PANEL_HEIGHT),
+                egui::Layout::top_down_justified(egui::Align::Min),
+                |ui| {
+                    ui.set_min_width(TAB_LIST_WIDTH);
+                    ui.set_max_width(TAB_LIST_WIDTH);
+                    for tab in SettingsTab::all() {
+                        let selected = state.tab == tab;
+                        let label = if selected {
+                            RichText::new(tab.label())
+                                .color(theme::ACCENT)
+                                .strong()
+                                .size(14.0)
                         } else {
-                            egui::Color32::TRANSPARENT
-                        })
-                        .min_size(egui::vec2(TAB_BUTTON_WIDTH, 26.0));
-                    if ui.add(btn).clicked() {
-                        state.tab = tab;
-                    }
-                }
-            },
-        );
-        ui.separator();
-        ui.add_space(4.0);
-        // Right: tab content. Remaining width is body - tab list -
-        // separator - spacing. Constrained so children can't reflow.
-        let content_width = body_size.x - TAB_LIST_WIDTH - 12.0;
-        ui.allocate_ui_with_layout(
-            egui::vec2(content_width, PANEL_HEIGHT),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(content_width);
-                ui.set_max_width(content_width);
-                egui::ScrollArea::vertical()
-                    .max_height(PANEL_HEIGHT)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_max_width(content_width - 4.0);
-                        match state.tab {
-                            SettingsTab::Engine => render_engine(ui, settings),
-                            SettingsTab::Cache => render_cache(ui, settings),
-                            SettingsTab::KeepStrategy => render_keep_strategy(ui, settings),
-                            SettingsTab::Safety => render_safety(ui, settings),
-                            SettingsTab::Preflight => render_preflight(ui, settings),
-                            SettingsTab::Network => render_network(ui, state),
-                            #[cfg(feature = "telemetry")]
-                            SettingsTab::Account => render_account(ui),
-                            #[cfg(feature = "telemetry")]
-                            SettingsTab::Leaderboard => render_leaderboard(ui),
+                            RichText::new(tab.label()).color(theme::TEXT_HI).size(14.0)
+                        };
+                        let btn = egui::Button::new(label)
+                            .frame(false)
+                            .fill(if selected {
+                                theme::ACCENT_DIM
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            })
+                            .min_size(egui::vec2(TAB_BUTTON_WIDTH, 26.0));
+                        if ui.add(btn).clicked() {
+                            state.tab = tab;
                         }
-                    });
-            },
-        );
-    });
+                    }
+                },
+            );
+            ui.separator();
+            ui.add_space(4.0);
+            // Right: tab content. Remaining width is body - tab list -
+            // separator - spacing. Constrained so children can't reflow.
+            let content_width = body_size.x - TAB_LIST_WIDTH - 12.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(content_width, PANEL_HEIGHT),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_width(content_width);
+                    ui.set_max_width(content_width);
+                    egui::ScrollArea::vertical()
+                        .max_height(PANEL_HEIGHT)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(content_width - 4.0);
+                            match state.tab {
+                                SettingsTab::Engine => render_engine(ui, settings),
+                                SettingsTab::Cache => render_cache(ui, settings),
+                                SettingsTab::KeepStrategy => render_keep_strategy(ui, settings),
+                                SettingsTab::Safety => render_safety(ui, settings),
+                                SettingsTab::Preflight => render_preflight(ui, settings),
+                                SettingsTab::Network => render_network(ui, state),
+                                #[cfg(feature = "telemetry")]
+                                SettingsTab::Account => render_account(ui),
+                                #[cfg(feature = "telemetry")]
+                                SettingsTab::Leaderboard => render_leaderboard(ui),
+                            }
+                        });
+                },
+            );
+        },
+    );
 
     ui.add_space(10.0);
     ui.separator();
@@ -368,11 +361,9 @@ fn render_modal_body(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(
-                    egui::Button::new(
-                        RichText::new("Done").color(theme::PANEL_DEEP).strong(),
-                    )
-                    .fill(theme::ACCENT)
-                    .min_size(egui::vec2(100.0, 28.0)),
+                    egui::Button::new(RichText::new("Done").color(theme::PANEL_DEEP).strong())
+                        .fill(theme::ACCENT)
+                        .min_size(egui::vec2(100.0, 28.0)),
                 )
                 .clicked()
             {
@@ -542,7 +533,10 @@ fn render_engine(ui: &mut egui::Ui, settings: &mut ScanSettings) {
         }
         if let Some(t) = settings.threads.as_mut() {
             let mut v = *t as i32;
-            if ui.add(egui::DragValue::new(&mut v).range(1..=256)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut v).range(1..=256))
+                .changed()
+            {
                 *t = v as usize;
             }
         } else {
@@ -861,7 +855,11 @@ fn render_network(ui: &mut egui::Ui, state: &mut SettingsModalState) {
                 pick.as_slug(),
             )
         };
-        let color = if registered { theme::TEXT_LO } else { theme::HOT };
+        let color = if registered {
+            theme::TEXT_LO
+        } else {
+            theme::HOT
+        };
         ui.label(RichText::new(line).color(color).small());
     }
 
@@ -1017,9 +1015,7 @@ fn render_account(ui: &mut egui::Ui) {
                         id,
                         oauth::DEFAULT_OAUTH_TIMEOUT,
                     ) {
-                        eprintln!(
-                            "account: couldn't auto-retry OAuth (session already in flight)"
-                        );
+                        eprintln!("account: couldn't auto-retry OAuth (session already in flight)");
                     }
                 }
                 show_done_dialog(format!(
@@ -1052,19 +1048,14 @@ fn render_account(ui: &mut egui::Ui) {
     // Status row.
     match &status {
         Some(oauth::AccountStatus::Anonymous) | None => {
-            let install_id = install::load()
-                .ok()
-                .flatten()
-                .map(|s| s.install_id);
+            let install_id = install::load().ok().flatten().map(|s| s.install_id);
             let id_short = install_id
                 .as_deref()
                 .map(|s| s.split('-').next().unwrap_or(s).to_string())
                 .unwrap_or_else(|| "not registered".to_string());
             ui.label(
-                RichText::new(format!(
-                    "Status: Anonymous (UUID {id_short}…)"
-                ))
-                .color(theme::TEXT_HI),
+                RichText::new(format!("Status: Anonymous (UUID {id_short}…)"))
+                    .color(theme::TEXT_HI),
             );
         }
         Some(oauth::AccountStatus::Linked {
@@ -1074,10 +1065,7 @@ fn render_account(ui: &mut egui::Ui) {
         }) => {
             use crate::gui::widgets::oauth_chooser::provider_icon;
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::Image::new(provider_icon(*provider))
-                        .max_size(egui::vec2(20.0, 20.0)),
-                );
+                ui.add(egui::Image::new(provider_icon(*provider)).max_size(egui::vec2(20.0, 20.0)));
                 ui.label(
                     RichText::new(format!(
                         "Status: Linked — {display_name} ({})",
@@ -1153,11 +1141,8 @@ fn render_account(ui: &mut egui::Ui) {
             ui.spinner();
             ui.add_space(4.0);
             ui.label(
-                RichText::new(format!(
-                    "Registering machine ({}s)…",
-                    elapsed.as_secs()
-                ))
-                .color(theme::TEXT_HI),
+                RichText::new(format!("Registering machine ({}s)…", elapsed.as_secs()))
+                    .color(theme::TEXT_HI),
             );
         });
         ui.add_space(8.0);
@@ -1169,7 +1154,8 @@ fn render_account(ui: &mut egui::Ui) {
             .color(theme::TEXT_LO)
             .small(),
         );
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
         return;
     }
 
@@ -1209,7 +1195,8 @@ fn render_account(ui: &mut egui::Ui) {
             .small(),
         );
         // Keep the spinner ticking smoothly while we wait.
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
         return;
     }
 
@@ -1553,11 +1540,7 @@ fn render_leaderboard(ui: &mut egui::Ui) {
 fn render_privacy_section(ui: &mut egui::Ui) {
     use crate::leaderboard::install;
 
-    ui.label(
-        RichText::new("Privacy")
-            .color(theme::TEXT_HI)
-            .strong(),
-    );
+    ui.label(RichText::new("Privacy").color(theme::TEXT_HI).strong());
     ui.add_space(4.0);
 
     // Load mutable state. If the install isn't present (not
@@ -1612,10 +1595,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
                         chosen = Some(install::ShareDefault::AutoOptIn);
                     }
                     if ui
-                        .selectable_label(
-                            current_share == install::ShareDefault::Never,
-                            "Never",
-                        )
+                        .selectable_label(current_share == install::ShareDefault::Never, "Never")
                         .on_hover_text(
                             "Never attempt to submit; never show the post-scan modal. \
                              Engine still builds the payload locally for diagnostic \
@@ -1625,15 +1605,11 @@ fn render_privacy_section(ui: &mut egui::Ui) {
                     {
                         chosen = Some(install::ShareDefault::Never);
                     }
-                    if let (Some(chosen), Some(mut s)) =
-                        (chosen, state_opt.clone())
-                    {
+                    if let (Some(chosen), Some(mut s)) = (chosen, state_opt.clone()) {
                         if chosen != s.share_default {
                             s.share_default = chosen;
                             if let Err(e) = install::save(&s) {
-                                eprintln!(
-                                    "leaderboard: failed to persist share preference: {e:?}"
-                                );
+                                eprintln!("leaderboard: failed to persist share preference: {e:?}");
                             }
                         }
                     }
@@ -1680,10 +1656,8 @@ fn render_privacy_section(ui: &mut egui::Ui) {
         ui.add_space(4.0);
         if ui
             .add(
-                egui::Button::new(
-                    RichText::new("Reset install").color(theme::WARN),
-                )
-                .min_size(egui::vec2(140.0, 26.0)),
+                egui::Button::new(RichText::new("Reset install").color(theme::WARN))
+                    .min_size(egui::vec2(140.0, 26.0)),
             )
             .on_hover_text(
                 "Back up the current install file to `.bak.<ts>`, then \
@@ -1706,10 +1680,9 @@ fn render_privacy_section(ui: &mut egui::Ui) {
                     "leaderboard: install reset requested — backing up + rotating install_id"
                 );
                 match install::back_up_for(active) {
-                    Ok(Some(path)) => eprintln!(
-                        "leaderboard: prior install backed up to {}",
-                        path.display()
-                    ),
+                    Ok(Some(path)) => {
+                        eprintln!("leaderboard: prior install backed up to {}", path.display())
+                    }
                     Ok(None) => eprintln!("leaderboard: no prior install to back up"),
                     Err(e) => eprintln!("leaderboard: backup failed: {e}"),
                 }
@@ -1739,9 +1712,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
         if let Some(result) = crate::leaderboard::registration::poll_register_session() {
             match result {
                 Ok(id) => {
-                    eprintln!(
-                        "leaderboard: register OK, install_id={id}"
-                    );
+                    eprintln!("leaderboard: register OK, install_id={id}");
                 }
                 Err(e) => {
                     eprintln!("leaderboard: register failed: {e:?}");
@@ -1755,19 +1726,15 @@ fn render_privacy_section(ui: &mut egui::Ui) {
                 let elapsed = crate::leaderboard::registration::register_session_elapsed()
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                ui.label(
-                    RichText::new(format!("Registering ({elapsed}s)…"))
-                        .color(theme::TEXT_HI),
-                );
+                ui.label(RichText::new(format!("Registering ({elapsed}s)…")).color(theme::TEXT_HI));
             });
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
         } else if ui
             .add(
-                egui::Button::new(
-                    RichText::new("Register").color(theme::PANEL_DEEP).strong(),
-                )
-                .fill(theme::ACCENT)
-                .min_size(egui::vec2(140.0, 26.0)),
+                egui::Button::new(RichText::new("Register").color(theme::PANEL_DEEP).strong())
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(140.0, 26.0)),
             )
             .on_hover_text(
                 "Push the current install identity (or a freshly-reset \
@@ -1857,11 +1824,9 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
         ui.horizontal(|ui| {
             if ui
                 .add(
-                    egui::Button::new(
-                        RichText::new("Close").color(theme::PANEL_DEEP).strong(),
-                    )
-                    .fill(theme::ACCENT)
-                    .min_size(egui::vec2(120.0, 28.0)),
+                    egui::Button::new(RichText::new("Close").color(theme::PANEL_DEEP).strong())
+                        .fill(theme::ACCENT)
+                        .min_size(egui::vec2(120.0, 28.0)),
                 )
                 .clicked()
             {
@@ -1886,11 +1851,12 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
 /// original.
 ///
 /// Safe against UTF-8 multi-byte boundaries: backs up to the
-/// previous char boundary if `cap` lands mid-codepoint. Without
-/// this guard, a rejection reason carrying e.g. an em-dash (3-byte
-/// UTF-8) could panic with `byte index N is not a char boundary`
-/// — and rejection messages come from network input we don't
-/// control, so a hostile backend could crash the GUI.
+///   previous char boundary if `cap` lands mid-codepoint. Without
+///   this guard, a rejection reason carrying e.g. an em-dash (3-byte
+///   UTF-8) could panic with `byte index N is not a char boundary`
+///   — and rejection messages come from network input we don't
+///   control, so a hostile backend could crash the GUI.
+#[cfg(feature = "telemetry")]
 fn truncate_for_display(s: &str, cap: usize) -> String {
     if s.len() <= cap {
         return s.to_string();
@@ -1904,7 +1870,7 @@ fn truncate_for_display(s: &str, cap: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "telemetry"))]
 mod truncate_tests {
     use super::truncate_for_display;
 
@@ -1987,9 +1953,7 @@ fn build_sample_payload_json() -> String {
         },
     };
     let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");
-    serde_json::to_string_pretty(&payload).unwrap_or_else(|e| {
-        format!("(render failed: {e})")
-    })
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|e| format!("(render failed: {e})"))
 }
 
 #[cfg(feature = "telemetry")]
@@ -2058,24 +2022,20 @@ fn render_submit_section(ui: &mut egui::Ui) {
                     let state = match install::load() {
                         Ok(Some(s)) if s.registered => s,
                         _ => {
-                            submission::store_last_outcome(
-                                submission::SubmitOutcome::Rejected {
-                                    status: 0,
-                                    reason: "install not registered".into(),
-                                },
-                            );
+                            submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                                status: 0,
+                                reason: "install not registered".into(),
+                            });
                             return;
                         }
                     };
                     let inputs = match submission::take_pending() {
                         Some(i) => i,
                         None => {
-                            submission::store_last_outcome(
-                                submission::SubmitOutcome::Rejected {
-                                    status: 0,
-                                    reason: "no pending submission".into(),
-                                },
-                            );
+                            submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                                status: 0,
+                                reason: "no pending submission".into(),
+                            });
                             return;
                         }
                     };
@@ -2095,8 +2055,7 @@ fn render_submit_section(ui: &mut egui::Ui) {
                             Some(k) => crate::leaderboard::hmac_signer::sign(&k, &body),
                             None => String::new(),
                         };
-                        if let Err(e) =
-                            submission::enqueue(&inputs, &state.install_id, &signature)
+                        if let Err(e) = submission::enqueue(&inputs, &state.install_id, &signature)
                         {
                             eprintln!("leaderboard: enqueue failed: {e:?}");
                         }
@@ -2123,11 +2082,7 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::S
             achievements_unlocked,
             profile_url,
         } => {
-            ui.label(
-                RichText::new("Accepted")
-                    .color(theme::ACCENT)
-                    .strong(),
-            );
+            ui.label(RichText::new("Accepted").color(theme::ACCENT).strong());
             if !submission_id.is_empty() {
                 ui.label(
                     RichText::new(format!("submission_id:  {submission_id}"))
@@ -2154,10 +2109,7 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::S
                 );
             }
             if let Some(url) = profile_url {
-                ui.hyperlink_to(
-                    RichText::new("view profile").color(theme::ACCENT),
-                    url,
-                );
+                ui.hyperlink_to(RichText::new("view profile").color(theme::ACCENT), url);
             }
         }
         SubmitOutcome::DuplicateNoChange => {
@@ -2190,7 +2142,9 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::S
             original_reason,
         } => {
             ui.label(
-                RichText::new("✓ Flagged for review").color(theme::ACCENT).strong(),
+                RichText::new("✓ Flagged for review")
+                    .color(theme::ACCENT)
+                    .strong(),
             );
             if let Some(id) = review_id {
                 ui.label(

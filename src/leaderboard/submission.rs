@@ -304,13 +304,12 @@ fn parse_error(code: u16, resp: ureq::Response) -> SubmitOutcome {
     }
     let reason = serde_json::from_str::<serde_json::Value>(&body_text)
         .ok()
-        .and_then(|v| {
-            v.get("reason")
-                .and_then(|r| r.as_str())
-                .map(String::from)
-        })
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from))
         .unwrap_or(body_text);
-    SubmitOutcome::Rejected { status: code, reason }
+    SubmitOutcome::Rejected {
+        status: code,
+        reason,
+    }
 }
 
 // ============================================================
@@ -351,11 +350,7 @@ pub fn review_dir() -> std::io::Result<PathBuf> {
 /// regardless of outcome. Best-effort: failure is logged + swallowed
 /// so a write error on the archive can't suppress the actual
 /// submission outcome from the UI.
-pub fn archive_attempt(
-    inputs: &SubmissionInputs,
-    install_id: &str,
-    outcome: &SubmitOutcome,
-) {
+pub fn archive_attempt(inputs: &SubmissionInputs, install_id: &str, outcome: &SubmitOutcome) {
     let body = build_payload(inputs, install_id);
     let entry = ArchivedSubmission {
         archived_at_unix: now_unix(),
@@ -452,9 +447,7 @@ fn try_upload_review(
             // Parse {accepted: true, review_id: "<uuid>"} per web's
             // contract; fall back to "<unknown>" if the body shape
             // changes later.
-            let v: serde_json::Value = r
-                .into_json()
-                .unwrap_or(serde_json::Value::Null);
+            let v: serde_json::Value = r.into_json().unwrap_or(serde_json::Value::Null);
             let review_id = v
                 .get("review_id")
                 .and_then(|v| v.as_str())
@@ -619,11 +612,7 @@ pub fn enqueue(
     let payload = build_payload(inputs, install_id);
     let body = hmac_signer::canonical_body(&payload);
     let body_hash_prefix = blake3::hash(&body).to_hex();
-    let filename = format!(
-        "{}-{}.json",
-        now_unix(),
-        &body_hash_prefix.as_str()[..8]
-    );
+    let filename = format!("{}-{}.json", now_unix(), &body_hash_prefix.as_str()[..8]);
     let path = dir.join(filename);
     let stored = QueuedSubmission {
         body: String::from_utf8_lossy(&body).into_owned(),
@@ -825,7 +814,10 @@ mod tests {
         ] {
             assert!(p.get(key).is_some(), "missing required key '{key}'");
         }
-        assert_eq!(p.get("install_id").and_then(|v| v.as_str()), Some("test-install-id"));
+        assert_eq!(
+            p.get("install_id").and_then(|v| v.as_str()),
+            Some("test-install-id")
+        );
         assert_eq!(p.get("schema_version").and_then(|v| v.as_str()), Some("v1"));
     }
 
@@ -898,7 +890,10 @@ mod tests {
             }),
             "accepted"
         );
-        assert_eq!(outcome_kind_tag(&SubmitOutcome::DuplicateNoChange), "duplicate");
+        assert_eq!(
+            outcome_kind_tag(&SubmitOutcome::DuplicateNoChange),
+            "duplicate"
+        );
         assert_eq!(
             outcome_kind_tag(&SubmitOutcome::Rejected {
                 status: 400,
@@ -957,8 +952,7 @@ mod tests {
         for v in &variants {
             let s = SerializableOutcome::from(v);
             let bytes = serde_json::to_vec(&s).expect("serialize");
-            let _: SerializableOutcome =
-                serde_json::from_slice(&bytes).expect("deserialize");
+            let _: SerializableOutcome = serde_json::from_slice(&bytes).expect("deserialize");
         }
     }
 
@@ -1003,9 +997,18 @@ mod tests {
         // strings; drift here = backend rejects submissions. Test
         // pins the constants byte-for-byte so a casual rename
         // surfaces here first.
-        assert_eq!(ACTION_BYTES_KEY_DELETED_TO_RECYCLE, "deleted_to_recycle_bytes");
-        assert_eq!(ACTION_BYTES_KEY_DELETED_PERMANENTLY, "deleted_permanently_bytes");
-        assert_eq!(ACTION_BYTES_KEY_HARDLINK_REPLACED, "hardlink_replaced_bytes");
+        assert_eq!(
+            ACTION_BYTES_KEY_DELETED_TO_RECYCLE,
+            "deleted_to_recycle_bytes"
+        );
+        assert_eq!(
+            ACTION_BYTES_KEY_DELETED_PERMANENTLY,
+            "deleted_permanently_bytes"
+        );
+        assert_eq!(
+            ACTION_BYTES_KEY_HARDLINK_REPLACED,
+            "hardlink_replaced_bytes"
+        );
     }
 
     #[test]
@@ -1022,8 +1025,7 @@ mod tests {
         assert!(json.contains("\"deleted_to_recycle_bytes\":1234"));
         assert!(json.contains("\"deleted_permanently_bytes\":5678"));
         assert!(json.contains("\"hardlink_replaced_bytes\":9012"));
-        let back: std::collections::BTreeMap<String, u64> =
-            serde_json::from_str(&json).unwrap();
+        let back: std::collections::BTreeMap<String, u64> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.get(ACTION_BYTES_KEY_DELETED_TO_RECYCLE), Some(&1234));
     }
 }

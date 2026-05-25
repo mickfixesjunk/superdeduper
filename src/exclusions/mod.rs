@@ -238,20 +238,19 @@ impl ExclusionPolicy {
             return Decision::Included;
         }
         let path_str_buf;
-        let match_target: &Path = if cfg!(windows)
-            || path.to_str().map(|s| s.contains('\\')).unwrap_or(false)
-        {
-            // Normalise backslashes once; reuse the buffer for
-            // both the path-match and the extension lookup.
-            let normalised = path
-                .to_str()
-                .map(|s| s.replace('\\', "/"))
-                .unwrap_or_default();
-            path_str_buf = std::path::PathBuf::from(normalised);
-            &path_str_buf
-        } else {
-            path
-        };
+        let match_target: &Path =
+            if cfg!(windows) || path.to_str().map(|s| s.contains('\\')).unwrap_or(false) {
+                // Normalise backslashes once; reuse the buffer for
+                // both the path-match and the extension lookup.
+                let normalised = path
+                    .to_str()
+                    .map(|s| s.replace('\\', "/"))
+                    .unwrap_or_default();
+                path_str_buf = std::path::PathBuf::from(normalised);
+                &path_str_buf
+            } else {
+                path
+            };
         if self.combined_paths.is_match(match_target) {
             let reason = if self.custom_paths.is_match(match_target) {
                 ExclusionReason::CustomPattern
@@ -394,7 +393,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn empty_presets() -> EmptyPresets {
-        EmptyPresets::default()
+        EmptyPresets
     }
 
     #[test]
@@ -554,7 +553,10 @@ mod tests {
             custom_patterns: vec!["[invalid".into()],
         };
         let r = ExclusionPolicy::compile(&config, &empty_presets());
-        assert!(r.is_err(), "malformed glob must surface as ExclusionConfigError::BadPattern");
+        assert!(
+            r.is_err(),
+            "malformed glob must surface as ExclusionConfigError::BadPattern"
+        );
         match r.unwrap_err() {
             ExclusionConfigError::BadPattern { pattern, .. } => {
                 assert_eq!(pattern, "[invalid");

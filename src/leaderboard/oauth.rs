@@ -295,8 +295,9 @@ pub fn load_for(channel: Channel) -> io::Result<Option<OauthToken>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let token: OauthToken = serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("oauth.json parse: {e}")))?;
+    let token: OauthToken = serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("oauth.json parse: {e}"))
+    })?;
     Ok(Some(token))
 }
 
@@ -308,7 +309,10 @@ pub fn save_for(channel: Channel, token: &OauthToken) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(token).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("oauth.json encode: {e}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("oauth.json encode: {e}"),
+        )
     })?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, &bytes)?;
@@ -490,8 +494,8 @@ pub fn build_auth_url(
             Ok((url, Some(verifier)))
         }
         Provider::Discord => {
-            let client_id = discord_client_id(channel)
-                .ok_or(OauthError::NoClientId { provider, channel })?;
+            let client_id =
+                discord_client_id(channel).ok_or(OauthError::NoClientId { provider, channel })?;
             let url = format!(
                 "https://discord.com/api/oauth2/authorize\
                  ?client_id={}\
@@ -556,14 +560,11 @@ fn fill_random_bytes(buf: &mut [u8]) {
 /// Base64url-no-pad encoder per RFC 4648 §5. Inline rather than
 /// pulling the `base64` crate: ~15 lines, no allocation surprises.
 fn base64url_nopad(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len() * 4 / 3 + 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
-        let n = (bytes[i] as u32) << 16
-            | (bytes[i + 1] as u32) << 8
-            | (bytes[i + 2] as u32);
+        let n = (bytes[i] as u32) << 16 | (bytes[i + 1] as u32) << 8 | (bytes[i + 2] as u32);
         out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
         out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
         out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
@@ -762,9 +763,7 @@ fn link_via_loopback_inner(
                 }
                 Err(_) => continue,
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .ok();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
             let mut stream = match stream.try_clone() {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -778,11 +777,8 @@ fn link_via_loopback_inner(
             let mut parts = first_line.split_whitespace();
             let method = parts.next().unwrap_or("");
             let path_and_query = parts.next().unwrap_or("");
-            if method != "GET"
-                || !path_and_query.starts_with("/oauth-callback")
-            {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            if method != "GET" || !path_and_query.starts_with("/oauth-callback") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
                 continue;
             }
             // Drain the rest of the headers/body (the provider
@@ -947,7 +943,11 @@ fn parse_callback_query(path_and_query: &str) -> CallbackPayload {
                 // If both `error` and `error_description` are
                 // present, prefer the longer human-friendly text.
                 if out.error.is_some() {
-                    out.error = Some(format!("{}: {}", out.error.as_deref().unwrap_or(""), decoded));
+                    out.error = Some(format!(
+                        "{}: {}",
+                        out.error.as_deref().unwrap_or(""),
+                        decoded
+                    ));
                 } else {
                     out.error = Some(decoded);
                 }
@@ -970,9 +970,7 @@ fn url_decode(s: &str) -> String {
             continue;
         }
         if b == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) =
-                (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
-            {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
                 out.push((hi * 16 + lo) as char);
                 i += 3;
                 continue;
@@ -1042,8 +1040,7 @@ fn exchange_code(
                              — register may have failed",
                         );
                         return Err(OauthError::BadCallback(
-                            "install state missing — register did not complete in time"
-                                .to_string(),
+                            "install state missing — register did not complete in time".to_string(),
                         ));
                     }
                     std::thread::sleep(poll_step);
@@ -1056,9 +1053,9 @@ fn exchange_code(
             }
         }
     };
-    let key = state.install_key().ok_or_else(|| {
-        OauthError::BadCallback("install_key_hex malformed".to_string())
-    })?;
+    let key = state
+        .install_key()
+        .ok_or_else(|| OauthError::BadCallback("install_key_hex malformed".to_string()))?;
 
     let url = format!(
         "{}/api/v1/account/oauth/{}",
@@ -1122,9 +1119,9 @@ fn exchange_code(
             }
             Err(OauthError::BackendRejected { status: code, body })
         }
-        Err(ureq::Error::Transport(t)) => Err(OauthError::BadCallback(format!(
-            "exchange transport: {t}"
-        ))),
+        Err(ureq::Error::Transport(t)) => {
+            Err(OauthError::BadCallback(format!("exchange transport: {t}")))
+        }
     }
 }
 
@@ -1325,8 +1322,7 @@ static SESSION_STATE_PENDING: SessionState = SessionState::Pending;
 // single Mutex<Option<OauthSession>> covers every call site.
 // =====================================================================
 
-static CURRENT_SESSION: parking_lot::Mutex<Option<OauthSession>> =
-    parking_lot::Mutex::new(None);
+static CURRENT_SESSION: parking_lot::Mutex<Option<OauthSession>> = parking_lot::Mutex::new(None);
 
 /// Attempt to start an OAuth flow. Returns `Err(())` if a flow is
 /// already in flight — the caller should keep showing the existing
@@ -1344,11 +1340,7 @@ pub fn try_start_session(
         return Err(());
     }
     *slot = Some(OauthSession::start(
-        provider,
-        channel,
-        server_url,
-        install_id,
-        timeout,
+        provider, channel, server_url, install_id, timeout,
     ));
     // Clear any prior toast — the user is starting fresh.
     clear_toast();
@@ -1414,9 +1406,7 @@ pub fn poll_session() -> Option<Result<OauthToken, OauthError>> {
                  kicking register session to auto-retry",
                 provider, channel
             ));
-            if crate::leaderboard::registration::try_start_register_session(channel)
-                .is_err()
-            {
+            if crate::leaderboard::registration::try_start_register_session(channel).is_err() {
                 log_oauth_event(
                     "auto_register_chain: register session already in flight; can't auto-chain",
                 );
@@ -1461,8 +1451,7 @@ pub enum OauthToast {
     },
 }
 
-static LAST_TOAST: parking_lot::Mutex<Option<OauthToast>> =
-    parking_lot::Mutex::new(None);
+static LAST_TOAST: parking_lot::Mutex<Option<OauthToast>> = parking_lot::Mutex::new(None);
 
 /// Record the result of a just-completed OAuth flow. Called from
 /// the three CTA surfaces inside their `poll_session` drain.
@@ -1501,8 +1490,7 @@ pub fn clear_toast() {
 // ("auto-register you because you've already decided to participate").
 // =====================================================================
 
-static PENDING_RETRY_PROVIDER: parking_lot::Mutex<Option<Provider>> =
-    parking_lot::Mutex::new(None);
+static PENDING_RETRY_PROVIDER: parking_lot::Mutex<Option<Provider>> = parking_lot::Mutex::new(None);
 
 pub fn set_pending_retry_provider(provider: Provider) {
     *PENDING_RETRY_PROVIDER.lock() = Some(provider);
@@ -1619,7 +1607,10 @@ fn make_nonce() -> String {
 fn try_open_browser(url: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open").arg(url).spawn().is_ok()
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .is_ok()
     }
     #[cfg(target_os = "macos")]
     {
@@ -1777,10 +1768,7 @@ mod tests {
         assert_eq!(t.provider, Provider::Discord);
         assert_eq!(t.display_name, "Mick");
         assert_eq!(t.account_id, "d8e2e7d8-f3e1-4c47-a916-10d4e45f5633");
-        assert_eq!(
-            t.linked_install_id,
-            "fec94a96-4489-4dbc-bba0-daf48c0416f9"
-        );
+        assert_eq!(t.linked_install_id, "fec94a96-4489-4dbc-bba0-daf48c0416f9");
     }
 
     #[test]
@@ -1842,9 +1830,13 @@ mod tests {
 
     #[test]
     fn build_auth_url_google_includes_pkce_and_correct_host() {
-        let (url, verifier) =
-            build_auth_url(Provider::Google, Channel::Dev, "http://127.0.0.1:12345/oauth-callback", "test-state")
-                .expect("google dev has a client_id");
+        let (url, verifier) = build_auth_url(
+            Provider::Google,
+            Channel::Dev,
+            "http://127.0.0.1:12345/oauth-callback",
+            "test-state",
+        )
+        .expect("google dev has a client_id");
         assert!(
             url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"),
             "google auth must target the official OAuth endpoint, got: {url}"
@@ -1858,9 +1850,8 @@ mod tests {
         let v = verifier.expect("google flow returns a PKCE verifier");
         assert!(v.len() >= 43, "verifier too short ({}): {v}", v.len());
         assert!(
-            v.chars().all(|c| {
-                c.is_ascii_alphanumeric() || c == '-' || c == '_'
-            }),
+            v.chars()
+                .all(|c| { c.is_ascii_alphanumeric() || c == '-' || c == '_' }),
             "verifier must be base64url-safe chars only: {v}"
         );
         // Client ID match — assert the dev one is in the URL.
@@ -1872,9 +1863,13 @@ mod tests {
 
     #[test]
     fn build_auth_url_discord_omits_pkce_on_dev() {
-        let (url, verifier) =
-            build_auth_url(Provider::Discord, Channel::Dev, "http://127.0.0.1:12345/oauth-callback", "test-state")
-                .expect("discord dev has a client_id");
+        let (url, verifier) = build_auth_url(
+            Provider::Discord,
+            Channel::Dev,
+            "http://127.0.0.1:12345/oauth-callback",
+            "test-state",
+        )
+        .expect("discord dev has a client_id");
         assert!(
             url.starts_with("https://discord.com/api/oauth2/authorize?"),
             "discord auth must target the discord endpoint, got: {url}"
@@ -1899,9 +1894,13 @@ mod tests {
         // (per 2026-05-24T23:12Z post). The engine must surface
         // a clear `NoClientId` error instead of building a
         // half-baked auth URL.
-        let err =
-            build_auth_url(Provider::Discord, Channel::Prod, "http://127.0.0.1:12345/oauth-callback", "test-state")
-                .expect_err("discord prod has no client_id yet");
+        let err = build_auth_url(
+            Provider::Discord,
+            Channel::Prod,
+            "http://127.0.0.1:12345/oauth-callback",
+            "test-state",
+        )
+        .expect_err("discord prod has no client_id yet");
         assert!(
             matches!(
                 err,
@@ -1922,8 +1921,7 @@ mod tests {
         //   E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
         let challenge = pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
         assert_eq!(
-            challenge,
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
             "PKCE challenge must match the RFC 7636 §B.2 reference vector"
         );
     }
@@ -2042,9 +2040,7 @@ mod tests {
                 break;
             }
             if cancel_started.elapsed() > Duration::from_secs(2) {
-                panic!(
-                    "session didn't resolve within 2s of cancel + 500ms timeout"
-                );
+                panic!("session didn't resolve within 2s of cancel + 500ms timeout");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -2076,16 +2072,14 @@ mod tests {
         assert!(current_session_snapshot().is_some());
 
         // Second start while first is in flight: must reject.
-        assert!(
-            try_start_session(
-                Provider::Google,
-                Channel::Local,
-                "http://127.0.0.1:1",
-                "test-install",
-                Duration::from_millis(200),
-            )
-            .is_err()
-        );
+        assert!(try_start_session(
+            Provider::Google,
+            Channel::Local,
+            "http://127.0.0.1:1",
+            "test-install",
+            Duration::from_millis(200),
+        )
+        .is_err());
 
         // Cancel + drain.
         cancel_current_session();

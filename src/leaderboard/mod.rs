@@ -24,10 +24,10 @@
 pub mod captcha;
 pub mod catalog;
 pub mod hardware;
-pub mod install;
 pub mod hmac_signer;
-pub mod predicates;
+pub mod install;
 pub mod oauth;
+pub mod predicates;
 pub mod ranks_poll;
 pub mod registration;
 pub mod submission;

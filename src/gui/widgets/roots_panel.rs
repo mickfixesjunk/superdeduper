@@ -127,8 +127,8 @@ pub fn show(
         if add_resp.clicked() {
             action = Some(RootsAction::PickFolder);
         }
-        let ref_btn = egui::Button::new(RichText::new("★").color(theme::WARN))
-            .min_size(vec2(32.0, 24.0));
+        let ref_btn =
+            egui::Button::new(RichText::new("★").color(theme::WARN)).min_size(vec2(32.0, 24.0));
         let ref_resp = ui.add_enabled(!is_scanning, ref_btn);
         let ref_resp = if is_scanning {
             ref_resp.on_hover_text("Cancel the running scan before adding reference folders.")

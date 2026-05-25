@@ -34,8 +34,7 @@ pub fn provider_icon(provider: oauth::Provider) -> egui::ImageSource<'static> {
 
 /// Process-wide flag — `true` while the chooser modal is showing.
 /// Set by any CTA's "open chooser" click; cleared on pick/Cancel.
-static CHOOSER_OPEN: parking_lot::Mutex<bool> =
-    parking_lot::Mutex::new(false);
+static CHOOSER_OPEN: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
 
 pub fn open() {
     *CHOOSER_OPEN.lock() = true;
@@ -176,9 +175,7 @@ fn start_link(provider: oauth::Provider, channel: Channel) {
              {provider} on {channel}",
         ));
         oauth::set_pending_retry_provider(provider);
-        if crate::leaderboard::registration::try_start_register_session(channel)
-            .is_err()
-        {
+        if crate::leaderboard::registration::try_start_register_session(channel).is_err() {
             eprintln!(
                 "oauth-chooser: register session already in flight (continuing with parallel OAuth)"
             );
@@ -199,8 +196,6 @@ fn start_link(provider: oauth::Provider, channel: Channel) {
     )
     .is_err()
     {
-        eprintln!(
-            "oauth-chooser: another OAuth flow is already in flight; ignoring"
-        );
+        eprintln!("oauth-chooser: another OAuth flow is already in flight; ignoring");
     }
 }

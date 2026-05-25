@@ -162,10 +162,10 @@ fn synth_metallic_hit() -> Vec<f32> {
     // A3 fundamental + Helmholtz-style inharmonic partials. Each
     // mode has its own decay so higher modes die off first.
     let modes: &[(f32, f32, f32)] = &[
-        (220.0, 0.55, 0.48),     // A3 fundamental
-        (606.32, 0.30, 0.22),    // 2.756 × first inharmonic
-        (1188.88, 0.18, 0.14),   // 5.404 ×
-        (1965.26, 0.10, 0.08),   // 8.933 ×
+        (220.0, 0.55, 0.48),   // A3 fundamental
+        (606.32, 0.30, 0.22),  // 2.756 × first inharmonic
+        (1188.88, 0.18, 0.14), // 5.404 ×
+        (1965.26, 0.10, 0.08), // 8.933 ×
     ];
 
     let mut noise_seed: u32 = 0xbadd_cafe;

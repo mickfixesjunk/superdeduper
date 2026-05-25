@@ -239,7 +239,8 @@ impl SuperdeduperApp {
             resume_effect_active: false,
             last_bar_fill: None,
             #[cfg(feature = "telemetry")]
-            scan_complete_modal: crate::gui::widgets::scan_complete_modal::ScanCompleteState::default(),
+            scan_complete_modal:
+                crate::gui::widgets::scan_complete_modal::ScanCompleteState::default(),
             #[cfg(feature = "telemetry")]
             scan_complete_data: None,
         };
@@ -542,9 +543,7 @@ impl SuperdeduperApp {
         if !self.preflight.is_active() {
             return;
         }
-        if let Some(action) =
-            crate::gui::widgets::preflight_modal::show(ctx, &self.preflight)
-        {
+        if let Some(action) = crate::gui::widgets::preflight_modal::show(ctx, &self.preflight) {
             // Snapshot the Defender RTP probe result *before* we drop
             // the report — G1 wants pre-scan defender state in the
             // leaderboard payload, and this is the only place the
@@ -584,9 +583,7 @@ impl SuperdeduperApp {
         duplicates: u64,
         reclaimable_bytes: u64,
     ) {
-        use crate::gui::widgets::scan_complete_modal::{
-            ScanCompleteData, ScanCompleteState,
-        };
+        use crate::gui::widgets::scan_complete_modal::{ScanCompleteData, ScanCompleteState};
         use crate::leaderboard::install;
         use crate::leaderboard::submission;
 
@@ -660,38 +657,27 @@ impl SuperdeduperApp {
                     match registration::register_cli(&mut s) {
                         Ok(()) => s,
                         Err(e) => {
-                            submission::store_last_outcome(
-                                submission::SubmitOutcome::Rejected {
-                                    status: 0,
-                                    reason: format!(
-                                        "auto-register before submit failed: {e:?}"
-                                    ),
-                                },
-                            );
+                            submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                                status: 0,
+                                reason: format!("auto-register before submit failed: {e:?}"),
+                            });
                             return;
                         }
                     }
                 }
                 Ok(None) => {
-                    eprintln!(
-                        "submit: no install state on disk; auto-registering before submit"
-                    );
-                    let server_url = crate::channel::server_url_for(
-                        crate::channel::active_channel(),
-                    )
-                    .to_string();
+                    eprintln!("submit: no install state on disk; auto-registering before submit");
+                    let server_url =
+                        crate::channel::server_url_for(crate::channel::active_channel())
+                            .to_string();
                     let mut s = install::new_unregistered(server_url);
                     match registration::register_cli(&mut s) {
                         Ok(()) => s,
                         Err(e) => {
-                            submission::store_last_outcome(
-                                submission::SubmitOutcome::Rejected {
-                                    status: 0,
-                                    reason: format!(
-                                        "auto-register before submit failed: {e:?}"
-                                    ),
-                                },
-                            );
+                            submission::store_last_outcome(submission::SubmitOutcome::Rejected {
+                                status: 0,
+                                reason: format!("auto-register before submit failed: {e:?}"),
+                            });
                             return;
                         }
                     }
@@ -856,12 +842,11 @@ impl SuperdeduperApp {
                 ScanCompleteAction::ClosePreview => {
                     // Return to the prior state — Ready unless an
                     // outcome already landed (then Done).
-                    self.scan_complete_modal =
-                        if submission::peek_last_outcome().is_some() {
-                            ScanCompleteState::Done
-                        } else {
-                            ScanCompleteState::Ready
-                        };
+                    self.scan_complete_modal = if submission::peek_last_outcome().is_some() {
+                        ScanCompleteState::Done
+                    } else {
+                        ScanCompleteState::Ready
+                    };
                 }
                 ScanCompleteAction::SubmitForReview => {
                     self.flag_pending_for_review();
@@ -898,23 +883,18 @@ impl SuperdeduperApp {
                     return;
                 }
             };
-            let rejection = submission::peek_last_outcome().unwrap_or(
-                submission::SubmitOutcome::Rejected {
+            let rejection =
+                submission::peek_last_outcome().unwrap_or(submission::SubmitOutcome::Rejected {
                     status: 0,
                     reason: "unknown".into(),
-                },
-            );
+                });
             // Capture the original rejection's status + reason so
             // the confirmation card can surface both "we flagged
             // this for review" AND the error that triggered it,
             // side by side, in the same view.
             let (original_status, original_reason) = match &rejection {
-                submission::SubmitOutcome::Rejected { status, reason } => {
-                    (*status, reason.clone())
-                }
-                submission::SubmitOutcome::Transient { reason } => {
-                    (0, reason.clone())
-                }
+                submission::SubmitOutcome::Rejected { status, reason } => (*status, reason.clone()),
+                submission::SubmitOutcome::Transient { reason } => (0, reason.clone()),
                 _ => (0, "unknown".to_string()),
             };
             match submission::flag_for_review(&state, &inputs, &rejection, None) {
@@ -924,14 +904,12 @@ impl SuperdeduperApp {
                         path.display(),
                         review_id
                     );
-                    submission::store_last_outcome(
-                        submission::SubmitOutcome::FlaggedForReview {
-                            review_id,
-                            local_path: path.display().to_string(),
-                            original_status,
-                            original_reason,
-                        },
-                    );
+                    submission::store_last_outcome(submission::SubmitOutcome::FlaggedForReview {
+                        review_id,
+                        local_path: path.display().to_string(),
+                        original_status,
+                        original_reason,
+                    });
                 }
                 Err(e) => {
                     eprintln!("review: local save failed: {e:?}");
@@ -961,10 +939,7 @@ impl SuperdeduperApp {
             }
             BadgeWallAction::OpenProfile => {
                 let url = match install::load() {
-                    Ok(Some(s)) => format!(
-                        "https://superdeduper.io/profile/{}",
-                        s.install_id
-                    ),
+                    Ok(Some(s)) => format!("https://superdeduper.io/profile/{}", s.install_id),
                     _ => "https://superdeduper.io/".to_string(),
                 };
                 open_url_in_browser(&url);
@@ -1300,13 +1275,7 @@ impl SuperdeduperApp {
                 Ok(ev) => {
                     match &ev {
                         EngineEvent::ScanStarted { .. } => self.is_scanning = true,
-                        EngineEvent::ScanFinished {
-                            total_files,
-                            total_bytes_read,
-                            duplicates,
-                            reclaimable_bytes,
-                            ..
-                        } => {
+                        EngineEvent::ScanFinished { .. } => {
                             self.is_scanning = false;
                             self.persisted.results_tab = ResultsTab::Groups;
                             self.groups_state = groups_table::GroupsTableState::default();
@@ -1508,9 +1477,7 @@ impl SuperdeduperApp {
                 // 0-byte-reclaimable groups (hardlinks) is at best
                 // pointless + at worst destructive (moving aliases
                 // doesn't free space on the source volume).
-                if hide_unreclaimable
-                    && crate::gui::state::inode_aware_savings(g) == 0
-                {
+                if hide_unreclaimable && crate::gui::state::inode_aware_savings(g) == 0 {
                     return None;
                 }
                 let keeper = g.files[0].clone();
@@ -1703,16 +1670,10 @@ impl SuperdeduperApp {
                 self.pick_archive_dest_and_run();
             }
             GroupAction::RecycleAllVisible => {
-                self.run_bulk_destructive_threaded(
-                    DedupeAction::Recycle,
-                    "♻ Recycle",
-                );
+                self.run_bulk_destructive_threaded(DedupeAction::Recycle, "♻ Recycle");
             }
             GroupAction::NukeAllVisible => {
-                self.run_bulk_destructive_threaded(
-                    DedupeAction::Remove,
-                    "💀 Nuke",
-                );
+                self.run_bulk_destructive_threaded(DedupeAction::Remove, "💀 Nuke");
             }
             GroupAction::PromoteKeeper {
                 group_idx,
@@ -1762,9 +1723,7 @@ impl SuperdeduperApp {
                 // Recycle/Nuke): if the user has 0-byte-reclaimable
                 // groups hidden from the table view, the Go button
                 // must not act on them either.
-                if hide_unreclaimable
-                    && crate::gui::state::inode_aware_savings(g) == 0
-                {
+                if hide_unreclaimable && crate::gui::state::inode_aware_savings(g) == 0 {
                     return None;
                 }
                 let keeper = g.files[0].clone();
@@ -2018,9 +1977,7 @@ impl SuperdeduperApp {
                 // partial-hardlinks with unique_inodes < 2).
                 // Hiding them visually + still acting on them via
                 // Go would be a silent-destruction trap.
-                if hide_unreclaimable
-                    && crate::gui::state::inode_aware_savings(g) == 0
-                {
+                if hide_unreclaimable && crate::gui::state::inode_aware_savings(g) == 0 {
                     return None;
                 }
                 let dupes: Vec<PathBuf> = g.files[1..]
@@ -2036,7 +1993,10 @@ impl SuperdeduperApp {
             })
             .collect();
         let total: u64 = groups.iter().map(|d| d.len() as u64).sum();
-        let action_label = format!("{label_emoji} · {total} file(s) across {} group(s)", groups.len());
+        let action_label = format!(
+            "{label_emoji} · {total} file(s) across {} group(s)",
+            groups.len()
+        );
         std::thread::Builder::new()
             .name("superdeduper-bulk-destructive".into())
             .spawn(move || {
@@ -2088,9 +2048,7 @@ impl SuperdeduperApp {
                 }
                 let label = if user_stopped { "stopped" } else { "complete" };
                 let _ = tx.send(EngineEvent::ActionFinished {
-                    summary: format!(
-                        "{label_emoji} {label} · {done} done, {failed} failed.",
-                    ),
+                    summary: format!("{label_emoji} {label} · {done} done, {failed} failed.",),
                 });
             })
             .expect("spawn bulk-destructive thread");
@@ -2408,10 +2366,7 @@ impl eframe::App for SuperdeduperApp {
         // of the window, above the menubar. Reads the active channel
         // from the channel module's process-global cell — set once
         // at GUI startup via channel::set_active_channel.
-        crate::gui::widgets::channel_banner::show(
-            ctx,
-            crate::channel::active_channel(),
-        );
+        crate::gui::widgets::channel_banner::show(ctx, crate::channel::active_channel());
 
         // File menubar — owns project lifecycle (New / Open / Save /
         // Save As / Open Archive Manifest). Rendered as a thin strip
@@ -2433,23 +2388,18 @@ impl eframe::App for SuperdeduperApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::Image::new(egui::include_image!(
-                            "../../assets/sdd-color-shield.png"
-                        ))
-                        .max_size(egui::vec2(84.0, 84.0)),
+                        egui::Image::new(egui::include_image!("../../assets/sdd-color-shield.png"))
+                            .max_size(egui::vec2(84.0, 84.0)),
                     );
                     ui.add_space(12.0);
-                    ui.with_layout(
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                egui::RichText::new("SuperDeDuper")
-                                    .color(theme::TEXT_HI)
-                                    .strong()
-                                    .size(36.0),
-                            );
-                        },
-                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("SuperDeDuper")
+                                .color(theme::TEXT_HI)
+                                .strong()
+                                .size(36.0),
+                        );
+                    });
                 });
             });
 
@@ -2562,12 +2512,12 @@ impl eframe::App for SuperdeduperApp {
                 stats_rect = out.stats_rect;
             });
         let _ = stats_rect; // anchor moved to progress-bar fill_rect
-        // Cache-fast-forward effect: STRICTLY resume-only. Only fires
-        // while resume_effect_active is true, the engine is in
-        // Hashing, and the rate exceeds the fast-forward threshold.
-        // After catch-up (Sparkles emits `left_fast_forward`) we
-        // clear resume_effect_active so the effect ends and the bar
-        // returns to its normal render for the rest of the scan.
+                            // Cache-fast-forward effect: STRICTLY resume-only. Only fires
+                            // while resume_effect_active is true, the engine is in
+                            // Hashing, and the rate exceeds the fast-forward threshold.
+                            // After catch-up (Sparkles emits `left_fast_forward`) we
+                            // clear resume_effect_active so the effect ends and the bar
+                            // returns to its normal render for the rest of the scan.
         if self.resume_effect_active
             && matches!(
                 self.state.overall.stage,

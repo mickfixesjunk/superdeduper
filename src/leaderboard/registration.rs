@@ -95,8 +95,7 @@ impl RegisterSession {
                 eprintln!("register: backup failed: {e} (continuing anyway)");
             }
             // Generate fresh install state for this channel.
-            let server_url =
-                crate::channel::server_url_for(channel).to_string();
+            let server_url = crate::channel::server_url_for(channel).to_string();
             let mut state = crate::leaderboard::install::new_unregistered(server_url);
             match register_cli(&mut state) {
                 Ok(()) => {
@@ -105,12 +104,9 @@ impl RegisterSession {
                     // helper so a non-active-channel register
                     // (Settings tab on dev while main is prod, etc.)
                     // also lands at the right path.
-                    if let Err(e) =
-                        crate::leaderboard::install::save_for(channel, &state)
-                    {
-                        let _ = tx.send(Err(RegisterError::SaveFailedAfterServerAck(
-                            format!("{e}"),
-                        )));
+                    if let Err(e) = crate::leaderboard::install::save_for(channel, &state) {
+                        let _ =
+                            tx.send(Err(RegisterError::SaveFailedAfterServerAck(format!("{e}"))));
                         return;
                     }
                     let _ = tx.send(Ok(state.install_id));
@@ -178,9 +174,7 @@ impl Drop for RegisterSession {
 
 /// Attempt to start a register session. `Err(())` if one is
 /// already in flight.
-pub fn try_start_register_session(
-    channel: crate::channel::Channel,
-) -> Result<(), ()> {
+pub fn try_start_register_session(channel: crate::channel::Channel) -> Result<(), ()> {
     let mut slot = CURRENT_REGISTER_SESSION.lock();
     if slot.is_some() {
         return Err(());
@@ -197,7 +191,10 @@ pub fn register_session_in_flight() -> bool {
 /// Elapsed time since the current register session started.
 /// `None` when no session is running.
 pub fn register_session_elapsed() -> Option<std::time::Duration> {
-    CURRENT_REGISTER_SESSION.lock().as_ref().map(|s| s.elapsed())
+    CURRENT_REGISTER_SESSION
+        .lock()
+        .as_ref()
+        .map(|s| s.elapsed())
 }
 
 /// Drain the current register session if it has completed.
@@ -254,8 +251,8 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
         return Err(RegisterError::AlreadyRegistered);
     }
     let key = state.install_key().ok_or(RegisterError::MalformedKey)?;
-    let nonce = compute_pow(&state.install_id, DEFAULT_POW_DIFFICULTY)
-        .ok_or(RegisterError::PoWTimeout)?;
+    let nonce =
+        compute_pow(&state.install_id, DEFAULT_POW_DIFFICULTY).ok_or(RegisterError::PoWTimeout)?;
 
     // Register is the bootstrap: the server doesn't have our
     // install_key_hex yet, so it can't verify the X-Sd-Signature
@@ -278,10 +275,7 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     let canonical = hmac_signer::canonical_body(&body);
     let signature = hmac_signer::sign(&key, &canonical);
 
-    let url = format!(
-        "{}/api/v1/register",
-        state.server_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/v1/register", state.server_url.trim_end_matches('/'));
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .set("X-Sd-Signature", &signature)
@@ -291,9 +285,8 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     match resp {
         Ok(_) => {
             state.registered = true;
-            install::save(state).map_err(|e| {
-                RegisterError::SaveFailedAfterServerAck(format!("{e}"))
-            })?;
+            install::save(state)
+                .map_err(|e| RegisterError::SaveFailedAfterServerAck(format!("{e}")))?;
             Ok(())
         }
         Err(ureq::Error::Status(429, _)) => Err(RegisterError::RateLimited),
@@ -368,10 +361,7 @@ pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), Registe
     let canonical = hmac_signer::canonical_body(&body);
     let signature = hmac_signer::sign(&key, &canonical);
 
-    let url = format!(
-        "{}/api/v1/register",
-        state.server_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/v1/register", state.server_url.trim_end_matches('/'));
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .set("X-Sd-Signature", &signature)
@@ -381,9 +371,8 @@ pub fn register_gui_via_loopback(state: &mut InstallState) -> Result<(), Registe
     match resp {
         Ok(_) => {
             state.registered = true;
-            install::save(state).map_err(|e| {
-                RegisterError::SaveFailedAfterServerAck(format!("{e}"))
-            })?;
+            install::save(state)
+                .map_err(|e| RegisterError::SaveFailedAfterServerAck(format!("{e}")))?;
             Ok(())
         }
         Err(ureq::Error::Status(429, _)) => Err(RegisterError::RateLimited),
@@ -476,7 +465,7 @@ mod tests {
         let mut d = [0u8; 32];
         d[0] = 0x00;
         d[1] = 0x0F; // top nibble of byte 1 is zero
-        // 8 + 4 = 12 leading zeros
+                     // 8 + 4 = 12 leading zeros
         assert!(has_leading_zero_bits(&d, 12));
         assert!(!has_leading_zero_bits(&d, 13));
     }

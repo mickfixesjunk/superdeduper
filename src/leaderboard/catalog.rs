@@ -157,7 +157,9 @@ fn fetch_profile_inner(
     };
     let mut req = ureq::get(&url).timeout(FETCH_TIMEOUT);
     if cache_bust {
-        req = req.set("Cache-Control", "no-cache").set("Pragma", "no-cache");
+        req = req
+            .set("Cache-Control", "no-cache")
+            .set("Pragma", "no-cache");
     }
     let resp = req.call();
     match resp {

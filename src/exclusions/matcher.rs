@@ -74,10 +74,7 @@ mod tests {
 
     #[test]
     fn trailing_dot_yields_empty_extension() {
-        assert_eq!(
-            lowercased_extension(Path::new("foo.")),
-            Some(String::new())
-        );
+        assert_eq!(lowercased_extension(Path::new("foo.")), Some(String::new()));
     }
 
     #[test]

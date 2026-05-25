@@ -71,6 +71,8 @@ fn run_scan(root: &Path, threads: usize, min_size: u64) -> Vec<pipeline::Duplica
         allow_recall_on_read: false,
         io_threads: 4,
         hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
+        exclusion_policy: superdeduper::exclusions::ExclusionPolicy::disabled(),
+        exclusion_counters: superdeduper::exclusions::ExclusionCounters::new(),
     };
     let files = inventory::enumerate(&cfg, None).unwrap();
     let size_groups = pipeline::grouping::group_by_size(files);

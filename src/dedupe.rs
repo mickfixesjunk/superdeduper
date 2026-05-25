@@ -794,7 +794,10 @@ mod tests {
         action_recycle(&target).expect("action_recycle on Linux");
 
         // Original gone.
-        assert!(!target.exists(), "recycled file should not remain at source");
+        assert!(
+            !target.exists(),
+            "recycled file should not remain at source"
+        );
         // Trash files dir has it.
         let trashed = fake_home.join(".local/share/Trash/files/doomed-recycle.bin");
         assert!(
@@ -802,8 +805,7 @@ mod tests {
             "file should land in XDG Trash files/ subdir"
         );
         // Matching info file.
-        let info = fake_home
-            .join(".local/share/Trash/info/doomed-recycle.bin.trashinfo");
+        let info = fake_home.join(".local/share/Trash/info/doomed-recycle.bin.trashinfo");
         assert!(info.exists(), "trashinfo should be written");
 
         match prev_home {
@@ -839,9 +841,7 @@ mod tests {
                 assert!(b.exists());
             }
             Err(Error::Unsupported(_)) => { /* expected on tmpfs */ }
-            Err(other) => panic!(
-                "expected Ok or Error::Unsupported, got {other:?}"
-            ),
+            Err(other) => panic!("expected Ok or Error::Unsupported, got {other:?}"),
         }
         fs::remove_dir_all(&d).ok();
     }

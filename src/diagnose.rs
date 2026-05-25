@@ -187,7 +187,10 @@ pub fn run_probes(target_paths: Vec<PathBuf>, skip_io: bool) -> anyhow::Result<D
     // disk without rerunning instrumented builds. Best-effort: if we
     // can't open it, just skip — the probes still run.
     let mut log = PreflightLog::open();
-    log.line("preflight-start", &format!("targets={}", target_paths.len()));
+    log.line(
+        "preflight-start",
+        &format!("targets={}", target_paths.len()),
+    );
     for p in &target_paths {
         log.line("target", &p.display().to_string());
     }
@@ -239,7 +242,10 @@ pub fn run_probes(target_paths: Vec<PathBuf>, skip_io: bool) -> anyhow::Result<D
     let report = DiagnoseReport {
         schema: "superdeduper.diagnose.v2",
         timestamp_unix: now_unix(),
-        target_paths: target_paths.iter().map(|p| p.display().to_string()).collect(),
+        target_paths: target_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         system,
         hash,
         drives,
@@ -274,19 +280,17 @@ struct PreflightLog {
 
 impl PreflightLog {
     fn open() -> Self {
-        let file = crate::cache::default_cache_path()
-            .ok()
-            .and_then(|mut p| {
-                p.set_file_name("preflight.log");
-                if let Some(parent) = p.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p)
-                    .ok()
-            });
+        let file = crate::cache::default_cache_path().ok().and_then(|mut p| {
+            p.set_file_name("preflight.log");
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
         Self { file }
     }
     fn line(&mut self, tag: &str, body: &str) {
@@ -305,7 +309,11 @@ impl PreflightLog {
 /// never escapes the drive — falling back to system temp would
 /// silently measure the system drive, which misleads the user.
 fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
-    let paths_str: Vec<String> = group.paths.iter().map(|p| p.display().to_string()).collect();
+    let paths_str: Vec<String> = group
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
     let scratch = find_writable_scratch_on_drive(group);
     let scratch_path = match scratch {
         Some(p) => p,
@@ -399,7 +407,7 @@ fn drive_identifier(path: &Path) -> (String, PathBuf) {
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
     // UNC path: \\server\share\...
     if let Some(rest) = s.strip_prefix(r"\\") {
-        let mut parts = rest.splitn(3, |c| c == '\\' || c == '/');
+        let mut parts = rest.splitn(3, ['\\', '/']);
         let server = parts.next().unwrap_or("");
         let share = parts.next().unwrap_or("");
         if !server.is_empty() && !share.is_empty() {
@@ -461,10 +469,7 @@ fn find_writable_scratch_on_drive(group: &DriveGroup) -> Option<PathBuf> {
 }
 
 pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
-    let target_path = args
-        .path
-        .clone()
-        .unwrap_or_else(std::env::temp_dir);
+    let target_path = args.path.clone().unwrap_or_else(std::env::temp_dir);
     let report = run_probes(vec![target_path], args.skip_io)?;
 
     use std::io::Write;
@@ -601,7 +606,9 @@ fn probe_hash_throughput() -> HashProbeResult {
 fn probe_tier1(scratch: &Path) -> anyhow::Result<Tier1ProbeResult> {
     // Create N scratch files (sequentially — write isn't what we're
     // probing).
-    let pattern: Vec<u8> = (0..TIER1_FILE_BYTES).map(|i| (i as u8).wrapping_mul(31)).collect();
+    let pattern: Vec<u8> = (0..TIER1_FILE_BYTES)
+        .map(|i| (i as u8).wrapping_mul(31))
+        .collect();
     let paths: Vec<PathBuf> = (0..TIER1_FILE_COUNT)
         .map(|i| scratch.join(format!("t1-{:04}.bin", i)))
         .collect();
@@ -745,13 +752,8 @@ fn read_for_disk_throughput(path: &Path) -> anyhow::Result<(u64, f64)> {
         // SAFETY: `buf` is sector-aligned, length is a sector
         // multiple, handle is open. `read_bytes` is a stable u32.
         unsafe {
-            ReadFile(
-                handle,
-                Some(buf),
-                Some(&mut read_bytes as *mut u32),
-                None,
-            )
-            .map_err(|e| anyhow::anyhow!("ReadFile: {e}"))?;
+            ReadFile(handle, Some(buf), Some(&mut read_bytes as *mut u32), None)
+                .map_err(|e| anyhow::anyhow!("ReadFile: {e}"))?;
         }
         if read_bytes == 0 {
             break;
@@ -916,8 +918,7 @@ fn build_recommendations(r: &DiagnoseReport, p: &MachineProfile) -> Vec<Recommen
                      Only do this if you trust the corpus you're scanning."
                 .into(),
             action: Some(
-                "Set-MpPreference -DisableRealtimeMonitoring $true (admin) — restore after"
-                    .into(),
+                "Set-MpPreference -DisableRealtimeMonitoring $true (admin) — restore after".into(),
             ),
         });
     }
@@ -979,10 +980,7 @@ fn build_recommendations(r: &DiagnoseReport, p: &MachineProfile) -> Vec<Recommen
     if !unmeasured.is_empty() {
         out.push(Recommendation {
             impact: RecommendationImpact::Informational,
-            title: format!(
-                "{} drive(s) could not be measured",
-                unmeasured.len()
-            ),
+            title: format!("{} drive(s) could not be measured", unmeasured.len()),
             detail: format!(
                 "Skipped disk probes on: {}. The drive(s) are read-only or refused \
                  our scratch directory. Your scan will still work — superdeduper only \
@@ -995,10 +993,7 @@ fn build_recommendations(r: &DiagnoseReport, p: &MachineProfile) -> Vec<Recommen
     out
 }
 
-fn write_text_report(
-    out: &mut dyn std::io::Write,
-    r: &DiagnoseReport,
-) -> anyhow::Result<()> {
+fn write_text_report(out: &mut dyn std::io::Write, r: &DiagnoseReport) -> anyhow::Result<()> {
     writeln!(out, "== superdeduper diagnose ==")?;
     writeln!(out, "Targets:")?;
     for p in &r.target_paths {
@@ -1067,7 +1062,11 @@ fn write_text_report(
     writeln!(out)?;
     writeln!(out, "Defender state:")?;
     match r.defender.rtp_enabled {
-        Some(true) => writeln!(out, "  RTP:         ENABLED  ({})", r.defender.detection_method)?,
+        Some(true) => writeln!(
+            out,
+            "  RTP:         ENABLED  ({})",
+            r.defender.detection_method
+        )?,
         Some(false) => writeln!(
             out,
             "  RTP:         disabled ({})",

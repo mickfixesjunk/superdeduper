@@ -107,7 +107,10 @@ fn write_text(
         writeln!(out)?;
     }
     if !skipped.is_empty() {
-        writeln!(out, "# placeholders observed (skipped from hashing where blocking)")?;
+        writeln!(
+            out,
+            "# placeholders observed (skipped from hashing where blocking)"
+        )?;
         for s in skipped {
             match s.reparse_tag {
                 Some(tag) => writeln!(
@@ -222,16 +225,13 @@ mod summarize_tests {
     use crate::pipeline::DuplicateGroup;
     use std::path::PathBuf;
 
-    fn group(
-        size: u64,
-        files: usize,
-        link_equivalent: bool,
-        unique_inodes: u64,
-    ) -> DuplicateGroup {
+    fn group(size: u64, files: usize, link_equivalent: bool, unique_inodes: u64) -> DuplicateGroup {
         DuplicateGroup {
             size,
             content_hash: "h".into(),
-            files: (0..files).map(|i| PathBuf::from(format!("/p/{i}"))).collect(),
+            files: (0..files)
+                .map(|i| PathBuf::from(format!("/p/{i}")))
+                .collect(),
             link_equivalent,
             unique_inodes,
         }
@@ -301,9 +301,9 @@ mod summarize_tests {
     fn mixed_groups_sum_correctly() {
         // Realistic /usr/lib-shaped mix: a hardlink group, a
         // single-alias dup group, a partial-hardlink group.
-        let g_hardlink = group(11_000_000, 114, true, 1);   // 0 reclaim
-        let g_dup     = group(1_000_000,    3, false, 3);  // 2_000_000 / 2_000_000
-        let g_mixed   = group(500_000,      6, false, 2);  // 2_500_000 / 500_000
+        let g_hardlink = group(11_000_000, 114, true, 1); // 0 reclaim
+        let g_dup = group(1_000_000, 3, false, 3); // 2_000_000 / 2_000_000
+        let g_mixed = group(500_000, 6, false, 2); // 2_500_000 / 500_000
         let s = summarize(&[g_hardlink, g_dup, g_mixed], &[]);
         assert_eq!(s.reclaimable_bytes, 4_500_000);
         assert_eq!(s.reclaimable_inode_bytes, 2_500_000);
@@ -328,9 +328,9 @@ mod summarize_tests {
         // Backend sanity check requires
         // `largest_single_group_bytes <= duplicate_bytes_reclaimable`.
         // Verify it holds across the realistic mix.
-        let g_a = group(2_000_000, 3, false, 3);  // 4_000_000
-        let g_b = group(800_000,   5, false, 5);  // 3_200_000
-        let g_c = group(10_000,    2, false, 2);  // 10_000
+        let g_a = group(2_000_000, 3, false, 3); // 4_000_000
+        let g_b = group(800_000, 5, false, 5); // 3_200_000
+        let g_c = group(10_000, 2, false, 2); // 10_000
         let s = summarize(&[g_a, g_b, g_c], &[]);
         let largest_inode = 4_000_000u64;
         assert!(

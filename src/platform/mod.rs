@@ -61,7 +61,9 @@ pub enum PlatformError {
 impl std::fmt::Display for PlatformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlatformError::Unsupported(reason) => write!(f, "unsupported on this platform: {reason}"),
+            PlatformError::Unsupported(reason) => {
+                write!(f, "unsupported on this platform: {reason}")
+            }
             PlatformError::Io(e) => write!(f, "{e}"),
             PlatformError::Other(s) => f.write_str(s),
         }
@@ -108,7 +110,9 @@ pub fn clone_file(src: &Path, dst: &Path) -> PlatformResult<()> {
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub fn clone_file(_src: &Path, _dst: &Path) -> PlatformResult<()> {
-    Err(PlatformError::Unsupported("reflink not supported on this platform"))
+    Err(PlatformError::Unsupported(
+        "reflink not supported on this platform",
+    ))
 }
 
 // ============================================================
@@ -142,7 +146,9 @@ pub fn trash_file(path: &Path) -> PlatformResult<()> {
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub fn trash_file(_path: &Path) -> PlatformResult<()> {
-    Err(PlatformError::Unsupported("trash not supported on this platform"))
+    Err(PlatformError::Unsupported(
+        "trash not supported on this platform",
+    ))
 }
 
 // ============================================================
@@ -167,5 +173,7 @@ pub fn open_url(url: &str) -> PlatformResult<()> {
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub fn open_url(_url: &str) -> PlatformResult<()> {
-    Err(PlatformError::Unsupported("open_url not supported on this platform"))
+    Err(PlatformError::Unsupported(
+        "open_url not supported on this platform",
+    ))
 }

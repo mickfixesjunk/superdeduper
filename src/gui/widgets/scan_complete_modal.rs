@@ -156,10 +156,7 @@ pub fn show(
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Submitting to leaderboard…")
-                            .color(theme::TEXT_HI),
-                    );
+                    ui.label(RichText::new("Submitting to leaderboard…").color(theme::TEXT_HI));
                 });
                 ui.add_space(4.0);
                 ui.label(
@@ -178,9 +175,7 @@ pub fn show(
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new("Close")
-                                    .color(theme::PANEL_DEEP)
-                                    .strong(),
+                                RichText::new("Close").color(theme::PANEL_DEEP).strong(),
                             )
                             .fill(theme::ACCENT)
                             .min_size(egui::vec2(120.0, 28.0)),
@@ -197,8 +192,7 @@ pub fn show(
                         && ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("Submit for review")
-                                        .color(theme::TEXT_HI),
+                                    RichText::new("Submit for review").color(theme::TEXT_HI),
                                 )
                                 .min_size(egui::vec2(160.0, 28.0)),
                             )
@@ -232,7 +226,12 @@ fn render_stats(ui: &mut egui::Ui, d: &ScanCompleteData) {
         .num_columns(2)
         .spacing([16.0, 6.0])
         .show(ui, |ui| {
-            big_stat_row(ui, "Reclaimable", &theme::humansize(d.reclaimable_bytes), theme::HOT);
+            big_stat_row(
+                ui,
+                "Reclaimable",
+                &theme::humansize(d.reclaimable_bytes),
+                theme::HOT,
+            );
             ui.end_row();
             big_stat_row(
                 ui,
@@ -294,9 +293,7 @@ fn render_signin_cta(ui: &mut egui::Ui) {
     // fires here too (post-scan CTA may be the surface visible
     // when register completes). The poll's internal logic
     // auto-kicks OAuth via the stashed retry provider.
-    if let Some(result) =
-        crate::leaderboard::registration::poll_register_session()
-    {
+    if let Some(result) = crate::leaderboard::registration::poll_register_session() {
         match &result {
             Ok(id) => eprintln!("post-scan-cta: register OK, install_id={id}"),
             Err(e) => eprintln!("post-scan-cta: register failed: {e:?}"),
@@ -362,11 +359,8 @@ fn render_signin_cta(ui: &mut egui::Ui) {
             ui.spinner();
             ui.add_space(4.0);
             ui.label(
-                RichText::new(format!(
-                    "Registering machine ({}s)…",
-                    elapsed.as_secs()
-                ))
-                .color(theme::TEXT_HI),
+                RichText::new(format!("Registering machine ({}s)…", elapsed.as_secs()))
+                    .color(theme::TEXT_HI),
             );
         });
         ui.add_space(8.0);
@@ -404,7 +398,8 @@ fn render_signin_cta(ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
         return;
     }
 
@@ -418,9 +413,7 @@ fn render_signin_cta(ui: &mut egui::Ui) {
         .map(|p| p.achievements.iter().filter(|g| g.granted).count())
         .unwrap_or(0);
     let copy = if granted_count > 0 {
-        format!(
-            "Sign in to keep your progress (you have earned {granted_count} badges)"
-        )
+        format!("Sign in to keep your progress (you have earned {granted_count} badges)")
     } else {
         "Sign in to start your collection.".to_string()
     };
@@ -471,10 +464,7 @@ fn render_signin_cta(ui: &mut egui::Ui) {
 /// Background-thread OAuth start; per-frame `poll_session()`
 /// drains the completion. Per issue #2 fix — never blocks the
 /// egui render loop.
-fn start_signin(
-    provider: crate::leaderboard::oauth::Provider,
-    channel: crate::channel::Channel,
-) {
+fn start_signin(provider: crate::leaderboard::oauth::Provider, channel: crate::channel::Channel) {
     use crate::leaderboard::{install, oauth, registration};
     let install_id_opt = install::load().ok().flatten().map(|s| s.install_id);
     let server_url = crate::channel::server_url_for(channel);
@@ -489,9 +479,7 @@ fn start_signin(
         ));
         oauth::set_pending_retry_provider(provider);
         if registration::try_start_register_session(channel).is_err() {
-            eprintln!(
-                "post-scan-cta: register already in flight (continuing with parallel OAuth)"
-            );
+            eprintln!("post-scan-cta: register already in flight (continuing with parallel OAuth)");
         }
     }
     let install_id_for_session = install_id_opt.unwrap_or_default();
@@ -504,9 +492,7 @@ fn start_signin(
     )
     .is_err()
     {
-        eprintln!(
-            "post-scan-cta: another OAuth flow is already in flight; ignoring"
-        );
+        eprintln!("post-scan-cta: another OAuth flow is already in flight; ignoring");
     }
 }
 
@@ -543,10 +529,8 @@ fn render_action_buttons(ui: &mut egui::Ui, action: &mut Option<ScanCompleteActi
         ui.add_space(4.0);
         if ui
             .add(
-                egui::Button::new(
-                    RichText::new("Auto-submit going forward").color(theme::TEXT_HI),
-                )
-                .min_size(egui::vec2(190.0, 30.0)),
+                egui::Button::new(RichText::new("Auto-submit going forward").color(theme::TEXT_HI))
+                    .min_size(egui::vec2(190.0, 30.0)),
             )
             .on_hover_text(
                 "Submit this run AND flip your share preference to \
@@ -614,17 +598,11 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
             }
             if let Some(url) = profile_url {
                 ui.add_space(6.0);
-                ui.hyperlink_to(
-                    RichText::new("View profile →").color(theme::ACCENT),
-                    url,
-                );
+                ui.hyperlink_to(RichText::new("View profile →").color(theme::ACCENT), url);
             }
         }
         SubmitOutcome::DuplicateNoChange => {
-            ui.label(
-                RichText::new("Already submitted (no change)")
-                    .color(theme::TEXT_LO),
-            );
+            ui.label(RichText::new("Already submitted (no change)").color(theme::TEXT_LO));
         }
         SubmitOutcome::Rejected { status, reason } => {
             ui.label(
@@ -632,18 +610,14 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
                     .color(theme::HOT)
                     .strong(),
             );
-            ui.label(
-                RichText::new(reason).color(theme::TEXT_LO).small(),
-            );
+            ui.label(RichText::new(reason).color(theme::TEXT_LO).small());
         }
         SubmitOutcome::Transient { reason } => {
             ui.label(
                 RichText::new("Network failure — queued for retry on next launch")
                     .color(theme::WARN),
             );
-            ui.label(
-                RichText::new(reason).color(theme::TEXT_LO).small(),
-            );
+            ui.label(RichText::new(reason).color(theme::TEXT_LO).small());
         }
         SubmitOutcome::FlaggedForReview {
             review_id,
@@ -667,11 +641,9 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
                             .monospace(),
                     );
                     ui.label(
-                        RichText::new(
-                            "Uploaded to the admin review queue + saved locally."
-                        )
-                        .color(theme::TEXT_LO)
-                        .small(),
+                        RichText::new("Uploaded to the admin review queue + saved locally.")
+                            .color(theme::TEXT_LO)
+                            .small(),
                     );
                 }
                 None => {
@@ -766,11 +738,9 @@ fn render_preview(ctx: &Context, payload: Option<&str>) -> Option<ScanCompleteAc
         ui.add_space(10.0);
         if ui
             .add(
-                egui::Button::new(
-                    RichText::new("Close").color(theme::PANEL_DEEP).strong(),
-                )
-                .fill(theme::ACCENT)
-                .min_size(egui::vec2(120.0, 28.0)),
+                egui::Button::new(RichText::new("Close").color(theme::PANEL_DEEP).strong())
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(120.0, 28.0)),
             )
             .clicked()
         {

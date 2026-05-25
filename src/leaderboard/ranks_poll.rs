@@ -102,7 +102,9 @@ pub fn poll_once(
 /// Silent-give-up on timeout or persistent error.
 pub fn spawn_ranks_poll_worker(submission_id: String) {
     if submission_id.is_empty() {
-        eprintln!("ranks-poll: empty submission_id; skipping (web won't have known what to look up)");
+        eprintln!(
+            "ranks-poll: empty submission_id; skipping (web won't have known what to look up)"
+        );
         return;
     }
     std::thread::spawn(move || run(submission_id));
@@ -175,20 +177,13 @@ fn deliver_ranks(ranks: Vec<RankEntry>) {
     // mutates the cached outcome + profile in that path (so `sd
     // achievements list` reflects fresh state) — just no UI toast.
     #[cfg(feature = "gui")]
-    crate::gui::widgets::toast::push(
-        "Leaderboard rank in",
-        lines,
-        Duration::from_secs(8),
-    );
+    crate::gui::widgets::toast::push("Leaderboard rank in", lines, Duration::from_secs(8));
     #[cfg(not(feature = "gui"))]
     let _ = lines;
 
     if let Ok(Some(state)) = crate::leaderboard::install::load() {
         if state.registered {
-            crate::leaderboard::catalog::spawn_profile_refresh(
-                state.server_url,
-                state.install_id,
-            );
+            crate::leaderboard::catalog::spawn_profile_refresh(state.server_url, state.install_id);
         }
     }
 }

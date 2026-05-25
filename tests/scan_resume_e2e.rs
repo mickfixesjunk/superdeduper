@@ -114,9 +114,7 @@ enum CancelTrigger {
 impl CancelTrigger {
     fn matches(&self, evt: &EngineEvent) -> bool {
         match (self, evt) {
-            (CancelTrigger::OnStatusContains(needle), EngineEvent::Status(s)) => {
-                s.contains(needle)
-            }
+            (CancelTrigger::OnStatusContains(needle), EngineEvent::Status(s)) => s.contains(needle),
             _ => false,
         }
     }

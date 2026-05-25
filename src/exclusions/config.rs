@@ -17,7 +17,7 @@ use super::PresetPackId;
 /// User-editable exclusion settings. Persists to TOML; the GUI's
 /// Settings → Exclusions tab + the CLI's `--exclude-*` flags both
 /// mutate instances of this type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExclusionConfig {
     /// Master toggle. When false, every other field is inert.
     /// Spec §2.5: Settings tab top-level toggle.
@@ -40,17 +40,6 @@ pub struct ExclusionConfig {
     /// [`ExclusionConfigError::BadPattern`] before the scan runs.
     #[serde(default)]
     pub custom_patterns: Vec<String>,
-}
-
-impl Default for ExclusionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            active_packs: Vec::new(),
-            custom_extensions: Vec::new(),
-            custom_patterns: Vec::new(),
-        }
-    }
 }
 
 /// Errors raised when compiling an [`ExclusionConfig`] into a

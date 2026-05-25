@@ -50,8 +50,8 @@ pub fn await_captcha_token(
     install_id: &str,
     timeout: Duration,
 ) -> Result<String, CaptchaError> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| CaptchaError::BindFailed(format!("{e}")))?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| CaptchaError::BindFailed(format!("{e}")))?;
     let port = listener
         .local_addr()
         .map_err(|e| CaptchaError::BindFailed(format!("{e}")))?
@@ -192,9 +192,7 @@ where
 
     // Anything that's not a POST to our exact path is a 404.
     if method != "POST" || path != expected_path {
-        let _ = writer.write_all(
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
-        );
+        let _ = writer.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
         return RequestOutcome::Continue;
     }
 
@@ -202,9 +200,7 @@ where
     let body_cap = content_length.min(16 * 1024);
     let mut body = vec![0u8; body_cap];
     if reader.read_exact(&mut body).is_err() {
-        let _ = writer.write_all(
-            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
-        );
+        let _ = writer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
         return RequestOutcome::Continue;
     }
 
@@ -230,9 +226,7 @@ where
         let _ = writer.write_all(body_out);
         RequestOutcome::Token(token)
     } else {
-        let _ = writer.write_all(
-            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
-        );
+        let _ = writer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
         RequestOutcome::Continue
     }
 }

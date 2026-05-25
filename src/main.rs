@@ -77,8 +77,8 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
             provider,
             timeout_secs,
         } => {
-            let provider = oauth::Provider::from_str(&provider)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let provider =
+                oauth::Provider::from_str(&provider).map_err(|e| anyhow::anyhow!("{e}"))?;
             let install_state = install::load()?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "not registered on channel `{}` — run `superdeduper register --channel {}` first",
@@ -194,15 +194,11 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
     }
 }
 
-
-
 /// G-track: `superdeduper achievements` — list / refetch the install's
 /// achievement state. Triage tool: pair with the GUI when the badge
 /// wall looks wrong.
 #[cfg(feature = "telemetry")]
-fn run_achievements(
-    cmd: superdeduper::cli::AchievementsCommand,
-) -> anyhow::Result<()> {
+fn run_achievements(cmd: superdeduper::cli::AchievementsCommand) -> anyhow::Result<()> {
     use superdeduper::cli::AchievementsCommand;
     use superdeduper::leaderboard::{catalog, install};
 
@@ -214,9 +210,7 @@ fn run_achievements(
             );
         }
         None => {
-            anyhow::bail!(
-                "no install.json found — run `superdeduper register` to create one"
-            );
+            anyhow::bail!("no install.json found — run `superdeduper register` to create one");
         }
     };
 
@@ -285,9 +279,7 @@ fn run_achievements(
                 if let Some(post) = install::load()? {
                     let n = post.counters.achievements_verify_invocations;
                     if n < 10 {
-                        println!(
-                            "\n(verify invocation #{n}; verify-veteran unlocks at 10.)"
-                        );
+                        println!("\n(verify invocation #{n}; verify-veteran unlocks at 10.)");
                     } else {
                         println!(
                             "\n(verify invocation #{n}; verify-veteran qualifies — will grant on next scan submit.)"
@@ -320,7 +312,10 @@ fn print_achievements(
     // Granted entries first (visual-test-friendly), then by
     // display_order. Matches the badge-wall ordering.
     entries.sort_by_key(|e| {
-        let granted = grants.get(e.id.as_str()).map(|g| g.granted).unwrap_or(false);
+        let granted = grants
+            .get(e.id.as_str())
+            .map(|g| g.granted)
+            .unwrap_or(false);
         (!granted, e.display_order)
     });
 
@@ -329,7 +324,10 @@ fn print_achievements(
             let rows: Vec<serde_json::Value> = entries
                 .iter()
                 .filter_map(|e| {
-                    let granted = grants.get(e.id.as_str()).map(|g| g.granted).unwrap_or(false);
+                    let granted = grants
+                        .get(e.id.as_str())
+                        .map(|g| g.granted)
+                        .unwrap_or(false);
                     if !all && !granted {
                         return None;
                     }
@@ -361,17 +359,25 @@ fn print_achievements(
             println!("install_id: {}", profile.install_id);
             println!(
                 "lifetime: {} bytes reclaimed across {} scans",
-                profile.lifetime_reclaimed_bytes(), profile.lifetime_scans()
+                profile.lifetime_reclaimed_bytes(),
+                profile.lifetime_scans()
             );
             let granted_count = grants.values().filter(|g| g.granted).count();
             println!(
                 "achievements: {}/{} granted{}",
                 granted_count,
                 entries.len(),
-                if all { " (showing all)" } else { " (showing granted only; --all for full list)" }
+                if all {
+                    " (showing all)"
+                } else {
+                    " (showing granted only; --all for full list)"
+                }
             );
             println!();
-            println!("{:<28}  {:<6}  {:<22}  {}", "ID", "TIER", "GRANTED_AT", "NAME");
+            println!(
+                "{:<28}  {:<6}  {:<22}  {}",
+                "ID", "TIER", "GRANTED_AT", "NAME"
+            );
             for e in entries {
                 let grant = grants.get(e.id.as_str());
                 let granted = grant.map(|g| g.granted).unwrap_or(false);
@@ -379,9 +385,7 @@ fn print_achievements(
                     continue;
                 }
                 let marker = if granted { "✓" } else { " " };
-                let at = grant
-                    .and_then(|g| g.granted_at.as_deref())
-                    .unwrap_or("-");
+                let at = grant.and_then(|g| g.granted_at.as_deref()).unwrap_or("-");
                 println!(
                     "{marker} {:<26}  {:<6}  {:<22}  {}",
                     e.id, e.tier, at, e.name
@@ -404,8 +408,7 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
     // server_url resolves to https://dev-api.superdeduper.io
     // automatically. Per dev-channel-spec.md §5.1.
     let server_url = args.server_url.unwrap_or_else(|| {
-        superdeduper::channel::server_url_for(superdeduper::channel::active_channel())
-            .to_string()
+        superdeduper::channel::server_url_for(superdeduper::channel::active_channel()).to_string()
     });
 
     // --reset rotates the install_id. Refuse without explicit opt-in
@@ -436,9 +439,7 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "First-time setup: registering this install. This takes ~1 second of CPU."
-    );
+    println!("First-time setup: registering this install. This takes ~1 second of CPU.");
     match registration::register_cli(&mut state) {
         Ok(()) => {
             println!(
@@ -789,9 +790,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
 
     // T2.1 phase 7: surface placeholder skip counts so a smaller-
     // than-expected dup-group count has a visible explanation.
-    let placeholders_recall = counters
-        .placeholders_blocked_recall
-        .load(Ordering::Relaxed);
+    let placeholders_recall = counters.placeholders_blocked_recall.load(Ordering::Relaxed);
     let placeholders_other = counters
         .placeholders_blocked_other_reparse
         .load(Ordering::Relaxed);
@@ -881,8 +880,7 @@ fn run_force_hash_mode(
     pool.install(|| {
         candidates.par_iter().for_each(|entry| {
             let path = &entry.path;
-            let mut hasher =
-                superdeduper::pipeline::hash::ContentHasher::new(cfg.hash_algo);
+            let mut hasher = superdeduper::pipeline::hash::ContentHasher::new(cfg.hash_algo);
             let mut buf = vec![0u8; STREAM_BUF];
             match std::fs::File::open(path) {
                 Ok(mut f) => {

@@ -219,7 +219,10 @@ mod tests {
 
     #[test]
     fn default_is_not_placeholder() {
-        assert_eq!(PlaceholderState::default(), PlaceholderState::NotPlaceholder);
+        assert_eq!(
+            PlaceholderState::default(),
+            PlaceholderState::NotPlaceholder
+        );
     }
 
     #[test]

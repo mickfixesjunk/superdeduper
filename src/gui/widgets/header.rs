@@ -31,11 +31,7 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool
         // visually answerable without uniquely-named EXEs. SHA comes
         // from build.rs at compile-time; falls back to "dev" if the
         // build host has no git checkout (e.g. tarball install).
-        let build_tag = format!(
-            "v{} · {}",
-            env!("CARGO_PKG_VERSION"),
-            env!("SD_BUILD_SHA"),
-        );
+        let build_tag = format!("v{} · {}", env!("CARGO_PKG_VERSION"), env!("SD_BUILD_SHA"),);
         ui.label(RichText::new(build_tag).color(theme::TEXT_LO).monospace())
             .on_hover_text(
                 "Cargo version (Cargo.toml) and git short-SHA of the commit \

@@ -47,6 +47,8 @@ fn cfg_for(roots: Vec<PathBuf>) -> ScanConfig {
         allow_recall_on_read: false,
         io_threads: 4,
         hash_algo: pipeline::hash::HashAlgo::Blake3,
+        exclusion_policy: superdeduper::exclusions::ExclusionPolicy::disabled(),
+        exclusion_counters: superdeduper::exclusions::ExclusionCounters::new(),
     }
 }
 
@@ -125,7 +127,11 @@ fn walker_applies_min_size_filter() {
         .iter()
         .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
         .collect();
-    assert_eq!(files.len(), 1, "only one file above min_size=50, got {names:?}");
+    assert_eq!(
+        files.len(),
+        1,
+        "only one file above min_size=50, got {names:?}"
+    );
     assert_eq!(names, vec!["small.txt"]);
 
     std::fs::remove_dir_all(&d).ok();

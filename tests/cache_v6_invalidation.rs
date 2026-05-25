@@ -13,8 +13,7 @@ use tempfile::tempdir;
 
 #[test]
 fn v6_cache_is_invalidated_to_v7_empty() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v6_cache.sqlite");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v6_cache.sqlite");
     let tmp = tempdir().unwrap();
     let dst = tmp.path().join("v6_to_v7.sqlite");
     std::fs::copy(&fixture, &dst).unwrap();

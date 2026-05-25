@@ -55,7 +55,6 @@ pub fn show(ui: &mut egui::Ui, state: &CatalogState) -> Option<BadgeWallAction> 
     action
 }
 
-
 /// Render the "Login & Claim" CTA + provider chooser, when the
 /// active channel's install is anonymous. No-op when linked.
 /// `link_via_loopback` blocks the UI thread for up to 5 minutes
@@ -90,9 +89,7 @@ fn render_login_cta(ui: &mut egui::Ui) {
     // fires regardless of which CTA the user is looking at. The
     // poll's internal logic auto-kicks OAuth via the stashed
     // retry provider when register lands Ok.
-    if let Some(result) =
-        crate::leaderboard::registration::poll_register_session()
-    {
+    if let Some(result) = crate::leaderboard::registration::poll_register_session() {
         match &result {
             Ok(id) => eprintln!("login-cta: register OK, install_id={id}"),
             Err(e) => eprintln!("login-cta: register failed: {e:?}"),
@@ -110,10 +107,7 @@ fn render_login_cta(ui: &mut egui::Ui) {
     // because of a transient filesystem hiccup.
     let active = crate::channel::active_channel();
     let status = oauth::status_for(active).ok();
-    let is_anon = matches!(
-        status,
-        Some(oauth::AccountStatus::Anonymous) | None
-    );
+    let is_anon = matches!(status, Some(oauth::AccountStatus::Anonymous) | None);
     // Linked state: render a discreet "Signed in as X (Provider)"
     // line above the grid instead of the CTA. Gives the user a
     // visible confirmation of the link that survives app
@@ -130,10 +124,7 @@ fn render_login_cta(ui: &mut egui::Ui) {
             // Provider logo + "Signed in as X" line. Logo lives
             // before the text so the eye picks up the icon
             // first; size matches the line-height for a tidy row.
-            ui.add(
-                egui::Image::new(provider_icon(*provider))
-                    .max_size(egui::vec2(18.0, 18.0)),
-            );
+            ui.add(egui::Image::new(provider_icon(*provider)).max_size(egui::vec2(18.0, 18.0)));
             ui.label(
                 RichText::new(format!(
                     "Signed in as {} ({})",
@@ -148,11 +139,7 @@ fn render_login_cta(ui: &mut egui::Ui) {
             // achievements grid. The full unlink + provider-
             // switch flow lives in Settings → Account.
             if ui
-                .link(
-                    RichText::new("Sign out")
-                        .color(theme::TEXT_LO)
-                        .small(),
-                )
+                .link(RichText::new("Sign out").color(theme::TEXT_LO).small())
                 .clicked()
             {
                 if let Err(e) = oauth::unlink_for(active) {
@@ -178,11 +165,8 @@ fn render_login_cta(ui: &mut egui::Ui) {
             ui.spinner();
             ui.add_space(4.0);
             ui.label(
-                RichText::new(format!(
-                    "Registering machine ({}s)…",
-                    elapsed.as_secs()
-                ))
-                .color(theme::TEXT_HI),
+                RichText::new(format!("Registering machine ({}s)…", elapsed.as_secs()))
+                    .color(theme::TEXT_HI),
             );
         });
         ui.add_space(6.0);
@@ -218,7 +202,8 @@ fn render_login_cta(ui: &mut egui::Ui) {
             }
         });
         ui.add_space(6.0);
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
         return;
     }
 
@@ -232,9 +217,7 @@ fn render_login_cta(ui: &mut egui::Ui) {
             .fill(theme::ACCENT)
             .min_size(egui::vec2(140.0, 28.0)),
         )
-        .on_hover_text(
-            "Sign in to permanently keep your achievements across all your machines",
-        );
+        .on_hover_text("Sign in to permanently keep your achievements across all your machines");
     if resp.clicked() {
         crate::gui::widgets::oauth_chooser::open();
     }
@@ -306,11 +289,7 @@ pub fn show_mini(ui: &mut egui::Ui, state: &CatalogState) -> Option<BadgeWallAct
                 .strong()
                 .small(),
         );
-        ui.label(
-            RichText::new(lifetime_human)
-                .color(theme::ACCENT)
-                .strong(),
-        );
+        ui.label(RichText::new(lifetime_human).color(theme::ACCENT).strong());
         let badges_line = match total_count {
             0 => format!("{granted_count} badges"),
             _ => format!("{granted_count} / {total_count} badges"),
@@ -326,11 +305,7 @@ pub fn show_mini(ui: &mut egui::Ui, state: &CatalogState) -> Option<BadgeWallAct
     action
 }
 
-fn render_header(
-    ui: &mut egui::Ui,
-    state: &CatalogState,
-    action: &mut Option<BadgeWallAction>,
-) {
+fn render_header(ui: &mut egui::Ui, state: &CatalogState, action: &mut Option<BadgeWallAction>) {
     let (granted_count, total_count) = count_grants(state);
     let lifetime_human = lifetime_reclaimed_human(state);
     ui.horizontal(|ui| {
@@ -355,11 +330,7 @@ fn render_header(
         ui.label(RichText::new(badges_line).color(theme::TEXT_HI).small());
         ui.add_space(8.0);
         if ui
-            .link(
-                RichText::new("View profile →")
-                    .color(theme::ACCENT)
-                    .small(),
-            )
+            .link(RichText::new("View profile →").color(theme::ACCENT).small())
             .clicked()
         {
             *action = Some(BadgeWallAction::OpenProfile);
@@ -367,11 +338,7 @@ fn render_header(
     });
 }
 
-fn render_grid(
-    ui: &mut egui::Ui,
-    state: &CatalogState,
-    action: &mut Option<BadgeWallAction>,
-) {
+fn render_grid(ui: &mut egui::Ui, state: &CatalogState, action: &mut Option<BadgeWallAction>) {
     let catalog = match state.catalog.as_ref() {
         Some(Ok(c)) => c,
         Some(Err(e)) => {
@@ -473,7 +440,11 @@ fn render_tile(
     } else {
         // Ungranted: muted panel + dim stroke + faded text. Reads
         // as "exists, not yet earned" rather than "broken."
-        (theme::PANEL_DEEP, Color32::from_gray(60), Color32::from_gray(140))
+        (
+            theme::PANEL_DEEP,
+            Color32::from_gray(60),
+            Color32::from_gray(140),
+        )
     };
 
     let resp = egui::Frame::NONE
@@ -489,36 +460,20 @@ fn render_tile(
                     // Locked tiles keep the padlock glyph — visual
                     // signal that the achievement is gated behind a
                     // feature that hasn't shipped yet.
-                    ui.label(
-                        RichText::new("⚿")
-                            .color(text_color)
-                            .strong()
-                            .size(28.0),
-                    );
+                    ui.label(RichText::new("⚿").color(text_color).strong().size(28.0));
                 } else {
                     let shield_src = if granted {
-                        egui::include_image!(
-                            "../../../assets/sdd-color-shield.png"
-                        )
+                        egui::include_image!("../../../assets/sdd-color-shield.png")
                     } else {
-                        egui::include_image!(
-                            "../../../assets/sdd-bw-shield.png"
-                        )
+                        egui::include_image!("../../../assets/sdd-bw-shield.png")
                     };
-                    ui.add(
-                        egui::Image::new(shield_src)
-                            .fit_to_exact_size(egui::vec2(48.0, 48.0)),
-                    );
+                    ui.add(egui::Image::new(shield_src).fit_to_exact_size(egui::vec2(48.0, 48.0)));
                 }
                 let face_label = match granted_years.last() {
                     Some(latest) => format!("{} {}", short_name(&entry.name), latest),
                     None => short_name(&entry.name),
                 };
-                ui.label(
-                    RichText::new(face_label)
-                        .color(text_color)
-                        .size(9.5),
-                );
+                ui.label(RichText::new(face_label).color(text_color).size(9.5));
             });
         })
         .response;
@@ -724,7 +679,13 @@ pub fn classify_grid_entries<'a>(
     // ungranted-but-available, then locked tiles last (gated
     // upcoming features cluster at the bottom of the grid).
     tiles.sort_by_key(|t| {
-        let bucket = if t.granted { 0 } else if t.locked { 2 } else { 1 };
+        let bucket = if t.granted {
+            0
+        } else if t.locked {
+            2
+        } else {
+            1
+        };
         (bucket, t.entry.display_order)
     });
     tiles
@@ -790,7 +751,10 @@ mod tests {
     #[test]
     fn short_name_strips_pathfinder_prefix() {
         assert_eq!(short_name("Pathfinder: ReFS"), "ReFS");
-        assert_eq!(short_name("Sub-Minute Club (corpus-v1 50 GB)"), "Sub-Minute Club");
+        assert_eq!(
+            short_name("Sub-Minute Club (corpus-v1 50 GB)"),
+            "Sub-Minute Club"
+        );
         assert_eq!(short_name("Tidy-up"), "Tidy-up");
     }
 
@@ -850,8 +814,8 @@ mod tests {
                 { "id": "hello-world", "granted": true,  "granted_at": "2026-05-24T14:22:52Z" }
             ]
         }"#;
-        let profile: Profile = serde_json::from_str(profile_json)
-            .expect("live server profile shape must deserialise");
+        let profile: Profile =
+            serde_json::from_str(profile_json).expect("live server profile shape must deserialise");
         let state = CatalogState {
             catalog: Some(Ok(catalog.clone())),
             profile: Some(Ok(profile)),
@@ -919,7 +883,10 @@ mod tests {
         };
         let tiles = classify_grid_entries(&state, &catalog_entries);
         assert_eq!(tiles.len(), 2);
-        assert!(tiles.iter().all(|t| !t.granted), "errored profile yields all-ungranted");
+        assert!(
+            tiles.iter().all(|t| !t.granted),
+            "errored profile yields all-ungranted"
+        );
     }
 
     /// **Render-pipeline test for the badge-wall bug class.**
@@ -1000,10 +967,8 @@ mod tests {
             .filter_map(|n| n.accesskit_node().label())
             .collect();
 
-        let granted_tiles: Vec<&String> = labels
-            .iter()
-            .filter(|s| s.ends_with(": granted"))
-            .collect();
+        let granted_tiles: Vec<&String> =
+            labels.iter().filter(|s| s.ends_with(": granted")).collect();
         let ungranted_tiles: Vec<&String> = labels
             .iter()
             .filter(|s| s.ends_with(": not yet earned"))
@@ -1095,7 +1060,10 @@ mod tests {
             catalog: Some(Ok(catalog)),
             profile: Some(Ok(live_profile)),
         };
-        render_to_png(&granted_state, out_dir.join("badge_wall-granted.png").as_path());
+        render_to_png(
+            &granted_state,
+            out_dir.join("badge_wall-granted.png").as_path(),
+        );
     }
 
     fn render_to_png(state: &CatalogState, path: &std::path::Path) {
@@ -1143,7 +1111,7 @@ mod tests {
                     },
                     ProfileGrant {
                         achievement_id: "schedule-master".into(),
-                        granted: true,  // <- engine masks this off
+                        granted: true, // <- engine masks this off
                         granted_at: None,
                     },
                 ],
@@ -1188,8 +1156,14 @@ mod tests {
         // Empty year, non-numeric year, empty base, multi-`#` — all
         // fall back to "treat as plain id" so a stray bad row doesn't
         // crash classify_grid_entries.
-        assert_eq!(parse_grant_id("holiday-cleaner#"), ("holiday-cleaner#", None));
-        assert_eq!(parse_grant_id("holiday-cleaner#abc"), ("holiday-cleaner#abc", None));
+        assert_eq!(
+            parse_grant_id("holiday-cleaner#"),
+            ("holiday-cleaner#", None)
+        );
+        assert_eq!(
+            parse_grant_id("holiday-cleaner#abc"),
+            ("holiday-cleaner#abc", None)
+        );
         assert_eq!(parse_grant_id("#2026"), ("#2026", None));
         // Multi-`#` is ambiguous; treat the entire thing as plain.
         assert_eq!(
@@ -1390,10 +1364,7 @@ mod tests {
         let state = CatalogState {
             catalog: Some(Ok(Catalog {
                 version: "v1".into(),
-                achievements: vec![
-                    entry("a", "A", "low", 1),
-                    entry("b", "B", "low", 2),
-                ],
+                achievements: vec![entry("a", "A", "low", 1), entry("b", "B", "low", 2)],
             })),
             profile: Some(Ok(Profile {
                 install_id: "x".into(),

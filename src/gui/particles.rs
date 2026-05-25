@@ -249,11 +249,11 @@ impl Sparkles {
             // electric-blue accent. No gold, no warn-amber, no
             // hot-pink. Occasional bright off-white for sparkle.
             let color = match (rand() * 6.0) as u32 {
-                0 => theme::ACCENT,                          // primary teal
-                1 => theme::ACCENT,                          // weighted
-                2 => Color32::from_rgb(0x69, 0x9b, 0xff),    // electric blue
-                3 => Color32::from_rgb(0xa0, 0xc6, 0xff),    // pale blue
-                _ => Color32::from_rgb(0xe8, 0xee, 0xf5),    // text-hi off-white
+                0 => theme::ACCENT,                       // primary teal
+                1 => theme::ACCENT,                       // weighted
+                2 => Color32::from_rgb(0x69, 0x9b, 0xff), // electric blue
+                3 => Color32::from_rgb(0xa0, 0xc6, 0xff), // pale blue
+                _ => Color32::from_rgb(0xe8, 0xee, 0xf5), // text-hi off-white
             };
 
             self.particles.push(Particle {
@@ -286,8 +286,7 @@ impl Sparkles {
             // Spawn anywhere along the full filled bar — celebratory
             // sweep across the catch-up extent, not just the lead.
             let x = fill_rect.min.x + rand() * fill_rect.width();
-            let y = fill_rect.min.y + 0.15 * fill_rect.height()
-                + rand() * 0.7 * fill_rect.height();
+            let y = fill_rect.min.y + 0.15 * fill_rect.height() + rand() * 0.7 * fill_rect.height();
             // Radial outward velocity (gentle), no gravity.
             let angle = rand() * std::f32::consts::TAU;
             let speed = 30.0 + rand() * 60.0;

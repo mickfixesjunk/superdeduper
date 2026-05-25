@@ -157,12 +157,11 @@ mod tests {
         let tmp = clone_tmp_path(dst);
         assert_eq!(tmp.parent(), dst.parent());
         assert_ne!(tmp.file_name(), dst.file_name());
-        assert!(
-            tmp.file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.ends_with(".superdeduper-clone-tmp"))
-                .unwrap_or(false)
-        );
+        assert!(tmp
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.ends_with(".superdeduper-clone-tmp"))
+            .unwrap_or(false));
     }
 
     #[test]

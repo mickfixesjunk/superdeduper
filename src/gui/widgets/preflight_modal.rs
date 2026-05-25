@@ -11,7 +11,9 @@
 use egui::{Color32, Context, RichText, Stroke, Window};
 
 use crate::diagnose::{DiagnoseReport, Recommendation, RecommendationImpact};
-use crate::gui::preflight::{AxisScore, DiskAxis, DriveScore, Grade, PreflightAction, PreflightState};
+use crate::gui::preflight::{
+    AxisScore, DiskAxis, DriveScore, Grade, PreflightAction, PreflightState,
+};
 use crate::gui::theme;
 
 pub fn show(ctx: &Context, state: &PreflightState) -> Option<PreflightAction> {
@@ -163,11 +165,7 @@ fn show_failed(ctx: &Context, err: &str) -> Option<PreflightAction> {
     action
 }
 
-fn show_report(
-    ctx: &Context,
-    report: &DiagnoseReport,
-    grade: &Grade,
-) -> Option<PreflightAction> {
+fn show_report(ctx: &Context, report: &DiagnoseReport, grade: &Grade) -> Option<PreflightAction> {
     let mut action: Option<PreflightAction> = None;
     Window::new(
         RichText::new("superdeduper · PREFLIGHT")
@@ -195,12 +193,12 @@ fn show_report(
                         .strong(),
                 );
                 ui.label(
-                    RichText::new(format!("{}% overall · {} cores · river5 {}",
-                        grade.overall_percent,
-                        report.system.cpu_threads,
-                        report.system.river5_impl))
-                        .color(theme::TEXT_LO)
-                        .small(),
+                    RichText::new(format!(
+                        "{}% overall · {} cores · river5 {}",
+                        grade.overall_percent, report.system.cpu_threads, report.system.river5_impl
+                    ))
+                    .color(theme::TEXT_LO)
+                    .small(),
                 );
             });
         });
@@ -330,8 +328,9 @@ fn disk_axis_rows(ui: &mut egui::Ui, disk: &DiskAxis) {
                     .strong()
                     .size(13.0),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match disk.composite_percent {
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| match disk.composite_percent {
                     Some(p) => {
                         ui.label(
                             RichText::new(format!("{}%", p))
@@ -357,8 +356,8 @@ fn disk_axis_rows(ui: &mut egui::Ui, disk: &DiskAxis) {
                                 .size(13.0),
                         );
                     }
-                }
-            });
+                },
+            );
         });
         ui.add_space(2.0);
         if disk.composite_percent.is_some() {
@@ -381,8 +380,9 @@ fn drive_row(ui: &mut egui::Ui, drive: &DriveScore) {
                 .size(12.0)
                 .monospace(),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            match (drive.percent, drive.tier3_mbps) {
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| match (drive.percent, drive.tier3_mbps) {
                 (Some(p), Some(mbps)) => {
                     let color = color_for_percent(p);
                     ui.label(
@@ -400,10 +400,7 @@ fn drive_row(ui: &mut egui::Ui, drive: &DriveScore) {
                     );
                 }
                 _ => {
-                    let note = drive
-                        .error
-                        .as_deref()
-                        .unwrap_or("not measured");
+                    let note = drive.error.as_deref().unwrap_or("not measured");
                     ui.label(
                         RichText::new(format!("({})", note))
                             .color(theme::TEXT_LO)
@@ -411,8 +408,8 @@ fn drive_row(ui: &mut egui::Ui, drive: &DriveScore) {
                             .italics(),
                     );
                 }
-            }
-        });
+            },
+        );
     });
     if let Some(p) = drive.percent {
         ui.horizontal(|ui| {
@@ -467,8 +464,10 @@ fn axis_row(ui: &mut egui::Ui, label: &str, score: &AxisScore, raw: &str) {
 
 fn draw_bar(ui: &mut egui::Ui, percent: u8, color: Color32) {
     let height = 10.0;
-    let (rect, _resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, theme::PANEL_DEEP);
     let fill_width = rect.width() * (percent as f32 / 100.0);
@@ -493,11 +492,7 @@ fn render_recommendation(ui: &mut egui::Ui, rec: &Recommendation) {
                     .size(13.0)
                     .strong(),
             );
-            ui.label(
-                RichText::new(&rec.detail)
-                    .color(theme::TEXT_LO)
-                    .size(12.0),
-            );
+            ui.label(RichText::new(&rec.detail).color(theme::TEXT_LO).size(12.0));
         });
     });
     ui.add_space(6.0);

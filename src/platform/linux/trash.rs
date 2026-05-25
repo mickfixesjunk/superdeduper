@@ -105,9 +105,7 @@ fn trash_root() -> PlatformResult<PathBuf> {
         // ignored.
     }
     let home = std::env::var_os("HOME").ok_or_else(|| {
-        PlatformError::Other(
-            "HOME is not set; cannot resolve XDG Trash root".to_string(),
-        )
+        PlatformError::Other("HOME is not set; cannot resolve XDG Trash root".to_string())
     })?;
     let mut p = PathBuf::from(home);
     p.push(".local");
@@ -124,9 +122,7 @@ fn trash_root() -> PlatformResult<PathBuf> {
 fn build_trashinfo(original: &Path) -> String {
     let path_escaped = url_escape_for_trashinfo(&original.to_string_lossy());
     let date = iso8601_local_seconds(now_unix_local());
-    format!(
-        "[Trash Info]\nPath={path_escaped}\nDeletionDate={date}\n",
-    )
+    format!("[Trash Info]\nPath={path_escaped}\nDeletionDate={date}\n",)
 }
 
 /// Escape characters that have special meaning in a .trashinfo
@@ -232,10 +228,7 @@ mod tests {
             url_escape_for_trashinfo("/path with space"),
             "/path%20with%20space"
         );
-        assert_eq!(
-            url_escape_for_trashinfo("/a&b=c"),
-            "/a%26b%3Dc"
-        );
+        assert_eq!(url_escape_for_trashinfo("/a&b=c"), "/a%26b%3Dc");
         // Unicode passes through as %XX-encoded UTF-8 bytes.
         assert_eq!(url_escape_for_trashinfo("a/é"), "a/%C3%A9");
     }
@@ -255,10 +248,7 @@ mod tests {
         // the raw seconds-since-epoch so this is what falls out.
         assert_eq!(iso8601_local_seconds(0), "1970-01-01T00:00:00");
         // Test vector also used by submission.rs.
-        assert_eq!(
-            iso8601_local_seconds(1_704_067_200),
-            "2024-01-01T00:00:00"
-        );
+        assert_eq!(iso8601_local_seconds(1_704_067_200), "2024-01-01T00:00:00");
     }
 
     #[test]

@@ -770,7 +770,10 @@ mod inode_identity_tests {
         let (ino_a, vol_a) = inode_identity(&m_a);
         let (ino_b, vol_b) = inode_identity(&m_b);
         assert_eq!(ino_a, ino_b, "hardlinked files must share file_ref");
-        assert_eq!(vol_a, vol_b, "hardlinked files on same fs must share volume_guid");
+        assert_eq!(
+            vol_a, vol_b,
+            "hardlinked files on same fs must share volume_guid"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

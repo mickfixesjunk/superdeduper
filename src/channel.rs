@@ -41,18 +41,13 @@ pub const ENV_VAR: &str = "SUPERDEDUPER_CHANNEL";
 
 /// The three channels supported in v1. `staging` deferred per
 /// dev-channel-spec.md §2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
+    #[default]
     Prod,
     Dev,
     Local,
-}
-
-impl Default for Channel {
-    fn default() -> Self {
-        Self::Prod
-    }
 }
 
 impl Channel {
@@ -236,10 +231,15 @@ pub fn read_persisted_channel() -> io::Result<Option<Channel>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("config.toml utf8: {e}")))?;
-    let parsed: PersistedConfig = toml::from_str(text)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("config.toml parse: {e}")))?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("config.toml utf8: {e}"))
+    })?;
+    let parsed: PersistedConfig = toml::from_str(text).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config.toml parse: {e}"),
+        )
+    })?;
     let Some(slug) = parsed.network.channel else {
         return Ok(None);
     };
@@ -265,7 +265,10 @@ pub fn write_persisted_channel(channel: Channel) -> io::Result<()> {
     };
     current.network.channel = Some(channel.as_slug().to_string());
     let serialised = toml::to_string_pretty(&current).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("config.toml encode: {e}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config.toml encode: {e}"),
+        )
     })?;
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, serialised.as_bytes())?;
@@ -341,9 +344,8 @@ pub fn active_channel() -> Channel {
 /// was trying to avoid prod).
 pub fn resolve_active_channel(cli_override: Option<&str>) -> io::Result<Channel> {
     if let Some(s) = cli_override {
-        return Channel::from_str(s).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
-        });
+        return Channel::from_str(s)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
     }
     if let Some(c) = read_env_channel()? {
         return Ok(c);
@@ -387,7 +389,10 @@ mod tests {
     #[test]
     fn server_url_for_matches_spec_5_1() {
         assert_eq!(server_url_for(Channel::Prod), "https://api.superdeduper.io");
-        assert_eq!(server_url_for(Channel::Dev), "https://dev-api.superdeduper.io");
+        assert_eq!(
+            server_url_for(Channel::Dev),
+            "https://dev-api.superdeduper.io"
+        );
         assert_eq!(server_url_for(Channel::Local), "http://localhost:3000");
     }
 
@@ -411,10 +416,7 @@ mod tests {
         // (We can't sanely test the env-var-set case here without
         // sequencing test threads, so we test the cli-override branch
         // in isolation.)
-        assert_eq!(
-            resolve_active_channel(Some("dev")).unwrap(),
-            Channel::Dev
-        );
+        assert_eq!(resolve_active_channel(Some("dev")).unwrap(), Channel::Dev);
         assert_eq!(
             resolve_active_channel(Some("local")).unwrap(),
             Channel::Local

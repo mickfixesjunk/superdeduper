@@ -41,9 +41,13 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: superdeduper-x86_64-windows
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            artifact: superdeduper-aarch64-windows
+          # aarch64-pc-windows-msvc temporarily removed: the river5
+          # crate's AES-NI C source uses x86-only intrinsics
+          # (`__m128i`, `_mm_aesenc_si128`) which the ARM64 MSVC
+          # compiler can't build. Tracked separately (river5 needs
+          # an aarch64 SIMD fallback or arch-conditional cc-rs
+          # config). Re-add this matrix entry once river5 ships a
+          # build that compiles cleanly on aarch64.
     steps:
       - uses: actions/checkout@v4
 

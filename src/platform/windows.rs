@@ -22,8 +22,7 @@ pub fn clone_file(src: &Path, dst: &Path) -> PlatformResult<()> {
 /// IFileOperation-based recycle via the existing winapi_wrappers
 /// implementation (T2.3 upgrade from SHFileOperationW).
 pub fn trash_file(path: &Path) -> PlatformResult<()> {
-    crate::winapi_wrappers::recycle(path)
-        .map_err(|e| PlatformError::Other(format!("{e}")))
+    crate::winapi_wrappers::recycle(path).map_err(|e| PlatformError::Other(format!("{e}")))
 }
 
 /// ShellExecuteW("open", url) — avoids `cmd /c start` mangling URLs

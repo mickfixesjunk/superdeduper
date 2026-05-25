@@ -63,6 +63,8 @@ fn finds_planted_duplicates() {
         allow_recall_on_read: false,
         io_threads: 4,
         hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
+        exclusion_policy: superdeduper::exclusions::ExclusionPolicy::disabled(),
+        exclusion_counters: superdeduper::exclusions::ExclusionCounters::new(),
     };
 
     let inv = superdeduper::inventory::enumerate(&cfg, None).unwrap();
@@ -134,6 +136,8 @@ fn empty_directory_yields_no_groups() {
         allow_recall_on_read: false,
         io_threads: 4,
         hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
+        exclusion_policy: superdeduper::exclusions::ExclusionPolicy::disabled(),
+        exclusion_counters: superdeduper::exclusions::ExclusionCounters::new(),
     };
     let inv = superdeduper::inventory::enumerate(&cfg, None).unwrap();
     assert!(inv.is_empty());

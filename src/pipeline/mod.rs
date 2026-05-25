@@ -37,10 +37,7 @@ pub struct SkippedFile {
 impl SkippedFile {
     /// Build from a path + `PlaceholderState`. Returns `None` for
     /// `NotPlaceholder` (not worth emitting).
-    pub fn from_state(
-        path: PathBuf,
-        state: crate::inventory::PlaceholderState,
-    ) -> Option<Self> {
+    pub fn from_state(path: PathBuf, state: crate::inventory::PlaceholderState) -> Option<Self> {
         use crate::inventory::PlaceholderState as P;
         let (kind, tag) = match state {
             P::NotPlaceholder => return None,

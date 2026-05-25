@@ -860,8 +860,8 @@ pub fn recycle(path: &Path) -> Result<()> {
         COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::Shell::{
-        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, FILEOPERATION_FLAGS,
-        FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+        FILEOPERATION_FLAGS, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
     };
 
     // Build a null-terminated UTF-16 path. SHCreateItemFromParsingName
@@ -895,9 +895,8 @@ pub fn recycle(path: &Path) -> Result<()> {
             // CoCreateInstance returns the COM object as the requested
             // interface; turbofish makes the type binding explicit.
             let op: IFileOperation =
-                CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER).map_err(|e| {
-                    Error::Other(format!("CoCreateInstance(IFileOperation): {e}"))
-                })?;
+                CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|e| Error::Other(format!("CoCreateInstance(IFileOperation): {e}")))?;
 
             // Flag combination matches the SHFileOperationW call we
             // replaced: SILENT (no progress UI) + NOCONFIRMATION (no
@@ -911,13 +910,13 @@ pub fn recycle(path: &Path) -> Result<()> {
             op.SetOperationFlags(FILEOPERATION_FLAGS(flags_u32))
                 .map_err(|e| Error::Other(format!("SetOperationFlags: {e}")))?;
 
-            let shell_item: IShellItem =
-                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(|e| {
-                    Error::Other(format!(
-                        "SHCreateItemFromParsingName({}): {e}",
-                        path.display()
-                    ))
-                })?;
+            let shell_item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)
+                .map_err(|e| {
+                Error::Other(format!(
+                    "SHCreateItemFromParsingName({}): {e}",
+                    path.display()
+                ))
+            })?;
 
             op.DeleteItem(&shell_item, None)
                 .map_err(|e| Error::Other(format!("DeleteItem({}): {e}", path.display())))?;

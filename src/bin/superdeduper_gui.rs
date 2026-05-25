@@ -50,10 +50,8 @@ fn main() -> eframe::Result<()> {
     // side.
     #[cfg(feature = "telemetry")]
     {
-        let oauth_path =
-            superdeduper::leaderboard::oauth::oauth_path_for(active).ok();
-        let install_path =
-            superdeduper::leaderboard::install::install_path_for(active).ok();
+        let oauth_path = superdeduper::leaderboard::oauth::oauth_path_for(active).ok();
+        let install_path = superdeduper::leaderboard::install::install_path_for(active).ok();
         superdeduper::leaderboard::oauth::log_oauth_event(&format!(
             "startup: channel={active} oauth_path={} oauth_exists={} install_path={} install_exists={}",
             oauth_path

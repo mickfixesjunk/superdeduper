@@ -50,7 +50,7 @@ fn build_themed_harness(
     size: egui::Vec2,
     ui_builder: impl FnMut(&mut Ui) + Send + 'static,
 ) -> egui_kittest::Harness<'static> {
-    let mut harness = egui_kittest::Harness::builder()
+    let harness = egui_kittest::Harness::builder()
         .with_size(size)
         .build_ui(ui_builder);
     // Install the engine theme on the harness's context. This is
@@ -68,13 +68,10 @@ fn build_themed_harness(
 /// PNG snapshot can't see that decay. This one can.
 #[test]
 fn theme_remains_dark_across_multiple_frames() {
-    let mut harness = build_themed_harness(
-        egui::vec2(200.0, 80.0),
-        |ui| {
-            let _ = ui.button("Sentinel button");
-            let _ = ui.button("Second sentinel");
-        },
-    );
+    let mut harness = build_themed_harness(egui::vec2(200.0, 80.0), |ui| {
+        let _ = ui.button("Sentinel button");
+        let _ = ui.button("Second sentinel");
+    });
     // Mid-test, simulate the system telling egui "you should switch
     // to Light mode." Without theme::install locking the preference
     // to Dark, this would propagate and the next frame's render
@@ -105,34 +102,31 @@ fn theme_remains_dark_across_multiple_frames() {
 /// any button is the regression.
 #[test]
 fn theme_snapshot_buttons_panel() {
-    let mut harness = build_themed_harness(
-        egui::vec2(400.0, 200.0),
-        |ui| {
-            ui.heading("Theme regression sentinels");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let _ = ui.button("Default button");
-                let _ = ui.button(RichText::new("Strong button").strong());
-                let _ = ui.add_enabled(false, egui::Button::new("Disabled"));
+    let mut harness = build_themed_harness(egui::vec2(400.0, 200.0), |ui| {
+        ui.heading("Theme regression sentinels");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let _ = ui.button("Default button");
+            let _ = ui.button(RichText::new("Strong button").strong());
+            let _ = ui.add_enabled(false, egui::Button::new("Disabled"));
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let _ = ui.add(egui::Button::new("Accent fill").fill(theme::ACCENT));
+            let _ = ui.add(egui::Button::new("Hot fill").fill(theme::HOT));
+        });
+        ui.add_space(8.0);
+        // The bare-default ComboBox is the regression smoking gun:
+        // in 0.32 it picks up widget styling defaults; if Visuals
+        // is partly-overridden, the dropdown reads light.
+        egui::ComboBox::from_label("Pick")
+            .selected_text("option-a")
+            .show_ui(ui, |ui| {
+                let mut s = "a".to_string();
+                ui.selectable_value(&mut s, "a".into(), "option-a");
+                ui.selectable_value(&mut s, "b".into(), "option-b");
             });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let _ = ui.add(egui::Button::new("Accent fill").fill(theme::ACCENT));
-                let _ = ui.add(egui::Button::new("Hot fill").fill(theme::HOT));
-            });
-            ui.add_space(8.0);
-            // The bare-default ComboBox is the regression smoking gun:
-            // in 0.32 it picks up widget styling defaults; if Visuals
-            // is partly-overridden, the dropdown reads light.
-            egui::ComboBox::from_label("Pick")
-                .selected_text("option-a")
-                .show_ui(ui, |ui| {
-                    let mut s = "a".to_string();
-                    ui.selectable_value(&mut s, "a".into(), "option-a");
-                    ui.selectable_value(&mut s, "b".into(), "option-b");
-                });
-        },
-    );
+    });
     harness.run();
     let img = harness.render().expect("render PNG");
     let out = artifact_dir().join("theme-buttons.png");
@@ -158,30 +152,28 @@ fn theme_snapshot_buttons_panel() {
 /// the broken render to localise which token drifted.
 #[test]
 fn theme_snapshot_palette_sheet() {
-    let mut harness = build_themed_harness(
-        egui::vec2(360.0, 360.0),
-        |ui| {
-            ui.heading("theme palette");
-            ui.add_space(6.0);
-            for (name, color) in [
-                ("BG", theme::BG),
-                ("PANEL", theme::PANEL),
-                ("PANEL_DEEP", theme::PANEL_DEEP),
-                ("TEXT_HI", theme::TEXT_HI),
-                ("TEXT_LO", theme::TEXT_LO),
-                ("ACCENT", theme::ACCENT),
-                ("ACCENT_DIM", theme::ACCENT_DIM),
-                ("WARN", theme::WARN),
-                ("HOT", theme::HOT),
-                ("COOL", theme::COOL),
-            ] {
-                swatch_row(ui, name, color);
-            }
-        },
-    );
+    let mut harness = build_themed_harness(egui::vec2(360.0, 360.0), |ui| {
+        ui.heading("theme palette");
+        ui.add_space(6.0);
+        for (name, color) in [
+            ("BG", theme::BG),
+            ("PANEL", theme::PANEL),
+            ("PANEL_DEEP", theme::PANEL_DEEP),
+            ("TEXT_HI", theme::TEXT_HI),
+            ("TEXT_LO", theme::TEXT_LO),
+            ("ACCENT", theme::ACCENT),
+            ("ACCENT_DIM", theme::ACCENT_DIM),
+            ("WARN", theme::WARN),
+            ("HOT", theme::HOT),
+            ("COOL", theme::COOL),
+        ] {
+            swatch_row(ui, name, color);
+        }
+    });
     harness.run();
     let img = harness.render().expect("render PNG");
-    img.save(artifact_dir().join("theme-palette.png")).expect("write PNG");
+    img.save(artifact_dir().join("theme-palette.png"))
+        .expect("write PNG");
 }
 
 fn swatch_row(ui: &mut Ui, name: &str, color: Color32) {
@@ -221,7 +213,11 @@ fn visuals_panel_fill_matches_engine_theme() {
          and theme.rs needs to be updated."
     );
     assert_eq!(v.window_fill, theme::PANEL, "window_fill mismatch");
-    assert_eq!(v.extreme_bg_color, theme::PANEL_DEEP, "extreme_bg_color mismatch");
+    assert_eq!(
+        v.extreme_bg_color,
+        theme::PANEL_DEEP,
+        "extreme_bg_color mismatch"
+    );
     assert_eq!(
         v.override_text_color,
         Some(theme::TEXT_HI),
@@ -269,9 +265,15 @@ fn theme_install_locks_preference_to_dark() {
         luma(bg) < 128 && luma(weak) < 128 && luma(panel) < 128,
         "post-install palette must be dark: bg #{:02x}{:02x}{:02x}, \
          weak #{:02x}{:02x}{:02x}, panel #{:02x}{:02x}{:02x}",
-        bg.r(), bg.g(), bg.b(),
-        weak.r(), weak.g(), weak.b(),
-        panel.r(), panel.g(), panel.b(),
+        bg.r(),
+        bg.g(),
+        bg.b(),
+        weak.r(),
+        weak.g(),
+        weak.b(),
+        panel.r(),
+        panel.g(),
+        panel.b(),
     );
 }
 
@@ -316,7 +318,10 @@ fn widget_visuals_bg_fills_are_dark() {
             "widget.{state_name}.bg_fill luma {} ≥ {DARK_LUMA} \
              (#{:02x}{:02x}{:02x}). The engine theme should keep every \
              widget fill darker than mid-grey.",
-            luma(bg), bg.r(), bg.g(), bg.b(),
+            luma(bg),
+            bg.r(),
+            bg.g(),
+            bg.b(),
         );
         assert!(
             luma(weak) < DARK_LUMA,
@@ -325,7 +330,10 @@ fn widget_visuals_bg_fills_are_dark() {
              separate field; if this is bright, theme.rs needs an \
              explicit override (this is exactly the regression class \
              from 2026-05-24T21:45Z).",
-            luma(weak), weak.r(), weak.g(), weak.b(),
+            luma(weak),
+            weak.r(),
+            weak.g(),
+            weak.b(),
         );
     }
 }
