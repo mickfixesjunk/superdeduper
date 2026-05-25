@@ -21,8 +21,24 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Process-wide serial gate for tests in this file. Both tests call
+/// `isolate_cache_dir`, which `env::set_var("XDG_CACHE_HOME", ...)`.
+/// When cargo runs the two tests in parallel within the same test
+/// binary, they race each other on that env var — test A's engine
+/// can read test B's XDG_CACHE_HOME, write its cache there, then
+/// test A's "run 2" finds zero cache hits because the rows are in
+/// the WRONG directory. Manifested as a hard-to-reproduce
+/// `run 2 should hit the cache from run 1's writes; cache: 0 hits`
+/// flake on faster CI runners (locally serial-by-default; CI's
+/// faster cores expose the race).
+///
+/// PoisonError doesn't kill us — even a panicked predecessor leaves
+/// the test infra in a state the next test can recover from (each
+/// test sets its own XDG_CACHE_HOME on entry).
+static SERIAL: Mutex<()> = Mutex::new(());
 
 use superdeduper::gui::checkpoint;
 use superdeduper::gui::events::{EngineEvent, LogLevel};
@@ -162,6 +178,7 @@ fn isolate_cache_dir(label: &str) -> tempfile::TempDir {
 
 #[test]
 fn cancel_mid_hash_writes_checkpoint() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _cache_dir = isolate_cache_dir("cancel-mid-hash");
     let (corpus_dir, root) = make_corpus(8, 3);
     let roots = vec![RootEntry {
@@ -212,6 +229,7 @@ fn cancel_mid_hash_writes_checkpoint() {
 
 #[test]
 fn resume_after_cancel_replays_checkpoint() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _cache_dir = isolate_cache_dir("resume-after-cancel");
     let (corpus_dir, root) = make_corpus(6, 3);
     let roots = vec![RootEntry {
