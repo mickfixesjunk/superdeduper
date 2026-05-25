@@ -167,14 +167,16 @@ pub fn find_similar_groups(
             .map(|&i| hashed[i].file.path.clone())
             .collect();
         files.sort();
-        groups.push(DuplicateGroup {
+        let g = DuplicateGroup {
             size: max_size,
             content_hash: format!("perceptual-{canonical_fp:016x}"),
             files,
             link_equivalent: false,
             unique_inodes: indices.len() as u64,
             similarity_kind: SimilarityKind::PerceptualImage,
-        });
+        };
+        crate::pipeline::assert_unique_paths(&g);
+        groups.push(g);
     }
     groups
 }

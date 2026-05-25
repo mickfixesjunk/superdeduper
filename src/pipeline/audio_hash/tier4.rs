@@ -161,7 +161,7 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> Vec<Dupli
             .map(|&i| hashed[i].file.path.clone())
             .collect();
         files.sort();
-        groups.push(DuplicateGroup {
+        let g = DuplicateGroup {
             size: max_size,
             content_hash: format!("perceptual-audio-{canonical_fp_token:016x}"),
             files,
@@ -174,7 +174,9 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> Vec<Dupli
             // field. Audio groups now correctly emit
             // PerceptualAudio.
             similarity_kind: SimilarityKind::PerceptualAudio,
-        });
+        };
+        crate::pipeline::assert_unique_paths(&g);
+        groups.push(g);
     }
     groups
 }
