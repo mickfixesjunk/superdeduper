@@ -33,17 +33,26 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Lint the default-feature surface first, then the gui-feature
-      # surface so gui-specific clippy lints get caught here too. We
-      # do NOT enable `audio` because that pulls alsa-sys → needs
-      # libasound2-dev on the runner; the Windows job covers gui+audio.
+      # Lint each feature combo we ship a binary for so feature-gated
+      # code (leaderboard/telemetry, perceptual similarity) gets its
+      # own clippy pass. We do NOT enable `audio` here because that
+      # pulls alsa-sys → needs libasound2-dev on the runner; the
+      # Windows job covers gui+audio.
       #
       # `-D warnings` catches NEW lints introduced by changed code AND
       # NEW deprecations (the egui 0.32 deprecation backlog was cleaned
       # up in #21; any future deprecation pass should be done before
       # merging the upgrade so this gate doesn't go red).
+      #
+      # #42 — added the telemetry + similarity combos so the backlog
+      # that accumulated under feature-gated code (~22 lints across
+      # `leaderboard/`, `gui/widgets/badge_wall`, etc.) can't
+      # reaccumulate. Future feature-gated additions must pass clippy
+      # on EACH cargo-feature combo below before merge.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --locked --features gui -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features "gui similar-images similar-audio" -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features "gui telemetry similar-images similar-audio" -- -D warnings
 
   test-linux:
     runs-on: ubuntu-latest

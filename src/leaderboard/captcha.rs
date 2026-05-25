@@ -287,11 +287,11 @@ fn open_browser(url: &str) -> Result<(), CaptchaError> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        return std::process::Command::new("xdg-open")
+        std::process::Command::new("xdg-open")
             .arg(url)
             .spawn()
             .map(|_| ())
-            .map_err(|e| CaptchaError::BrowserOpenFailed(format!("{e}")));
+            .map_err(|e| CaptchaError::BrowserOpenFailed(format!("{e}")))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
     {

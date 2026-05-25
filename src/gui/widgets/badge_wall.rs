@@ -585,7 +585,7 @@ const NAS_PRO_LOCKED_IDS: &[&str] = &[
 ];
 
 fn is_nas_pro_locked(id: &str) -> bool {
-    NAS_PRO_LOCKED_IDS.iter().any(|nas_id| *nas_id == id)
+    NAS_PRO_LOCKED_IDS.contains(&id)
 }
 
 /// Split a grant ID into `(base, Some(year))` if it carries the
@@ -962,7 +962,7 @@ mod tests {
         // skips classification, or fails to publish accessibility
         // info, this test goes red.
         let labels: Vec<String> = harness
-            .node()
+            .root()
             .query_all_by_label_contains("")
             .filter_map(|n| n.accesskit_node().label())
             .collect();
