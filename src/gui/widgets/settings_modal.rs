@@ -216,7 +216,7 @@ pub fn show(
             let painter = ui.painter();
             painter.rect_filled(
                 screen,
-                egui::Rounding::ZERO,
+                egui::CornerRadius::ZERO,
                 egui::Color32::from_black_alpha(140),
             );
         });
@@ -228,7 +228,7 @@ pub fn show(
             egui::Frame::popup(ui.style())
                 .fill(theme::PANEL_DEEP)
                 .stroke(egui::Stroke::new(1.0, theme::ACCENT_DIM))
-                .rounding(egui::Rounding::same(6))
+                .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.set_min_size(egui::vec2(MODAL_WIDTH, MODAL_HEIGHT));
@@ -418,7 +418,7 @@ fn render_engine(ui: &mut egui::Ui, settings: &mut ScanSettings) {
     ui.horizontal(|ui| {
         ui.label("Algorithm:");
         let mut algo = settings.hash_algo;
-        let combo = egui::ComboBox::from_id_source("hash-algo")
+        let combo = egui::ComboBox::from_id_salt("hash-algo")
             .selected_text(match algo {
                 crate::pipeline::hash::HashAlgo::Blake3 => "BLAKE3 (32-byte, cryptographic)",
                 crate::pipeline::hash::HashAlgo::River5 => "RIVER5 (16-byte, AES-NI, default)",
@@ -808,7 +808,7 @@ fn render_network(ui: &mut egui::Ui, state: &mut SettingsModalState) {
     // Dropdown
     let mut pick = selected;
     let prior_pick = pick;
-    egui::ComboBox::from_id_source("sd_network_channel_dropdown")
+    egui::ComboBox::from_id_salt("sd_network_channel_dropdown")
         .selected_text(pick.as_slug())
         .show_ui(ui, |ui| {
             for &c in Channel::all() {
@@ -1565,7 +1565,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
             install::ShareDefault::Never => "Never",
         };
         ui.add_enabled_ui(enabled, |ui| {
-            egui::ComboBox::from_id_source("sd_share_frequency")
+            egui::ComboBox::from_id_salt("sd_share_frequency")
                 .selected_text(label_text)
                 .show_ui(ui, |ui| {
                     let mut chosen: Option<install::ShareDefault> = None;
@@ -1781,7 +1781,7 @@ fn render_sample_preview_modal(ctx: &Context, json: &str) {
         .show(ctx, |ui| {
             ui.painter().rect_filled(
                 ctx.screen_rect(),
-                egui::Rounding::ZERO,
+                egui::CornerRadius::ZERO,
                 egui::Color32::from_black_alpha(160),
             );
         });

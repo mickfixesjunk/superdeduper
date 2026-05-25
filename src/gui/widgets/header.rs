@@ -1,6 +1,6 @@
 //! Top status bar — title, settings button, status line, big stat tiles.
 
-use egui::{vec2, Align, Color32, Frame, Layout, RichText, Rounding, Sense, Stroke, Ui};
+use egui::{vec2, Align, Color32, CornerRadius, Frame, Layout, RichText, Sense, Stroke, Ui};
 
 use crate::gui::state::UiState;
 use crate::gui::theme;
@@ -142,9 +142,9 @@ fn hash_algo_pill(ui: &mut Ui, algo: HashAlgo) -> bool {
     // plus a contrasting border so it reads at a glance even on
     // the dark background.
     let bg = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 32);
-    let frame = Frame::none()
+    let frame = Frame::new()
         .fill(bg)
-        .rounding(Rounding::same(10))
+        .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0, fill))
         .inner_margin(egui::Margin::symmetric(10, 4));
     let resp = frame
@@ -181,9 +181,9 @@ fn hash_algo_pill_disabled(ui: &mut Ui, algo: HashAlgo) {
         HashAlgo::River5 => ("RIVER5", theme::ACCENT),
     };
     let bg = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 32);
-    let frame = Frame::none()
+    let frame = Frame::new()
         .fill(bg)
-        .rounding(Rounding::same(10))
+        .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0, fill))
         .inner_margin(egui::Margin::symmetric(10, 4));
     frame

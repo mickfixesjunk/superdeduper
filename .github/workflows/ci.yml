@@ -38,14 +38,12 @@ jobs:
       # do NOT enable `audio` because that pulls alsa-sys → needs
       # libasound2-dev on the runner; the Windows job covers gui+audio.
       #
-      # `-A deprecated` skips the 40+ egui 0.32 deprecation warnings
-      # left over from the 0.28→0.32 upgrade (Rounding → CornerRadius,
-      # egui::menu::bar → MenuBar::new, ui.close_menu → ui.close).
-      # Same pragmatic call as the env-level RUSTFLAGS drop: keep main
-      # green over cleaning each one by hand. Backlog tracked in
-      # GitHub issues (egui-0.32 deprecation pass).
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings -A deprecated
-      - run: cargo clippy --workspace --all-targets --locked --features gui -- -D warnings -A deprecated
+      # `-D warnings` catches NEW lints introduced by changed code AND
+      # NEW deprecations (the egui 0.32 deprecation backlog was cleaned
+      # up in #21; any future deprecation pass should be done before
+      # merging the upgrade so this gate doesn't go red).
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features gui -- -D warnings
 
   test-linux:
     runs-on: ubuntu-latest

@@ -677,7 +677,7 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
             // mono box so the user can read what they sent.
             egui::ScrollArea::vertical()
                 .max_height(120.0)
-                .id_source("flagged-orig-reason")
+                .id_salt("flagged-orig-reason")
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut original_reason.clone())

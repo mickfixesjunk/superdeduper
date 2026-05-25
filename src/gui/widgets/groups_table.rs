@@ -228,7 +228,7 @@ pub fn show_filtered(
     // actions now sit in the same place.
     ui.horizontal(|ui| {
         let action_selected = table_state.bulk_action;
-        egui::ComboBox::from_id_source("bulk-action-combo")
+        egui::ComboBox::from_id_salt("bulk-action-combo")
             .selected_text(action_selected.label())
             .width(240.0)
             .show_ui(ui, |ui| {
@@ -360,7 +360,7 @@ pub fn show_filtered(
     ui.add_space(4.0);
 
     ScrollArea::vertical()
-        .id_source("groups-table")
+        .id_salt("groups-table")
         .show(ui, |ui| {
             TableBuilder::new(ui)
                 .striped(true)
