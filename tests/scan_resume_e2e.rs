@@ -91,6 +91,7 @@ fn drive_engine_until_done(
         None,
         superdeduper::cli::ScanMode::Exact,
         5,
+        superdeduper::cli::ImageHashAlgoArg::default(),
         5.0,
     );
 

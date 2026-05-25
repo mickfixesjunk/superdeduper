@@ -176,6 +176,7 @@ mod tests {
             hash_algo: HashAlgoArg::River5,
             mode: crate::cli::ScanMode::Exact,
             image_similarity_threshold: 5,
+            image_hash_algorithm: crate::cli::ImageHashAlgoArg::Dhash,
             audio_similarity_threshold: 5.0,
         }
     }

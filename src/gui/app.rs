@@ -618,6 +618,7 @@ impl SuperdeduperApp {
             self.scan_mode,
             5, // image_similarity_threshold — TODO add a Settings input
             // when v3 ships the GUI threshold control.
+            crate::cli::ImageHashAlgoArg::default(), // dhash; Settings TODO too.
             5.0, // audio_similarity_threshold — same Settings TODO.
         );
     }

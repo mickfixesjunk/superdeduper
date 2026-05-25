@@ -50,6 +50,7 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
         None,
         crate::cli::ScanMode::Exact,
         5,
+        crate::cli::ImageHashAlgoArg::default(),
         5.0,
     )
 }
@@ -63,6 +64,7 @@ pub fn spawn_with_settings(
     defender_rtp_pre: Option<bool>,
     scan_mode: crate::cli::ScanMode,
     image_similarity_threshold: u32,
+    image_hash_algorithm: crate::cli::ImageHashAlgoArg,
     audio_similarity_threshold: f64,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
@@ -76,6 +78,7 @@ pub fn spawn_with_settings(
                 defender_rtp_pre,
                 scan_mode,
                 image_similarity_threshold,
+                image_hash_algorithm,
                 audio_similarity_threshold,
             ) {
                 let _ = tx.send(EngineEvent::Log {
@@ -97,6 +100,7 @@ fn run(
     _defender_rtp_pre: Option<bool>,
     scan_mode: crate::cli::ScanMode,
     image_similarity_threshold: u32,
+    image_hash_algorithm: crate::cli::ImageHashAlgoArg,
     audio_similarity_threshold: f64,
 ) -> crate::Result<()> {
     let _scan_started_at = Instant::now();
@@ -1393,10 +1397,11 @@ fn run(
     #[cfg(feature = "similar-images")]
     if matches!(scan_mode, crate::cli::ScanMode::Image) {
         if let Some(inv) = inventory_for_tier4.as_deref() {
+            let algo: crate::pipeline::image_hash::Algorithm = image_hash_algorithm.into();
             let t_tier4 = std::time::Instant::now();
             let tier4_groups = crate::pipeline::image_hash::tier4::find_similar_groups(
                 inv,
-                crate::pipeline::image_hash::Algorithm::default(),
+                algo,
                 image_similarity_threshold,
             );
             let n_groups = tier4_groups.len();
@@ -1421,14 +1426,15 @@ fn run(
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Info,
                 message: format!(
-                    "Tier-4 perceptual: {n_groups} group(s) within {image_similarity_threshold} bits ({} ms)",
+                    "Tier-4 perceptual ({}): {n_groups} group(s) within {image_similarity_threshold} bits ({} ms)",
+                    algo.as_slug(),
                     t_tier4.elapsed().as_millis()
                 ),
             });
         }
     }
     #[cfg(not(feature = "similar-images"))]
-    let _ = (scan_mode, image_similarity_threshold);
+    let _ = (scan_mode, image_similarity_threshold, image_hash_algorithm);
 
     // #26 T1.3 GUI Tier-4 wiring. Audio analog of the image branch
     // above; runs when user picked `--mode audio`. Threshold comes
