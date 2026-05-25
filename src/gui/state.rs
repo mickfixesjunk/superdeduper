@@ -380,6 +380,24 @@ impl UiState {
                 self.totals.bytes_read = self.totals.bytes_read.saturating_add(sample.bytes);
             }
             EngineEvent::DuplicateFound(g) => {
+                // #39 fix — on resume the App's `adopt_resume_state`
+                // populates `self.duplicates` from the on-disk
+                // checkpoint BEFORE the engine spawns; the engine then
+                // re-emits the same groups via DuplicateFound to keep
+                // the streaming-event surface uniform. Without this
+                // de-dupe check, every resumed group would be counted
+                // twice in `totals.duplicates` + appear twice in the
+                // Groups table. Content_hash is the right identity:
+                // it's the BLAKE3 hex for byte-identical groups +
+                // the synthetic `perceptual-{fp}` token for Tier-4
+                // groups; both are stable across the resume hand-off.
+                if self
+                    .duplicates
+                    .iter()
+                    .any(|prev| prev.content_hash == g.content_hash)
+                {
+                    return;
+                }
                 self.totals.duplicates = self.totals.duplicates.saturating_add(1);
                 let savings = inode_aware_savings(&g);
                 self.totals.reclaimable_bytes =
@@ -537,9 +555,15 @@ mod inode_aware_tests {
         link_equivalent: bool,
         unique_inodes: u64,
     ) -> DuplicateGroupSummary {
+        // Stamp content_hash with the group's distinguishing attrs so
+        // every call to `mk_group` produces a unique hash. The #39
+        // dedupe-on-DuplicateFound check uses content_hash as the
+        // identity key; sharing a hash across test groups would
+        // collapse them into one in the apply loop.
+        let content_hash = format!("h-{size}-{n_files}-{link_equivalent}-{unique_inodes}");
         DuplicateGroupSummary {
             size,
-            content_hash: "h".into(),
+            content_hash,
             files: (0..n_files)
                 .map(|i| PathBuf::from(format!("/p/{i}")))
                 .collect(),
@@ -686,5 +710,63 @@ mod inode_aware_tests {
         );
         assert_eq!(total, 1800);
         assert_eq!(largest, 1000);
+    }
+
+    /// #39 regression test — when `adopt_resume_state` populates
+    /// `state.duplicates` from disk THEN the engine emits
+    /// `DuplicateFound` for the same groups (which it does via
+    /// `live::run`'s `for g in &prior.previous_duplicates`), the
+    /// totals must not double. The dedupe lives in `state.apply`
+    /// keyed on `content_hash` so the replay events become no-ops
+    /// for already-adopted groups.
+    #[test]
+    fn duplicate_found_dedupes_on_content_hash_after_resume() {
+        use crate::gui::events::EngineEvent;
+        let mut state = UiState::default();
+        let g_a = mk_group(50_000_000, 3, false, 3);
+        let g_b = mk_group(20_000_000, 2, false, 2);
+
+        // Simulate adopt_resume_state's behaviour — push the prior
+        // groups directly into state without going through apply,
+        // bumping totals as adopt does.
+        for g in [&g_a, &g_b] {
+            state.totals.duplicates += 1;
+            state.totals.reclaimable_bytes += inode_aware_savings(g);
+            state.duplicates.push(g.clone());
+        }
+        assert_eq!(state.totals.duplicates, 2);
+        assert_eq!(state.duplicates.len(), 2);
+
+        // Now replay them via DuplicateFound — engine does this on
+        // resume to keep the streaming-event surface uniform.
+        state.apply(EngineEvent::DuplicateFound(g_a.clone()));
+        state.apply(EngineEvent::DuplicateFound(g_b.clone()));
+
+        // Without the fix, totals would now be 4 + reclaimable
+        // doubled. With it, the dedupe filters by content_hash:
+        assert_eq!(
+            state.totals.duplicates, 2,
+            "resume-replayed groups must not double-count"
+        );
+        assert_eq!(
+            state.duplicates.len(),
+            2,
+            "resume-replayed groups must not duplicate the list"
+        );
+    }
+
+    /// Companion test — fresh-scan emission with distinct
+    /// content_hashes must STILL count each group. The dedupe
+    /// only kicks in when the same identity arrives twice.
+    #[test]
+    fn duplicate_found_still_counts_distinct_groups() {
+        use crate::gui::events::EngineEvent;
+        let mut state = UiState::default();
+        let g_a = mk_group(50_000_000, 3, false, 3);
+        let g_b = mk_group(20_000_000, 2, false, 2);
+        state.apply(EngineEvent::DuplicateFound(g_a));
+        state.apply(EngineEvent::DuplicateFound(g_b));
+        assert_eq!(state.totals.duplicates, 2);
+        assert_eq!(state.duplicates.len(), 2);
     }
 }
