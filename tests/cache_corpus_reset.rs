@@ -56,7 +56,6 @@ fn mk_cfg(roots: Vec<PathBuf>) -> ScanConfig {
         use_cache: true,
         use_format_aware: false,
         threads: 2,
-        queue_depth: None,
         output: None,
         follow_links: false,
         allow_system_paths: false,

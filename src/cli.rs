@@ -254,10 +254,6 @@ pub struct ScanArgs {
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
 
-    /// Per-drive I/O queue depth. Defaults to auto (HDD=32, SSD=256).
-    #[arg(long, value_name = "N")]
-    pub queue_depth: Option<usize>,
-
     /// Write results to file instead of stdout.
     #[arg(long, short, value_name = "FILE")]
     pub output: Option<PathBuf>,

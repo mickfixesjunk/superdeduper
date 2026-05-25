@@ -1199,7 +1199,6 @@ mod tests {
             use_cache: false,
             use_format_aware: false,
             threads: 1,
-            queue_depth: None,
             output: None,
             follow_links: false,
             allow_system_paths: false,

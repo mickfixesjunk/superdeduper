@@ -10,11 +10,13 @@
 //!
 //! State machine:
 //!
+//! ```text
 //!     Hidden ──ScanFinished + AlwaysAsk──► Ready
 //!     Ready  ──Submit / AutoSubmit──────► Submitting ──response──► Done
 //!     Ready  ──Skip─────────────────────► Hidden
 //!     Done   ──Close────────────────────► Hidden
 //!     {Ready,Done} ──OpenPreview────────► Preview ──ClosePreview──► back
+//! ```
 //!
 //! AutoOptIn share preference bypasses the modal — submission happens
 //! silently in the background with a brief status-line toast (handled

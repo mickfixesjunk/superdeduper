@@ -64,7 +64,6 @@ fn run_scan(root: &Path, threads: usize, min_size: u64) -> Vec<pipeline::Duplica
         use_cache: false,
         use_format_aware: false,
         threads,
-        queue_depth: None,
         output: None,
         follow_links: false,
         allow_system_paths: false,
