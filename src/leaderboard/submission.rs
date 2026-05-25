@@ -107,6 +107,24 @@ pub struct RunShape {
     /// actually read from those shares.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub share_count_in_scope: Option<u64>,
+    /// #89 — `true` when this scan submission carries no destructive
+    /// actions. GUI scans are always dry-run at scan-finish time
+    /// (actions ship later via PATCH /actions). CLI `scan` subcommand
+    /// is intrinsically dry-run; `dedupe` doesn't generate a fresh
+    /// scan submission. Server's `aggregates-delta.ts` increments
+    /// `lifetime_dry_run_count` by 1 when this is true, powering the
+    /// `safety-first` achievement.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dry_run: Option<bool>,
+    /// #89 — count of duplicate-group cards the user opened/reviewed
+    /// in the GUI since the last scan finished. Server aggregates
+    /// into `lifetime_groups_reviewed`. Plumbed wire-compatibly;
+    /// initially `None` (submission ships at scan-finish *before*
+    /// reviews happen). Future work: PATCH-update this field as the
+    /// user opens groups, or defer initial submission until first
+    /// review.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub groups_reviewed_count: Option<u64>,
 }
 
 /// `result_summary` block per backend schema.
@@ -941,6 +959,8 @@ mod tests {
                 max_hardlink_count_in_scan: None,
                 name_collision_count: None,
                 share_count_in_scope: None,
+                dry_run: None,
+                groups_reviewed_count: None,
             },
             result_summary: ResultSummary {
                 duplicate_groups: 42,

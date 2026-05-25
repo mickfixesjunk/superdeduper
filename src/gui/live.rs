@@ -1539,6 +1539,18 @@ fn run(
                         None
                     }
                 },
+                // #89 — at GUI scan-finish, no destructive action has
+                // run yet (actions ship later via PATCH /actions).
+                // So this submission is intrinsically dry-run; server
+                // increments `lifetime_dry_run_count` accordingly,
+                // powering the `safety-first` cumulative achievement.
+                dry_run: Some(true),
+                // #89 — group-reviews happen AFTER scan-finish, so
+                // the count is always 0 at initial submission time.
+                // Plumbed as `None` (omitted from payload) until a
+                // PATCH path updates it. See submission.rs comment
+                // on the field for the deferred future-work note.
+                groups_reviewed_count: None,
             },
             result_summary: ResultSummary {
                 duplicate_groups: total_dups,
