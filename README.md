@@ -60,6 +60,21 @@ near-instant via the USN journal.
 
 ## Installing a release
 
+### Linux one-liner
+
+```sh
+curl -fsSL https://github.com/mickfixesjunk/superdeduper/raw/main/scripts/install.sh | sh
+```
+
+Downloads the latest tagged release tarball, verifies its SHA-256
+against the release's `SHA256SUMS`, and installs `superdeduper` +
+`superdeduper-gui` to `~/.local/bin` (or `/usr/local/bin` with sudo
+if `~/.local/bin` isn't on `$PATH`). Override the install location
+with `SUPERDEDUPER_INSTALL_DIR=...`. Pin a specific version with
+`SUPERDEDUPER_VERSION=v0.2.1`.
+
+### Manual download
+
 Releases are at
 [github.com/mickfixesjunk/superdeduper/releases](https://github.com/mickfixesjunk/superdeduper/releases).
 Each release ships standalone binaries for Windows + Linux (CLI + GUI),
@@ -70,7 +85,7 @@ via `SHA256SUMS` is the interim path:
 
 ```pwsh
 # Windows (PowerShell)
-Get-FileHash superdeduper-gui-windows-x86_64.exe -Algorithm SHA256
+Get-FileHash superdeduper-v0.2.1-windows-x86_64.zip -Algorithm SHA256
 # Compare against the line in SHA256SUMS
 ```
 
