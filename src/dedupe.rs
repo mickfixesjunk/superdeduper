@@ -66,8 +66,15 @@ pub fn run(args: &DedupeArgs) -> Result<Outcome> {
 
     let references = canonical_set(&[]); // reference set is part of the scan; reserved.
     let mut outcome = Outcome::default();
+    // Construct the action-receipt writer once per run. Disabled
+    // sink when --integration-test-mode is off; emit calls become
+    // no-ops downstream and the flag costs effectively nothing.
+    let mut receipts = crate::action_receipt::ReceiptWriter::from_flags(
+        args.integration_test_mode,
+        args.receipt_file.as_deref(),
+    );
     for (i, group) in results.groups.iter().enumerate() {
-        if let Err(e) = process_group(i, group, args, &references, &mut outcome) {
+        if let Err(e) = process_group(i, group, args, &references, &mut outcome, &mut receipts) {
             outcome.failed += 1;
             tracing::warn!(group = i + 1, error = %e, "group skipped");
         }
@@ -81,6 +88,7 @@ fn process_group(
     args: &DedupeArgs,
     references: &BTreeMap<PathBuf, ()>,
     outcome: &mut Outcome,
+    receipts: &mut crate::action_receipt::ReceiptWriter,
 ) -> Result<()> {
     if group.files.len() < 2 {
         return Ok(());
@@ -139,8 +147,19 @@ fn process_group(
             );
             outcome.executed += 1;
             outcome.bytes_reclaimed += group.size;
+            let _ = receipts.emit(&crate::action_receipt::ActionReceipt::dry_run(
+                &path.display().to_string(),
+                &keeper.display().to_string(),
+                group.size,
+            ));
             continue;
         }
+
+        // Capture pre-action inode + hardlink count so the receipt
+        // can report deltas. The harness uses these to assert that
+        // the action affected EXACTLY the targeted inode (and
+        // nothing else).
+        let pre = crate::action_receipt::read_inode_and_nlink(path);
 
         match perform_action(args.action, path, keeper, args.allow_destructive_on_deduped) {
             Ok(()) => {
@@ -153,6 +172,7 @@ fn process_group(
                     keeper = %keeper.display(),
                     "applied"
                 );
+                emit_action_receipt(receipts, args.action, path, keeper, group.size, pre, None);
             }
             Err(e) => {
                 outcome.failed += 1;
@@ -162,10 +182,76 @@ fn process_group(
                     error = %e,
                     "action failed"
                 );
+                let err_str = format!("{e}");
+                emit_action_receipt(
+                    receipts,
+                    args.action,
+                    path,
+                    keeper,
+                    group.size,
+                    pre,
+                    Some(err_str),
+                );
             }
         }
     }
     Ok(())
+}
+
+/// Build + emit one action receipt after `perform_action` returns.
+/// Captures the post-action inode + hardlink count when the file
+/// still exists; reports the appropriate outcome + delta. Errors
+/// during emission are logged but never propagate — a receipt-file
+/// write failure shouldn't kill a long-running dedupe.
+fn emit_action_receipt(
+    receipts: &mut crate::action_receipt::ReceiptWriter,
+    action: DedupeAction,
+    path: &Path,
+    keeper: &Path,
+    size: u64,
+    pre: Option<(String, u64)>,
+    error: Option<String>,
+) {
+    use crate::action_receipt::{action_label, ActionReceipt, read_inode_and_nlink};
+
+    let action_str = action_label(action);
+    let source_str = path.display().to_string();
+    let keeper_str = keeper.display().to_string();
+
+    let mut receipt = if let Some(err) = error.as_deref() {
+        ActionReceipt::error_for(action_str, &source_str, &keeper_str, size, err)
+    } else {
+        ActionReceipt::new(action_str, &source_str, &keeper_str, size)
+    };
+
+    if let Some((ino, _nlink_before)) = pre {
+        receipt.inode_before = Some(ino);
+    }
+    // Post-action stat: file may have been deleted (None) or
+    // re-pointed at the keeper's inode (hardlink-replace).
+    let post = read_inode_and_nlink(path);
+    if let Some((ino_after, _nlink_after)) = &post {
+        receipt.inode_after = Some(ino_after.clone());
+    }
+
+    // Hardlink-count delta heuristic:
+    // - delete-to-recycle / delete-permanently: -1 when the source's
+    //   inode is gone (post is None), 0 otherwise.
+    // - hardlink-replace: +1 on success (source now shares keeper's
+    //   inode → keeper's nlink incremented).
+    // - reflink / safe-rename: 0 (no nlink mutation).
+    // - dry-run / left-alone: covered by their own emit paths.
+    if error.is_none() {
+        receipt.hardlink_count_delta = match action {
+            DedupeAction::Recycle | DedupeAction::Remove => {
+                if post.is_none() { -1 } else { 0 }
+            }
+            DedupeAction::Hardlink => 1,
+            DedupeAction::Reflink | DedupeAction::SafeRename => 0,
+        };
+    }
+
+    let _ = receipts.emit(&receipt);
 }
 
 fn pick_keeper(
@@ -630,6 +716,8 @@ mod tests {
             dry_run,
             allow_system_paths: false,
             allow_destructive_on_deduped: false,
+            integration_test_mode: false,
+            receipt_file: None,
         }
     }
 
