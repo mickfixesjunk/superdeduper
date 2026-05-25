@@ -51,12 +51,19 @@ pub enum GroupAction {
     },
     /// Safe-rename across EVERY visible duplicate group at once.
     SafeRenameAllVisible,
-    /// Archive every dupe across every visible group — the GUI's
-    /// roots panel used to host this as a standalone "Archive dupes"
-    /// button; it now lives next to Safe-rename in the bulk-action
-    /// dropdown above the results table so both bulk actions sit in
-    /// the same place.
+    /// Archive every dupe across every visible group via MOVE
+    /// (rename from source, fall back to copy+remove on cross-
+    /// device — both paths reclaim bytes from source). Requires
+    /// the typed-confirm modal with word "ARCHIVE" (#85).
     ArchiveAllVisible,
+    /// #90 — Archive every dupe via COPY only — leaves the source
+    /// file in place. Does NOT reclaim bytes; does NOT credit
+    /// `archived_bytes` to the leaderboard. Skips the typed-
+    /// confirm modal because no source file is touched (vault-
+    /// style workflow: collect copies of dupes for archival sanity
+    /// check before later running ArchiveMove or Nuke). Manifest
+    /// entry still written so the user can see what was copied.
+    ArchiveCopyAllVisible,
     /// Recycle (send to Recycle Bin) every dupe across every visible
     /// group. Reversible from the OS recycle bin until emptied;
     /// reference paths are never touched. Same destructive-confirm
@@ -87,7 +94,12 @@ pub enum GroupAction {
 pub enum BulkAction {
     #[default]
     SafeRenameDupes,
-    ArchiveDupes,
+    /// #90 — was BulkAction::ArchiveDupes pre-v0.2.9. The Move
+    /// variant reclaims bytes from source.
+    ArchiveMoveDupes,
+    /// #90 — new in v0.2.9. Copy variant leaves source intact;
+    /// no reclaim credit.
+    ArchiveCopyDupes,
     RecycleDupes,
     NukeDupes,
 }
@@ -96,15 +108,18 @@ impl BulkAction {
     fn label(self) -> &'static str {
         match self {
             BulkAction::SafeRenameDupes => "🛡 Safe-rename dupes",
-            BulkAction::ArchiveDupes => "📦 Archive dupes",
+            BulkAction::ArchiveMoveDupes => "📦 Archive (Move) dupes",
+            BulkAction::ArchiveCopyDupes => "📋 Archive (Copy) dupes",
             BulkAction::RecycleDupes => "♻ Recycle dupes",
             BulkAction::NukeDupes => "💀 Nuke dupes (permanent)",
         }
     }
 
     /// `true` for actions that permanently destroy files (no recycle
-    /// bin, no .superdeduper rename). The destructive-confirm modal
-    /// uses this to decide whether to show the "type DELETE" gate.
+    /// bin, no .superdeduper rename). The action-confirmation modal
+    /// uses this to decide whether to show the typed-word gate.
+    /// ArchiveCopy is intentionally non-destructive — source is
+    /// untouched, so no confirm friction.
     pub fn is_destructive(self) -> bool {
         matches!(self, BulkAction::RecycleDupes | BulkAction::NukeDupes,)
     }
@@ -243,8 +258,13 @@ pub fn show_filtered(
                 );
                 ui.selectable_value(
                     &mut table_state.bulk_action,
-                    BulkAction::ArchiveDupes,
-                    BulkAction::ArchiveDupes.label(),
+                    BulkAction::ArchiveMoveDupes,
+                    BulkAction::ArchiveMoveDupes.label(),
+                );
+                ui.selectable_value(
+                    &mut table_state.bulk_action,
+                    BulkAction::ArchiveCopyDupes,
+                    BulkAction::ArchiveCopyDupes.label(),
                 );
                 ui.selectable_value(
                     &mut table_state.bulk_action,
@@ -272,12 +292,21 @@ pub fn show_filtered(
                  visible group. Reversible: click Unsuperdeduper in the \
                  Roots panel to restore. Reference paths are never touched."
             }
-            BulkAction::ArchiveDupes => {
-                "Pick a destination folder, then move every duplicate \
+            BulkAction::ArchiveMoveDupes => {
+                "Pick a destination folder, then MOVE every duplicate \
                  (except the keeper per group, and never anything under a \
-                 reference root) into that folder. Preserves the original \
-                 directory tree under the destination so a future restore \
-                 can put files back. Writes a manifest JSON alongside."
+                 reference root) into that folder. Reclaims bytes from \
+                 source. Preserves the directory tree under the \
+                 destination so a future restore can put files back. \
+                 Writes a manifest JSON alongside. Requires typing \
+                 ARCHIVE to confirm."
+            }
+            BulkAction::ArchiveCopyDupes => {
+                "Pick a destination folder, then COPY every duplicate to \
+                 that folder. Source files are NOT touched — disk usage \
+                 grows, nothing reclaims. Useful as a vault-style \
+                 backup before later running Archive (Move) or Nuke. \
+                 No confirmation prompt because nothing is destroyed."
             }
             BulkAction::RecycleDupes => {
                 "Send every non-keeper across every visible group to the \
@@ -310,7 +339,8 @@ pub fn show_filtered(
         {
             clicked = Some(match table_state.bulk_action {
                 BulkAction::SafeRenameDupes => GroupAction::SafeRenameAllVisible,
-                BulkAction::ArchiveDupes => GroupAction::ArchiveAllVisible,
+                BulkAction::ArchiveMoveDupes => GroupAction::ArchiveAllVisible,
+                BulkAction::ArchiveCopyDupes => GroupAction::ArchiveCopyAllVisible,
                 BulkAction::RecycleDupes => GroupAction::RecycleAllVisible,
                 BulkAction::NukeDupes => GroupAction::NukeAllVisible,
             });
@@ -318,7 +348,8 @@ pub fn show_filtered(
 
         let trailer = match table_state.bulk_action {
             BulkAction::SafeRenameDupes => "safe-mode (no files deleted)",
-            BulkAction::ArchiveDupes => "moves dupes, writes manifest",
+            BulkAction::ArchiveMoveDupes => "moves dupes, writes manifest",
+            BulkAction::ArchiveCopyDupes => "copies dupes (no reclaim, no confirm)",
             BulkAction::RecycleDupes => "recoverable from recycle bin",
             BulkAction::NukeDupes => "PERMANENT delete — no undo",
         };
