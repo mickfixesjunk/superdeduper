@@ -129,23 +129,48 @@ pub fn clone_file(_src: &Path, _dst: &Path) -> PlatformResult<()> {
 // situations + headless server installs).
 // ============================================================
 
+/// Cross-platform "what just got trashed" metadata. Populated when
+/// the per-platform trash backend has detail to surface; consumed by
+/// the dedupe pipeline to fill the `recycle_bin_entry` field on
+/// action receipts (per GH #33). v1 only Linux populates this; the
+/// Windows IFileOperation result wiring is a follow-up.
+#[derive(Debug, Clone, Default)]
+pub struct TrashOutcome {
+    pub original_path: Option<std::path::PathBuf>,
+    pub container: Option<std::path::PathBuf>,
+    pub info_file: Option<std::path::PathBuf>,
+    pub data_file: Option<std::path::PathBuf>,
+}
+
 #[cfg(target_os = "linux")]
-pub fn trash_file(path: &Path) -> PlatformResult<()> {
-    linux::trash::trash_file(path)
+pub fn trash_file(path: &Path) -> PlatformResult<TrashOutcome> {
+    let e = linux::trash::trash_file(path)?;
+    Ok(TrashOutcome {
+        original_path: Some(e.original_path),
+        container: Some(e.container),
+        info_file: Some(e.info_file),
+        data_file: Some(e.data_file),
+    })
 }
 
 #[cfg(windows)]
-pub fn trash_file(path: &Path) -> PlatformResult<()> {
-    windows::trash_file(path)
+pub fn trash_file(path: &Path) -> PlatformResult<TrashOutcome> {
+    windows::trash_file(path)?;
+    // TODO #33 v2 — extract IFileOperation result (the $I + $R
+    // filenames the shell minted) and populate this struct. Today
+    // the windows::trash_file shim doesn't return that; needs a
+    // wider plumbing job in winapi_wrappers::recycle.
+    Ok(TrashOutcome::default())
 }
 
 #[cfg(target_os = "macos")]
-pub fn trash_file(path: &Path) -> PlatformResult<()> {
-    macos::trash_file(path)
+pub fn trash_file(path: &Path) -> PlatformResult<TrashOutcome> {
+    macos::trash_file(path)?;
+    Ok(TrashOutcome::default())
 }
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-pub fn trash_file(_path: &Path) -> PlatformResult<()> {
+pub fn trash_file(_path: &Path) -> PlatformResult<TrashOutcome> {
     Err(PlatformError::Unsupported(
         "trash not supported on this platform",
     ))

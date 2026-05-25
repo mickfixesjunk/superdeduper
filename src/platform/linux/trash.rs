@@ -46,7 +46,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{PlatformError, PlatformResult};
 
-pub fn trash_file(path: &Path) -> PlatformResult<()> {
+/// Outcome of a successful [`trash_file`] call. Caller (the dedupe
+/// pipeline) feeds these fields into the action_receipt's
+/// `recycle_bin_entry` block so integration-test harnesses can
+/// verify the trash spec invariants without parsing the .trashinfo
+/// file format directly. Per GH #33.
+#[derive(Debug, Clone)]
+pub struct TrashEntry {
+    /// Absolute original path that got trashed (matches the `Path=`
+    /// field in the .trashinfo file, pre URL-escaping).
+    pub original_path: PathBuf,
+    /// Trash root that received the file (typically
+    /// `$XDG_DATA_HOME/Trash` or `$HOME/.local/share/Trash`).
+    pub container: PathBuf,
+    /// Full path to the `<base>.trashinfo` metadata file. Lives
+    /// under `<container>/info/`.
+    pub info_file: PathBuf,
+    /// Full path to the moved-aside data file. Lives under
+    /// `<container>/files/`. Same basename as info_file's stem.
+    pub data_file: PathBuf,
+}
+
+pub fn trash_file(path: &Path) -> PlatformResult<TrashEntry> {
     let abs = fs::canonicalize(path).map_err(PlatformError::Io)?;
 
     let trash_root = trash_root()?;
@@ -90,7 +111,12 @@ pub fn trash_file(path: &Path) -> PlatformResult<()> {
         return Err(PlatformError::Io(e));
     }
 
-    Ok(())
+    Ok(TrashEntry {
+        original_path: abs,
+        container: trash_root,
+        info_file: info_path,
+        data_file: target_in_files,
+    })
 }
 
 /// `$XDG_DATA_HOME/Trash` (default `$HOME/.local/share/Trash`).

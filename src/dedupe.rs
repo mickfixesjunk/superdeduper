@@ -164,7 +164,7 @@ fn process_group(
         let pre = crate::action_receipt::read_inode_and_nlink(path);
 
         match perform_action(args.action, path, keeper, args.allow_destructive_on_deduped) {
-            Ok(()) => {
+            Ok(trash_outcome) => {
                 outcome.executed += 1;
                 outcome.bytes_reclaimed += group.size;
                 tracing::info!(
@@ -174,7 +174,16 @@ fn process_group(
                     keeper = %keeper.display(),
                     "applied"
                 );
-                emit_action_receipt(receipts, args.action, path, keeper, group.size, pre, None);
+                emit_action_receipt(
+                    receipts,
+                    args.action,
+                    path,
+                    keeper,
+                    group.size,
+                    pre,
+                    None,
+                    trash_outcome,
+                );
             }
             Err(e) => {
                 outcome.failed += 1;
@@ -193,6 +202,7 @@ fn process_group(
                     group.size,
                     pre,
                     Some(err_str),
+                    crate::platform::TrashOutcome::default(),
                 );
             }
         }
@@ -205,6 +215,7 @@ fn process_group(
 /// still exists; reports the appropriate outcome + delta. Errors
 /// during emission are logged but never propagate — a receipt-file
 /// write failure shouldn't kill a long-running dedupe.
+#[allow(clippy::too_many_arguments)]
 fn emit_action_receipt(
     receipts: &mut crate::action_receipt::ReceiptWriter,
     action: DedupeAction,
@@ -213,8 +224,11 @@ fn emit_action_receipt(
     size: u64,
     pre: Option<(String, u64)>,
     error: Option<String>,
+    trash_outcome: crate::platform::TrashOutcome,
 ) {
-    use crate::action_receipt::{action_label, read_inode_and_nlink, ActionReceipt};
+    use crate::action_receipt::{
+        action_label, read_inode_and_nlink, ActionReceipt, RecycleBinEntry,
+    };
 
     let action_str = action_label(action);
     let source_str = path.display().to_string();
@@ -225,6 +239,39 @@ fn emit_action_receipt(
     } else {
         ActionReceipt::new(action_str, &source_str, &keeper_str, size)
     };
+
+    // GH #33 — populate the recycle_bin_entry block when the action
+    // was recycle-to-trash AND the platform backend surfaced metadata.
+    // Linux's XDG trash impl fills all four fields; Windows IFileOperation
+    // wiring is v2 territory (TrashOutcome::default() leaves them None).
+    if matches!(action, DedupeAction::Recycle)
+        && (trash_outcome.container.is_some()
+            || trash_outcome.info_file.is_some()
+            || trash_outcome.data_file.is_some())
+    {
+        receipt.recycle_bin_entry = Some(RecycleBinEntry {
+            container: trash_outcome
+                .container
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            index_file: trash_outcome
+                .info_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            data_file: trash_outcome
+                .data_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            original_path: trash_outcome
+                .original_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| source_str.clone()),
+        });
+    }
 
     if let Some((ino, _nlink_before)) = pre {
         receipt.inode_before = Some(ino);
@@ -366,14 +413,26 @@ fn perform_action(
     path: &Path,
     keeper: &Path,
     allow_destructive_on_deduped: bool,
-) -> Result<()> {
+) -> Result<crate::platform::TrashOutcome> {
     guard_destructive(path, allow_destructive_on_deduped)?;
     match action {
-        DedupeAction::Remove => fs::remove_file(path).map_err(Into::into),
+        DedupeAction::Remove => {
+            fs::remove_file(path)?;
+            Ok(crate::platform::TrashOutcome::default())
+        }
         DedupeAction::Recycle => recycle(path),
-        DedupeAction::Hardlink => replace_with_hardlink(path, keeper),
-        DedupeAction::Reflink => replace_with_reflink(path, keeper),
-        DedupeAction::SafeRename => safe_rename_unguarded(path),
+        DedupeAction::Hardlink => {
+            replace_with_hardlink(path, keeper)?;
+            Ok(crate::platform::TrashOutcome::default())
+        }
+        DedupeAction::Reflink => {
+            replace_with_reflink(path, keeper)?;
+            Ok(crate::platform::TrashOutcome::default())
+        }
+        DedupeAction::SafeRename => {
+            safe_rename_unguarded(path)?;
+            Ok(crate::platform::TrashOutcome::default())
+        }
     }
 }
 
@@ -440,7 +499,12 @@ pub fn action_remove(path: &Path) -> Result<()> {
 
 pub fn action_recycle(path: &Path) -> Result<()> {
     guard_destructive(path, false)?;
-    recycle(path)
+    // Drop the TrashOutcome — the GUI's per-row recycle path doesn't
+    // emit receipts (it's only the `dedupe` subcommand flow that
+    // surfaces them). Future: thread metadata into a per-action
+    // event the GUI can render in the action-progress modal.
+    recycle(path)?;
+    Ok(())
 }
 
 pub fn action_hardlink(target: &Path, keeper: &Path) -> Result<()> {
@@ -556,22 +620,31 @@ pub fn unsuperdeduper_root(root: &Path) -> Result<(u64, u64, u64)> {
     Ok((renamed, skipped, errors))
 }
 
+/// Recycle/trash a file, returning whatever metadata the platform
+/// backend can surface. The metadata is fed into the action_receipt's
+/// `recycle_bin_entry` block per GH #33. Empty `TrashOutcome` (no
+/// fields populated) is fine — the receipt just emits an empty
+/// sub-object in that case.
 #[cfg(windows)]
-fn recycle(path: &Path) -> Result<()> {
-    crate::winapi_wrappers::recycle(path)
+fn recycle(path: &Path) -> Result<crate::platform::TrashOutcome> {
+    crate::winapi_wrappers::recycle(path)?;
+    // TODO #33 v2 — windows::trash route through IFileOperation
+    // doesn't yet capture the $I/$R filenames the shell minted.
+    // Once it does, plumb them into TrashOutcome here.
+    Ok(crate::platform::TrashOutcome::default())
 }
 
 #[cfg(target_os = "linux")]
-fn recycle(path: &Path) -> Result<()> {
+fn recycle(path: &Path) -> Result<crate::platform::TrashOutcome> {
     // L0: XDG Trash spec implementation. Lives in src/platform/linux/trash.rs.
     crate::platform::trash_file(path).map_err(|e| Error::other(format!("trash: {e}")))
 }
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
-fn recycle(path: &Path) -> Result<()> {
+fn recycle(path: &Path) -> Result<crate::platform::TrashOutcome> {
     // Other Unixes (macOS pending L3) — fall back to plain remove for now.
     fs::remove_file(path)?;
-    Ok(())
+    Ok(crate::platform::TrashOutcome::default())
 }
 
 #[cfg(windows)]
