@@ -42,6 +42,32 @@ fn main() -> eframe::Result<()> {
         superdeduper::channel::Channel::Prod
     });
     superdeduper::channel::set_active_channel(active);
+    // Persistence diagnostic for the "linked status not showing
+    // after restart" bug (Mick 2026-05-25T01:35Z). Logs which
+    // channel was resolved + whether the corresponding oauth
+    // token file exists. Helps localise whether the bug is on
+    // the save side, the channel-resolution side, or the read
+    // side.
+    #[cfg(feature = "telemetry")]
+    {
+        let oauth_path =
+            superdeduper::leaderboard::oauth::oauth_path_for(active).ok();
+        let install_path =
+            superdeduper::leaderboard::install::install_path_for(active).ok();
+        superdeduper::leaderboard::oauth::log_oauth_event(&format!(
+            "startup: channel={active} oauth_path={} oauth_exists={} install_path={} install_exists={}",
+            oauth_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<error>".to_string()),
+            oauth_path.as_ref().map(|p| p.exists()).unwrap_or(false),
+            install_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<error>".to_string()),
+            install_path.as_ref().map(|p| p.exists()).unwrap_or(false),
+        ));
+    }
 
     // Window title carries version + git SHA so multi-window users
     // can disambiguate which build is which without us shipping

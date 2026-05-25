@@ -91,6 +91,64 @@ pub struct SettingsModalState {
 static SAMPLE_PREVIEW: parking_lot::Mutex<Option<String>> =
     parking_lot::Mutex::new(None);
 
+/// Process-wide slot for a simple "Done" confirmation dialog —
+/// shown after register / unlink / reset completions per Mick's
+/// 2026-05-25T01:35Z preference. Anyone can write a message; the
+/// outer `show()` renders an OK-button modal until dismissed.
+static DONE_DIALOG: parking_lot::Mutex<Option<String>> =
+    parking_lot::Mutex::new(None);
+
+pub fn show_done_dialog(message: String) {
+    *DONE_DIALOG.lock() = Some(message);
+}
+
+fn take_done_dialog() -> Option<String> {
+    DONE_DIALOG.lock().clone()
+}
+
+fn clear_done_dialog() {
+    *DONE_DIALOG.lock() = None;
+}
+
+fn render_done_dialog(ctx: &egui::Context) {
+    let Some(msg) = take_done_dialog() else {
+        return;
+    };
+    let mut close = false;
+    egui::Window::new(
+        RichText::new("Done")
+            .color(theme::TEXT_HI)
+            .heading(),
+    )
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .default_width(420.0)
+    .show(ctx, |ui| {
+        ui.label(RichText::new(msg).color(theme::TEXT_HI));
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("OK")
+                            .color(theme::PANEL_DEEP)
+                            .strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(100.0, 28.0)),
+                )
+                .clicked()
+            {
+                close = true;
+            }
+        });
+    });
+    if close {
+        clear_done_dialog();
+    }
+}
+
 fn show_sample_preview(json: String) {
     *SAMPLE_PREVIEW.lock() = Some(json);
 }
@@ -138,6 +196,12 @@ pub fn show(
     if let Some(json) = take_sample_preview() {
         render_sample_preview_modal(ctx, &json);
     }
+
+    // Done-dialog: simple OK-button modal shown after
+    // register / unlink / reset completions. Rendered ABOVE the
+    // main settings layer so the OK click doesn't affect the
+    // settings-modal state machine.
+    render_done_dialog(ctx);
 
     if !*open {
         return false;
@@ -898,6 +962,28 @@ fn render_account(ui: &mut egui::Ui) {
     // status, so the post-link "Linked: …" row shows up the same
     // frame the user finished sign-in. Issue #2 fix.
     if let Some(result) = oauth::poll_session() {
+        // Auto-register chain: if the OAuth flow failed because
+        // this install isn't known to the leaderboard server,
+        // remember which provider the user tried + kick off a
+        // register session in the background. When the register
+        // completes successfully, the next poll drains it +
+        // auto-retries OAuth with the same provider. Per Mick's
+        // 2026-05-25T01:35Z preference — the user already
+        // committed to participation by clicking Link, so engine
+        // doesn't need to ask twice.
+        if let Err(oauth::OauthError::InstallNotRegistered) = &result {
+            // Capture the failing provider so we can retry once
+            // register lands. snapshot before record_toast clears.
+            // We don't know the provider from the result directly,
+            // but the current_session_snapshot was the last
+            // in-flight session's provider; egui state holds it.
+            // Simpler: stash it from current_session_snapshot
+            // BEFORE the session was drained — too late now;
+            // record_toast still useful for failure-other-than-401.
+            // Instead set the retry below from the per-CTA
+            // start_link path (see oauth_chooser::start_link).
+            let _ = ();
+        }
         oauth::record_toast(&result);
         ui.ctx().request_repaint();
         match &result {
@@ -907,6 +993,44 @@ fn render_account(ui: &mut egui::Ui) {
                 token.display_name
             ),
             Err(e) => eprintln!("account: link failed: {e}"),
+        }
+    }
+
+    // Drain any completed register session. When register lands
+    // successfully AND a pending retry provider is stashed, fire
+    // a fresh OAuth flow with the retry provider — that's the
+    // auto-register chain landing.
+    if let Some(reg_result) = crate::leaderboard::registration::poll_register_session() {
+        match &reg_result {
+            Ok(id) => {
+                eprintln!("account: register OK, install_id={id}");
+                if let Some(provider) = oauth::take_pending_retry_provider() {
+                    eprintln!(
+                        "account: auto-retrying OAuth with {} after register",
+                        provider.display_name()
+                    );
+                    let server_url = crate::channel::server_url_for(active);
+                    if let Err(()) = oauth::try_start_session(
+                        provider,
+                        active,
+                        server_url,
+                        id,
+                        oauth::DEFAULT_OAUTH_TIMEOUT,
+                    ) {
+                        eprintln!(
+                            "account: couldn't auto-retry OAuth (session already in flight)"
+                        );
+                    }
+                }
+                show_done_dialog(format!(
+                    "Registered. install_id = {}\n\nYou can now sign in with Google or Discord.",
+                    id
+                ));
+            }
+            Err(e) => {
+                eprintln!("account: register failed: {e:?}");
+                show_done_dialog(format!("Register failed:\n\n{e:?}"));
+            }
         }
     }
 
@@ -1079,8 +1203,26 @@ fn render_account(ui: &mut egui::Ui) {
         };
         let unlink_btn = egui::Button::new(unlink_text).min_size(egui::vec2(100.0, 28.0));
         if ui.add_enabled(is_linked, unlink_btn).clicked() {
+            let prior_display = if let Some(oauth::AccountStatus::Linked {
+                provider,
+                display_name,
+                ..
+            }) = &status
+            {
+                format!("{} ({})", display_name, provider.display_name())
+            } else {
+                "this machine".to_string()
+            };
             if let Err(e) = oauth::unlink_for(active) {
                 eprintln!("account: unlink failed: {e}");
+                show_done_dialog(format!("Unlink failed:\n\n{e}"));
+            } else {
+                show_done_dialog(format!(
+                    "Unlinked {prior_display}.\n\n\
+                     Local link record cleared. Note: the server-side \
+                     binding stays in place until the v1.1 unlink \
+                     endpoint ships."
+                ));
             }
         }
     });

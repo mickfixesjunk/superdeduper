@@ -1349,14 +1349,54 @@ pub fn session_in_flight() -> bool {
 /// exactly once per session, after which the slot is cleared and
 /// the next `try_start_session` can run. While the session is
 /// still pending, returns `None`.
+///
+/// **Auto-register side effect** (Mick 2026-05-25T01:35Z): when
+/// the result is `Err(InstallNotRegistered)`, captures the
+/// provider that was in flight + kicks off a register session in
+/// the background so the user doesn't have to bounce out to the
+/// CLI. The `take_pending_retry_provider` slot is what
+/// [`crate::leaderboard::registration::poll_register_session`]
+/// consumes on success to auto-retry the OAuth flow.
 pub fn poll_session() -> Option<Result<OauthToken, OauthError>> {
-    let mut slot = CURRENT_SESSION.lock();
-    let session = slot.as_mut()?;
-    if let Some(result) = session.try_take_result() {
-        *slot = None;
-        return Some(result);
+    // Snapshot the in-flight provider BEFORE drain — once we
+    // clear the slot, this info is gone.
+    let provider_in_flight = {
+        let slot = CURRENT_SESSION.lock();
+        slot.as_ref().map(|s| (s.provider(), s.channel()))
+    };
+
+    let result = {
+        let mut slot = CURRENT_SESSION.lock();
+        let session = slot.as_mut()?;
+        if let Some(result) = session.try_take_result() {
+            *slot = None;
+            result
+        } else {
+            return None;
+        }
+    };
+
+    // Auto-register chain: install isn't known to web → kick off
+    // register + remember the provider for auto-retry post-register.
+    if let Err(OauthError::InstallNotRegistered) = &result {
+        if let Some((provider, channel)) = provider_in_flight {
+            set_pending_retry_provider(provider);
+            log_oauth_event(&format!(
+                "auto_register_chain: InstallNotRegistered for {} on {}; \
+                 kicking register session to auto-retry",
+                provider, channel
+            ));
+            if crate::leaderboard::registration::try_start_register_session(channel)
+                .is_err()
+            {
+                log_oauth_event(
+                    "auto_register_chain: register session already in flight; can't auto-chain",
+                );
+            }
+        }
     }
-    None
+
+    Some(result)
 }
 
 /// Signal the in-flight session to cancel + drop it. Listener
@@ -1422,6 +1462,26 @@ pub fn current_toast() -> Option<OauthToast> {
 /// from `try_start_session` when a fresh flow kicks off.
 pub fn clear_toast() {
     *LAST_TOAST.lock() = None;
+}
+
+// =====================================================================
+// Pending OAuth retry — when an OAuth flow fails with
+// InstallNotRegistered, engine kicks off a register flow + stashes
+// the provider here. After register completes successfully, the
+// next CTA frame consumes this slot + auto-retries OAuth with the
+// stored provider. Per Mick's 2026-05-25T01:35Z preference
+// ("auto-register you because you've already decided to participate").
+// =====================================================================
+
+static PENDING_RETRY_PROVIDER: parking_lot::Mutex<Option<Provider>> =
+    parking_lot::Mutex::new(None);
+
+pub fn set_pending_retry_provider(provider: Provider) {
+    *PENDING_RETRY_PROVIDER.lock() = Some(provider);
+}
+
+pub fn take_pending_retry_provider() -> Option<Provider> {
+    PENDING_RETRY_PROVIDER.lock().take()
 }
 
 /// Parse the JSON body web POSTs to our loopback. Expected shape:

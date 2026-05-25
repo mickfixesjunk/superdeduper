@@ -202,14 +202,51 @@ pub fn register_session_elapsed() -> Option<std::time::Duration> {
 
 /// Drain the current register session if it has completed.
 /// Returns `Some(_)` exactly once per session.
+///
+/// **Auto-retry OAuth side effect** (Mick 2026-05-25T01:35Z):
+/// when register succeeds AND
+/// [`crate::leaderboard::oauth::take_pending_retry_provider`]
+/// returns a stashed provider, kicks off an OAuth flow with that
+/// provider automatically. Closes the chain that started when an
+/// earlier OAuth flow failed with `InstallNotRegistered`.
 pub fn poll_register_session() -> Option<Result<String, RegisterError>> {
-    let mut slot = CURRENT_REGISTER_SESSION.lock();
-    let session = slot.as_mut()?;
-    if let Some(result) = session.try_take_result() {
-        *slot = None;
-        return Some(result);
+    let result = {
+        let mut slot = CURRENT_REGISTER_SESSION.lock();
+        let session = slot.as_mut()?;
+        if let Some(result) = session.try_take_result() {
+            *slot = None;
+            result
+        } else {
+            return None;
+        }
+    };
+
+    // Auto-retry OAuth if a retry provider is stashed.
+    if let Ok(install_id) = &result {
+        if let Some(provider) = crate::leaderboard::oauth::take_pending_retry_provider() {
+            let active = crate::channel::active_channel();
+            let server_url = crate::channel::server_url_for(active);
+            crate::leaderboard::oauth::log_oauth_event(&format!(
+                "auto_register_chain: register OK; auto-retrying OAuth with {} on {}",
+                provider, active
+            ));
+            if crate::leaderboard::oauth::try_start_session(
+                provider,
+                active,
+                server_url,
+                install_id,
+                crate::leaderboard::oauth::DEFAULT_OAUTH_TIMEOUT,
+            )
+            .is_err()
+            {
+                crate::leaderboard::oauth::log_oauth_event(
+                    "auto_register_chain: OAuth session already in flight; can't auto-retry",
+                );
+            }
+        }
     }
-    None
+
+    Some(result)
 }
 
 pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
