@@ -1052,81 +1052,75 @@ fn render_account(ui: &mut egui::Ui) {
     }
 
     // Action row. Single-provider-per-install policy (Mick
-    // 2026-05-25T01:05Z): when linked, hide the other-provider
-    // Link button; only show Unlink. The user must unlink first
-    // before linking with a different provider. The post-scan
-    // modal CTA + above-grid Login & Claim CTA already hide
-    // entirely when linked.
-    match &status {
-        Some(oauth::AccountStatus::Linked { provider, .. }) => {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "Currently linked via {}",
-                        provider.display_name()
-                    ))
-                    .color(theme::TEXT_LO)
-                    .small(),
-                );
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("Unlink").color(theme::HOT))
-                            .min_size(egui::vec2(100.0, 28.0)),
-                    )
-                    .clicked()
-                {
-                    if let Err(e) = oauth::unlink_for(active) {
-                        eprintln!("account: unlink failed: {e}");
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(
-                    "To switch providers, click Unlink first then choose \
-                     the other provider. Note: Unlink only clears the \
-                     local link record — the server-side binding stays \
-                     until the v1.1 unlink endpoint ships. Re-linking the \
-                     same install to a different account requires a dev-DB \
-                     wipe in the meantime.",
+    // 2026-05-25T01:05Z): when linked, only the linked provider
+    // is named + Unlink is the only action. When anonymous, both
+    // Link buttons are active; Unlink stays visible but greyed
+    // so the row layout doesn't jump between states.
+    let is_linked = matches!(status, Some(oauth::AccountStatus::Linked { .. }));
+    ui.horizontal(|ui| {
+        // Link Google: enabled only when anonymous (single-
+        // provider-per-install). Hidden when linked to keep the
+        // row tidy on the linked-state.
+        if !is_linked {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Link Google").color(theme::TEXT_HI))
+                        .min_size(egui::vec2(120.0, 28.0)),
                 )
-                .color(theme::TEXT_LO)
-                .small(),
-            );
-        }
-        Some(oauth::AccountStatus::Anonymous) | None => {
-            ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("Link Google").color(theme::TEXT_HI))
-                            .min_size(egui::vec2(120.0, 28.0)),
-                    )
-                    .clicked()
-                {
-                    start_link(oauth::Provider::Google, active);
-                }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("Link Discord").color(theme::TEXT_HI))
-                            .min_size(egui::vec2(120.0, 28.0)),
-                    )
-                    .clicked()
-                {
-                    start_link(oauth::Provider::Discord, active);
-                }
-            });
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(
-                    "Clicking Link opens your browser to the provider's sign-in \
-                     page. The Cancel button stays available while you sign in; \
-                     this window updates automatically when the flow finishes. \
-                     CLI: `superdeduper account link google|discord`.",
+                .clicked()
+            {
+                start_link(oauth::Provider::Google, active);
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Link Discord").color(theme::TEXT_HI))
+                        .min_size(egui::vec2(120.0, 28.0)),
                 )
-                .color(theme::TEXT_LO)
-                .small(),
-            );
+                .clicked()
+            {
+                start_link(oauth::Provider::Discord, active);
+            }
+            ui.add_space(12.0);
         }
+        // Unlink: always visible, enabled only when linked.
+        // Greyed in anonymous state per Mick's 2026-05-25T01:20Z
+        // preference — keeps the action surface consistent.
+        let unlink_text = if is_linked {
+            RichText::new("Unlink").color(theme::HOT)
+        } else {
+            RichText::new("Unlink").color(theme::TEXT_LO)
+        };
+        let unlink_btn = egui::Button::new(unlink_text).min_size(egui::vec2(100.0, 28.0));
+        if ui.add_enabled(is_linked, unlink_btn).clicked() {
+            if let Err(e) = oauth::unlink_for(active) {
+                eprintln!("account: unlink failed: {e}");
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    if is_linked {
+        ui.label(
+            RichText::new(
+                "To switch providers, click Unlink first then choose \
+                 the other provider. Note: Unlink only clears the \
+                 local link record — the server-side binding stays \
+                 until the v1.1 unlink endpoint ships.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+    } else {
+        ui.label(
+            RichText::new(
+                "Clicking Link opens your browser to the provider's sign-in \
+                 page. The Cancel button stays available while you sign in; \
+                 this window updates automatically when the flow finishes. \
+                 CLI: `superdeduper account link google|discord`.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
     }
 }
 

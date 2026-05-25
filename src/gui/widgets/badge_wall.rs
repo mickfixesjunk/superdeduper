@@ -56,14 +56,11 @@ pub fn show(ui: &mut egui::Ui, state: &CatalogState) -> Option<BadgeWallAction> 
 }
 
 /// Process-wide flag for the "Login & Claim" provider chooser
-/// popup. `true` once the user clicks the CTA — next frame
-/// re-renders the chooser row instead of the CTA button. Cleared
-/// when the user picks a provider OR clicks Cancel OR the OAuth
-/// flow returns (success or failure).
-///
-/// Same Mutex-static pattern the settings modal uses for its
-/// sample-preview popup — keeps the widget signature stable
-/// without threading a new state struct through every caller.
+/// modal dialog. `true` once the user clicks the CTA — the next
+/// frame renders an `egui::Window` provider chooser on top of
+/// the badge wall. Cleared when the user picks a provider OR
+/// closes the dialog. Same Mutex-static pattern the settings
+/// modal uses for its sample-preview popup.
 static LOGIN_CTA_CHOOSER_OPEN: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
 
 /// Render the "Login & Claim" CTA + provider chooser, when the
@@ -143,64 +140,116 @@ fn render_login_cta(ui: &mut egui::Ui) {
         return;
     }
 
-    let mut open = LOGIN_CTA_CHOOSER_OPEN.lock();
-    if *open {
-        // Provider chooser row.
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Sign in with:")
-                    .color(theme::TEXT_HI)
-                    .small(),
-            );
-            let pick_google = ui
-                .add(
-                    egui::Button::new(RichText::new("Google").color(theme::TEXT_HI))
-                        .min_size(egui::vec2(80.0, 24.0)),
-                )
-                .clicked();
-            let pick_discord = ui
-                .add(
-                    egui::Button::new(RichText::new("Discord").color(theme::TEXT_HI))
-                        .min_size(egui::vec2(80.0, 24.0)),
-                )
-                .clicked();
-            let cancel = ui
-                .add(
-                    egui::Button::new(RichText::new("Cancel").color(theme::TEXT_LO))
-                        .min_size(egui::vec2(60.0, 24.0)),
-                )
-                .clicked();
-            if pick_google {
-                *open = false;
-                drop(open);
-                start_link(oauth::Provider::Google, active);
-            } else if pick_discord {
-                *open = false;
-                drop(open);
-                start_link(oauth::Provider::Discord, active);
-            } else if cancel {
-                *open = false;
-            }
-        });
-    } else {
-        let resp = ui
-            .add(
-                egui::Button::new(
-                    RichText::new("Login & Claim")
-                        .color(theme::PANEL_DEEP)
-                        .strong(),
-                )
-                .fill(theme::ACCENT)
-                .min_size(egui::vec2(140.0, 28.0)),
+    let resp = ui
+        .add(
+            egui::Button::new(
+                RichText::new("Login & Claim")
+                    .color(theme::PANEL_DEEP)
+                    .strong(),
             )
-            .on_hover_text(
-                "Sign in to permanently keep your achievements across all your machines",
-            );
-        if resp.clicked() {
-            *open = true;
-        }
+            .fill(theme::ACCENT)
+            .min_size(egui::vec2(140.0, 28.0)),
+        )
+        .on_hover_text(
+            "Sign in to permanently keep your achievements across all your machines",
+        );
+    if resp.clicked() {
+        *LOGIN_CTA_CHOOSER_OPEN.lock() = true;
     }
     ui.add_space(6.0);
+
+    // Modal provider-chooser dialog. Renders on top of the badge
+    // wall when the user has clicked Login & Claim. Per Mick's
+    // 2026-05-25T01:20Z preference, this is a modal dialog (not
+    // an inline chooser row) so the user's attention focuses on
+    // the provider choice; picking one starts the OAuth flow +
+    // closes the dialog.
+    render_provider_chooser_dialog(ui.ctx(), active);
+}
+
+/// Provider-chooser modal: rendered when the global
+/// `LOGIN_CTA_CHOOSER_OPEN` flag is set. Picking Google or
+/// Discord kicks off the OAuth flow + dismisses the modal; the
+/// inflight spinner then renders on the next frame via the
+/// CTA's `current_session_snapshot` branch.
+fn render_provider_chooser_dialog(
+    ctx: &egui::Context,
+    channel: crate::channel::Channel,
+) {
+    let mut open = LOGIN_CTA_CHOOSER_OPEN.lock();
+    if !*open {
+        return;
+    }
+    let mut close_after_render = false;
+    let mut start_provider: Option<crate::leaderboard::oauth::Provider> = None;
+    egui::Window::new(
+        RichText::new("Sign in to claim")
+            .color(theme::TEXT_HI)
+            .heading(),
+    )
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .default_width(360.0)
+    .show(ctx, |ui| {
+        ui.label(
+            RichText::new(
+                "Pick a provider to sign in with. Your achievements \
+                 will roll up under one account across all your machines.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Sign in with Google")
+                            .color(theme::PANEL_DEEP)
+                            .strong(),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(150.0, 32.0)),
+                )
+                .clicked()
+            {
+                start_provider = Some(crate::leaderboard::oauth::Provider::Google);
+                close_after_render = true;
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Sign in with Discord").color(theme::TEXT_HI))
+                        .min_size(egui::vec2(150.0, 32.0)),
+                )
+                .clicked()
+            {
+                start_provider = Some(crate::leaderboard::oauth::Provider::Discord);
+                close_after_render = true;
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Cancel").color(theme::TEXT_LO))
+                            .min_size(egui::vec2(80.0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    close_after_render = true;
+                }
+            });
+        });
+    });
+    if close_after_render {
+        *open = false;
+    }
+    drop(open);
+    if let Some(p) = start_provider {
+        start_link(p, channel);
+    }
 }
 
 /// Render the most-recent OAuth toast inline below the CTA. Goes
