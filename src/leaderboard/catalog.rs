@@ -204,6 +204,12 @@ pub struct CatalogState {
     /// on success; `Some(Err)` on terminal failure.
     pub catalog: Option<Result<Catalog, String>>,
     pub profile: Option<Result<Profile, String>>,
+    /// #77 — Cross-machine badge multiplier summary. Populated for
+    /// signed-in accounts; left None for anonymous installs.
+    /// Per-achievement `count` + `installs[]` list (see
+    /// `account_badge_summary` module for the wire shape).
+    pub account_badge_summary:
+        Option<Result<Vec<super::account_badge_summary::AccountBadgeEntry>, String>>,
 }
 
 impl CatalogState {
@@ -211,7 +217,38 @@ impl CatalogState {
         Self {
             catalog: None,
             profile: None,
+            account_badge_summary: None,
         }
+    }
+
+    /// #77 — look up the per-achievement multiplier. Returns 1
+    /// when no summary is loaded yet OR the achievement isn't in
+    /// the summary OR the user is anonymous. Single source of
+    /// truth so the badge_wall's overlay + the click-detail
+    /// panel both agree on the count to show.
+    pub fn multiplier_for(&self, achievement_id: &str) -> u32 {
+        self.account_badge_summary
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|entries| entries.iter().find(|e| e.achievement_id == achievement_id))
+            .map(|e| e.count)
+            .unwrap_or(1)
+    }
+
+    /// #77 — fetch the per-install detail rows for a given
+    /// achievement_id. Used by the click-detail panel. Returns
+    /// an empty slice when no summary is loaded / achievement
+    /// not in the summary.
+    pub fn installs_for(
+        &self,
+        achievement_id: &str,
+    ) -> &[super::account_badge_summary::AccountBadgeInstall] {
+        self.account_badge_summary
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|entries| entries.iter().find(|e| e.achievement_id == achievement_id))
+            .map(|e| e.installs.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -233,6 +270,14 @@ pub fn set_profile(r: Result<Profile, String>) {
     slot().lock().profile = Some(r);
 }
 
+/// #77 — store the cross-install badge-summary result. Called by
+/// the fetch worker after `account_badge_summary::fetch` returns.
+pub fn set_account_badge_summary(
+    r: Result<Vec<super::account_badge_summary::AccountBadgeEntry>, String>,
+) {
+    slot().lock().account_badge_summary = Some(r);
+}
+
 /// Spawn a background fetch for the catalog (always) and profile
 /// (only if registered). Called once at app start. Cheap to call
 /// twice; subsequent calls overwrite the slot with fresh data.
@@ -246,6 +291,33 @@ pub fn spawn_initial_fetch(server_url: String, install_id: Option<String>) {
             match fetch_profile(&server_url, &id) {
                 Ok(p) => set_profile(Ok(p)),
                 Err(e) => set_profile(Err(format!("{e:?}"))),
+            }
+            // #77 — also fetch the cross-install badge summary
+            // so the badge-wall multiplier overlay has data to
+            // render against. Best-effort — server may not have
+            // the endpoint deployed yet; the badge wall handles
+            // the no-data case (multiplier=1, no overlay).
+            if let Ok(Some(state)) = super::install::load() {
+                if state.install_id == id && state.registered {
+                    use super::account_badge_summary::{fetch, BadgeSummaryOutcome};
+                    match fetch(&state) {
+                        BadgeSummaryOutcome::Ok(entries) => {
+                            set_account_badge_summary(Ok(entries));
+                        }
+                        BadgeSummaryOutcome::Unauthorised(reason) => {
+                            set_account_badge_summary(Err(format!("auth: {reason}")));
+                        }
+                        BadgeSummaryOutcome::Rejected(reason) => {
+                            set_account_badge_summary(Err(format!("rejected: {reason}")));
+                        }
+                        BadgeSummaryOutcome::Transient(reason) => {
+                            // Endpoint not deployed yet (404) lands
+                            // here; engine treats as no-data + the
+                            // badge wall renders multiplier=1.
+                            set_account_badge_summary(Err(format!("transient: {reason}")));
+                        }
+                    }
+                }
             }
         }
     });

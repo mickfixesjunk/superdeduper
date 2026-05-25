@@ -1176,6 +1176,31 @@ impl SuperdeduperApp {
             BadgeWallAction::TileClicked(id) => {
                 eprintln!("badge-wall: tile clicked: {id}");
             }
+            BadgeWallAction::TileClickedMultiplier { achievement_id } => {
+                // #77 v1 — log the click + the cross-install
+                // summary so the user can see which installs
+                // earned this badge. v2 will wire this into a
+                // proper modal widget (BadgeMultiplierDetail);
+                // v1 ships the overlay rendering + the
+                // surface-via-log so Mick can validate the
+                // multiplier value end-to-end against his
+                // two-machine setup today.
+                let state = crate::leaderboard::catalog::peek_state();
+                let installs = state.installs_for(&achievement_id);
+                eprintln!(
+                    "badge-wall: multiplier clicked: {achievement_id} ×{} ({} install(s) earned: {})",
+                    state.multiplier_for(&achievement_id),
+                    installs.len(),
+                    installs
+                        .iter()
+                        .map(|i| i
+                            .nickname
+                            .clone()
+                            .unwrap_or_else(|| i.install_id_prefix.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
             BadgeWallAction::OpenProfile => {
                 let url = match install::load() {
                     Ok(Some(s)) => format!("https://superdeduper.io/profile/{}", s.install_id),
