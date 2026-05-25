@@ -1072,13 +1072,20 @@ fn render_account(ui: &mut egui::Ui) {
             display_name,
             ..
         }) => {
-            ui.label(
-                RichText::new(format!(
-                    "Status: Linked — {display_name} ({})",
-                    provider.display_name()
-                ))
-                .color(theme::TEXT_HI),
-            );
+            use crate::gui::widgets::oauth_chooser::provider_icon;
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Image::new(provider_icon(*provider))
+                        .max_size(egui::vec2(20.0, 20.0)),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Status: Linked — {display_name} ({})",
+                        provider.display_name()
+                    ))
+                    .color(theme::TEXT_HI),
+                );
+            });
         }
     }
     ui.add_space(4.0);

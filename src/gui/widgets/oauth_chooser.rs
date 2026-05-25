@@ -22,6 +22,16 @@ use crate::channel::Channel;
 use crate::gui::theme;
 use crate::leaderboard::{install, oauth};
 
+/// Embedded provider logos. 48x48 PNGs in `assets/`; reused by
+/// the modal chooser, the post-scan CTAs, the linked-state row
+/// above the badge grid, and the Settings → Account status row.
+pub fn provider_icon(provider: oauth::Provider) -> egui::ImageSource<'static> {
+    match provider {
+        oauth::Provider::Google => egui::include_image!("../../../../assets/48x48-google.png"),
+        oauth::Provider::Discord => egui::include_image!("../../../../assets/48x48-discord.png"),
+    }
+}
+
 /// Process-wide flag — `true` while the chooser modal is showing.
 /// Set by any CTA's "open chooser" click; cleared on pick/Cancel.
 static CHOOSER_OPEN: parking_lot::Mutex<bool> =
@@ -70,15 +80,20 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
         );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
+            // Icon + text per provider. egui::Button::image_and_text
+            // packs the logo + label into one click target so the
+            // user can hit the icon, the text, or anywhere between.
             if ui
                 .add(
-                    egui::Button::new(
+                    egui::Button::image_and_text(
+                        egui::Image::new(provider_icon(oauth::Provider::Google))
+                            .max_size(egui::vec2(20.0, 20.0)),
                         RichText::new("Sign in with Google")
                             .color(theme::PANEL_DEEP)
                             .strong(),
                     )
                     .fill(theme::ACCENT)
-                    .min_size(egui::vec2(150.0, 32.0)),
+                    .min_size(egui::vec2(170.0, 36.0)),
                 )
                 .clicked()
             {
@@ -87,10 +102,12 @@ pub fn show(ctx: &egui::Context, channel: Channel) {
             }
             if ui
                 .add(
-                    egui::Button::new(
+                    egui::Button::image_and_text(
+                        egui::Image::new(provider_icon(oauth::Provider::Discord))
+                            .max_size(egui::vec2(20.0, 20.0)),
                         RichText::new("Sign in with Discord").color(theme::TEXT_HI),
                     )
-                    .min_size(egui::vec2(150.0, 32.0)),
+                    .min_size(egui::vec2(170.0, 36.0)),
                 )
                 .clicked()
             {

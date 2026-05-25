@@ -178,6 +178,11 @@ enum MenuAction {
 impl SuperdeduperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
+        // egui_extras' image loaders enable `egui::include_image!`
+        // — used by the OAuth provider chooser + the linked-state
+        // affordances to embed the 48x48 PNG provider logos. One-
+        // time install at app boot.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let persisted: PersistedAppState = cc
             .storage
             .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdeduper.app.v1"))

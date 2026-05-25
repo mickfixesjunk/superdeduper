@@ -428,15 +428,18 @@ fn render_signin_cta(ui: &mut egui::Ui) {
     ui.label(RichText::new(copy).color(theme::TEXT_HI).strong());
     ui.add_space(4.0);
     ui.horizontal(|ui| {
+        use crate::gui::widgets::oauth_chooser::provider_icon;
         if ui
             .add(
-                egui::Button::new(
+                egui::Button::image_and_text(
+                    egui::Image::new(provider_icon(oauth::Provider::Google))
+                        .max_size(egui::vec2(20.0, 20.0)),
                     RichText::new("Connect Google")
                         .color(theme::PANEL_DEEP)
                         .strong(),
                 )
                 .fill(theme::ACCENT)
-                .min_size(egui::vec2(140.0, 28.0)),
+                .min_size(egui::vec2(160.0, 32.0)),
             )
             .clicked()
         {
@@ -444,8 +447,12 @@ fn render_signin_cta(ui: &mut egui::Ui) {
         }
         if ui
             .add(
-                egui::Button::new(RichText::new("Connect Discord").color(theme::TEXT_HI))
-                    .min_size(egui::vec2(140.0, 28.0)),
+                egui::Button::image_and_text(
+                    egui::Image::new(provider_icon(oauth::Provider::Discord))
+                        .max_size(egui::vec2(20.0, 20.0)),
+                    RichText::new("Connect Discord").color(theme::TEXT_HI),
+                )
+                .min_size(egui::vec2(160.0, 32.0)),
             )
             .clicked()
         {

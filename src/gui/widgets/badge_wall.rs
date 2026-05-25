@@ -125,10 +125,18 @@ fn render_login_cta(ui: &mut egui::Ui) {
         ..
     }) = &status
     {
+        use crate::gui::widgets::oauth_chooser::provider_icon;
         ui.horizontal(|ui| {
+            // Provider logo + "Signed in as X" line. Logo lives
+            // before the text so the eye picks up the icon
+            // first; size matches the line-height for a tidy row.
+            ui.add(
+                egui::Image::new(provider_icon(*provider))
+                    .max_size(egui::vec2(18.0, 18.0)),
+            );
             ui.label(
                 RichText::new(format!(
-                    "✓ Signed in as {} ({})",
+                    "Signed in as {} ({})",
                     display_name,
                     provider.display_name(),
                 ))
