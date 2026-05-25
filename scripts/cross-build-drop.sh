@@ -78,19 +78,19 @@ echo "    archive: ${ARCHIVE_DIR}"
 echo "    latest:  ${LATEST_DIR}"
 
 echo "==> Linux CLI (telemetry; musl static — no glibc dependency)"
-cargo zigbuild --release --features "telemetry" --bin superdeduper \
+cargo zigbuild --release --features "telemetry similar-images" --bin superdeduper \
   --target x86_64-unknown-linux-musl
 
 echo "==> Linux GUI (gui + telemetry; musl static — Ubuntu 20.04+ compat)"
-cargo zigbuild --release --features "gui telemetry" --bin superdeduper-gui \
+cargo zigbuild --release --features "gui telemetry similar-images" --bin superdeduper-gui \
   --target x86_64-unknown-linux-musl
 
 echo "==> Windows CLI (telemetry; cross-compile via cargo-zigbuild)"
-cargo zigbuild --release --features "telemetry" --bin superdeduper \
+cargo zigbuild --release --features "telemetry similar-images" --bin superdeduper \
   --target x86_64-pc-windows-gnu
 
 echo "==> Windows GUI (gui + telemetry + audio; cross-compile via cargo-zigbuild)"
-cargo zigbuild --release --features "gui telemetry audio" --bin superdeduper-gui \
+cargo zigbuild --release --features "gui telemetry audio similar-images" --bin superdeduper-gui \
   --target x86_64-pc-windows-gnu
 
 # Stage into the archive dir (never overwrite an existing per-sha
