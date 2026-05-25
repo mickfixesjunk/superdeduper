@@ -1554,12 +1554,19 @@ fn run(
                         None
                     }
                 },
-                // #89 — at GUI scan-finish, no destructive action has
-                // run yet (actions ship later via PATCH /actions).
-                // So this submission is intrinsically dry-run; server
-                // increments `lifetime_dry_run_count` accordingly,
-                // powering the `safety-first` cumulative achievement.
-                dry_run: Some(true),
+                // #89 — kept `None` per design's catalog-semantic
+                // flag (rollback from initial `Some(true)`). The
+                // `safety-first` achievement (catalog:932) describes
+                // "Used --dry-run 25+ times before commit" and sits
+                // on the skill/curation axis — it rewards deliberate
+                // dry-run *intent*, not every-submission protocol
+                // shape. Setting Some(true) per scan-finish would
+                // collapse the metric into "scanned 25+ times" and
+                // strip the curation semantic. Reactivate the field
+                // when a real dry-run UX ships: a future GUI
+                // "Preview without action" toggle, or CLI
+                // `superdeduper scan --dry-run`.
+                dry_run: None,
                 // #89 — group-reviews happen AFTER scan-finish, so
                 // the count is always 0 at initial submission time.
                 // Plumbed as `None` (omitted from payload) until a
