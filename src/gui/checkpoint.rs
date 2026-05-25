@@ -246,6 +246,7 @@ mod tests {
             files: vec![PathBuf::from("/tmp/x/a"), PathBuf::from("/tmp/x/b")],
             link_equivalent: false,
             unique_inodes: 2,
+            similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
         });
         save(&path, &cp).unwrap();
 

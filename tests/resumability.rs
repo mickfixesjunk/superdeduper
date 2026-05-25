@@ -49,6 +49,7 @@ fn sample_checkpoint() -> Checkpoint {
         ],
         link_equivalent: false,
         unique_inodes: 2,
+        similarity_kind: superdeduper::pipeline::SimilarityKind::ByteIdentical,
     });
     cp.record(&DuplicateGroupSummary {
         size: 4096,
@@ -59,6 +60,7 @@ fn sample_checkpoint() -> Checkpoint {
         ],
         link_equivalent: false,
         unique_inodes: 2,
+        similarity_kind: superdeduper::pipeline::SimilarityKind::ByteIdentical,
     });
     cp.saved_inventory = Some(vec![SavedFileEntry {
         path: PathBuf::from("C:\\Users\\Audio\\f.bin"),

@@ -1118,6 +1118,7 @@ fn run(
                 files: visible_files,
                 link_equivalent: g.link_equivalent,
                 unique_inodes: g.unique_inodes,
+                similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
             };
             checkpoint_state.record(&summary);
             let _ = tx.send(EngineEvent::DuplicateFound(summary));
@@ -1402,6 +1403,7 @@ fn run(
                     files: g.files,
                     link_equivalent: g.link_equivalent,
                     unique_inodes: g.unique_inodes,
+                    similarity_kind: g.similarity_kind,
                 };
                 let _ = tx.send(EngineEvent::DuplicateFound(summary));
             }
