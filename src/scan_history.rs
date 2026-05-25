@@ -83,8 +83,12 @@ use crate::pipeline::{DuplicateGroup, SimilarityKind};
 ///     ORIGINAL channel even after the user switched. Cross-
 ///     channel resubmit is blocked with a surfaced error.
 ///
-/// All v3 fields are `#[serde(default)]`; v1/v2 rows still load.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+/// All v3+v4 fields are `#[serde(default)]`; v1/v2/v3 rows still load.
+/// v4 (2026-05-25, #82): adds the reclaim-state fields (submission_id,
+/// reclaim_at_unix, reclaim_updated_at_unix, actually_reclaimed_bytes,
+/// action_breakdown) so the History tab can render scan-vs-reclaim
+/// state per row.
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Submission state at the time the row was last touched.
 /// v1 only ever writes `Pending`; v2 will transition through the
@@ -173,6 +177,43 @@ pub struct ScanRecord {
     /// knows the row has been retried.
     #[serde(default)]
     pub attempt_count: u32,
+    /// #82 — server-issued submission_id from the most-recent
+    /// `POST /api/v1/submit` Accepted response. `None` ⇒ the
+    /// scan was never submitted (anonymous flow / share-default
+    /// = Never / submission failed). Used as the join key
+    /// between this row and the action_submission worker's
+    /// PATCH outcome — when a reclaim PATCH succeeds, we look
+    /// up the matching ScanRecord by submission_id and update
+    /// its reclaim fields below.
+    #[serde(default)]
+    pub submission_id: Option<String>,
+    /// #82 — Unix seconds when the FIRST `PATCH /api/v1/submit/
+    /// {id}/actions` for this scan succeeded. `None` ⇒ no
+    /// reclaim has landed yet (scan-only state); the History
+    /// panel renders the row without a reclaim line.
+    #[serde(default)]
+    pub reclaim_at_unix: Option<u64>,
+    /// #82 — Unix seconds when the MOST RECENT PATCH for this
+    /// scan succeeded. Equals `reclaim_at_unix` for the common
+    /// single-PATCH case; differs only when the user re-ran
+    /// actions on the same scan (rare). History panel uses this
+    /// for the tooltip / hover detail.
+    #[serde(default)]
+    pub reclaim_updated_at_unix: Option<u64>,
+    /// #82 — Sum of `actions_taken_summary` values from the
+    /// most-recent successful PATCH. The "Actually reclaimed:
+    /// X" headline figure in the History panel reads from here.
+    /// `0` ⇒ either no PATCH yet OR every action failed.
+    #[serde(default)]
+    pub actually_reclaimed_bytes: u64,
+    /// #82 — per-LOCKED_ACTION_KEY byte breakdown from the
+    /// most-recent successful PATCH. Empty when no reclaim
+    /// has landed; populated with the same keys as the wire
+    /// `actions_taken_summary` map (`deleted_to_recycle_bytes`,
+    /// `deleted_permanently_bytes`, etc.). Drives the per-
+    /// action sub-line in the reclaim row.
+    #[serde(default)]
+    pub action_breakdown: BTreeMap<String, u64>,
 }
 
 /// Build the `groups_by_similarity_kind` map for a finished scan's
@@ -233,6 +274,14 @@ impl ScanRecord {
             built_with_install_id: None,
             last_attempt_at_unix: None,
             attempt_count: 0,
+            // #82 reclaim-state fields default to None/0/empty; the
+            // row's reclaim state is populated by
+            // `update_reclaim_for_submission` once the PATCH lands.
+            submission_id: None,
+            reclaim_at_unix: None,
+            reclaim_updated_at_unix: None,
+            actually_reclaimed_bytes: 0,
+            action_breakdown: BTreeMap::new(),
         }
     }
 
@@ -401,6 +450,60 @@ pub fn update_submission_state(
         record.last_attempt_at_unix = Some(unix_now());
         record.attempt_count = record.attempt_count.saturating_add(1);
     }
+    record_completed(&record)?;
+    Ok(true)
+}
+
+/// #82 — Stash the server-issued `submission_id` on the row that
+/// just submitted. Called from the GUI's submit-worker thread on
+/// `SubmitOutcome::Accepted`. Returns true if a row matched + was
+/// updated; false if the scan_id has been pruned or never existed.
+pub fn set_submission_id(scan_id: &str, submission_id: String) -> io::Result<bool> {
+    let mut record = match load(scan_id)? {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    record.submission_id = Some(submission_id);
+    record_completed(&record)?;
+    Ok(true)
+}
+
+/// #82 — Look up a ScanRecord by its server-issued submission_id
+/// (set via [`set_submission_id`] at POST-success time). Used by
+/// the action_submission worker's success path: after the PATCH
+/// lands, the worker needs to find the matching ScanRecord to
+/// stamp the reclaim fields onto. Returns `None` when no row has
+/// stashed this submission_id — either the scan was pruned, or
+/// the POST hadn't actually written the id back (e.g. an offline-
+/// session resubmit that never round-tripped through this path).
+pub fn find_by_submission_id(submission_id: &str) -> io::Result<Option<ScanRecord>> {
+    Ok(list()?
+        .into_iter()
+        .find(|r| r.submission_id.as_deref() == Some(submission_id)))
+}
+
+/// #82 — Stamp the reclaim-side fields onto a ScanRecord when
+/// the PATCH succeeds. Idempotent / overwrites — multi-PATCH on
+/// the same scan keeps `reclaim_at_unix` from the FIRST success
+/// (set only when None) and updates `reclaim_updated_at_unix` +
+/// the byte fields to the latest values. Returns true if a row
+/// matched.
+pub fn update_reclaim_for_submission(
+    submission_id: &str,
+    actually_reclaimed_bytes: u64,
+    action_breakdown: BTreeMap<String, u64>,
+) -> io::Result<bool> {
+    let mut record = match find_by_submission_id(submission_id)? {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    let now = unix_now();
+    if record.reclaim_at_unix.is_none() {
+        record.reclaim_at_unix = Some(now);
+    }
+    record.reclaim_updated_at_unix = Some(now);
+    record.actually_reclaimed_bytes = actually_reclaimed_bytes;
+    record.action_breakdown = action_breakdown;
     record_completed(&record)?;
     Ok(true)
 }
@@ -764,6 +867,88 @@ mod tests {
         let missing = update_submission_state("does-not-exist", SubmissionState::Failed, true)
             .expect("missing row is not an error");
         assert!(!missing);
+    }
+
+    /// #82 — `set_submission_id` round-trip plus `find_by_submission_id`
+    /// plus `update_reclaim_for_submission` all work end-to-end
+    /// against real disk state. Pins the scan-vs-reclaim join key.
+    #[test]
+    fn submission_id_and_reclaim_round_trip() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _td = isolate("reclaim-roundtrip");
+        let scan_id = new_scan_id();
+        let r = ScanRecord::new_finished(
+            scan_id.clone(),
+            1_700_000_000,
+            "prod",
+            vec![],
+            10,
+            5,
+            0,
+            123_456,
+            BTreeMap::new(),
+        );
+        record_completed(&r).unwrap();
+
+        // Pre-set: submission_id and reclaim fields default empty.
+        let before = load(&scan_id).unwrap().unwrap();
+        assert_eq!(before.submission_id, None);
+        assert_eq!(before.reclaim_at_unix, None);
+        assert_eq!(before.actually_reclaimed_bytes, 0);
+        assert!(before.action_breakdown.is_empty());
+
+        // set_submission_id stamps the server id.
+        let sid = "0123-4567-89ab-cdef".to_string();
+        let ok = set_submission_id(&scan_id, sid.clone()).unwrap();
+        assert!(ok);
+        let after_set = load(&scan_id).unwrap().unwrap();
+        assert_eq!(after_set.submission_id.as_deref(), Some(sid.as_str()));
+
+        // find_by_submission_id resolves it.
+        let found = find_by_submission_id(&sid).unwrap().unwrap();
+        assert_eq!(found.scan_id, scan_id);
+
+        // update_reclaim stamps the bytes + breakdown.
+        let mut breakdown = BTreeMap::new();
+        breakdown.insert("deleted_to_recycle_bytes".to_string(), 8 * 1024 * 1024);
+        breakdown.insert("hardlink_replaced_bytes".to_string(), 4 * 1024 * 1024);
+        let total = breakdown.values().sum();
+        let ok = update_reclaim_for_submission(&sid, total, breakdown.clone()).unwrap();
+        assert!(ok);
+        let after_reclaim = load(&scan_id).unwrap().unwrap();
+        assert!(after_reclaim.reclaim_at_unix.is_some());
+        assert!(after_reclaim.reclaim_updated_at_unix.is_some());
+        assert_eq!(after_reclaim.actually_reclaimed_bytes, total);
+        assert_eq!(after_reclaim.action_breakdown, breakdown);
+
+        // Idempotent re-update keeps reclaim_at_unix from the first
+        // call + updates reclaim_updated_at_unix.
+        let first_at = after_reclaim.reclaim_at_unix.unwrap();
+        let mut breakdown2 = BTreeMap::new();
+        breakdown2.insert("archived_bytes".to_string(), 99_999);
+        // Need a noticeable wait between updates so the second
+        // reclaim_updated_at_unix can differ from the first.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        update_reclaim_for_submission(&sid, 99_999, breakdown2.clone()).unwrap();
+        let after2 = load(&scan_id).unwrap().unwrap();
+        assert_eq!(
+            after2.reclaim_at_unix,
+            Some(first_at),
+            "reclaim_at_unix is set-once",
+        );
+        assert!(
+            after2.reclaim_updated_at_unix.unwrap() >= first_at,
+            "reclaim_updated_at_unix bumps to latest",
+        );
+        assert_eq!(after2.actually_reclaimed_bytes, 99_999);
+        assert_eq!(after2.action_breakdown, breakdown2);
+
+        // Missing row → Ok(false).
+        let none = set_submission_id("does-not-exist", "xyz".into()).unwrap();
+        assert!(!none);
+        let none2 =
+            update_reclaim_for_submission("not-a-real-id", 0, BTreeMap::new()).unwrap();
+        assert!(!none2);
     }
 
     /// #41 — `prune_older_than(0)` is a no-op (used by GUI when the

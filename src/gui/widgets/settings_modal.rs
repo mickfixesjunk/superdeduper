@@ -2318,6 +2318,7 @@ fn build_sample_payload_json() -> String {
     let inputs = submission::SubmissionInputs {
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         run_uuid: "00000000-0000-0000-0000-000000000000".into(),
+        scan_id: None,
         hardware: hardware::detect(),
         run_shape: submission::RunShape {
             wall_clock_seconds: 137.4,

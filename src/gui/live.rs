@@ -1394,6 +1394,13 @@ fn run(
             total_dups,
         ),
     });
+    // #82 — Hoist scan_id generation above the SubmissionInputs build
+    // so it can be threaded into BOTH the inputs (for #82's
+    // submission_id-back-onto-ScanRecord join) AND the
+    // record_completed call below. Pre-#82 the id was generated only
+    // at record_completed; now we share one id across both call
+    // sites in this fn.
+    let scan_id_for_this_run = crate::scan_history::new_scan_id();
     // #41 v3 — scan_history v2 persists the canonical payload so the
     // History tab's Resubmit button has something ready-to-POST. Built
     // inside the telemetry cfg block below (alongside the existing
@@ -1478,6 +1485,7 @@ fn run(
         let inputs = SubmissionInputs {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             run_uuid: uuid::Uuid::new_v4().to_string(),
+            scan_id: Some(scan_id_for_this_run.clone()),
             hardware: hardware::detect(),
             run_shape: RunShape {
                 wall_clock_seconds,
@@ -1710,7 +1718,7 @@ fn run(
             .collect();
         #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))]
         let mut record = crate::scan_history::ScanRecord::new_finished(
-            crate::scan_history::new_scan_id(),
+            scan_id_for_this_run.clone(),
             started_at_unix,
             channel_slug,
             root_strings,

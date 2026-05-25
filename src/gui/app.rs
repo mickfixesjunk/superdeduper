@@ -1051,6 +1051,25 @@ impl SuperdeduperApp {
                 );
                 // #79 — stash for the post-Go PATCH client.
                 submission::store_pending_submission_id(submission_id.clone());
+                // #82 — stamp the server-issued submission_id onto
+                // the History row that produced this submission so
+                // the History panel can render scan-vs-reclaim. The
+                // scan_id was threaded in via SubmissionInputs at
+                // scan-finish; resubmit-from-history flows skip
+                // because their inputs.scan_id wouldn't change the
+                // row state (it already has a submission_id).
+                if let Some(scan_id) = inputs.scan_id.as_deref() {
+                    if let Err(e) = crate::scan_history::set_submission_id(
+                        scan_id,
+                        submission_id.clone(),
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            scan_id = %scan_id,
+                            "scan_history: set_submission_id failed (non-fatal)",
+                        );
+                    }
+                }
             }
             // Clear the pending slot only when the server accepted
             // the payload (or has it on file via 409). Rejected /

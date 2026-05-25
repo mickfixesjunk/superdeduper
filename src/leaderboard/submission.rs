@@ -42,6 +42,14 @@ pub struct SubmissionInputs {
     /// diagnostic logging (e.g. "payload built for run X"). NOT on
     /// the wire; backend assigns its own submission_id.
     pub run_uuid: String,
+    /// #82 — `scan_history::ScanRecord::scan_id` of the row this
+    /// submission belongs to. Threaded through so the submit
+    /// worker can stamp the server-issued `submission_id` back
+    /// onto the right history row at POST-success time. `None`
+    /// when telemetry is off OR the submission path is not the
+    /// freshly-finished scan (e.g. resubmit from history, which
+    /// already has the scan_id from a different path).
+    pub scan_id: Option<String>,
 }
 
 /// `run_shape` block per backend schema.
@@ -908,6 +916,7 @@ mod tests {
         SubmissionInputs {
             client_version: "0.1.0".into(),
             run_uuid: "9d4a0000-0000-0000-0000-000000000001".into(),
+            scan_id: None,
             hardware: crate::leaderboard::hardware::detect(),
             run_shape: RunShape {
                 wall_clock_seconds: 5.678,

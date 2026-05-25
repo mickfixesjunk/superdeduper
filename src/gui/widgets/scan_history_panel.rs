@@ -91,7 +91,7 @@ pub fn show(ui: &mut Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("scan_history_grid")
-                .num_columns(6)
+                .num_columns(7)
                 .spacing([12.0, 6.0])
                 .striped(true)
                 .show(ui, |ui| {
@@ -140,6 +140,7 @@ fn header_row(ui: &mut Ui) {
     hdr(ui, "Scope");
     hdr(ui, "Files");
     hdr(ui, "Duplicates");
+    hdr(ui, "Reclaimed");
     hdr(ui, "Status");
     hdr(ui, "Actions");
     ui.end_row();
@@ -179,7 +180,9 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
             .monospace(),
     );
 
-    // Duplicates + reclaim summary, combined.
+    // Duplicates + reclaimable summary, combined. (#82: this is
+    // the "what was scannable" figure, distinct from the
+    // "actually reclaimed" column below.)
     let reclaim = humansize::format_size(record.reclaimable_bytes, humansize::BINARY);
     ui.label(
         RichText::new(format!(
@@ -188,6 +191,40 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
         ))
         .color(theme::TEXT_HI),
     );
+
+    // #82 — Actually-reclaimed column. None ⇒ scan-only (the
+    // user never clicked Go or actions failed); Some ⇒
+    // "♻ X.Y GB" with a hover tooltip showing the per-action
+    // breakdown. Distinct visual from the "reclaimable" figure
+    // above so users can see at a glance what they actually
+    // followed through on.
+    if record.reclaim_at_unix.is_some() {
+        let actually = humansize::format_size(
+            record.actually_reclaimed_bytes,
+            humansize::BINARY,
+        );
+        let cell = ui.label(
+            RichText::new(format!("♻ {actually}"))
+                .color(theme::ACCENT)
+                .monospace(),
+        );
+        if !record.action_breakdown.is_empty() {
+            let tooltip = action_breakdown_tooltip(record);
+            cell.on_hover_text(tooltip);
+        }
+    } else {
+        ui.label(
+            RichText::new("—")
+                .color(theme::TEXT_LO)
+                .monospace()
+                .small(),
+        )
+        .on_hover_text(
+            "Scan only — no actions were taken on this run. Run \
+             Recycle / Hardlink / Reflink / Archive on the groups \
+             to credit reclaim bytes to your profile.",
+        );
+    }
 
     // Status pill. v1 always reads "pending" because the resubmit
     // path is v2 work, but we render it as a proper pill anyway so
@@ -432,6 +469,43 @@ fn truncate_tail(s: &str, cap: usize) -> String {
     let skip = s.chars().count() - cap + 1;
     let tail: String = s.chars().skip(skip).collect();
     format!("…{tail}")
+}
+
+/// #82 — Compose the hover tooltip for the Reclaimed column. One
+/// line per locked-action key with non-zero bytes, plus a header
+/// summary. Stable key ordering matches the `LOCKED_ACTION_KEYS`
+/// list so the breakdown reads the same way across rows.
+fn action_breakdown_tooltip(record: &ScanRecord) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let reclaim_at = record
+        .reclaim_at_unix
+        .map(format_unix_local)
+        .unwrap_or_else(|| "—".into());
+    lines.push(format!("Reclaim landed: {reclaim_at}"));
+    if let Some(updated) = record.reclaim_updated_at_unix {
+        if Some(updated) != record.reclaim_at_unix {
+            lines.push(format!("Most recent update: {}", format_unix_local(updated)));
+        }
+    }
+    lines.push(String::new()); // blank between header + body
+    let labels = [
+        ("deleted_to_recycle_bytes", "Recycle"),
+        ("deleted_permanently_bytes", "Remove"),
+        ("hardlink_replaced_bytes", "Hardlink"),
+        ("reflink_replaced_bytes", "Reflink"),
+        ("archived_bytes", "Archive"),
+    ];
+    for (key, label) in labels {
+        if let Some(bytes) = record.action_breakdown.get(key) {
+            if *bytes > 0 {
+                lines.push(format!(
+                    "  {label}: {}",
+                    humansize::format_size(*bytes, humansize::BINARY),
+                ));
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 /// Compact count formatting: `42`, `1.2k`, `15.3k`, `2.1M`. Matches

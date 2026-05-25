@@ -302,6 +302,23 @@ pub fn spawn_submit_worker(
                         lifetime_bytes_reclaimed,
                         newly_granted_achievements,
                     } => {
+                        // #82 — stamp the reclaim figures back onto
+                        // the matching ScanRecord so the History
+                        // tab renders the two-row scan+reclaim
+                        // shape. Sum the action_keys for the
+                        // "actually reclaimed" headline; pass the
+                        // full map as the action_breakdown sub-line.
+                        let actually_reclaimed_bytes: u64 =
+                            actions_taken_summary.values().sum();
+                        if let Err(e) = crate::scan_history::update_reclaim_for_submission(
+                            &submission_id,
+                            actually_reclaimed_bytes,
+                            actions_taken_summary.clone(),
+                        ) {
+                            eprintln!(
+                                "scan_history: update_reclaim_for_submission failed for {submission_id} ({e})"
+                            );
+                        }
                         store_status(ActionSubmissionStatus::Credited {
                             lifetime_bytes_reclaimed,
                             newly_granted_achievements,
