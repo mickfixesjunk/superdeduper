@@ -350,24 +350,27 @@ pub struct ScanArgs {
 
     /// Hamming-distance threshold for `--mode image`. Pairs of
     /// images whose perceptual hashes are within this many bits
-    /// of one another group together. Per spec §2 the default 5
-    /// (~92% bit-similarity) catches resize / format-conversion /
-    /// minor color-edit twins without false-positive flood. Tighter
-    /// thresholds (1–3) are useful for high-precision triage;
-    /// looser (8–10) catches heavier edits at higher false-positive
-    /// rate.
-    #[arg(long, value_name = "BITS", default_value_t = 5)]
+    /// of one another group together. Default 10 is calibrated for
+    /// photo content (resize / format-conversion / heavier edits)
+    /// when paired with the default `--image-hash-algorithm phash`;
+    /// keeps precision at 1.0 while lifting recall ~7pp over the
+    /// pre-v0.2.11 default of 5. If your corpus skews procedural
+    /// (screenshots, generated UI, synthetic art) and you see
+    /// false-positive flood, switch to `--image-hash-algorithm dhash
+    /// --image-similarity-threshold 5` — that combination resists
+    /// the phash-on-procedural precision collapse.
+    #[arg(long, value_name = "BITS", default_value_t = 10)]
     pub image_similarity_threshold: u32,
 
     /// Perceptual-hash algorithm used by `--mode image` (#45).
-    /// Defaults to `dhash` (DifferenceHash) per spec §2's
-    /// "ship dHash as default" recommendation — fast + robust enough
-    /// for typical phone-photo / screenshot dedupe. `ahash` (mean) is
-    /// cheaper, good as a prefilter only. `phash` (DCT) is more
-    /// robust to rotation + heavy edits at higher CPU cost. Exposed
-    /// so testrunner can empirically compare precision/recall/F1
-    /// across the three algorithms against a labeled corpus.
-    #[arg(long, value_enum, default_value_t = ImageHashAlgoArg::Dhash)]
+    /// Defaults to `phash` (DCT-based) — empirically beats dhash on
+    /// real photo content (+6.5pp T1 recall, +0.067 F1 on the
+    /// testrunner CC0 retest). `dhash` (DifferenceHash) is the right
+    /// pick for procedural / screenshot-dominant corpora where phash
+    /// false-positives flood the result; pair it with
+    /// `--image-similarity-threshold 5` for that path. `ahash` (mean)
+    /// is cheaper and useful as a prefilter only.
+    #[arg(long, value_enum, default_value_t = ImageHashAlgoArg::Phash)]
     pub image_hash_algorithm: ImageHashAlgoArg,
 
     /// Average per-chunk Hamming-distance threshold for `--mode audio`.
@@ -413,11 +416,11 @@ pub enum HashAlgoArg {
 pub enum ImageHashAlgoArg {
     /// Average hash — cheap, prefilter-only.
     Ahash,
-    /// Difference hash — default, balanced.
-    #[default]
+    /// Difference hash — robust on procedural / screenshot content;
+    /// pair with `--image-similarity-threshold 5`.
     Dhash,
-    /// Perceptual (DCT) hash — most robust to rotation + heavy
-    /// edits, higher CPU.
+    /// Perceptual (DCT) hash — default; best on real photos.
+    #[default]
     Phash,
 }
 

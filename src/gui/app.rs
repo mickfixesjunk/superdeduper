@@ -886,9 +886,10 @@ impl SuperdeduperApp {
             self.cancel.clone(),
             defender_rtp_pre,
             self.scan_mode,
-            5, // image_similarity_threshold — TODO add a Settings input
-            // when v3 ships the GUI threshold control.
-            crate::cli::ImageHashAlgoArg::default(), // dhash; Settings TODO too.
+            10, // image_similarity_threshold — TODO add a Settings input
+            // when v3 ships the GUI threshold control. Default 10 matches
+            // the CLI default (#87, phash-tuned for photo corpora).
+            crate::cli::ImageHashAlgoArg::default(), // phash; Settings TODO too.
             5.0, // audio_similarity_threshold — same Settings TODO.
         );
     }
