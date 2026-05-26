@@ -36,6 +36,36 @@ pub fn show(ui: &mut Ui, state: &UiState) {
                     .small(),
             );
         }
+        // Copy-to-clipboard button. Pulls every log entry in the
+        // buffer (not just the visible 500), formats as plain text
+        // with the same `info / warn / error` prefix the panel
+        // shows, and dumps to the OS clipboard via egui's built-in
+        // `output_mut`. Useful for Mick's repro-and-share flow
+        // where pasting the engine log into a comms channel is the
+        // diagnostic step.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("📋 Copy")
+                .on_hover_text(
+                    "Copy every log entry to the clipboard so you can paste into a bug report",
+                )
+                .clicked()
+            {
+                let mut buf = String::with_capacity(state.logs.len() * 80);
+                for entry in &state.logs {
+                    let tag = match entry.level {
+                        LogLevel::Info => "info ",
+                        LogLevel::Warn => "warn ",
+                        LogLevel::Error => "error",
+                    };
+                    buf.push_str(tag);
+                    buf.push(' ');
+                    buf.push_str(&entry.message);
+                    buf.push('\n');
+                }
+                ui.ctx().copy_text(buf);
+            }
+        });
     });
     ui.add_space(2.0);
 
