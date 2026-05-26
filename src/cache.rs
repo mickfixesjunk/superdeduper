@@ -86,6 +86,47 @@ pub struct CachedHashes {
     pub tier3_hash: Option<Vec<u8>>,
 }
 
+/// #99 PR3 — Cache lookup outcome with the structural detail
+/// `lookup()`'s `Option<CachedHashes>` flattens away. Distinguishes
+/// "no row" from "row exists but file drifted"; the hash pipeline
+/// uses Drift detection to tally per-file re-validation events for
+/// the UI status surface (resume runs no longer silently
+/// restart-from-zero on USN advance per #52).
+#[derive(Debug, Clone)]
+pub enum LookupOutcome {
+    /// Cache row matches all (size, mtime, usn) — hashes returned.
+    Hit(CachedHashes),
+    /// Cache row exists but key fields changed since last hash.
+    /// File will be re-hashed; bump the drift counter.
+    Drift {
+        reason: DriftReason,
+    },
+    /// No cache row for this `(volume_guid, file_ref, hash_algo)`.
+    /// File has either never been hashed or its inode was reused.
+    NoRow,
+}
+
+/// Which axis of (size, mtime, usn) caused the cache invalidation.
+/// Checked in order; first mismatch wins. Future per-axis breakdown
+/// could be useful — e.g., counting USN-only drift vs mtime-touch
+/// vs size-change separately would let us flag "files that grew"
+/// (typical: log append) vs "files that shrank" (typical: truncate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftReason {
+    /// File size changed since last hash. Strongest signal of
+    /// real-content change.
+    Size,
+    /// File mtime advanced; size unchanged. Could be "touched
+    /// without modification" (rare) or "modified to same length
+    /// with different content."
+    Mtime,
+    /// USN-journal sequence advanced; size + mtime unchanged.
+    /// Windows-specific signal that any of a broader set of
+    /// attributes changed (metadata, attributes flag, security
+    /// descriptor); content may or may not have changed.
+    Usn,
+}
+
 /// Persistent companion to the warm-path Stage 1 enumerator.
 /// `journal_id` and `last_usn` together identify "the journal state
 /// at the moment we last enumerated this volume". When we come back
@@ -286,8 +327,20 @@ impl Cache {
     /// the cached `(size, mtime, usn)` differ from the supplied key —
     /// i.e. the file has changed since we last hashed it.
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<CachedHashes>> {
-        // Row layout from the SELECT below. Aliased so the function
-        // signature isn't a 100-column horror.
+        match self.lookup_detailed(key)? {
+            LookupOutcome::Hit(h) => Ok(Some(h)),
+            LookupOutcome::Drift { .. } | LookupOutcome::NoRow => Ok(None),
+        }
+    }
+
+    /// #99 PR3 — Same lookup, but distinguishes "no cache row" from
+    /// "row exists but file drifted." Powers the per-file
+    /// revalidation status surfaced to the UI on resume runs so
+    /// users don't see opaque progress restart-from-zero (#52).
+    /// The `Drift` variant carries the kind of drift that caused
+    /// the invalidation so per-axis counts can be tallied if
+    /// future work wants the breakdown.
+    pub fn lookup_detailed(&self, key: &CacheKey) -> Result<LookupOutcome> {
         type Row = (
             i64,             // size
             i64,             // mtime
@@ -319,13 +372,25 @@ impl Cache {
 
         let (size, mtime, usn, t0, t1, t2, t3) = match row {
             Some(r) => r,
-            None => return Ok(None),
+            None => return Ok(LookupOutcome::NoRow),
         };
-        if size as u64 != key.size || mtime != key.mtime || usn != key.usn {
-            return Ok(None);
+        if size as u64 != key.size {
+            return Ok(LookupOutcome::Drift {
+                reason: DriftReason::Size,
+            });
+        }
+        if mtime != key.mtime {
+            return Ok(LookupOutcome::Drift {
+                reason: DriftReason::Mtime,
+            });
+        }
+        if usn != key.usn {
+            return Ok(LookupOutcome::Drift {
+                reason: DriftReason::Usn,
+            });
         }
 
-        Ok(Some(CachedHashes {
+        Ok(LookupOutcome::Hit(CachedHashes {
             tier0_fingerprint: t0,
             tier1_hash: t1,
             tier2_hash: t2,
@@ -845,6 +910,72 @@ mod tests {
         cache.store(&k, &hashes).unwrap();
         let modified = key(42, 1024, 100_000, 8);
         assert!(cache.lookup(&modified).unwrap().is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn lookup_detailed_distinguishes_no_row_from_drift_kinds() {
+        // #99 PR3 — verify the structured outcome the hash pipeline
+        // uses to bump cache_drift_misses (vs no-row, which doesn't
+        // signal "file changed since last hash").
+        let p = tmp_db();
+        let cache = Cache::open(&p).unwrap();
+        let k = key(42, 1024, 100_000, 7);
+        let hashes = CachedHashes {
+            tier3_hash: Some(vec![0xABu8; 32]),
+            ..CachedHashes::default()
+        };
+        cache.store(&k, &hashes).unwrap();
+
+        // Hit — exact match.
+        match cache.lookup_detailed(&k).unwrap() {
+            LookupOutcome::Hit(h) => assert_eq!(h.tier3_hash, Some(vec![0xABu8; 32])),
+            other => panic!("expected Hit, got {other:?}"),
+        }
+
+        // Size drift.
+        let size_drift = key(42, 2048, 100_000, 7);
+        assert!(
+            matches!(
+                cache.lookup_detailed(&size_drift).unwrap(),
+                LookupOutcome::Drift {
+                    reason: DriftReason::Size
+                }
+            ),
+            "size change must classify as Drift{{Size}}"
+        );
+
+        // Mtime drift.
+        let mtime_drift = key(42, 1024, 100_001, 7);
+        assert!(
+            matches!(
+                cache.lookup_detailed(&mtime_drift).unwrap(),
+                LookupOutcome::Drift {
+                    reason: DriftReason::Mtime
+                }
+            ),
+            "mtime change must classify as Drift{{Mtime}}"
+        );
+
+        // USN drift — #52's primary signal.
+        let usn_drift = key(42, 1024, 100_000, 8);
+        assert!(
+            matches!(
+                cache.lookup_detailed(&usn_drift).unwrap(),
+                LookupOutcome::Drift {
+                    reason: DriftReason::Usn
+                }
+            ),
+            "usn change must classify as Drift{{Usn}}"
+        );
+
+        // No row — different file_ref.
+        let missing = key(99, 1024, 100_000, 7);
+        assert!(matches!(
+            cache.lookup_detailed(&missing).unwrap(),
+            LookupOutcome::NoRow
+        ));
+
         std::fs::remove_file(&p).ok();
     }
 

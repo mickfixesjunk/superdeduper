@@ -81,6 +81,15 @@ const TIER3_BUF: usize = 1 << 20;
 pub struct HashCounters {
     pub cache_hits: AtomicU64,
     pub cache_writes: AtomicU64,
+    /// #99 PR3 — Count of cache rows that EXISTED for a file but
+    /// were invalidated at lookup time because (size / mtime / usn)
+    /// didn't match. Distinct from "no cache row at all" — these
+    /// are files we'd previously hashed whose on-disk state has
+    /// drifted since (USN-advance, mtime touch, size change).
+    /// Surfaced in the gui/live.rs scan-finish summary as
+    /// "X files re-validated after FS changes" so resume runs
+    /// don't silently restart-at-zero per #52.
+    pub cache_drift_misses: AtomicU64,
     pub bytes_read: AtomicU64,
     /// Microseconds spent computing a fresh hash at each tier
     /// (cache hits and failures excluded — only successful
@@ -228,6 +237,9 @@ fn run_with_counters_inner(
         HashCounters {
             cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
             cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
+            cache_drift_misses: AtomicU64::new(
+                arc.cache_drift_misses.load(Ordering::Relaxed),
+            ),
             bytes_read: AtomicU64::new(arc.bytes_read.load(Ordering::Relaxed)),
             tier_micros: snap_arr(&arc.tier_micros),
             tier_bytes: snap_arr(&arc.tier_bytes),
@@ -713,19 +725,36 @@ where
 {
     if let Some(c) = cache {
         if let Some(key) = cache_key(f, algo) {
-            if let Ok(Some(cached)) = c.lock().lookup(&key) {
-                if let Some(h) = pick_hash(&cached, tier) {
-                    counters.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    if let Some(cb) = on_file {
-                        cb(
-                            &f.entry.path,
-                            tier_index(tier),
-                            ProgressOutcome::Cached {
-                                bytes: f.entry.size,
-                            },
-                        );
+            match c.lock().lookup_detailed(&key) {
+                Ok(crate::cache::LookupOutcome::Hit(cached)) => {
+                    if let Some(h) = pick_hash(&cached, tier) {
+                        counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        if let Some(cb) = on_file {
+                            cb(
+                                &f.entry.path,
+                                tier_index(tier),
+                                ProgressOutcome::Cached {
+                                    bytes: f.entry.size,
+                                },
+                            );
+                        }
+                        return Ok(h);
                     }
-                    return Ok(h);
+                }
+                Ok(crate::cache::LookupOutcome::Drift { .. }) => {
+                    // #99 PR3 — file existed in cache but drifted
+                    // (size / mtime / usn). Bump the counter so the
+                    // gui/live.rs scan-finish summary can surface
+                    // "X files re-validated after FS changes"
+                    // instead of opaque restart-from-zero per #52.
+                    counters
+                        .cache_drift_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(crate::cache::LookupOutcome::NoRow) | Err(_) => {
+                    // No cache row at all (or lookup error) — fall
+                    // through to compute path. No drift counter
+                    // bump; this isn't a "file changed" signal.
                 }
             }
         }
@@ -787,20 +816,29 @@ where
 {
     if let Some(c) = cache {
         if let Some(key) = cache_key(f, algo) {
-            if let Ok(Some(cached)) = c.lock().lookup(&key) {
-                if let Some(h) = pick_hash(&cached, tier) {
-                    counters.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    if let Some(cb) = on_file {
-                        cb(
-                            &f.entry.path,
-                            tier_index(tier),
-                            ProgressOutcome::Cached {
-                                bytes: f.entry.size,
-                            },
-                        );
+            match c.lock().lookup_detailed(&key) {
+                Ok(crate::cache::LookupOutcome::Hit(cached)) => {
+                    if let Some(h) = pick_hash(&cached, tier) {
+                        counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        if let Some(cb) = on_file {
+                            cb(
+                                &f.entry.path,
+                                tier_index(tier),
+                                ProgressOutcome::Cached {
+                                    bytes: f.entry.size,
+                                },
+                            );
+                        }
+                        return Some(h);
                     }
-                    return Some(h);
                 }
+                Ok(crate::cache::LookupOutcome::Drift { .. }) => {
+                    // #99 PR3 — mirror tiered() drift counter bump.
+                    counters
+                        .cache_drift_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(crate::cache::LookupOutcome::NoRow) | Err(_) => {}
             }
         }
     }

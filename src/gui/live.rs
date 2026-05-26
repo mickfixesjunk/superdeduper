@@ -891,6 +891,12 @@ fn run(
         },
     });
     let mut total_cache_hits: u64 = 0;
+    // #99 PR3 — Tally of files whose cache row existed but
+    // invalidated at lookup time (size / mtime / usn drift). Summed
+    // across chunks; surfaced at scan-finish as the
+    // "X files re-validated after FS changes" status line so resume
+    // runs don't silently appear to restart-at-zero per #52.
+    let mut total_cache_drift_misses: u64 = 0;
     let mut total_cache_writes: u64 = 0;
 
     // Smaller chunks → more frequent updates between chunks. We also
@@ -1222,6 +1228,10 @@ fn run(
             total_cache_hits.saturating_add(counters.cache_hits.load(Ordering::Relaxed));
         total_cache_writes =
             total_cache_writes.saturating_add(counters.cache_writes.load(Ordering::Relaxed));
+        // #99 PR3 — Sum the per-file drift counter across chunks so
+        // the scan-finish summary can surface re-validation count.
+        total_cache_drift_misses = total_cache_drift_misses
+            .saturating_add(counters.cache_drift_misses.load(Ordering::Relaxed));
         for i in 0..4 {
             tier_micros_total[i] = tier_micros_total[i]
                 .saturating_add(counters.tier_micros[i].load(Ordering::Relaxed));
@@ -1434,6 +1444,22 @@ fn run(
             hit_rate
         ),
     });
+    // #99 PR3 — Per testdesign B2-USN spec. When a resumed scan
+    // finds cache rows that drifted (size/mtime/usn changed since
+    // the prior hash), surface the count so the user understands
+    // why progress visibly restarted from low cache-hit ratio
+    // instead of the expected fast-forward. Closes #52: the
+    // restart-at-zero symptom now has an explicit "X files
+    // re-validated after FS changes" log line.
+    if total_cache_drift_misses > 0 {
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "cache: {total_cache_drift_misses} file(s) re-validated after FS changes \
+                 (cache row existed but size/mtime/usn drifted — file modified between scans)"
+            ),
+        });
+    }
     // Diagnostic: surface both reclaim flavors + bytes_read at
     // scan-end so a "reclaim > read" report (hardlink-heavy corpora,
     // partial-hardlink groups with stale unique_inodes, etc.) is
