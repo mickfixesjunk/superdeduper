@@ -181,6 +181,23 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
     // through rubato + push the i16-converted output into chromaprint.
     let mut mono_buf: Vec<f32> = Vec::with_capacity(RESAMPLE_CHUNK * 4);
 
+    // feat/audio-resample-opt — pre-allocate rubato input + output
+    // buffers + i16 PCM staging so the hot loop has zero per-chunk
+    // heap allocs. v0.2.12 v2 allocated 2-3 Vecs per RESAMPLE_CHUNK
+    // (input drain.collect, rubato process output, pcm i16 collect)
+    // — for a 4-minute 44.1kHz file that's 20-30K small allocs per
+    // file. AT5 N=500 hits ~10-15M small allocs total, which showed
+    // up as the +37% wall-clock regression vs dc3dfe9.
+    //
+    // Pattern: input_buffer_allocate(true) + output_buffer_allocate(true)
+    // give us correctly-sized Vec<Vec<f32>> (1 channel × N frames).
+    // process_into_buffer reads from input slice + writes to output
+    // slice with no allocation. pcm_buf is grown once to the max
+    // output frame count then reused via clear()+extend.
+    let mut input_buf: Vec<Vec<f32>> = resampler.input_buffer_allocate(true);
+    let mut output_buf: Vec<Vec<f32>> = resampler.output_buffer_allocate(true);
+    let mut pcm_buf: Vec<i16> = Vec::with_capacity(resampler.output_frames_max());
+
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -260,18 +277,24 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
         }
 
         // Drain in RESAMPLE_CHUNK-sized blocks through rubato.
+        // Zero-alloc per chunk: copy into pre-sized input_buf[0],
+        // call process_into_buffer, refill pcm_buf in place.
         while mono_buf.len() >= RESAMPLE_CHUNK {
-            let chunk: Vec<f32> = mono_buf.drain(..RESAMPLE_CHUNK).collect();
-            let input: [&[f32]; 1] = [&chunk];
-            let resampled = resampler
-                .process(&input, None)
+            // input_buf[0] was sized to input_frames_max() by
+            // input_buffer_allocate; we use the first RESAMPLE_CHUNK
+            // slots. drain() is O(n) but doesn't allocate.
+            input_buf[0].clear();
+            input_buf[0].extend(mono_buf.drain(..RESAMPLE_CHUNK));
+            let (_in_consumed, out_written) = resampler
+                .process_into_buffer(&input_buf, &mut output_buf, None)
                 .map_err(|e| HashError::Chromaprint(format!("rubato process: {e}")))?;
-            let out_mono = &resampled[0];
-            let pcm: Vec<i16> = out_mono
-                .iter()
-                .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
-                .collect();
-            chroma.consume(&pcm);
+            pcm_buf.clear();
+            pcm_buf.extend(
+                output_buf[0][..out_written]
+                    .iter()
+                    .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16),
+            );
+            chroma.consume(&pcm_buf);
         }
     }
 
@@ -279,18 +302,22 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
     // up to the chunk boundary. Drops up to ~93ms of trailing audio
     // detail (1024 samples @ 11025 Hz target), well below the
     // chromaprint per-chunk granularity that matters for matching.
+    // Uses process_partial_into_buffer which handles padding
+    // internally + reuses output_buf (one small temp alloc for the
+    // padded input — one-off per file, not per chunk).
     if !mono_buf.is_empty() {
-        mono_buf.resize(RESAMPLE_CHUNK, 0.0);
-        let input: [&[f32]; 1] = [&mono_buf];
-        let resampled = resampler
-            .process(&input, None)
+        let tail: &[f32] = &mono_buf[..];
+        let tail_in: [&[f32]; 1] = [tail];
+        let (_in_consumed, out_written) = resampler
+            .process_partial_into_buffer(Some(&tail_in), &mut output_buf, None)
             .map_err(|e| HashError::Chromaprint(format!("rubato flush: {e}")))?;
-        let out_mono = &resampled[0];
-        let pcm: Vec<i16> = out_mono
-            .iter()
-            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
-            .collect();
-        chroma.consume(&pcm);
+        pcm_buf.clear();
+        pcm_buf.extend(
+            output_buf[0][..out_written]
+                .iter()
+                .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16),
+        );
+        chroma.consume(&pcm_buf);
     }
 
     chroma.finish();
