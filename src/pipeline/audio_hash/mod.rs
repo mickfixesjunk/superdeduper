@@ -157,6 +157,33 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
     const RESAMPLE_CHUNK: usize = 1024;
     let sample_rate = codec_params.sample_rate.unwrap_or(44_100);
     let resample_ratio = TARGET_RATE as f64 / sample_rate as f64;
+
+    // #97 PCM-diff diagnostic — env-gated dump of the post-resample
+    // i16 PCM stream so testrunner can `cmp` the bytes between
+    // same-source-different-codec pairs. Off when SD_PCM_DUMP_DIR
+    // unset; in production-ship builds this branch costs one
+    // `env::var_os` lookup per call to hash_file. Filename shape:
+    // `sd-pcm-dump-{basename}.raw` per testrunner 2026-05-26T08:42Z.
+    let pcm_dump_writer: Option<std::sync::Mutex<std::fs::File>> = std::env::var_os(
+        "SD_PCM_DUMP_DIR",
+    )
+    .and_then(|dir| {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let basename = path
+            .file_name()
+            .and_then(|o| o.to_str())
+            .unwrap_or("unknown");
+        let dump_path = dir.join(format!("sd-pcm-dump-{basename}.raw"));
+        let f = std::fs::File::create(&dump_path).ok()?;
+        eprintln!(
+            "[PCM-DUMP] writing post-resample i16 PCM for {} -> {}",
+            path.display(),
+            dump_path.display()
+        );
+        Some(std::sync::Mutex::new(f))
+    });
+
     let mut resampler = rubato::FastFixedIn::<f32>::new(
         resample_ratio,
         1.0,
@@ -245,6 +272,15 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
                 .iter()
                 .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
                 .collect();
+            // #97 PCM-diff diagnostic — see top of fn for the gate.
+            if let Some(ref w) = pcm_dump_writer {
+                use std::io::Write;
+                let mut le_bytes: Vec<u8> = Vec::with_capacity(pcm.len() * 2);
+                for &s in &pcm {
+                    le_bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = w.lock().unwrap().write_all(&le_bytes);
+            }
             chroma.consume(&pcm);
         }
     }
