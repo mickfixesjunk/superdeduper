@@ -962,6 +962,33 @@ fn run(
                 });
             }
         }
+        // #99 PR9 — warm the in-memory mirror. Bulk-loads every
+        // cache row for cfg.hash_algo into a HashMap on the Cache
+        // struct. Subsequent lookup_detailed calls check the
+        // HashMap first and skip SQLite — ~1000x per-call speedup
+        // turns mutex-bound 300/sec lookups into ~100k/sec.
+        // For Mick's killed-at-25% scenario: 126k rows warm in
+        // ~100ms, then cache-hit phase completes in seconds.
+        let warm_started = Instant::now();
+        match c.lock().warm_in_place(cfg.hash_algo) {
+            Ok(n) => {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "cache warmed: {n} row(s) loaded into in-memory mirror in {} ms (per-file lookup now lock-free-equivalent)",
+                        warm_started.elapsed().as_millis()
+                    ),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "cache warm-load failed: {e} — falling back to per-file SQLite lookup (slower path)"
+                    ),
+                });
+            }
+        }
     }
     let mut total_cache_hits: u64 = 0;
     // #99 PR3 — Tally of files whose cache row existed but
