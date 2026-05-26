@@ -103,6 +103,13 @@ pub struct SuperdeduperApp {
     /// user to pick. While this is `Some`, the rest of the UI stays
     /// behind the modal so Start Fresh can safely wipe state.
     pending_resume: Option<crate::gui::checkpoint::CheckpointSummary>,
+    /// #99 PR2 — Classified resume tier corresponding to the
+    /// currently-pending `pending_resume`. Computed alongside the
+    /// summary at GUI startup (when the on-disk checkpoint loads)
+    /// so the launch-time modal can render tier-specific copy.
+    /// `None` whenever `pending_resume` is `None` — they cycle
+    /// together.
+    pending_resume_tier: Option<crate::gui::resume_tier::ResumeTier>,
     /// #51 — Mid-session "Settings changed since the paused scan"
     /// modal. Populated by `start_live` when a checkpoint exists on
     /// disk but its roots/settings differ from what the user is
@@ -282,6 +289,25 @@ impl SuperdeduperApp {
             Err(_) => None,
         };
 
+        // #99 PR2 — Classify the resume tier from the lightweight
+        // summary so the launch-time modal can render tier-specific
+        // copy. SessionContext built from the just-loaded
+        // persisted state + a read-only schema_state probe. The
+        // probe is cheap (single SQLite SELECT against a tiny meta
+        // table, opened read-only); no side effects, no cache
+        // modification.
+        let pending_resume_tier = pending_resume.as_ref().map(|summary| {
+            let schema_state = crate::cache::default_cache_path()
+                .and_then(|p| crate::cache::schema_state(&p))
+                .unwrap_or(crate::cache::SchemaState::NoCache);
+            let ctx = crate::gui::resume_tier::SessionContext {
+                roots: persisted.roots.clone(),
+                settings: persisted.settings.clone(),
+                schema_version_mismatch: schema_state.implies_cold_cache(),
+            };
+            crate::gui::resume_tier::classify_resume_tier_from_summary(summary, &ctx)
+        });
+
         let app = Self {
             state: UiState::default(),
             rx,
@@ -296,6 +322,7 @@ impl SuperdeduperApp {
             selected_drive: None,
             drive_render_overrides: hashbrown::HashMap::new(),
             pending_resume,
+            pending_resume_tier,
             pending_drift_modal: None,
             previewed_file: None,
             preview_state: crate::gui::preview::PreviewState::default(),
@@ -778,6 +805,7 @@ impl SuperdeduperApp {
             roots: cp.roots,
             duplicate_count: cp.previous_duplicates.len(),
             has_saved_inventory: cp.saved_inventory.is_some(),
+            settings: cp.settings,
         })
     }
 
@@ -2965,8 +2993,18 @@ impl eframe::App for SuperdeduperApp {
             CentralPanel::default()
                 .frame(Frame::default().fill(theme::BG).inner_margin(0.0))
                 .show(ctx, |_ui| { /* empty backdrop */ });
-            if let Some(choice) = resume_modal::show(ctx, &summary) {
+            // #99 PR2 — Compute the tier BEFORE rendering the
+            // modal so the tier-specific copy + button label can
+            // surface what the resume click will actually do. The
+            // tier is a pure function of (loaded checkpoint,
+            // current session context); recomputed on every frame
+            // is cheap because there's no I/O.
+            let tier = self
+                .pending_resume_tier
+                .unwrap_or(crate::gui::resume_tier::ResumeTier::Fresh);
+            if let Some(choice) = resume_modal::show(ctx, &summary, tier) {
                 self.pending_resume = None;
+                self.pending_resume_tier = None;
                 match choice {
                     ResumeChoice::Resume => self.accept_resume(),
                     ResumeChoice::StartFresh => self.accept_start_fresh(),

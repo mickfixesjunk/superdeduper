@@ -24,6 +24,7 @@ pub mod project;
 #[cfg(feature = "telemetry")]
 pub mod resubmit;
 pub mod results_store;
+pub mod resume_tier;
 #[cfg(feature = "audio")]
 pub mod sound;
 pub mod state;

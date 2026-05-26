@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use egui::{Context, RichText, Window};
 
 use crate::gui::checkpoint::CheckpointSummary;
+use crate::gui::resume_tier::ResumeTier;
 use crate::gui::theme;
 
 /// What the user picked. `None` ⇒ keep showing the modal until they
@@ -21,7 +22,11 @@ pub enum ResumeChoice {
     StartFresh,
 }
 
-pub fn show(ctx: &Context, summary: &CheckpointSummary) -> Option<ResumeChoice> {
+pub fn show(
+    ctx: &Context,
+    summary: &CheckpointSummary,
+    tier: ResumeTier,
+) -> Option<ResumeChoice> {
     let mut choice: Option<ResumeChoice> = None;
     Window::new(
         RichText::new("Previous scan found")
@@ -79,6 +84,40 @@ pub fn show(ctx: &Context, summary: &CheckpointSummary) -> Option<ResumeChoice> 
         ui.separator();
         ui.add_space(8.0);
 
+        // #99 PR2 — Tier-specific copy. Pre-#99 the modal always
+        // said "Resume previous scan"; with the ResumeTier model,
+        // we surface what's actually going to happen so the user
+        // knows whether to expect a cold-cache re-validation pass,
+        // a settings-rerun, or a clean full resume.
+        let tier_blurb = match tier {
+            ResumeTier::Full => {
+                "All your prior work is intact — hash cache hot, settings unchanged. \
+                 This will be a fast continuation."
+            }
+            ResumeTier::Warm => {
+                "Engine was upgraded since the pause; hash cache had to be wiped. \
+                 Your duplicate list will be restored, but files will be re-validated \
+                 against current disk state (cache misses are expected)."
+            }
+            ResumeTier::InventoryOnly => {
+                "Scan settings changed since the pause. Your file list is still good, \
+                 but grouping + hashing will be redone under the new settings."
+            }
+            ResumeTier::Marker => {
+                "The previous scan was paused before any duplicates were found. \
+                 Resuming starts a fresh walk; nothing is restored."
+            }
+            ResumeTier::Fresh => {
+                "Nothing from the previous run can be reused (roots don't match, \
+                 or no usable state). Both buttons will start a fresh scan."
+            }
+        };
+        ui.label(
+            RichText::new(tier_blurb)
+                .color(theme::TEXT_HI)
+                .size(13.0),
+        );
+        ui.add_space(6.0);
         ui.label(
             RichText::new(
                 "Starting fresh keeps your hash cache and renames the previous \
@@ -91,13 +130,18 @@ pub fn show(ctx: &Context, summary: &CheckpointSummary) -> Option<ResumeChoice> 
         ui.add_space(10.0);
 
         ui.horizontal(|ui| {
+            // #99 PR2 — Resume button label tracks the tier so the
+            // user knows what they're committing to. Fresh tier
+            // shows a no-op-equivalent label since both buttons
+            // produce the same outcome.
+            let resume_label = tier.modal_label();
             let resume_btn = egui::Button::new(
-                RichText::new("▶  Resume previous scan")
+                RichText::new(format!("▶  {resume_label}"))
                     .color(theme::PANEL_DEEP)
                     .strong(),
             )
             .fill(theme::ACCENT)
-            .min_size(egui::vec2(200.0, 32.0));
+            .min_size(egui::vec2(280.0, 32.0));
             if ui.add(resume_btn).clicked() {
                 choice = Some(ResumeChoice::Resume);
             }
