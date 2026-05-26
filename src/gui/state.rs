@@ -389,30 +389,44 @@ impl UiState {
     pub fn apply(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::ScanStarted { at, roots } => {
-                // #99 PR4 — preserve the log history across the
-                // per-scan reset. Pre-fix, the wholesale `*self =
-                // UiState::default()` wiped state.logs, which
-                // destroyed every line the engine + UI thread had
-                // pushed up to that point — including the
-                // resume-diag lines emitted from gui/live.rs:200-360
-                // (checkpoint loaded, classified tier, resuming
-                // from checkpoint, etc.) AND PR1's
-                // apply_resume_hydrated bookkeeping logs. Net
-                // effect: Mick reported "no resume diag lines"
-                // because by the time he looked, the wipe had
-                // already destroyed them. The visible-log started
-                // with "starting scan over X root(s)" emitted
-                // AFTER ScanStarted.
+                // #99 PR4+PR5 — preserve resume-relevant history
+                // across the per-scan reset. Pre-PR4 the wholesale
+                // `*self = UiState::default()` wiped state.logs;
+                // Mick reported "no resume diag lines." PR4 fixed
+                // that.
                 //
-                // Logs are history, not per-scan data. Preserve
-                // them across the reset so users can see what the
-                // engine did before each new scan kicked off.
-                // Everything else (duplicates, totals, drives,
-                // stage_counts, etc.) is correctly per-scan and
-                // gets the default-init.
+                // PR5 (this change) — also preserve `duplicates`,
+                // `duplicate_hashes`, `totals.duplicates`, and
+                // `totals.reclaimable_bytes`. PR1's
+                // apply_resume_hydrated populates these from the
+                // checkpoint's previous_duplicates BEFORE the
+                // engine emits ScanStarted. Pre-PR5, the wipe
+                // destroyed them too — Mick reported "Groups tab
+                // shows no dups after resume" because the 4211
+                // restored groups vanished at ScanStarted.
+                //
+                // For FRESH scans, `app.rs::start_live` is
+                // responsible for clearing these BEFORE invoking
+                // the engine (gated on
+                // `!self.resume_effect_active`). The wipe here
+                // unconditionally preserves; the App's pre-spawn
+                // clear is the source of fresh-scan reset.
+                //
+                // Per-scan transient state (drives, stage_counts,
+                // overall progress, bytes_read) still gets the
+                // default-init via the wholesale reset.
                 let preserved_logs = std::mem::take(&mut self.logs);
+                let preserved_duplicates = std::mem::take(&mut self.duplicates);
+                let preserved_duplicate_hashes =
+                    std::mem::take(&mut self.duplicate_hashes);
+                let preserved_dup_count = self.totals.duplicates;
+                let preserved_reclaimable = self.totals.reclaimable_bytes;
                 *self = UiState::default();
                 self.logs = preserved_logs;
+                self.duplicates = preserved_duplicates;
+                self.duplicate_hashes = preserved_duplicate_hashes;
+                self.totals.duplicates = preserved_dup_count;
+                self.totals.reclaimable_bytes = preserved_reclaimable;
                 self.scan_started_at = Some(at);
                 self.roots = roots;
                 self.status = "Scanning…".into();

@@ -754,6 +754,25 @@ impl SuperdeduperApp {
         if self.preflight.is_active() {
             return;
         }
+        // #99 PR5 — fresh-scan dup-state clear. state.rs's
+        // ScanStarted handler now PRESERVES `duplicates` +
+        // `duplicate_hashes` + the dup-related totals across the
+        // per-scan reset (necessary so PR1's apply_resume_hydrated
+        // restored groups survive into the resumed scan). For
+        // fresh scans (not following a Resume modal click), App
+        // must explicitly clear those fields here so the new scan
+        // starts with a clean slate instead of carrying over the
+        // previous scan's dups visually.
+        //
+        // `resume_effect_active` is the signal: PR1 sets it true
+        // right before calling start_live(); fresh-scan kicks
+        // leave it false.
+        if !self.resume_effect_active {
+            self.state.duplicates.clear();
+            self.state.duplicate_hashes.clear();
+            self.state.totals.duplicates = 0;
+            self.state.totals.reclaimable_bytes = 0;
+        }
         // #51 — guard against silent settings-drift restarts.
         // A checkpoint sitting on disk whose roots+settings don't
         // match what the user is about to launch with would be
