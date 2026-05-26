@@ -415,6 +415,29 @@ impl Cache {
         Ok(n)
     }
 
+    /// #99 PR11 — Walk the supplied keys against the warm map and
+    /// return the count of `Hit` outcomes. Used by `gui/live.rs` to
+    /// pre-credit the Stage-4 progress bar at frame zero so the bar
+    /// JUMPS to the pre-kill position on resume instead of climbing
+    /// up to it over the duration of the fast-forward window.
+    ///
+    /// Cost: one HashMap lookup + size/mtime/usn compare per key,
+    /// no SQLite I/O. ~1µs/key → 450k keys = sub-second pre-flight.
+    /// If the warm map is None (warm load skipped/failed), returns 0
+    /// and the bar falls back to the climb-during-fast-forward UX.
+    pub fn predict_hits(&self, keys: &[CacheKey]) -> u64 {
+        let Some(ref warm) = self.warm_map else {
+            return 0;
+        };
+        let mut hits: u64 = 0;
+        for key in keys {
+            if matches!(lookup_warm(warm, key), LookupOutcome::Hit(_)) {
+                hits = hits.saturating_add(1);
+            }
+        }
+        hits
+    }
+
     /// #99 PR3 — Same lookup, but distinguishes "no cache row" from
     /// "row exists but file drifted." Powers the per-file
     /// revalidation status surfaced to the UI on resume runs so
@@ -1119,6 +1142,47 @@ mod tests {
             LookupOutcome::NoRow
         ));
 
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn predict_hits_counts_only_hits_not_drift_or_norow() {
+        // #99 PR11 — pre-flight credit must exactly match the
+        // number of files that will actually hit on warm lookup.
+        // Drift rows and missing rows must NOT count, otherwise
+        // the bar over-credits and freezes (PR7's failure mode).
+        let p = tmp_db();
+        let mut cache = Cache::open(&p).unwrap();
+        let stored = [
+            (key(1, 1024, 100_000, 7), CachedHashes { tier3_hash: Some(vec![1; 32]), ..CachedHashes::default() }),
+            (key(2, 2048, 200_000, 8), CachedHashes { tier3_hash: Some(vec![2; 32]), ..CachedHashes::default() }),
+            (key(3, 4096, 300_000, 9), CachedHashes { tier3_hash: Some(vec![3; 32]), ..CachedHashes::default() }),
+        ];
+        for (k, h) in &stored {
+            cache.store(k, h).unwrap();
+        }
+        cache.warm_in_place(HashAlgo::Blake3).unwrap();
+
+        let preflight = [
+            key(1, 1024, 100_000, 7), // exact → Hit
+            key(2, 9999, 200_000, 8), // size drift → not counted
+            key(3, 4096, 300_000, 9), // exact → Hit
+            key(99, 1, 1, 1),         // no row → not counted
+        ];
+        assert_eq!(cache.predict_hits(&preflight), 2);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn predict_hits_is_zero_when_warm_map_absent() {
+        // If warm_in_place wasn't called (e.g. cold cache or
+        // schema mismatch), predict_hits returns 0 and the bar
+        // falls back to the climb-during-fast-forward UX.
+        let p = tmp_db();
+        let cache = Cache::open(&p).unwrap();
+        let k = key(1, 1024, 100_000, 7);
+        cache.store(&k, &CachedHashes::default()).unwrap();
+        assert_eq!(cache.predict_hits(&[k]), 0);
         std::fs::remove_file(&p).ok();
     }
 

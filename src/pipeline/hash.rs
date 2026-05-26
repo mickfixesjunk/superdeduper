@@ -889,7 +889,7 @@ fn tier_index(tier: Tier) -> u8 {
     }
 }
 
-fn cache_key(f: &LaidOutFile, algo: HashAlgo) -> Option<CacheKey> {
+pub(crate) fn cache_key(f: &LaidOutFile, algo: HashAlgo) -> Option<CacheKey> {
     // The cache schema's PRIMARY KEY is (volume_guid, file_ref,
     // hash_algo). When the walker's fallback path leaves file_ref
     // at zero (and Stage 2b's `resolve_file_ids` couldn't resolve
