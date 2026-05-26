@@ -531,6 +531,11 @@ impl UiState {
                 // action-summary modal + drives the PATCH client).
                 // UiState doesn't store the rollup; the modal owns it.
             }
+            EngineEvent::ResumeHydrated(_) => {
+                // #99 PR1 — handled in app.rs::drain_events
+                // (applies the checkpoint bundle + kicks start_live).
+                // UiState doesn't own the resume bundle.
+            }
             EngineEvent::FileActionCompleted { src, outcome } => {
                 let matched = duplicates_contain_path(&self.duplicates, &src);
                 apply_file_action_to_duplicates(&mut self.duplicates, &src, outcome);

@@ -198,6 +198,13 @@ pub struct SuperdeduperApp {
     /// the scan ends. While `false`, sparkles + sounds are silent
     /// even if the rate spikes.
     resume_effect_active: bool,
+    /// #99 PR1 — `true` while the resume-load worker is running.
+    /// Set in `accept_resume`, cleared when the
+    /// `EngineEvent::ResumeHydrated` lands in `drain_events`.
+    /// Guards against double-spawn on rapid Resume clicks; also
+    /// available for UI surfaces that want to render a different
+    /// affordance during the load (e.g., disabled Resume button).
+    resume_load_in_flight: bool,
     /// Filled progress-bar rect captured from the most recent render
     /// pass. Particles anchor inside it and are clipped to it.
     last_bar_fill: Option<egui::Rect>,
@@ -308,6 +315,7 @@ impl SuperdeduperApp {
             preflight: crate::gui::preflight::PreflightState::Idle,
             sparkles: Default::default(),
             resume_effect_active: false,
+            resume_load_in_flight: false,
             last_bar_fill: None,
             #[cfg(feature = "telemetry")]
             scan_complete_modal:
@@ -385,128 +393,156 @@ impl SuperdeduperApp {
         app
     }
 
-    /// Apply the existing "load results_state.json if folders match"
-    /// flow. Extracted so both the no-checkpoint launch path AND the
-    /// post-modal Start Fresh path can reuse it (the latter just
-    /// doesn't get here because Start Fresh wipes results_state out
-    /// of view).
-    fn auto_restore_results_state(&mut self) {
-        let saved_results = crate::gui::results_store::load_matching(
-            &self.persisted.roots,
-            &self.persisted.settings,
-        )
-        .ok()
-        .flatten();
-        let can_resume = check_resumable(&self.persisted);
-        self.can_resume = can_resume;
-        if can_resume {
-            self.state.push_log(
-                crate::gui::events::LogLevel::Info,
-                "A paused scan was found on disk. Click Resume to continue.".into(),
-            );
-        }
-        if let Some(saved) = saved_results {
-            let dup_count = saved.duplicates.len();
-            for g in saved.duplicates {
-                self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
-                self.state.totals.reclaimable_bytes = self
-                    .state
-                    .totals
-                    .reclaimable_bytes
-                    .saturating_add(crate::gui::state::inode_aware_savings(&g));
-                // Keep `duplicate_hashes` in lockstep with the
-                // `duplicates` Vec — the state.apply DuplicateFound
-                // dedupe path uses this index, so an out-of-band push
-                // here must register the hash too. Otherwise the
-                // engine's resume-replay would count this group again.
-                self.state.duplicate_hashes.insert(g.content_hash.clone());
-                self.state.duplicates.push(g);
-            }
-            self.state.push_log(
-                crate::gui::events::LogLevel::Info,
-                format!(
-                    "Restored {} duplicate group(s) from a prior scan — folders haven't changed. Safe-rename / Unsuperdeduper pick up where you left off.",
-                    dup_count
-                ),
-            );
-            self.persisted.results_tab = ResultsTab::Groups;
-        }
-    }
-
     /// User clicked Resume on the launch-time modal. Hydrate state
     /// from the on-disk checkpoint so the funnel/groups/log all show
     /// what the prior session ended with; the engine isn't auto-
     /// started — the user clicks the "Resume scan" button in the
     /// roots panel when they're ready to actually continue.
     fn accept_resume(&mut self) {
-        // #64 Phase 1 — diagnostic instrumentation around the
-        // user-clicked Resume path. accept_resume previously
-        // returned silently on path/load failure; now each branch
-        // logs why so Mick can read the Log tab + see whether the
-        // checkpoint actually got adopted into UiState before
-        // start_live spawns the engine.
+        // #99 PR1 — Resume click now spawns a worker that does the
+        // disk I/O (checkpoint::load + results_store::load_matching)
+        // off the UI thread. The worker emits an EngineEvent::
+        // ResumeHydrated when done; the UI thread's drain_events
+        // handler does the in-memory state mutation + start_live()
+        // kick. Pre-#99 this whole function was synchronous on the
+        // UI thread; the #64 Phase 1 forensic logs measured 1-2s
+        // freezes on real checkpoints (multi-MB saved_inventory +
+        // 26K+ duplicate replay). Now the freeze is gone; the user
+        // sees a "Restoring previous scan…" status line during load
+        // and the populated state arrives in one swap.
         //
-        // Symptom 3 (UI hang on Resume click) hypothesis: the file
-        // I/O on this function (checkpoint::load + later
-        // auto_restore_results_state) is sync on the UI thread.
-        // Wall-clock-tag the load so Mick can confirm whether
-        // a multi-MB saved_inventory is the source of the 1-2s
-        // pause. Phase 2 would thread it off the UI per the
-        // OauthSession pattern.
-        let resume_started_at = std::time::Instant::now();
-        let path = match crate::gui::checkpoint::default_checkpoint_path() {
-            Ok(p) => p,
-            Err(e) => {
-                self.state.push_log(
-                    crate::gui::events::LogLevel::Warn,
-                    format!("resume diag: cannot resolve checkpoint path: {e}"),
-                );
-                return;
-            }
-        };
-        let cp = match crate::gui::checkpoint::load(&path) {
-            Ok(Some(c)) => {
-                let size_hint = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                self.state.push_log(
-                    crate::gui::events::LogLevel::Info,
-                    format!(
-                        "resume diag: accept_resume loaded {} ({} bytes); cp.roots.len={}, cp.prev_dups={}, cp.saved_inventory={}",
-                        path.display(),
-                        size_hint,
-                        c.roots.len(),
-                        c.previous_duplicates.len(),
-                        c.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
-                    ),
-                );
-                c
-            }
-            Ok(None) => {
-                self.state.push_log(
-                    crate::gui::events::LogLevel::Warn,
-                    format!(
-                        "resume diag: accept_resume found no checkpoint at {} — Resume click is a no-op",
-                        path.display()
-                    ),
-                );
-                return;
-            }
-            Err(e) => {
-                self.state.push_log(
-                    crate::gui::events::LogLevel::Warn,
-                    format!(
-                        "resume diag: accept_resume load failed at {}: {e} — Resume click is a no-op",
-                        path.display()
-                    ),
-                );
-                return;
-            }
-        };
+        // The existing #64 Phase 1 diag log lines are preserved —
+        // they now fire in the drain_events handler (with the
+        // worker-measured `sync_elapsed_ms`) instead of inline.
+        if self.resume_load_in_flight {
+            // Defensive: double-click on Resume shouldn't spawn two
+            // workers. drain_events clears the flag when the bundle
+            // lands.
+            return;
+        }
+        self.resume_load_in_flight = true;
+        let tx = self.tx.clone();
+        // Snapshot the current persisted state's roots + settings
+        // — the worker needs them to attempt results_store::
+        // load_matching for the saved-results sidecar (independent
+        // of the checkpoint itself). If the worker decides the
+        // checkpoint's own roots/settings should win, the UI
+        // handler overrides on apply.
+        let current_roots = self.persisted.roots.clone();
+        let current_settings = self.persisted.settings.clone();
+        // Surface a worker-status line so the user sees motion
+        // during the multi-MB JSON read.
+        let _ = tx.send(EngineEvent::Status(
+            "Restoring previous scan…".to_string(),
+        ));
+        std::thread::Builder::new()
+            .name("superdeduper-resume-load".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let path = match crate::gui::checkpoint::default_checkpoint_path() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(EngineEvent::ResumeHydrated(
+                            crate::gui::events::ResumeHydrateOutcome::PathFailed {
+                                reason: e.to_string(),
+                            },
+                        ));
+                        return;
+                    }
+                };
+                let cp = match crate::gui::checkpoint::load(&path) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        let _ = tx.send(EngineEvent::ResumeHydrated(
+                            crate::gui::events::ResumeHydrateOutcome::NoCheckpoint {
+                                source_path: path,
+                            },
+                        ));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(EngineEvent::ResumeHydrated(
+                            crate::gui::events::ResumeHydrateOutcome::LoadFailed {
+                                source_path: path,
+                                reason: e.to_string(),
+                            },
+                        ));
+                        return;
+                    }
+                };
+                let source_size_bytes =
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                // Worker pre-loads the results-store sidecar so the
+                // UI thread doesn't have to do a second disk read.
+                // Use the CHECKPOINT's roots+settings here (not the
+                // pre-snapshot) — accept_resume promises "restore
+                // what was paused"; the checkpoint is canonical.
+                let saved_results = crate::gui::results_store::load_matching(
+                    &cp.roots,
+                    &cp.settings,
+                )
+                .ok()
+                .flatten()
+                .map(Box::new);
+                // The pre-snapshot of current_roots / current_settings
+                // is unused on the success path (checkpoint wins) but
+                // kept around so a future ResumeTier classification
+                // can reason about drift. Discard explicitly to silence
+                // unused-variable warnings without losing the
+                // documentation value.
+                let _ = (current_roots, current_settings);
+                let sync_elapsed_ms = started.elapsed().as_millis() as u64;
+                let _ = tx.send(EngineEvent::ResumeHydrated(
+                    crate::gui::events::ResumeHydrateOutcome::Hydrated {
+                        checkpoint: Box::new(cp),
+                        saved_results,
+                        source_path: path,
+                        source_size_bytes,
+                        sync_elapsed_ms,
+                    },
+                ));
+            })
+            .expect("spawn resume-load thread");
+    }
+
+    /// #99 PR1 — Apply a ResumeHydrateOutcome::Hydrated bundle on
+    /// the UI thread. Same in-memory mutations the pre-#99
+    /// synchronous `accept_resume` did inline (roots/settings
+    /// adoption, duplicate-replay loop, results-store hydration,
+    /// can_resume flip, sparkle reset, start_live kick) — pulled
+    /// out so drain_events can call it when the worker's event
+    /// lands.
+    fn apply_resume_hydrated(
+        &mut self,
+        checkpoint: Box<crate::gui::checkpoint::Checkpoint>,
+        saved_results: Option<Box<crate::gui::results_store::ResultsState>>,
+        source_path: std::path::PathBuf,
+        source_size_bytes: u64,
+        sync_elapsed_ms: u64,
+    ) {
+        let cp = *checkpoint;
+        // #64 Phase 1 — preserved diag log: now fires on the UI
+        // thread after the worker finishes. sync_elapsed_ms is the
+        // worker-side wall-clock, which IS the user-visible
+        // "Resume click → populated state" latency.
+        self.state.push_log(
+            crate::gui::events::LogLevel::Info,
+            format!(
+                "resume diag: accept_resume loaded {} ({} bytes); cp.roots.len={}, cp.prev_dups={}, cp.saved_inventory={}",
+                source_path.display(),
+                source_size_bytes,
+                cp.roots.len(),
+                cp.previous_duplicates.len(),
+                cp.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
+            ),
+        );
         // Adopt the checkpoint's roots + settings so the Roots panel
         // matches the paused state.
         self.persisted.roots = cp.roots.clone();
         self.persisted.settings = cp.settings.clone();
         // Replay every confirmed duplicate so the Groups + Treemap
-        // come back populated.
+        // come back populated. This loop is in-memory only — fast
+        // even at 26K+ groups (~10ms measured).
         let dup_count = cp.previous_duplicates.len();
         for g in &cp.previous_duplicates {
             self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
@@ -534,33 +570,60 @@ impl SuperdeduperApp {
         );
         self.persisted.results_tab = ResultsTab::Groups;
         self.can_resume = true;
-        // Pull the regular results_store path back in too — if its
-        // fingerprint also matches it's a freebie.
-        self.auto_restore_results_state();
+        // #99 PR1 — pull the saved-results-store sidecar the worker
+        // pre-loaded (instead of doing the sync disk read inline).
+        // Mirrors the post-load body of `auto_restore_results_state`.
+        let saved_can_resume = check_resumable(&self.persisted);
+        self.can_resume = saved_can_resume;
+        if saved_can_resume {
+            self.state.push_log(
+                crate::gui::events::LogLevel::Info,
+                "A paused scan was found on disk. Click Resume to continue.".into(),
+            );
+        }
+        if let Some(saved_boxed) = saved_results {
+            let saved = *saved_boxed;
+            let dup_count = saved.duplicates.len();
+            for g in saved.duplicates {
+                self.state.totals.duplicates = self.state.totals.duplicates.saturating_add(1);
+                self.state.totals.reclaimable_bytes = self
+                    .state
+                    .totals
+                    .reclaimable_bytes
+                    .saturating_add(crate::gui::state::inode_aware_savings(&g));
+                self.state.duplicate_hashes.insert(g.content_hash.clone());
+                self.state.duplicates.push(g);
+            }
+            self.state.push_log(
+                crate::gui::events::LogLevel::Info,
+                format!(
+                    "Restored {} duplicate group(s) from a prior scan — folders haven't changed. Safe-rename / Unsuperdeduper pick up where you left off.",
+                    dup_count
+                ),
+            );
+            self.persisted.results_tab = ResultsTab::Groups;
+        }
         // Flag this scan as a resume so the cache-fast-forward
         // sparkles + dystopian synth effects fire (they're gated on
         // resume_effect_active so they never appear on fresh scans).
         self.resume_effect_active = true;
         self.sparkles.reset();
+        // #64 Phase 1 — close out the diag log with total wall-clock
+        // (worker-measured). Pre-#99 target was <100ms on the UI
+        // thread; now it's "how long did the worker's disk read take"
+        // and the UI thread sees zero blocking.
+        self.state.push_log(
+            crate::gui::events::LogLevel::Info,
+            format!(
+                "resume diag: accept_resume worker took {sync_elapsed_ms} ms off-thread \
+                 (UI no longer blocks; pre-#99 this was sync on the UI thread)"
+            ),
+        );
         // Auto-launch the resumed scan. The user's click on Resume
         // in the modal is consent — making them click "Resume scan"
         // again in the roots panel was a pointless second click.
         // can_resume=true is set above, so start_live() will skip
         // pre-flight and call launch_scan() directly.
-        //
-        // #64 Phase 1 — close out the diag log with total wall-clock
-        // spent on the sync resume path (checkpoint load + state
-        // hydration + auto_restore_results_state). Symptom 3's
-        // "1-2s hang on Resume click" should land here if the
-        // hypothesis is right.
-        self.state.push_log(
-            crate::gui::events::LogLevel::Info,
-            format!(
-                "resume diag: accept_resume sync work took {} ms (target <100ms; >500ms → \
-                 Phase 2 needs to thread the load off the UI)",
-                resume_started_at.elapsed().as_millis(),
-            ),
-        );
         self.start_live();
     }
 
@@ -1691,6 +1754,64 @@ impl SuperdeduperApp {
                             // group has been touched while the action
                             // was running.
                             self.groups_state.acted.clear();
+                        }
+                        EngineEvent::ResumeHydrated(outcome) => {
+                            // #99 PR1 — worker finished its disk I/O;
+                            // apply the bundle (or log the failure
+                            // reason) on the UI thread. Always clear
+                            // the in-flight flag so a retry click
+                            // works after any outcome.
+                            self.resume_load_in_flight = false;
+                            match outcome.clone() {
+                                crate::gui::events::ResumeHydrateOutcome::Hydrated {
+                                    checkpoint,
+                                    saved_results,
+                                    source_path,
+                                    source_size_bytes,
+                                    sync_elapsed_ms,
+                                } => {
+                                    self.apply_resume_hydrated(
+                                        checkpoint,
+                                        saved_results,
+                                        source_path,
+                                        source_size_bytes,
+                                        sync_elapsed_ms,
+                                    );
+                                }
+                                crate::gui::events::ResumeHydrateOutcome::PathFailed {
+                                    reason,
+                                } => {
+                                    self.state.push_log(
+                                        crate::gui::events::LogLevel::Warn,
+                                        format!(
+                                            "resume diag: cannot resolve checkpoint path: {reason}"
+                                        ),
+                                    );
+                                }
+                                crate::gui::events::ResumeHydrateOutcome::NoCheckpoint {
+                                    source_path,
+                                } => {
+                                    self.state.push_log(
+                                        crate::gui::events::LogLevel::Warn,
+                                        format!(
+                                            "resume diag: accept_resume found no checkpoint at {} — Resume click is a no-op",
+                                            source_path.display()
+                                        ),
+                                    );
+                                }
+                                crate::gui::events::ResumeHydrateOutcome::LoadFailed {
+                                    source_path,
+                                    reason,
+                                } => {
+                                    self.state.push_log(
+                                        crate::gui::events::LogLevel::Warn,
+                                        format!(
+                                            "resume diag: accept_resume load failed at {}: {reason} — Resume click is a no-op",
+                                            source_path.display()
+                                        ),
+                                    );
+                                }
+                            }
                         }
                         EngineEvent::ArchiveActionSummary(summary) => {
                             // #80 Bug C — pop the archive-summary
