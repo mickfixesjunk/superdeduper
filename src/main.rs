@@ -1074,15 +1074,26 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         if matches!(mode, ScanMode::Audio) {
             if let Some(inv) = inventory_for_tier4_audio.as_deref() {
                 let t_tier4 = std::time::Instant::now();
-                let groups = tier4::find_similar_groups(inv, audio_similarity_threshold);
+                let result = tier4::find_similar_groups(inv, audio_similarity_threshold);
                 let _ = writeln!(
                     io::stderr(),
                     "stage 4 acoustic: {} group(s) within {} bits/chunk avg ({} ms)",
-                    groups.len(),
+                    result.groups.len(),
                     audio_similarity_threshold,
                     t_tier4.elapsed().as_millis(),
                 );
-                all.extend(groups);
+                // #102 — surface <30s perceptual-skip count so CLI
+                // users understand why their short voice memos / sound
+                // effects didn't cluster perceptually. Byte-identical
+                // matching still ran in Tier 0-3.
+                if result.short_skipped_count > 0 {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "stage 4 acoustic: {} audio file(s) too short for perceptual matching (<30s); processed via byte-identical tier only",
+                        result.short_skipped_count,
+                    );
+                }
+                all.extend(result.groups);
             }
         }
         all

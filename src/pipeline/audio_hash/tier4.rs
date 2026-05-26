@@ -46,6 +46,20 @@ struct Hashed<'a> {
     fingerprint: AudioFingerprint,
 }
 
+/// #102 — Result of Tier-4 audio grouping. Carries the count of
+/// files filtered out because their decoded duration was below
+/// chromaprint's ~30s minimum so the scan-finish summary can
+/// explain why short voice memos / sound effects didn't cluster.
+/// These files are NOT lost from the dedup — Tier 0-3 byte-
+/// identical matching ran independently first; this counter just
+/// surfaces the perceptual-tier opt-out so the user understands
+/// the behavior.
+#[derive(Debug, Default)]
+pub struct AudioTier4Result {
+    pub groups: Vec<DuplicateGroup>,
+    pub short_skipped_count: u64,
+}
+
 /// Take an inventory, hash every audio file in it, group by
 /// average per-chunk Hamming distance ≤ `threshold`. Single-file
 /// groups are filtered out.
@@ -55,10 +69,13 @@ struct Hashed<'a> {
 /// alternative (failing the whole scan on one bad MP3) would
 /// kill usability for any music library with a stray file.
 ///
-/// Returns groups in arbitrary order; sorting is the caller's job.
-pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> Vec<DuplicateGroup> {
+/// Returns groups (in arbitrary order; sorting is the caller's
+/// job) plus the count of files filtered for being too short to
+/// fingerprint per #102.
+pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier4Result {
     // Step 1: filter to audio extensions + hash each. Hash failures
     // drop silently with a tracing::debug! so triage has a trail.
+    let mut short_skipped_count: u64 = 0;
     let hashed: Vec<Hashed<'_>> = inventory
         .iter()
         .filter(|f| is_audio_file(&f.path))
@@ -72,6 +89,7 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> Vec<Dupli
                     path = %f.path.display(),
                     "tier-4 audio: empty fingerprint; skipping (likely <30s of decoded audio)",
                 );
+                short_skipped_count = short_skipped_count.saturating_add(1);
                 None
             }
             Err(e) => {
@@ -86,7 +104,10 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> Vec<Dupli
         .collect();
 
     if hashed.len() < 2 {
-        return Vec::new();
+        return AudioTier4Result {
+            groups: Vec::new(),
+            short_skipped_count,
+        };
     }
 
     // Step 2: brute-force union-find on average chunk-Hamming
@@ -178,7 +199,10 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> Vec<Dupli
         crate::pipeline::assert_unique_paths(&g);
         groups.push(g);
     }
-    groups
+    AudioTier4Result {
+        groups,
+        short_skipped_count,
+    }
 }
 
 #[cfg(test)]
@@ -204,7 +228,8 @@ mod tests {
     #[test]
     fn empty_inventory_yields_no_groups() {
         let out = find_similar_groups(&[], 5.0);
-        assert!(out.is_empty());
+        assert!(out.groups.is_empty());
+        assert_eq!(out.short_skipped_count, 0);
     }
 
     #[test]
@@ -217,7 +242,8 @@ mod tests {
         std::fs::write(&p, b"not audio").unwrap();
         let inv = vec![entry(p, 12)];
         let out = find_similar_groups(&inv, 5.0);
-        assert!(out.is_empty());
+        assert!(out.groups.is_empty());
+        assert_eq!(out.short_skipped_count, 0);
     }
 
     // Synthesising real audio files in unit tests is heavy + slow

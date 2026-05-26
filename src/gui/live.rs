@@ -2013,9 +2013,10 @@ fn run(
         if let Some(inv) = inventory_for_tier4_audio.as_deref() {
             use crate::pipeline::audio_hash::tier4 as audio_tier4;
             let t_tier4 = std::time::Instant::now();
-            let tier4_groups = audio_tier4::find_similar_groups(inv, audio_similarity_threshold);
-            let n_groups = tier4_groups.len();
-            for g in tier4_groups {
+            let tier4_result = audio_tier4::find_similar_groups(inv, audio_similarity_threshold);
+            let n_groups = tier4_result.groups.len();
+            let short_skipped = tier4_result.short_skipped_count;
+            for g in tier4_result.groups {
                 total_dups += 1;
                 *groups_by_similarity_kind
                     .entry("perceptual-audio".to_string())
@@ -2041,6 +2042,18 @@ fn run(
                     t_tier4.elapsed().as_millis()
                 ),
             });
+            // #102 — surface <30s perceptual-skip count so users
+            // understand why short voice memos / sound effects didn't
+            // cluster perceptually. Byte-identical matching still ran
+            // in Tier 0-3 — #103 confirmed those files aren't lost.
+            if short_skipped > 0 {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "{short_skipped} audio file(s) too short for perceptual matching (<30s); processed via byte-identical tier only"
+                    ),
+                });
+            }
         }
     }
     #[cfg(not(feature = "similar-audio"))]
