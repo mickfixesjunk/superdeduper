@@ -18,6 +18,7 @@
 //! is path-keyed somewhere we haven't found yet.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
