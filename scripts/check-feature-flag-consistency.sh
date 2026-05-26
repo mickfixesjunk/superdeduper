@@ -175,3 +175,63 @@ fi
 
 echo
 echo "All feature-flag tuples match between $SCRIPT_FILE and $WORKFLOW_FILE."
+
+# ---------------------------------------------------------------------
+# chore/97-build-gotcha — additional guard: even when the two files
+# agree, that agreement must include the Tier-4 features. v0.2.4's
+# regression was both files agreeing on a feature SET that was
+# MISSING `telemetry` + `similar-*`. The drift-detector catches
+# divergence but not unanimous-omission. This block enforces a
+# required-feature floor for the GUI builds (where Tier-4 actually
+# runs).
+#
+# Floor for GUI builds: gui + telemetry + similar-images + similar-audio.
+# Audio chime (`audio` feature) is Windows-only because the WSL
+# cross-build runner has no libasound2-dev. CLI builds are exempt
+# because Tier-4 modes are GUI-driven today (per scan_mode_picker
+# spec — CLI usage is power-users who pass --mode explicitly and
+# will hit the hard-error at startup if the feature is missing,
+# which is the OTHER half of this chore).
+REQUIRED_GUI_FLOOR=(gui telemetry similar-images similar-audio)
+REQUIRED_WIN_GUI_EXTRA=(audio)
+
+check_floor() {
+  local key="$1"; shift
+  local actual="${script_feats[$key]:-}"
+  local missing=()
+  for required in "$@"; do
+    if ! echo " $actual " | grep -q " $required "; then
+      missing+=("$required")
+    fi
+  done
+  if (( ${#missing[@]} > 0 )); then
+    echo "FLOOR-MISS on $key: missing required feature(s): ${missing[*]}" >&2
+    echo "  actual: '$actual'" >&2
+    return 1
+  fi
+  echo "FLOOR-OK $key: includes $* (actual: '$actual')"
+  return 0
+}
+
+declare -i floor_miss=0
+check_floor win-gui "${REQUIRED_GUI_FLOOR[@]}" "${REQUIRED_WIN_GUI_EXTRA[@]}" || floor_miss=1
+check_floor linux-gui "${REQUIRED_GUI_FLOOR[@]}" || floor_miss=1
+
+if (( floor_miss == 1 )); then
+  cat >&2 <<EOF
+
+Required-feature floor violated. The GUI release binaries MUST ship
+with the Tier-4 similarity stack compiled in (similar-images +
+similar-audio) plus the leaderboard stack (telemetry). v0.2.4 shipped
+without these because both build files agreed on a smaller feature
+set; the drift-detector above passed but the binary was broken.
+
+If you intentionally removed a feature, you also need to update the
+REQUIRED_GUI_FLOOR list in this script + post the rationale to the
+design channel before merging.
+EOF
+  exit 1
+fi
+
+echo
+echo "All required Tier-4 features present in GUI release builds."
