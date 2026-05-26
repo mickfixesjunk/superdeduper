@@ -98,7 +98,10 @@ fn two_step_symlink_cycle_does_not_hang() {
         .count();
     assert_eq!(count_a, 1, "file-in-a should appear once, got {count_a}");
     assert_eq!(count_b, 1, "file-in-b should appear once, got {count_b}");
-    assert_eq!(skipped, 1, "expected one SymlinkCycleSkipped event, got {skipped}");
+    assert_eq!(
+        skipped, 1,
+        "expected one SymlinkCycleSkipped event, got {skipped}"
+    );
 }
 
 /// Criterion 2: self-cycle. dir_a/loop → dir_a.

@@ -144,9 +144,7 @@ pub enum LookupOutcome {
     Hit(CachedHashes),
     /// Cache row exists but key fields changed since last hash.
     /// File will be re-hashed; bump the drift counter.
-    Drift {
-        reason: DriftReason,
-    },
+    Drift { reason: DriftReason },
     /// No cache row for this `(volume_guid, file_ref, hash_algo)`.
     /// File has either never been hashed or its inode was reused.
     NoRow,
@@ -1154,9 +1152,27 @@ mod tests {
         let p = tmp_db();
         let mut cache = Cache::open(&p).unwrap();
         let stored = [
-            (key(1, 1024, 100_000, 7), CachedHashes { tier3_hash: Some(vec![1; 32]), ..CachedHashes::default() }),
-            (key(2, 2048, 200_000, 8), CachedHashes { tier3_hash: Some(vec![2; 32]), ..CachedHashes::default() }),
-            (key(3, 4096, 300_000, 9), CachedHashes { tier3_hash: Some(vec![3; 32]), ..CachedHashes::default() }),
+            (
+                key(1, 1024, 100_000, 7),
+                CachedHashes {
+                    tier3_hash: Some(vec![1; 32]),
+                    ..CachedHashes::default()
+                },
+            ),
+            (
+                key(2, 2048, 200_000, 8),
+                CachedHashes {
+                    tier3_hash: Some(vec![2; 32]),
+                    ..CachedHashes::default()
+                },
+            ),
+            (
+                key(3, 4096, 300_000, 9),
+                CachedHashes {
+                    tier3_hash: Some(vec![3; 32]),
+                    ..CachedHashes::default()
+                },
+            ),
         ];
         for (k, h) in &stored {
             cache.store(k, h).unwrap();

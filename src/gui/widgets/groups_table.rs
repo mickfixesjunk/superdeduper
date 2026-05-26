@@ -240,11 +240,7 @@ pub fn show_filtered(
     });
     if has_perceptual_group {
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new("Note:")
-                    .color(theme::TEXT_LO)
-                    .strong(),
-            );
+            ui.label(RichText::new("Note:").color(theme::TEXT_LO).strong());
             ui.label(
                 RichText::new(
                     "Tier-4 perceptual similarity may produce false positives at scale; \

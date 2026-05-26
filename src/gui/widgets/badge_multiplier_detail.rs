@@ -104,16 +104,13 @@ pub fn show(
                             })
                             .strong(),
                     );
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let mut tail = format_earned_at(install.earned_at_unix);
-                            if let Some(cls) = &install.cpu_class {
-                                tail = format!("{tail} · {cls}");
-                            }
-                            ui.label(RichText::new(tail).color(theme::TEXT_LO).small());
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut tail = format_earned_at(install.earned_at_unix);
+                        if let Some(cls) = &install.cpu_class {
+                            tail = format!("{tail} · {cls}");
+                        }
+                        ui.label(RichText::new(tail).color(theme::TEXT_LO).small());
+                    });
                 });
                 ui.separator();
             }
@@ -136,9 +133,10 @@ pub fn show(
     // None — e.g. ctx-internal collapse path).
     if let Some(resp) = response {
         let clicked_outside = ctx.input(|i| i.pointer.any_click())
-            && !resp.response.rect.contains(
-                ctx.input(|i| i.pointer.interact_pos().unwrap_or_default()),
-            );
+            && !resp
+                .response
+                .rect
+                .contains(ctx.input(|i| i.pointer.interact_pos().unwrap_or_default()));
         if clicked_outside {
             choice = Some(BadgeMultiplierDetailChoice::Close);
         }
@@ -188,7 +186,12 @@ fn format_earned_at(unix_seconds: u64) -> String {
 mod tests {
     use super::*;
 
-    fn install(prefix: &str, nick: Option<&str>, archived: bool, earned: u64) -> AccountBadgeInstall {
+    fn install(
+        prefix: &str,
+        nick: Option<&str>,
+        archived: bool,
+        earned: u64,
+    ) -> AccountBadgeInstall {
         AccountBadgeInstall {
             install_id: format!("{prefix}-aaaa"),
             install_id_prefix: prefix.into(),

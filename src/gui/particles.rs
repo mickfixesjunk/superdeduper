@@ -389,7 +389,10 @@ mod tests {
              that's PR11's bar-jump artifact, not actual hash flow"
         );
         assert!(!s.is_fast_forwarding());
-        assert_eq!(s.last_files, 17_837, "baseline must snap to first observed value");
+        assert_eq!(
+            s.last_files, 17_837,
+            "baseline must snap to first observed value"
+        );
     }
 
     #[test]

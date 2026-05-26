@@ -857,10 +857,11 @@ fn render_exclusions(ui: &mut egui::Ui, settings: &mut ScanSettings) {
     ui.add_space(6.0);
 
     let cfg = &mut settings.exclusion_config;
-    ui.checkbox(&mut cfg.enabled, "Enable exclusion filter").on_hover_text(
-        "Master toggle. When OFF, no exclusions apply regardless of \
+    ui.checkbox(&mut cfg.enabled, "Enable exclusion filter")
+        .on_hover_text(
+            "Master toggle. When OFF, no exclusions apply regardless of \
          the pack checkboxes or custom rules below.",
-    );
+        );
 
     ui.add_space(8.0);
     ui.separator();
@@ -898,7 +899,10 @@ fn render_exclusions(ui: &mut egui::Ui, settings: &mut ScanSettings) {
             // Preserve canonical order so the persisted TOML is
             // deterministic across saves.
             cfg.active_packs.sort_by_key(|p| {
-                PresetPackId::ALL.iter().position(|x| x == p).unwrap_or(usize::MAX)
+                PresetPackId::ALL
+                    .iter()
+                    .position(|x| x == p)
+                    .unwrap_or(usize::MAX)
             });
         }
         if !active {
@@ -909,7 +913,11 @@ fn render_exclusions(ui: &mut egui::Ui, settings: &mut ScanSettings) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(8.0);
-    ui.label(RichText::new("Custom extensions").color(theme::TEXT_HI).strong());
+    ui.label(
+        RichText::new("Custom extensions")
+            .color(theme::TEXT_HI)
+            .strong(),
+    );
     ui.label(
         RichText::new("One per line; leading dot optional (\".tmp\" or \"tmp\" both work).")
             .color(theme::TEXT_LO)
@@ -931,13 +939,15 @@ fn render_exclusions(ui: &mut egui::Ui, settings: &mut ScanSettings) {
     }
 
     ui.add_space(8.0);
-    ui.label(RichText::new("Custom path patterns").color(theme::TEXT_HI).strong());
     ui.label(
-        RichText::new(
-            "Glob syntax: `**/node_modules/**`, `/tmp/**`, etc. One pattern per line.",
-        )
-        .color(theme::TEXT_LO)
-        .small(),
+        RichText::new("Custom path patterns")
+            .color(theme::TEXT_HI)
+            .strong(),
+    );
+    ui.label(
+        RichText::new("Glob syntax: `**/node_modules/**`, `/tmp/**`, etc. One pattern per line.")
+            .color(theme::TEXT_LO)
+            .small(),
     );
     let mut pat_text = cfg.custom_patterns.join("\n");
     let pat_resp = ui.add(
@@ -969,9 +979,17 @@ fn render_exclusions(ui: &mut egui::Ui, settings: &mut ScanSettings) {
             *cfg = crate::exclusions::ExclusionConfig::default();
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let total_ext: usize = cfg.active_packs.iter().map(|p| presets.get(*p).extensions.len()).sum::<usize>()
+            let total_ext: usize = cfg
+                .active_packs
+                .iter()
+                .map(|p| presets.get(*p).extensions.len())
+                .sum::<usize>()
                 + cfg.custom_extensions.len();
-            let total_paths: usize = cfg.active_packs.iter().map(|p| presets.get(*p).paths.len()).sum::<usize>()
+            let total_paths: usize = cfg
+                .active_packs
+                .iter()
+                .map(|p| presets.get(*p).paths.len())
+                .sum::<usize>()
                 + cfg.custom_patterns.len();
             ui.label(
                 RichText::new(format!(

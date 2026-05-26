@@ -946,8 +946,7 @@ mod tests {
         // Missing row → Ok(false).
         let none = set_submission_id("does-not-exist", "xyz".into()).unwrap();
         assert!(!none);
-        let none2 =
-            update_reclaim_for_submission("not-a-real-id", 0, BTreeMap::new()).unwrap();
+        let none2 = update_reclaim_for_submission("not-a-real-id", 0, BTreeMap::new()).unwrap();
         assert!(!none2);
     }
 

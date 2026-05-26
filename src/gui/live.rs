@@ -321,8 +321,7 @@ fn run(
     // (bar restarts at 0 and burns CPU re-confirming what we
     // already know). Built INSIDE the `if let Some(prior)` arm so
     // it stays empty on a fresh scan with no prior state.
-    let mut restored_dup_paths: hashbrown::HashSet<std::path::PathBuf> =
-        hashbrown::HashSet::new();
+    let mut restored_dup_paths: hashbrown::HashSet<std::path::PathBuf> = hashbrown::HashSet::new();
     if let Some(prior) = prior {
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
@@ -1342,8 +1341,7 @@ fn run(
                 let adjusted_done = n
                     .saturating_add(progress_restored_skipped)
                     .max(progress_restored_skipped.saturating_add(progress_predicted_cache_hits));
-                let adjusted_total = total_to_hash_inner
-                    .saturating_add(progress_restored_skipped);
+                let adjusted_total = total_to_hash_inner.saturating_add(progress_restored_skipped);
                 let frac = if total_to_hash_inner > 0 {
                     (n as f32 / total_to_hash_inner as f32).clamp(0.0, 1.0)
                 } else {
@@ -2699,7 +2697,9 @@ mod tests {
         // UNC.
         assert!(is_network_share_path(Path::new(r"\\fileserver\public")));
         assert!(is_network_share_path(Path::new(r"\\fileserver\public\sub")));
-        assert!(is_network_share_path(Path::new(r"\\?\UNC\fileserver\public\sub")));
+        assert!(is_network_share_path(Path::new(
+            r"\\?\UNC\fileserver\public\sub"
+        )));
         // URL forms.
         assert!(is_network_share_path(Path::new("smb://nas.local/photos")));
         assert!(is_network_share_path(Path::new("nfs://10.0.0.5/export")));

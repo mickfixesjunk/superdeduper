@@ -417,8 +417,7 @@ impl UiState {
                 // default-init via the wholesale reset.
                 let preserved_logs = std::mem::take(&mut self.logs);
                 let preserved_duplicates = std::mem::take(&mut self.duplicates);
-                let preserved_duplicate_hashes =
-                    std::mem::take(&mut self.duplicate_hashes);
+                let preserved_duplicate_hashes = std::mem::take(&mut self.duplicate_hashes);
                 let preserved_dup_count = self.totals.duplicates;
                 let preserved_reclaimable = self.totals.reclaimable_bytes;
                 *self = UiState::default();
@@ -640,13 +639,8 @@ pub fn inode_aware_savings(g: &DuplicateGroupSummary) -> u64 {
 /// the symptom of a real bug class (worker emits a path that
 /// doesn't byte-match the scan-time path), worth logging rather
 /// than silently no-op'ing.
-fn duplicates_contain_path(
-    duplicates: &[DuplicateGroupSummary],
-    src: &std::path::Path,
-) -> bool {
-    duplicates
-        .iter()
-        .any(|g| g.files.iter().any(|p| p == src))
+fn duplicates_contain_path(duplicates: &[DuplicateGroupSummary], src: &std::path::Path) -> bool {
+    duplicates.iter().any(|g| g.files.iter().any(|p| p == src))
 }
 
 /// #83 — Update `state.duplicates` in response to a per-file action

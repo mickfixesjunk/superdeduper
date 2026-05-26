@@ -22,11 +22,7 @@ pub enum ResumeChoice {
     StartFresh,
 }
 
-pub fn show(
-    ctx: &Context,
-    summary: &CheckpointSummary,
-    tier: ResumeTier,
-) -> Option<ResumeChoice> {
+pub fn show(ctx: &Context, summary: &CheckpointSummary, tier: ResumeTier) -> Option<ResumeChoice> {
     let mut choice: Option<ResumeChoice> = None;
     Window::new(
         RichText::new("Previous scan found")
@@ -112,11 +108,7 @@ pub fn show(
                  or no usable state). Both buttons will start a fresh scan."
             }
         };
-        ui.label(
-            RichText::new(tier_blurb)
-                .color(theme::TEXT_HI)
-                .size(13.0),
-        );
+        ui.label(RichText::new(tier_blurb).color(theme::TEXT_HI).size(13.0));
         ui.add_space(6.0);
         ui.label(
             RichText::new(

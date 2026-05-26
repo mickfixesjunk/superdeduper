@@ -237,9 +237,7 @@ fn run_with_counters_inner(
         HashCounters {
             cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
             cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
-            cache_drift_misses: AtomicU64::new(
-                arc.cache_drift_misses.load(Ordering::Relaxed),
-            ),
+            cache_drift_misses: AtomicU64::new(arc.cache_drift_misses.load(Ordering::Relaxed)),
             bytes_read: AtomicU64::new(arc.bytes_read.load(Ordering::Relaxed)),
             tier_micros: snap_arr(&arc.tier_micros),
             tier_bytes: snap_arr(&arc.tier_bytes),
@@ -747,9 +745,7 @@ where
                     // gui/live.rs scan-finish summary can surface
                     // "X files re-validated after FS changes"
                     // instead of opaque restart-from-zero per #52.
-                    counters
-                        .cache_drift_misses
-                        .fetch_add(1, Ordering::Relaxed);
+                    counters.cache_drift_misses.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(crate::cache::LookupOutcome::NoRow) | Err(_) => {
                     // No cache row at all (or lookup error) — fall
@@ -834,9 +830,7 @@ where
                 }
                 Ok(crate::cache::LookupOutcome::Drift { .. }) => {
                     // #99 PR3 — mirror tiered() drift counter bump.
-                    counters
-                        .cache_drift_misses
-                        .fetch_add(1, Ordering::Relaxed);
+                    counters.cache_drift_misses.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(crate::cache::LookupOutcome::NoRow) | Err(_) => {}
             }

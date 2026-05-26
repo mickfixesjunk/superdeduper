@@ -125,9 +125,7 @@ impl ScanConfig {
 ///   pack named in `--exclusion-pack`. Custom extension / glob CLI
 ///   flags are not yet wired (deferred to a follow-up; users with
 ///   custom needs can edit the GUI settings TOML).
-fn build_cli_exclusion_policy(
-    args: &ScanArgs,
-) -> Result<crate::exclusions::ExclusionPolicy> {
+fn build_cli_exclusion_policy(args: &ScanArgs) -> Result<crate::exclusions::ExclusionPolicy> {
     use crate::exclusions::{ExclusionConfig, ExclusionPolicy, PresetPackId};
     if matches!(args.exclusions, cli::ExclusionsToggle::Off) {
         return Ok(ExclusionPolicy::disabled());

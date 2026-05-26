@@ -199,10 +199,7 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
     // above so users can see at a glance what they actually
     // followed through on.
     if record.reclaim_at_unix.is_some() {
-        let actually = humansize::format_size(
-            record.actually_reclaimed_bytes,
-            humansize::BINARY,
-        );
+        let actually = humansize::format_size(record.actually_reclaimed_bytes, humansize::BINARY);
         let cell = ui.label(
             RichText::new(format!("♻ {actually}"))
                 .color(theme::ACCENT)
@@ -213,17 +210,12 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
             cell.on_hover_text(tooltip);
         }
     } else {
-        ui.label(
-            RichText::new("—")
-                .color(theme::TEXT_LO)
-                .monospace()
-                .small(),
-        )
-        .on_hover_text(
-            "Scan only — no actions were taken on this run. Run \
+        ui.label(RichText::new("—").color(theme::TEXT_LO).monospace().small())
+            .on_hover_text(
+                "Scan only — no actions were taken on this run. Run \
              Recycle / Hardlink / Reflink / Archive on the groups \
              to credit reclaim bytes to your profile.",
-        );
+            );
     }
 
     // Status pill. v1 always reads "pending" because the resubmit
@@ -484,7 +476,10 @@ fn action_breakdown_tooltip(record: &ScanRecord) -> String {
     lines.push(format!("Reclaim landed: {reclaim_at}"));
     if let Some(updated) = record.reclaim_updated_at_unix {
         if Some(updated) != record.reclaim_at_unix {
-            lines.push(format!("Most recent update: {}", format_unix_local(updated)));
+            lines.push(format!(
+                "Most recent update: {}",
+                format_unix_local(updated)
+            ));
         }
     }
     lines.push(String::new()); // blank between header + body

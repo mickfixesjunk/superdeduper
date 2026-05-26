@@ -38,9 +38,7 @@ use super::install::InstallState;
 /// Build the PATCH body from a populated `actions_taken_summary`
 /// map. Kept as a free function so the modal + retry path can
 /// also call it without dragging the whole submit closure.
-pub fn build_actions_body(
-    actions_taken_summary: &BTreeMap<String, u64>,
-) -> serde_json::Value {
+pub fn build_actions_body(actions_taken_summary: &BTreeMap<String, u64>) -> serde_json::Value {
     serde_json::json!({
         "actions_taken_summary": actions_taken_summary,
     })
