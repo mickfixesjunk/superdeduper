@@ -997,6 +997,10 @@ fn run(
     // runs don't silently appear to restart-at-zero per #52.
     let mut total_cache_drift_misses: u64 = 0;
     let mut total_cache_writes: u64 = 0;
+    // #106 PR2 — Surface Err returns from Cache::store so a stuck or
+    // corrupt cache DB shows up in the scan-finish line instead of
+    // silently swallowing writes.
+    let mut total_cache_write_failures: u64 = 0;
 
     // #99 PR11 — Pre-flight predicted-hit count against the warm
     // map. Lets the initial Stage-4 OverallProgress emit JUMP the
@@ -1418,6 +1422,10 @@ fn run(
         // the scan-finish summary can surface re-validation count.
         total_cache_drift_misses = total_cache_drift_misses
             .saturating_add(counters.cache_drift_misses.load(Ordering::Relaxed));
+        // #106 PR2 — Sum cache_write_failures across chunks for the
+        // scan-finish counters line.
+        total_cache_write_failures = total_cache_write_failures
+            .saturating_add(counters.cache_write_failures.load(Ordering::Relaxed));
         for i in 0..4 {
             tier_micros_total[i] = tier_micros_total[i]
                 .saturating_add(counters.tier_micros[i].load(Ordering::Relaxed));
@@ -1661,12 +1669,18 @@ fn run(
     } else {
         0.0
     };
+    // #106 PR2 — Counters line: hits / drift-misses / writes /
+    // write-failures consolidated, plus fresh-hashes + hit-rate as the
+    // headline metrics. Pre-#106 the line silently lost the Err path
+    // of `Cache::store` and only reported writes that succeeded.
     let _ = tx.send(EngineEvent::Log {
         level: LogLevel::Info,
         message: format!(
-            "cache: {} hits, {} writes, {} fresh hashes — {:.1}% hit rate",
+            "cache: {} hits, {} drift-misses, {} writes, {} write-failures, {} fresh hashes — {:.1}% hit rate",
             total_cache_hits,
+            total_cache_drift_misses,
             total_cache_writes,
+            total_cache_write_failures,
             total_hash_ops.saturating_sub(total_cache_hits),
             hit_rate
         ),
