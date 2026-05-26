@@ -890,6 +890,28 @@ fn run(
             }
         },
     });
+    // #100 — surface cache state at Stage 4 start so a resume run
+    // where the cache appears NOT to fast-forward (Mick's
+    // "restarted at 0" report) can be diagnosed without waiting
+    // for the scan-finish summary. If `rows` is high (~tens of
+    // thousands) but the bar still appears to crawl, the issue is
+    // visibility/threshold-tuning, not cache-not-persisted. If
+    // `rows` is near zero, the cache was wiped or never populated.
+    if let Some(c) = &cache {
+        if let Ok(cache_path) = crate::cache::default_cache_path() {
+            if let Ok(stats) = c.lock().stats(&cache_path) {
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "cache state at Stage 4 start: {} hash row(s), {} inventory row(s), {} bytes on disk",
+                        stats.rows,
+                        stats.snapshot_rows,
+                        stats.bytes_on_disk
+                    ),
+                });
+            }
+        }
+    }
     let mut total_cache_hits: u64 = 0;
     // #99 PR3 — Tally of files whose cache row existed but
     // invalidated at lookup time (size / mtime / usn drift). Summed
@@ -1378,6 +1400,32 @@ fn run(
             total_chunks,
             total_dups
         )));
+        // #100 — periodic cache-stats emit during Stage 4 so a user
+        // watching a resume run can see in real-time whether the
+        // cache fast-forward is happening (vs waiting for scan-
+        // finish). Fires every 10 chunks; cheap (atomic loads).
+        if (i + 1).is_multiple_of(10) {
+            let total_so_far = total_cache_hits.saturating_add(
+                tier_count_total[0]
+                    .saturating_add(tier_count_total[1])
+                    .saturating_add(tier_count_total[2])
+                    .saturating_add(tier_count_total[3]),
+            );
+            let hit_rate_so_far = if total_so_far > 0 {
+                (total_cache_hits as f64 / total_so_far as f64) * 100.0
+            } else {
+                0.0
+            };
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "cache so far: {total_cache_hits} hit(s), {total_cache_drift_misses} drift miss(es), {} fresh hash(es) — {hit_rate_so_far:.1}% hit rate (chunk {}/{})",
+                    total_so_far.saturating_sub(total_cache_hits),
+                    i + 1,
+                    total_chunks,
+                ),
+            });
+        }
     }
 
     // Scan finished cleanly — the checkpoint has served its purpose.
