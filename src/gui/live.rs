@@ -939,7 +939,15 @@ fn run(
     // thousands) but the bar still appears to crawl, the issue is
     // visibility/threshold-tuning, not cache-not-persisted. If
     // `rows` is near zero, the cache was wiped or never populated.
-    if let Some(c) = &cache {
+    //
+    // #99 PR7 — also capture the row count as a hint for the
+    // initial OverallProgress emit below. Rows ≈ "files
+    // previously hashed in some prior session" — for a same-
+    // corpus resume, these will mostly cache-hit on the current
+    // scan. Clamped against `total_to_hash` (rows can exceed the
+    // current candidate set if the cache holds entries from
+    // earlier scans of unrelated paths).
+    let cache_estimated_hits: u64 = if let Some(c) = &cache {
         if let Ok(cache_path) = crate::cache::default_cache_path() {
             if let Ok(stats) = c.lock().stats(&cache_path) {
                 let _ = tx.send(EngineEvent::Log {
@@ -951,9 +959,16 @@ fn run(
                         stats.bytes_on_disk
                     ),
                 });
+                stats.rows
+            } else {
+                0
             }
+        } else {
+            0
         }
-    }
+    } else {
+        0
+    };
     let mut total_cache_hits: u64 = 0;
     // #99 PR3 — Tally of files whose cache row existed but
     // invalidated at lookup time (size / mtime / usn drift). Summed
@@ -974,15 +989,23 @@ fn run(
         "Stage 4 — hashing {} chunk(s)…",
         total_chunks
     )));
-    // #99 PR6 — bar reflects prior position. Resumed files that
-    // are already in dup groups were filtered out of size_groups
-    // above (Stage 4 won't process them); count them toward `done`
-    // and bump `total` by the same amount so the bar starts at
-    // the genuine prior progress percentage instead of 0%.
+    // #99 PR6+PR7 — bar reflects prior position with TWO credits:
+    //   (PR6) restored_skipped: files in restored dup groups,
+    //         filtered out of size_groups above (Stage 4 won't
+    //         process them; they're already-confirmed).
+    //   (PR7) cache_estimated_hits.min(total_to_hash): clamped
+    //         row count from the cache. Most of these will fire
+    //         as cache hits during Stage 4; the in-loop emit
+    //         uses `max(cache_estimated_hits, actual_hits)` so
+    //         the bar doesn't drop below this initial position
+    //         even if actual hit count lags briefly.
+    let cache_credit = cache_estimated_hits.min(total_to_hash);
+    let initial_done = restored_skipped.saturating_add(cache_credit);
+    let stage4_total = total_to_hash.saturating_add(restored_skipped);
     let _ = tx.try_send(EngineEvent::OverallProgress {
         stage: OverallStage::Hashing,
-        done: restored_skipped,
-        total: total_to_hash.saturating_add(restored_skipped),
+        done: initial_done,
+        total: stage4_total,
         eta_secs: None,
     });
 
@@ -1127,10 +1150,14 @@ fn run(
         let hashing_started_inner = hashing_started;
         // #99 PR6 — capture the resume skip count so the in-loop
         // OverallProgress emit can offset `done` + `total` by it.
-        // Keeps the bar percentage = (skipped + this-scan-hashed)
-        // / (skipped + total-candidates) which is the genuine
-        // overall position rather than the in-this-scan position.
         let progress_restored_skipped = restored_skipped;
+        // #99 PR7 — capture the cache-credit estimate so the bar's
+        // `done` value never drops below `restored_skipped +
+        // cache_credit` even if actual cache-hit count lags behind
+        // the estimate. The bar starts at the prior position and
+        // climbs from there as fresh hashes (or extra cache hits)
+        // accumulate.
+        let progress_cache_credit = cache_credit;
         let progress_diag = diag.clone();
         let progress_tier_counts = [
             Arc::clone(&tier_counts[0]),
@@ -1231,13 +1258,23 @@ fn run(
             // Headline OverallProgress + ETA: only Tier 1 advances.
             if counts_for_progress && n.is_multiple_of(100) {
                 let elapsed = hashing_started_inner.elapsed().as_secs_f32();
-                // #99 PR6 — offset both `done` and `total` by the
-                // resume skip count so the bar percentage reflects
-                // overall position (prior + this-scan) rather than
-                // in-this-scan-only. ETA stays computed from the
-                // in-this-scan progress because the prior work
-                // already happened — no time is being spent on it.
-                let adjusted_done = n.saturating_add(progress_restored_skipped);
+                // #99 PR6+PR7 — bar position math:
+                //   done = restored_skipped + max(cache_credit, n)
+                //   total = total_to_hash + restored_skipped
+                //
+                // PR6 contributed restored_skipped (files in
+                // already-confirmed dup groups, filtered out of
+                // size_groups). PR7 contributes cache_credit (the
+                // cache-row-count estimate). Using max() ensures
+                // the bar never drops below the cache_credit floor
+                // — for the first 60-100 chunks of a resume, n
+                // grows steadily but stays below cache_credit
+                // (because actual cache hits are bumping n at
+                // ~cached-throughput speed). After cache exhausts,
+                // n continues to climb past cache_credit via fresh
+                // hashes, and the max() naturally yields to n.
+                let bar_n = n.max(progress_cache_credit);
+                let adjusted_done = bar_n.saturating_add(progress_restored_skipped);
                 let adjusted_total = total_to_hash_inner
                     .saturating_add(progress_restored_skipped);
                 let frac = if total_to_hash_inner > 0 {
