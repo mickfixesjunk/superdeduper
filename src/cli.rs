@@ -378,28 +378,39 @@ pub struct ScanArgs {
     pub mode: ScanMode,
 
     /// Hamming-distance threshold for `--mode image`. Pairs of
-    /// images whose perceptual hashes are within this many bits
-    /// of one another group together. Default 10 is calibrated for
-    /// photo content (resize / format-conversion / heavier edits)
-    /// when paired with the default `--image-hash-algorithm phash`;
-    /// keeps precision at 1.0 while lifting recall ~7pp over the
-    /// pre-v0.2.11 default of 5. If your corpus skews procedural
-    /// (screenshots, generated UI, synthetic art) and you see
-    /// false-positive flood, switch to `--image-hash-algorithm dhash
-    /// --image-similarity-threshold 5` — that combination resists
-    /// the phash-on-procedural precision collapse.
-    #[arg(long, value_name = "BITS", default_value_t = 10)]
+    /// images whose perceptual hashes are within this many bits of
+    /// one another group together. Default 5 paired with the default
+    /// `--image-hash-algorithm dhash` is the cross-corpus operating
+    /// point: dhash's row-pair difference signal stays
+    /// discriminative across variant-augmented photo corpora where
+    /// phash's DCT-coefficient signal overlaps between same-source
+    /// and different-source pairs.
+    ///
+    /// History: v0.2.11 #87 retuned to phash+τ=10 based on a 27-photo
+    /// no-variant retest (the recall lift was real on that subset).
+    /// testdesign's 2026-05-26 variant-augmented spec caught 100% AT2
+    /// false-positives on phash at every threshold tested
+    /// (τ=10 / 7 / 5), so v0.2.13 reverts to the pre-v0.2.11 default.
+    /// If your corpus is photo-heavy AND single-variant, the
+    /// `--image-hash-algorithm phash --image-similarity-threshold 10`
+    /// combination still works — it just doesn't generalize to corpora
+    /// with per-source variant fan-out.
+    #[arg(long, value_name = "BITS", default_value_t = 5)]
     pub image_similarity_threshold: u32,
 
     /// Perceptual-hash algorithm used by `--mode image` (#45).
-    /// Defaults to `phash` (DCT-based) — empirically beats dhash on
-    /// real photo content (+6.5pp T1 recall, +0.067 F1 on the
-    /// testrunner CC0 retest). `dhash` (DifferenceHash) is the right
-    /// pick for procedural / screenshot-dominant corpora where phash
-    /// false-positives flood the result; pair it with
-    /// `--image-similarity-threshold 5` for that path. `ahash` (mean)
-    /// is cheaper and useful as a prefilter only.
-    #[arg(long, value_enum, default_value_t = ImageHashAlgoArg::Phash)]
+    /// Defaults to `dhash` (row-pair Difference Hash) — cross-corpus
+    /// reliable: discriminative on both photo and procedural content,
+    /// and resilient to variant-augmented corpora where phash's
+    /// DCT-coefficient signal overlaps between same- and
+    /// different-source pairs. Paired with the default
+    /// `--image-similarity-threshold 5`. `phash` (DCT-based) had a
+    /// recall edge on small no-variant photo retests but fails AT2
+    /// (false-positive flood) on variant-augmented corpora at every
+    /// tested threshold — see history note on
+    /// `--image-similarity-threshold`. `ahash` (mean) is cheaper but
+    /// less discriminative; useful as a prefilter only.
+    #[arg(long, value_enum, default_value_t = ImageHashAlgoArg::Dhash)]
     pub image_hash_algorithm: ImageHashAlgoArg,
 
     /// Average per-chunk Hamming-distance threshold for `--mode audio`.
