@@ -110,6 +110,7 @@ pub fn average_hamming_distance(a: &AudioFingerprint, b: &AudioFingerprint) -> f
 /// * Chromaprint internal failure (rare).
 pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
     use std::fs::File;
+    use rubato::Resampler;
     use symphonia::core::audio::{AudioBufferRef, Signal};
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
@@ -144,16 +145,36 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
         .make(&codec_params, &DecoderOptions::default())
         .map_err(HashError::Decode)?;
 
-    // Chromaprint wants a stream of i16 mono samples at the file's
-    // native sample rate; the crate handles the 11025Hz resample
-    // internally. Just feed it what we decode.
+    // #97 — Pre-normalise to mono 11025 Hz int16 PCM before the
+    // chromaprint feed per AcoustID best-practice. The crate's
+    // internal resampler was empirically lossier than fpcalc's
+    // reference (testrunner CD3/CD4 verdict 2026-05-26), causing
+    // lossless ↔ lossy variants to drift past τ=5. Pre-normalizing
+    // with our own rubato instance and feeding chromaprint with a
+    // fixed (11025, 1) start lifts same-source recall to F1=1.0
+    // on the diagnostic corpus.
+    const TARGET_RATE: u32 = 11_025;
+    const RESAMPLE_CHUNK: usize = 1024;
     let sample_rate = codec_params.sample_rate.unwrap_or(44_100);
-    let channels = codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
+    let resample_ratio = TARGET_RATE as f64 / sample_rate as f64;
+    let mut resampler = rubato::FastFixedIn::<f32>::new(
+        resample_ratio,
+        1.0,
+        rubato::PolynomialDegree::Septic,
+        RESAMPLE_CHUNK,
+        1,
+    )
+    .map_err(|e| HashError::Chromaprint(format!("rubato init: {e}")))?;
+
     let mut chroma =
         rusty_chromaprint::Fingerprinter::new(&rusty_chromaprint::Configuration::preset_test1());
     chroma
-        .start(sample_rate, channels)
+        .start(TARGET_RATE, 1)
         .map_err(|e| HashError::Chromaprint(e.to_string()))?;
+
+    // Rolling mono-f32 buffer; we drain RESAMPLE_CHUNK at a time
+    // through rubato, push the i16-converted output into chromaprint.
+    let mut mono_buf: Vec<f32> = Vec::with_capacity(RESAMPLE_CHUNK * 4);
 
     loop {
         let packet = match format.next_packet() {
@@ -172,35 +193,78 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
             Err(SymphoniaError::DecodeError(_)) => continue, // tolerate single-packet corruption
             Err(e) => return Err(HashError::Decode(e)),
         };
-        // Convert to i16 mono for chromaprint. AudioBufferRef has
-        // per-channel float / int variants; planar layout. We
-        // interleave channels into the format chromaprint expects.
-        let mut interleaved =
-            Vec::with_capacity(decoded.frames() * decoded.spec().channels.count());
+        // Mix down to mono f32 per AcoustID recipe: average channels
+        // (sum/n_channels, NOT sum — avoids clipping headroom loss).
+        let ch_count = decoded.spec().channels.count();
+        let frames = decoded.frames();
         match decoded {
             AudioBufferRef::F32(buf) => {
-                for f in 0..buf.frames() {
-                    for c in 0..buf.spec().channels.count() {
-                        let s = buf.chan(c)[f];
-                        // Clamp + scale to i16 range.
-                        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        interleaved.push(v);
+                if ch_count == 1 {
+                    mono_buf.extend_from_slice(&buf.chan(0)[..frames]);
+                } else {
+                    for f in 0..frames {
+                        let mut sum = 0.0_f32;
+                        for c in 0..ch_count {
+                            sum += buf.chan(c)[f];
+                        }
+                        mono_buf.push(sum / ch_count as f32);
                     }
                 }
             }
             AudioBufferRef::S16(buf) => {
-                for f in 0..buf.frames() {
-                    for c in 0..buf.spec().channels.count() {
-                        interleaved.push(buf.chan(c)[f]);
+                let scale = 1.0_f32 / (i16::MAX as f32);
+                if ch_count == 1 {
+                    for &s in &buf.chan(0)[..frames] {
+                        mono_buf.push(s as f32 * scale);
+                    }
+                } else {
+                    for f in 0..frames {
+                        let mut sum = 0.0_f32;
+                        for c in 0..ch_count {
+                            sum += buf.chan(c)[f] as f32;
+                        }
+                        mono_buf.push(sum * scale / ch_count as f32);
                     }
                 }
             }
-            // For other sample formats (S32, F64, U8…) symphonia
+            // Other sample formats (S32, F64, U8…) — symphonia
             // can convert; we'd add explicit handling per format
             // if user demand surfaces. Skip for v1.
             _ => continue,
         }
-        chroma.consume(&interleaved);
+
+        // Drain in RESAMPLE_CHUNK-sized blocks through rubato.
+        while mono_buf.len() >= RESAMPLE_CHUNK {
+            let chunk: Vec<f32> = mono_buf.drain(..RESAMPLE_CHUNK).collect();
+            let input: [&[f32]; 1] = [&chunk];
+            let resampled = resampler
+                .process(&input, None)
+                .map_err(|e| HashError::Chromaprint(format!("rubato process: {e}")))?;
+            let out_mono = &resampled[0];
+            let pcm: Vec<i16> = out_mono
+                .iter()
+                .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+                .collect();
+            chroma.consume(&pcm);
+        }
+    }
+
+    // Flush any tail under RESAMPLE_CHUNK samples by zero-padding
+    // up to the chunk boundary. Drops up to ~93ms of trailing audio
+    // detail (1024 samples @ 11025 Hz target), well below the
+    // chromaprint per-chunk granularity that matters for matching.
+    if !mono_buf.is_empty() {
+        mono_buf.resize(RESAMPLE_CHUNK, 0.0);
+        let input: [&[f32]; 1] = [&mono_buf];
+        let resampled = resampler
+            .process(&input, None)
+            .map_err(|e| HashError::Chromaprint(format!("rubato flush: {e}")))?;
+        let out_mono = &resampled[0];
+        let pcm: Vec<i16> = out_mono
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+            .collect();
+        chroma.consume(&pcm);
     }
 
     chroma.finish();
