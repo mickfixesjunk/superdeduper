@@ -285,20 +285,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # aarch64-apple-darwin temporarily removed: same root
-          # cause as aarch64-pc-windows-msvc (see build job above
-          # / #22) — the river5 crate's AES-NI C source uses
-          # x86-only intrinsics (__m128i, _mm_aesenc_si128) which
-          # Apple Silicon's clang can't build either:
-          #
-          #   csrc/river5_aesni.c:49: error: "This header is only
-          #   meant to be used on x86 and x64 architecture"
-          #
-          # Re-add this matrix entry once river5 ships a NEON
-          # (Apple Silicon) or scalar fallback gated behind a
-          # target_arch cfg. Tracked in #22.
           - target: x86_64-apple-darwin
             platform: macos-x86_64
+          # aarch64-apple-darwin re-added v0.2.12 after river5 35533ce
+          # shipped arch-conditional AES-NI gating. On non-x86 targets
+          # the river5 build now falls through to the scalar `stub`
+          # variant via the `RIVER5_HAS_AESNI` cfg — public API stable;
+          # `impl_name()` returns the stub name on aarch64. Tracks
+          # `aarch64-pc-windows-msvc` re-add as the next platform step
+          # (Windows ARM64 is the same blocker; same unblock).
+          - target: aarch64-apple-darwin
+            platform: macos-aarch64
     steps:
       - uses: actions/checkout@v4
 
