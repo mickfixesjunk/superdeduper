@@ -308,6 +308,34 @@ fn run(
             }
         },
     };
+    // #108 — Snapshot cumulative scan-work counters from prior
+    // *before* the `if let Some(prior) = prior` block below moves
+    // `prior` into its own scope. Used both to seed
+    // checkpoint_state.cumulative_bytes_scanned (so the
+    // pre-/post-inventory marker saves preserve the count across
+    // multiple pause/resume cycles) and to pre-bump the engine
+    // local accumulators (total_bytes_read, total_dups,
+    // reclaimable_inode) so the submission payload reflects
+    // cumulative work, not just post-resume work.
+    let prior_cumulative_bytes_scanned: u64 = prior
+        .as_ref()
+        .map(|p| p.cumulative_bytes_scanned)
+        .unwrap_or(0);
+    let prior_cumulative_dups: u64 = prior
+        .as_ref()
+        .map(|p| p.previous_duplicates.len() as u64)
+        .unwrap_or(0);
+    let prior_cumulative_reclaimable: u64 = prior
+        .as_ref()
+        .map(|p| {
+            p.previous_duplicates
+                .iter()
+                .map(|g| g.unique_inodes.saturating_sub(1).saturating_mul(g.size))
+                .sum()
+        })
+        .unwrap_or(0);
+    checkpoint_state.cumulative_bytes_scanned = prior_cumulative_bytes_scanned;
+
     // Inventory state carried over from a prior pause: lets us skip
     // Stage 1 entirely and jump straight to size-grouping. Empty
     // (None) ⇒ no saved inventory; do a fresh walk.
@@ -1079,10 +1107,21 @@ fn run(
         });
     }
 
-    let mut total_bytes_read: u64 = 0;
-    let mut total_dups: u64 = 0;
-    let mut reclaimable: u64 = 0;
-    let mut reclaimable_inode: u64 = 0;
+    // #108 — Seed engine local accumulators from `prior` so the
+    // submission payload reflects cumulative work across the resume
+    // chain, not just post-resume work. Pre-#108 these all started
+    // at 0 on every spawn including resumes, so a pause+resume
+    // sequence under-reported `bytes_scanned`, `duplicate_groups`,
+    // and `duplicate_bytes_reclaimable` to the leaderboard backend
+    // — restored-dup-group files (PR6) were filtered before the
+    // chunk loop on the engine side but counted in the user-visible
+    // Groups tab (PR5). The asymmetry didn't trip the backend 422
+    // (clamp at line ~1893 protects), it just under-credited
+    // resume-cluster users on the leaderboard. Closes #108.
+    let mut total_bytes_read: u64 = prior_cumulative_bytes_scanned;
+    let mut total_dups: u64 = prior_cumulative_dups;
+    let mut reclaimable: u64 = prior_cumulative_reclaimable;
+    let mut reclaimable_inode: u64 = prior_cumulative_reclaimable;
     // #49 — per-SimilarityKind group counts; incremented every time
     // we bump `total_dups`. Persisted in the scan-history record at
     // ScanFinished so the History tab can show "32 perceptual + 30
@@ -1181,7 +1220,8 @@ fn run(
     for (i, chunk) in chunks.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             if let Some(p) = &checkpoint_path {
-                if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
+        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
                     let _ = tx.send(EngineEvent::Log {
                         level: LogLevel::Warn,
                         message: format!("checkpoint save failed: {e}"),
@@ -1383,7 +1423,8 @@ fn run(
                 // failure and the checkpoint would never write — the
                 // exact bug that breaks resume after a mid-hash cancel.
                 if let Some(p) = &checkpoint_path {
-                    if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                    checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
+        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
                         let _ = tx.send(EngineEvent::Log {
                             level: LogLevel::Warn,
                             message: format!("checkpoint save failed: {e}"),

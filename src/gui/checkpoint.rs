@@ -59,6 +59,16 @@ pub struct Checkpoint {
     /// when the pause fired, and a fresh walk is required.
     #[serde(default)]
     pub saved_inventory: Option<Vec<SavedFileEntry>>,
+    /// #108 — Bytes hashed cumulatively across all resume sessions
+    /// for this scan. Updated at every pause save site. On resume,
+    /// the engine seeds its local `total_bytes_read` from this so the
+    /// submission payload's `bytes_scanned` reflects total work
+    /// across pauses, not just post-resume work. Old (v0.2.10)
+    /// checkpoints deserialise this as 0 via `#[serde(default)]` —
+    /// behaviour matches pre-#108 (under-reports cumulative work in
+    /// the leaderboard payload) until the user pauses again.
+    #[serde(default)]
+    pub cumulative_bytes_scanned: u64,
 }
 
 impl Checkpoint {
@@ -71,6 +81,7 @@ impl Checkpoint {
             completed_hashes: Vec::new(),
             previous_duplicates: Vec::new(),
             saved_inventory: None,
+            cumulative_bytes_scanned: 0,
         }
     }
 
