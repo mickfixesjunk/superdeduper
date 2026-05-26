@@ -389,7 +389,30 @@ impl UiState {
     pub fn apply(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::ScanStarted { at, roots } => {
+                // #99 PR4 — preserve the log history across the
+                // per-scan reset. Pre-fix, the wholesale `*self =
+                // UiState::default()` wiped state.logs, which
+                // destroyed every line the engine + UI thread had
+                // pushed up to that point — including the
+                // resume-diag lines emitted from gui/live.rs:200-360
+                // (checkpoint loaded, classified tier, resuming
+                // from checkpoint, etc.) AND PR1's
+                // apply_resume_hydrated bookkeeping logs. Net
+                // effect: Mick reported "no resume diag lines"
+                // because by the time he looked, the wipe had
+                // already destroyed them. The visible-log started
+                // with "starting scan over X root(s)" emitted
+                // AFTER ScanStarted.
+                //
+                // Logs are history, not per-scan data. Preserve
+                // them across the reset so users can see what the
+                // engine did before each new scan kicked off.
+                // Everything else (duplicates, totals, drives,
+                // stage_counts, etc.) is correctly per-scan and
+                // gets the default-init.
+                let preserved_logs = std::mem::take(&mut self.logs);
                 *self = UiState::default();
+                self.logs = preserved_logs;
                 self.scan_started_at = Some(at);
                 self.roots = roots;
                 self.status = "Scanning…".into();
