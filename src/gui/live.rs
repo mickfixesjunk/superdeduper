@@ -312,6 +312,17 @@ fn run(
     // Stage 1 entirely and jump straight to size-grouping. Empty
     // (None) ⇒ no saved inventory; do a fresh walk.
     let mut resumed_inventory: Option<Vec<crate::inventory::FileEntry>> = None;
+    // #99 PR6 — paths of files that are already members of restored
+    // dup groups. These don't need Stage 4 re-hashing: their
+    // group membership is already proven and survives across the
+    // resume via PR5's preserved state.duplicates. Stage 4 filters
+    // them out so the user sees genuine fast-forward (progress
+    // bar starts at the prior position) instead of pretend-resume
+    // (bar restarts at 0 and burns CPU re-confirming what we
+    // already know). Built INSIDE the `if let Some(prior)` arm so
+    // it stays empty on a fresh scan with no prior state.
+    let mut restored_dup_paths: hashbrown::HashSet<std::path::PathBuf> =
+        hashbrown::HashSet::new();
     if let Some(prior) = prior {
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
@@ -322,6 +333,9 @@ fn run(
         });
         for g in &prior.previous_duplicates {
             checkpoint_state.record(g);
+            for p in &g.files {
+                restored_dup_paths.insert(p.clone());
+            }
             let _ = tx.send(EngineEvent::DuplicateFound(g.clone()));
         }
         // If the prior pause happened after inventory completed, the
@@ -817,6 +831,34 @@ fn run(
     // the per-file GetFileInformationByHandle. See the docs on
     // `pipeline::grouping::resolve_file_ids`.
     pipeline::grouping::resolve_file_ids(&mut size_groups);
+    // #99 PR6 — pre-Stage-4 filter: drop files that are already
+    // members of restored dup groups. Those files' membership is
+    // already proven (the group sits in state.duplicates from
+    // PR5's preservation) — re-hashing them would be wasted work.
+    // After the filter, size classes that drop below 2 members
+    // get pruned (a single-file class can't produce dups).
+    //
+    // Empty restored_dup_paths (fresh scan) is a no-op.
+    let restored_skipped: u64 = if !restored_dup_paths.is_empty() {
+        let mut skipped: u64 = 0;
+        for g in size_groups.iter_mut() {
+            let before = g.files.len();
+            g.files.retain(|f| !restored_dup_paths.contains(&f.path));
+            skipped = skipped.saturating_add((before - g.files.len()) as u64);
+        }
+        size_groups.retain(|g| g.files.len() >= 2);
+        if skipped > 0 {
+            let _ = tx.send(EngineEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Resume fast-forward: skipping {skipped} file(s) already in restored dup groups (already-confirmed; no re-hash needed)"
+                ),
+            });
+        }
+        skipped
+    } else {
+        0
+    };
     let size_candidates: u64 = size_groups.iter().map(|g| g.files.len() as u64).sum();
     let _ = tx.send(EngineEvent::StageTick {
         stage: Stage::SizeGroup,
@@ -932,10 +974,15 @@ fn run(
         "Stage 4 — hashing {} chunk(s)…",
         total_chunks
     )));
+    // #99 PR6 — bar reflects prior position. Resumed files that
+    // are already in dup groups were filtered out of size_groups
+    // above (Stage 4 won't process them); count them toward `done`
+    // and bump `total` by the same amount so the bar starts at
+    // the genuine prior progress percentage instead of 0%.
     let _ = tx.try_send(EngineEvent::OverallProgress {
         stage: OverallStage::Hashing,
-        done: 0,
-        total: total_to_hash,
+        done: restored_skipped,
+        total: total_to_hash.saturating_add(restored_skipped),
         eta_secs: None,
     });
 
@@ -1078,6 +1125,12 @@ fn run(
             .unwrap_or(true);
         let total_to_hash_inner = total_to_hash;
         let hashing_started_inner = hashing_started;
+        // #99 PR6 — capture the resume skip count so the in-loop
+        // OverallProgress emit can offset `done` + `total` by it.
+        // Keeps the bar percentage = (skipped + this-scan-hashed)
+        // / (skipped + total-candidates) which is the genuine
+        // overall position rather than the in-this-scan position.
+        let progress_restored_skipped = restored_skipped;
         let progress_diag = diag.clone();
         let progress_tier_counts = [
             Arc::clone(&tier_counts[0]),
@@ -1178,6 +1231,15 @@ fn run(
             // Headline OverallProgress + ETA: only Tier 1 advances.
             if counts_for_progress && n.is_multiple_of(100) {
                 let elapsed = hashing_started_inner.elapsed().as_secs_f32();
+                // #99 PR6 — offset both `done` and `total` by the
+                // resume skip count so the bar percentage reflects
+                // overall position (prior + this-scan) rather than
+                // in-this-scan-only. ETA stays computed from the
+                // in-this-scan progress because the prior work
+                // already happened — no time is being spent on it.
+                let adjusted_done = n.saturating_add(progress_restored_skipped);
+                let adjusted_total = total_to_hash_inner
+                    .saturating_add(progress_restored_skipped);
                 let frac = if total_to_hash_inner > 0 {
                     (n as f32 / total_to_hash_inner as f32).clamp(0.0, 1.0)
                 } else {
@@ -1190,8 +1252,8 @@ fn run(
                 };
                 let _ = progress_tx.try_send(EngineEvent::OverallProgress {
                     stage: OverallStage::Hashing,
-                    done: n,
-                    total: total_to_hash_inner,
+                    done: adjusted_done,
+                    total: adjusted_total,
                     eta_secs: eta,
                 });
             }
