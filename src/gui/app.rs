@@ -3503,9 +3503,28 @@ impl eframe::App for SuperdeduperApp {
                 crate::gui::events::OverallStage::Hashing
             )
         {
+            // #99 PR13 — feed the sparkles a counter that climbs
+            // through cache hits even while `state.overall.done` is
+            // pinned by PR11's bar-floor. `Tier1Head.total` is bumped
+            // by every per-file callback (cache hits included), so
+            // its rate tracks the actual catch-up speed regardless
+            // of whether the visible bar is moving.
+            //
+            // Without this, sparkles' delta during catch-up is 0 —
+            // PR11's floor pins state.overall.done at the credit
+            // position — and the effect can't fire until the bar
+            // starts climbing past the credit, which is AFTER
+            // catch-up finishes. Mick's spec: effect should fire
+            // FROM chunk 1, during catch-up, not after.
+            let sparkle_input = self
+                .state
+                .stage_counts
+                .get(&crate::gui::events::Stage::Tier1Head)
+                .map(|c| c.total)
+                .unwrap_or(self.state.overall.done);
             let signals = self
                 .sparkles
-                .tick(self.state.overall.done, self.last_bar_fill);
+                .tick(sparkle_input, self.last_bar_fill);
             // Resume catch-up sounds intentionally removed — the
             // synth attempts didn't land. Scan-finish chime in
             // state.rs is untouched.
