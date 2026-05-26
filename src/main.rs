@@ -930,6 +930,36 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     let image_hash_algorithm = args.image_hash_algorithm;
     let audio_similarity_threshold = args.audio_similarity_threshold;
 
+    // chore/97-build-gotcha — close the silent-fall-through to
+    // byte-identical when `--mode {image,audio}` is requested on a
+    // binary built without the matching feature. Previously emitted
+    // a warning + ran exact-only matching; the user clicked Recycle
+    // on a Tier-0-3 result thinking they got perceptual matching.
+    // Same anti-pattern that bit #97 v1 (the chromaprint silent-
+    // drop of S32). Hard-error before any scan work happens.
+    #[cfg(not(feature = "similar-images"))]
+    if matches!(mode, superdeduper::cli::ScanMode::Image) {
+        anyhow::bail!(
+            "this binary was built without the `similar-images` feature, \
+             but `--mode image` was requested. Rebuild with \
+             `cargo build --features similar-images` (or use a release \
+             binary that ships with it on) to enable Tier-4 perceptual \
+             image similarity. Refusing to fall through to byte-identical \
+             dedup."
+        );
+    }
+    #[cfg(not(feature = "similar-audio"))]
+    if matches!(mode, superdeduper::cli::ScanMode::Audio) {
+        anyhow::bail!(
+            "this binary was built without the `similar-audio` feature, \
+             but `--mode audio` was requested. Rebuild with \
+             `cargo build --features similar-audio` (or use a release \
+             binary that ships with it on) to enable Tier-4 acoustic \
+             similarity. Refusing to fall through to byte-identical \
+             dedup."
+        );
+    }
+
     let scan_started = std::time::Instant::now();
     // Wall-clock UNIX seconds for the scan_history record — same
     // pattern as `gui::live::run()` so CLI + GUI scans both persist
@@ -1286,32 +1316,15 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         }
         all
     };
+    // chore/97-build-gotcha — the `--mode {image,audio}` feature-
+    // missing case is hard-errored at the top of run_scan() before
+    // any scan work happens. These `let _` lines silence the
+    // unused-variable warning in the `not(feature = "…")` build of
+    // the rest of run_scan().
     #[cfg(not(feature = "similar-images"))]
-    {
-        if matches!(mode, superdeduper::cli::ScanMode::Image) {
-            eprintln!(
-                "warning: this binary was built without the `similar-images` \
-                 feature — `--mode image` falls through to byte-identical \
-                 dedup. Rebuild with `cargo build --features similar-images` \
-                 (or use a release binary that ships with it on) to enable \
-                 Tier-4."
-            );
-        }
-        let _ = (mode, image_similarity_threshold, image_hash_algorithm);
-    }
+    let _ = (mode, image_similarity_threshold, image_hash_algorithm);
     #[cfg(not(feature = "similar-audio"))]
-    {
-        if matches!(mode, superdeduper::cli::ScanMode::Audio) {
-            eprintln!(
-                "warning: this binary was built without the `similar-audio` \
-                 feature — `--mode audio` falls through to byte-identical \
-                 dedup. Rebuild with `cargo build --features similar-audio` \
-                 (or use a release binary that ships with it on) to enable \
-                 Tier-4 acoustic similarity."
-            );
-        }
-        let _ = audio_similarity_threshold;
-    }
+    let _ = audio_similarity_threshold;
 
     let mut writer: Box<dyn Write> = match &cfg.output {
         Some(p) => Box::new(BufWriter::new(
