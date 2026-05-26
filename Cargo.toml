@@ -32,7 +32,7 @@ blake3 = { version = "1", features = ["rayon"] }
 # unpushed working copy, add to a (gitignored) `.cargo/config.toml`:
 #   [patch."https://github.com/mickfixesjunk/river5"]
 #   river5 = { path = "../river5" }
-river5 = { git = "https://github.com/mickfixesjunk/river5", rev = "f3a3ddb790673cc3c7c1518f67e03ad11fd56fc6" }
+river5 = { git = "https://github.com/mickfixesjunk/river5", rev = "35533ced58c0c29f28726fdd355ace8d51c28e8b" }
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 hashbrown = "0.14"
