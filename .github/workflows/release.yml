@@ -365,6 +365,91 @@ jobs:
           files: |
             superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}.tar.gz
 
+  build-freebsd:
+    # FreeBSD x86_64 build. cargo-zigbuild was the originally-stated
+    # approach in #105 but zig 0.13 ships no FreeBSD libc headers in
+    # its bundled libc collection — `zig targets` libc list has the
+    # Linux musl/gnu, Windows-gnu, and macos-none flavors but zero
+    # `*-freebsd-*` entries. river5's C sources fail at compile time
+    # with `'stdlib.h' file not found` because zigcc has nothing
+    # FreeBSD-shaped to resolve against.
+    #
+    # Path B (design call 2026-05-26T08:16Z): use vmactions/freebsd-vm
+    # to run a real FreeBSD VM inside the Linux runner and compile
+    # natively in there. Slower per build (~5-8 min VM boot + ~10-15
+    # min build) but no sysroot-version maintenance burden, no
+    # cross-compile surface, and a free side-benefit: the VM is
+    # capable of running `cargo test` if we ever want native FreeBSD
+    # tests in the v0.2.x cycle. Build-only for v0.2.11.
+    #
+    # `audio` feature is OFF for the same reason it's off on Linux —
+    # rodio/alsa-sys behavior is uncharted on FreeBSD + we don't ship
+    # the scan-done chime on non-Windows anyway.
+    name: build (freebsd-x86_64)
+    runs-on: ubuntu-latest
+    env:
+      VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          # Pin to FreeBSD 14.1 — current stable as of v0.2.11. Mick
+          # can bump this when a newer release is desired; ABI-stable
+          # within FreeBSD 14.x.
+          release: "14.1"
+          usesh: true
+          # Inside the VM: install rust + build deps, then build
+          # both CLI and GUI binaries with the canonical release
+          # feature set (matching the Linux/macOS jobs above).
+          prepare: |
+            pkg install -y rust pkgconf
+          run: |
+            cargo build --release --locked --features "telemetry similar-images similar-audio" --bin superdeduper
+            cargo build --release --locked --features "gui telemetry similar-images similar-audio" --bin superdeduper-gui
+            # Strip inside the VM so we use FreeBSD's native strip on
+            # FreeBSD ELF binaries (avoids any ABI-tag handling
+            # mismatch from running Linux strip on a non-Linux ELF).
+            strip target/release/superdeduper target/release/superdeduper-gui || true
+
+      - name: Stage artifacts
+        run: |
+          stage="stage/superdeduper-${VERSION_TAG}-freebsd-x86_64"
+          mkdir -p "$stage"
+          cp target/release/superdeduper "$stage/"
+          cp target/release/superdeduper-gui "$stage/"
+          cp LICENSE "$stage/"
+          cp README.md "$stage/"
+          chmod +x "$stage/superdeduper" "$stage/superdeduper-gui"
+
+      - name: Compute inside-tarball SHA-256 checksums
+        run: |
+          stage="stage/superdeduper-${VERSION_TAG}-freebsd-x86_64"
+          ( cd "$stage" && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Tar artifact
+        run: |
+          tar -czf "superdeduper-${VERSION_TAG}-freebsd-x86_64.tar.gz" \
+            -C stage "superdeduper-${VERSION_TAG}-freebsd-x86_64"
+
+      - name: Attest build provenance
+        if: ${{ github.event.repository.visibility != 'private' || github.event.repository.owner.type == 'Organization' }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            superdeduper-${{ env.VERSION_TAG }}-freebsd-x86_64.tar.gz
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            superdeduper-${{ env.VERSION_TAG }}-freebsd-x86_64.tar.gz
+
   checksums:
     # Finalize job that computes the canonical release-root
     # SHA256SUMS file. Runs after every build leg finishes so it
@@ -373,7 +458,7 @@ jobs:
     # draft. Per #11 spec, one canonical file at the release root
     # is the source-of-truth for download-integrity verification.
     name: checksums
-    needs: [build, build-linux, build-macos]
+    needs: [build, build-linux, build-macos, build-freebsd]
     runs-on: ubuntu-latest
     env:
       VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}

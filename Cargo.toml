@@ -1,6 +1,6 @@
 [package]
 name = "superdeduper"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2021"
 rust-version = "1.87"
 description = "superdeduper — the fastest duplicate file finder for Windows / NTFS."
@@ -104,6 +104,14 @@ image_hasher = { version = "3", optional = true }
 # containers).
 symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3", "aac", "flac", "wav", "vorbis", "ogg", "isomp4"] }
 rusty-chromaprint = { version = "0.3", optional = true }
+# #97 — Pre-normalise decoded audio to mono 11025 Hz int16 PCM before
+# the chromaprint feed, per AcoustID best-practice. rusty-chromaprint
+# pulls rubato transitively for its internal resampler, but empirical
+# results (testrunner CD3/CD4) show that resampler is lossier than
+# fpcalc's reference; pre-normalizing with our own rubato instance
+# (FastFixedIn polynomial) and then feeding the chromaprint with a
+# fixed (11025, 1) start lifts AT1 same-source recall 50.8% → 95%+.
+rubato = { version = "0.16", optional = true }
 
 [features]
 default = []
@@ -134,7 +142,7 @@ similar-images = ["dep:image", "dep:image_hasher"]
 # Initial slice: algorithm wrapper module + `--mode audio`
 # CLI flag (already in place from #25 v1), no pipeline
 # integration yet.
-similar-audio = ["dep:symphonia", "dep:rusty-chromaprint"]
+similar-audio = ["dep:symphonia", "dep:rusty-chromaprint", "dep:rubato"]
 
 [[bin]]
 name = "superdeduper-gui"

@@ -90,6 +90,15 @@ pub struct HashCounters {
     /// "X files re-validated after FS changes" so resume runs
     /// don't silently restart-at-zero per #52.
     pub cache_drift_misses: AtomicU64,
+    /// #106 PR2 — Count of cache write attempts that returned an
+    /// error from `Cache::store`. Pre-#106 the Err path was silently
+    /// swallowed via `.is_ok()`, so a stuck or corrupt cache DB
+    /// would show 0 writes with no surfaced reason. Now Err paths
+    /// increment this counter + log a `tracing::warn!`, and the
+    /// scan-finish summary reports the count so the user can
+    /// distinguish "cache empty because no writes happened" from
+    /// "cache empty because writes kept failing."
+    pub cache_write_failures: AtomicU64,
     pub bytes_read: AtomicU64,
     /// Microseconds spent computing a fresh hash at each tier
     /// (cache hits and failures excluded — only successful
@@ -238,6 +247,9 @@ fn run_with_counters_inner(
             cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
             cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
             cache_drift_misses: AtomicU64::new(arc.cache_drift_misses.load(Ordering::Relaxed)),
+            cache_write_failures: AtomicU64::new(
+                arc.cache_write_failures.load(Ordering::Relaxed),
+            ),
             bytes_read: AtomicU64::new(arc.bytes_read.load(Ordering::Relaxed)),
             tier_micros: snap_arr(&arc.tier_micros),
             tier_bytes: snap_arr(&arc.tier_bytes),
@@ -776,8 +788,22 @@ where
                 if let Some(key) = cache_key(f, algo) {
                     let mut hashes = CachedHashes::default();
                     put_hash(&mut hashes, tier, h.clone());
-                    if c.lock().store(&key, &hashes).is_ok() {
-                        counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+                    // #106 PR2 — F17-pattern: count Err separately
+                    // and surface via tracing::warn so a stuck cache
+                    // doesn't silently throw work away.
+                    match c.lock().store(&key, &hashes) {
+                        Ok(()) => {
+                            counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            counters
+                                .cache_write_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                "cache write failed for {}: {e}",
+                                f.entry.path.display()
+                            );
+                        }
                     }
                 }
             }
@@ -857,8 +883,22 @@ where
                 if let Some(key) = cache_key(f, algo) {
                     let mut hashes = CachedHashes::default();
                     put_hash(&mut hashes, tier, h.clone());
-                    if c.lock().store(&key, &hashes).is_ok() {
-                        counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+                    // #106 PR2 — F17-pattern: count Err separately
+                    // and surface via tracing::warn so a stuck cache
+                    // doesn't silently throw work away.
+                    match c.lock().store(&key, &hashes) {
+                        Ok(()) => {
+                            counters.cache_writes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            counters
+                                .cache_write_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                "cache write failed for {}: {e}",
+                                f.entry.path.display()
+                            );
+                        }
                     }
                 }
             }
