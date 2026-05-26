@@ -247,9 +247,7 @@ fn run_with_counters_inner(
             cache_hits: AtomicU64::new(arc.cache_hits.load(Ordering::Relaxed)),
             cache_writes: AtomicU64::new(arc.cache_writes.load(Ordering::Relaxed)),
             cache_drift_misses: AtomicU64::new(arc.cache_drift_misses.load(Ordering::Relaxed)),
-            cache_write_failures: AtomicU64::new(
-                arc.cache_write_failures.load(Ordering::Relaxed),
-            ),
+            cache_write_failures: AtomicU64::new(arc.cache_write_failures.load(Ordering::Relaxed)),
             bytes_read: AtomicU64::new(arc.bytes_read.load(Ordering::Relaxed)),
             tier_micros: snap_arr(&arc.tier_micros),
             tier_bytes: snap_arr(&arc.tier_bytes),
