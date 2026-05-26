@@ -92,7 +92,16 @@ unicode-script = { version = "0.5", optional = true }
 # in the `image` crate yet (per spec §3.4); revisit if user demand
 # surfaces.
 image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico"] }
-image_hasher = { version = "3", optional = true }
+# image_hasher pinned exact (=3.1.1) because the `fast_resize_unstable`
+# feature has the "unstable" suffix per upstream — semantics could
+# shift between minor versions. Bump deliberately when the upstream
+# stabilizes the API. The feature swaps the resize path from `image`
+# crate's resizer to `fast_image_resize` (6.0+) for a 2-5× speedup
+# on the perceptual-image Tier-4 hot loop (research Inv #5,
+# 2026-05-26). Fingerprint values drift slightly from the previous
+# `image`-crate resize — testdesign re-runs the AT-image consistency
+# spec on each image_hasher bump.
+image_hasher = { version = "=3.1.1", optional = true, features = ["fast_resize_unstable"] }
 
 # T1.3 acoustic audio similarity (#26). `symphonia` decodes the
 # common audio formats; `rusty-chromaprint` produces the 32-bit
