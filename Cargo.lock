@@ -4274,7 +4274,6 @@ dependencies = [
  "rfd",
  "river5",
  "rodio",
- "rubato",
  "rusqlite",
  "rusty-chromaprint",
  "serde",
