@@ -103,13 +103,19 @@ impl Sparkles {
 
         let was_ff = self.fast_forwarding;
         // Enter on rate spike. Exit on EITHER (a) hard duration cap
-        // (FF_MAX_DURATION_SECS) OR (b) rate drop. Rate alone isn't
-        // reliable as an exit signal — Tier 1 over many small files
-        // with 32 rayon workers can sustain 5K+ files/sec, well
-        // above any reasonable "not fast-forwarding" threshold. The
-        // time cap guarantees the effect always terminates within a
-        // few seconds.
-        if !self.fast_forwarding && self.rate_ewma > 2_000.0 {
+        // (FF_MAX_DURATION_SECS) OR (b) rate drop.
+        //
+        // #99 PR6 — threshold lowered from 2000 → 250 files/sec
+        // because the realistic cache-fast-forward throughput on
+        // Mick's hardware is ~300-700 files/sec (SQLite Mutex
+        // serialization across Rayon workers caps lookup rate).
+        // 2000 was set when "fast forward" meant "raw Tier 1 hash
+        // throughput on small files" which IS ~5000+/sec on SSD,
+        // but tick() is gated on `resume_effect_active` (app.rs:
+        // 3489) so it only runs during the resume cache-hit window
+        // anyway. False-firing on fresh-scan throughput is
+        // impossible by virtue of the App-side gate.
+        if !self.fast_forwarding && self.rate_ewma > 250.0 {
             self.fast_forwarding = true;
             self.started_at = Some(now);
         } else if self.fast_forwarding {
@@ -117,7 +123,11 @@ impl Sparkles {
                 .started_at
                 .map(|t| now.saturating_duration_since(t).as_secs_f32() > FF_MAX_DURATION_SECS)
                 .unwrap_or(false);
-            if too_long || self.rate_ewma < 800.0 {
+            // Exit threshold also dropped proportionally (was 800,
+            // now 100). Keeps the effect on during the dropoff
+            // tail when hit rate is declining but cache hits are
+            // still firing.
+            if too_long || self.rate_ewma < 100.0 {
                 self.fast_forwarding = false;
                 self.started_at = None;
             }
