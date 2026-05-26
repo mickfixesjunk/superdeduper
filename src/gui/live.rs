@@ -219,31 +219,71 @@ fn run(
                         cp.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
                     ),
                 });
-                // Filter — surface the mismatch axis when rejected.
-                let roots_match = cp.roots == roots;
-                let settings_match = cp.settings == settings;
-                if roots_match && settings_match {
-                    Some(cp)
-                } else {
-                    let mismatch_axes = match (roots_match, settings_match) {
-                        (false, false) => "BOTH roots + settings differ",
-                        (false, true) => "roots differ",
-                        (true, false) => "settings differ",
-                        (true, true) => unreachable!(),
-                    };
-                    let _ = tx.send(EngineEvent::Log {
-                        level: LogLevel::Warn,
-                        message: format!(
-                            "resume diag: checkpoint rejected — {mismatch_axes}; \
-                             cp.roots.len={}, current.roots.len={}; \
-                             cp.prev_dups={}, cp.saved_inventory={} (NOT carried forward)",
-                            cp.roots.len(),
-                            roots.len(),
-                            cp.previous_duplicates.len(),
-                            cp.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
-                        ),
-                    });
-                    None
+                // #99 PR2 — Replace the pre-#99 binary
+                // `roots_match && settings_match` filter with the
+                // unified ResumeTier classification. Tier dictates
+                // what gets carried forward: Full/Warm restore
+                // everything; InventoryOnly keeps saved_inventory
+                // only; Marker/Fresh skip the restore.
+                let schema_state = crate::cache::default_cache_path()
+                    .and_then(|p| crate::cache::schema_state(&p))
+                    .unwrap_or(crate::cache::SchemaState::NoCache);
+                let session_ctx = crate::gui::resume_tier::SessionContext {
+                    roots: roots.clone(),
+                    settings: settings.clone(),
+                    schema_version_mismatch: schema_state.implies_cold_cache(),
+                };
+                let tier = crate::gui::resume_tier::classify_resume_tier(&cp, &session_ctx);
+                let _ = tx.send(EngineEvent::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "resume diag: classified tier = {tier:?}; cp.roots.len={}, current.roots.len={}; cp.prev_dups={}, cp.saved_inventory={}",
+                        cp.roots.len(),
+                        roots.len(),
+                        cp.previous_duplicates.len(),
+                        cp.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
+                    ),
+                });
+                match tier {
+                    crate::gui::resume_tier::ResumeTier::Full
+                    | crate::gui::resume_tier::ResumeTier::Warm => Some(cp),
+                    crate::gui::resume_tier::ResumeTier::InventoryOnly => {
+                        // Reuse the walker output (file list) but
+                        // drop previous_duplicates — they were
+                        // computed under different settings and
+                        // may not be valid (e.g., min_size/paranoid
+                        // changed → different group composition).
+                        let _ = tx.send(EngineEvent::Log {
+                            level: LogLevel::Info,
+                            message: "resume: settings changed since pause — reusing file inventory, redoing analysis".into(),
+                        });
+                        let mut trimmed = cp;
+                        trimmed.previous_duplicates.clear();
+                        trimmed.completed_hashes.clear();
+                        Some(trimmed)
+                    }
+                    crate::gui::resume_tier::ResumeTier::Marker => {
+                        // Checkpoint exists but holds nothing
+                        // usable — pre-inventory marker only.
+                        // Walker starts fresh.
+                        let _ = tx.send(EngineEvent::Log {
+                            level: LogLevel::Info,
+                            message: "resume: pre-inventory marker — walker starts fresh".into(),
+                        });
+                        None
+                    }
+                    crate::gui::resume_tier::ResumeTier::Fresh => {
+                        let _ = tx.send(EngineEvent::Log {
+                            level: LogLevel::Warn,
+                            message: format!(
+                                "resume diag: tier=Fresh (roots or settings drifted beyond reuse); \
+                                 cp.prev_dups={}, cp.saved_inventory={} (NOT carried forward)",
+                                cp.previous_duplicates.len(),
+                                cp.saved_inventory.as_ref().map(|v| v.len()).unwrap_or(0),
+                            ),
+                        });
+                        None
+                    }
                 }
             }
             Ok(None) => {

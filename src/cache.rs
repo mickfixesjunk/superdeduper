@@ -677,6 +677,68 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// #99 PR2 — Read-only schema-version observation. Tells the
+/// caller whether the next [`Cache::open`] will trigger the
+/// SCHEMA_VERSION-mismatch wipe (init_schema:202-212) WITHOUT
+/// actually opening the cache + triggering the wipe.
+///
+/// Used by [`crate::gui::resume_tier::SessionContext`] to decide
+/// whether to classify a resume as `Warm` (cold cache) vs `Full`
+/// (cache should still be hot). Pure observation; opens the db
+/// read-only, queries `meta`, closes. No side effects.
+pub fn schema_state(path: &Path) -> Result<SchemaState> {
+    if !path.exists() {
+        return Ok(SchemaState::NoCache);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match existing.as_deref() {
+        Some(v) if v == SCHEMA_VERSION => SchemaState::Current,
+        Some(_) => SchemaState::Mismatch,
+        None => SchemaState::Uninitialized,
+    })
+}
+
+/// Outcome of [`schema_state`] — tells classify-time callers
+/// whether the cache will survive the next `Cache::open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaState {
+    /// SCHEMA_VERSION matches; cache is hot, `Cache::open` won't
+    /// wipe it.
+    Current,
+    /// SCHEMA_VERSION drifted (engine upgraded since last scan).
+    /// `Cache::open` WILL wipe + recreate the tables;
+    /// `cache_hit_ratio` for the next scan will be ~0.
+    Mismatch,
+    /// `meta` row exists but `schema_version` key isn't set.
+    /// First-time-after-open shape; rare in practice. Treated as
+    /// "cold cache, won't wipe but won't help either."
+    Uninitialized,
+    /// Cache file doesn't exist (fresh install, manually deleted).
+    /// Equivalent to a cold cache; classify treats as
+    /// schema-mismatch-equivalent because cache lookups will all
+    /// miss on the next scan.
+    NoCache,
+}
+
+impl SchemaState {
+    /// `true` when the next scan will operate against an effectively
+    /// cold cache (either freshly wiped or freshly created or empty).
+    /// Powers the `SessionContext::schema_version_mismatch` signal.
+    pub fn implies_cold_cache(self) -> bool {
+        matches!(
+            self,
+            SchemaState::Mismatch | SchemaState::NoCache | SchemaState::Uninitialized
+        )
+    }
+}
+
 #[cfg(windows)]
 pub fn default_cache_path() -> Result<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").map_err(|_| Error::other("LOCALAPPDATA not set"))?;

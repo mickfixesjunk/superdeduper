@@ -126,6 +126,11 @@ pub struct CheckpointSummary {
     pub roots: Vec<RootEntry>,
     pub duplicate_count: usize,
     pub has_saved_inventory: bool,
+    /// #99 PR2 — Carried so `classify_resume_tier` can run at GUI
+    /// startup against the launch-time modal data without reloading
+    /// the full Checkpoint. Cheap (~hundreds of bytes); same disk
+    /// load already happens to compute the other summary fields.
+    pub settings: ScanSettings,
 }
 
 pub fn summary(path: &Path) -> Result<Option<CheckpointSummary>> {
@@ -135,6 +140,7 @@ pub fn summary(path: &Path) -> Result<Option<CheckpointSummary>> {
             roots: cp.roots,
             duplicate_count: cp.previous_duplicates.len(),
             has_saved_inventory: cp.saved_inventory.is_some(),
+            settings: cp.settings,
         })),
         None => Ok(None),
     }
