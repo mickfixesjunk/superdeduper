@@ -86,10 +86,20 @@ impl Sparkles {
     /// `entered_fast_forward` / `left_fast_forward`.
     pub fn tick(&mut self, files_done: u64, fill_rect: Option<Rect>) -> SparkleSignals {
         let now = Instant::now();
-        let dt = match self.last_frame {
-            Some(prev) => now.saturating_duration_since(prev).as_secs_f32().max(0.001),
-            None => 0.016,
+        // #99 PR12 — first tick after reset snaps the baseline
+        // instead of computing a delta from zero. Without this,
+        // PR11's frame-zero bar-jump (done goes 0 → predicted_hits
+        // in a single emit) registers as a massive rate spike, fires
+        // fast-forward at jump-time, and then the EWMA decays back
+        // below threshold within ~150 ms — exiting the effect BEFORE
+        // chunks start catching up. Snapping the baseline means the
+        // effect only fires when actual hash work flows past the bar.
+        let Some(prev) = self.last_frame else {
+            self.last_files = files_done;
+            self.last_frame = Some(now);
+            return SparkleSignals::default();
         };
+        let dt = now.saturating_duration_since(prev).as_secs_f32().max(0.001);
         self.last_frame = Some(now);
 
         let delta = files_done.saturating_sub(self.last_files);
@@ -356,5 +366,59 @@ impl Sparkles {
             );
             painter.circle_filled(p.pos, radius, c);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #99 PR12 — verifies that PR11's frame-zero bar jump
+    /// (state.overall.done going 0 → predicted_cache_hits in a
+    /// single emit) does NOT spuriously fire the fast-forward
+    /// effect at jump-time. The effect should only fire when
+    /// actual hash work is flowing past the bar — i.e. when
+    /// chunks are catching up to the credited position.
+    #[test]
+    fn first_tick_after_reset_snaps_baseline_no_spike() {
+        let mut s = Sparkles::default();
+        let signals = s.tick(17_837, None);
+        assert!(
+            !signals.entered_fast_forward,
+            "first tick after reset must NOT enter fast-forward — \
+             that's PR11's bar-jump artifact, not actual hash flow"
+        );
+        assert!(!s.is_fast_forwarding());
+        assert_eq!(s.last_files, 17_837, "baseline must snap to first observed value");
+    }
+
+    #[test]
+    fn second_tick_with_real_flow_fires_fast_forward() {
+        let mut s = Sparkles::default();
+        // First tick snaps the baseline (PR11 bar-jump).
+        s.tick(17_837, None);
+        // Simulate ~16 ms frame interval.
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        // Second tick: 500 actual cache hits flowed through.
+        // Rate = 500 / 0.016 = 31_250 files/sec — far above the
+        // 250/sec enter threshold.
+        let signals = s.tick(17_837 + 500, None);
+        assert!(
+            signals.entered_fast_forward || s.is_fast_forwarding(),
+            "actual hash flow after baseline snap MUST fire the effect"
+        );
+    }
+
+    #[test]
+    fn reset_clears_baseline_so_next_tick_snaps_again() {
+        let mut s = Sparkles::default();
+        s.tick(17_837, None);
+        s.reset();
+        let signals = s.tick(42_000, None);
+        assert!(
+            !signals.entered_fast_forward,
+            "after reset, the first tick of the next scan must snap baseline, \
+             not treat the jump as a rate spike"
+        );
     }
 }
