@@ -2364,13 +2364,13 @@ fn count_distinct_share_roots(paths: &[std::path::PathBuf]) -> u64 {
             let two: Vec<&str> = rest.splitn(3, '\\').take(2).collect();
             format!("unc:{}", two.join("\\"))
         } else if let Some(rest) = s.strip_prefix("smb://") {
-            let auth = rest.splitn(2, '/').next().unwrap_or("");
+            let auth = rest.split('/').next().unwrap_or("");
             format!("smb:{auth}")
         } else if let Some(rest) = s.strip_prefix("nfs://") {
-            let auth = rest.splitn(2, '/').next().unwrap_or("");
+            let auth = rest.split('/').next().unwrap_or("");
             format!("nfs:{auth}")
         } else if let Some(rest) = s.strip_prefix("cifs://") {
-            let auth = rest.splitn(2, '/').next().unwrap_or("");
+            let auth = rest.split('/').next().unwrap_or("");
             format!("cifs:{auth}")
         } else {
             s.to_string()
