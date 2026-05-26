@@ -234,6 +234,48 @@ pub enum EngineEvent {
     /// per #80 Bug C; this variant covers the simpler shape where
     /// only success/fail counts + bytes matter.
     DedupeActionSummary(crate::dedupe::DedupeActionSummary),
+    /// #99 PR1 — User clicked Resume on the launch-time modal.
+    /// The worker thread emitting this has finished the sync disk
+    /// I/O (checkpoint::load + results_store::load_matching) and
+    /// is handing the assembled bundle back to the UI thread to
+    /// apply. UI thread does the in-memory state mutation +
+    /// `start_live()` kick on receipt; loop count avoids the
+    /// multi-second freeze the sync path previously caused
+    /// (gui/app.rs:441 forensic logs measured 1-2s on real
+    /// checkpoints).
+    ResumeHydrated(ResumeHydrateOutcome),
+}
+
+/// #99 PR1 — Disposition of the worker that loads the on-disk
+/// resume artifacts. The UI thread handles each variant when the
+/// `EngineEvent::ResumeHydrated` lands in `drain_events`.
+#[derive(Clone, Debug)]
+pub enum ResumeHydrateOutcome {
+    /// Worker successfully loaded the checkpoint. `saved_results`
+    /// is the optional companion results-store snapshot —
+    /// independent of the checkpoint, so it can be `None` even
+    /// when checkpoint loaded fine. `sync_elapsed_ms` is the
+    /// worker-side wall-clock so the existing #64 Phase 1 diag
+    /// log can keep reporting "resume diag" lines unchanged.
+    Hydrated {
+        checkpoint: Box<crate::gui::checkpoint::Checkpoint>,
+        saved_results: Option<Box<crate::gui::results_store::ResultsState>>,
+        source_path: PathBuf,
+        source_size_bytes: u64,
+        sync_elapsed_ms: u64,
+    },
+    /// Checkpoint path resolution failed before the load could
+    /// run. UI logs the reason; Resume click is a no-op.
+    PathFailed { reason: String },
+    /// Checkpoint file didn't exist. UI logs the warn; Resume
+    /// click is a no-op.
+    NoCheckpoint { source_path: PathBuf },
+    /// Checkpoint file existed but `checkpoint::load` returned an
+    /// error. UI logs the reason; Resume click is a no-op.
+    LoadFailed {
+        source_path: PathBuf,
+        reason: String,
+    },
 }
 
 /// #83 — Disposition of a single file after a Go-action worker
