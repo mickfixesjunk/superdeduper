@@ -273,6 +273,14 @@ impl Cache {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // #106 PR1 — busy_timeout. Without this, a concurrent writer
+        // racing with our connection returns SQLITE_BUSY immediately
+        // and we surface the error as a cache write-failure (now
+        // tracked via cache_write_failures counter). 5s is SQLite's
+        // community default — long enough that ordinary contention
+        // resolves, short enough that a genuinely stuck DB doesn't
+        // freeze the scan.
+        conn.pragma_update(None, "busy_timeout", "5000")?;
 
         let cache = Cache {
             conn,
