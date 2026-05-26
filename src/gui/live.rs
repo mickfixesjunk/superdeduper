@@ -1023,6 +1023,23 @@ fn run(
         total: total_to_hash.saturating_add(restored_skipped),
         eta_secs: None,
     });
+    // #99 PR10 — frame-zero bar emit. Lets a paste-back of the
+    // log capture the bar position BEFORE chunk 1 runs, so the
+    // jump-vs-climb of the fast-forward is unambiguous.
+    {
+        let initial_adjusted_total = total_to_hash.saturating_add(restored_skipped);
+        let initial_bar_pct = if initial_adjusted_total > 0 {
+            (restored_skipped as f64 / initial_adjusted_total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Stage 4 bar frame-zero: bar {initial_bar_pct:.2}% ({restored_skipped}/{initial_adjusted_total} files) · total_to_hash={total_to_hash}, restored_dup_skip={restored_skipped}, total_chunks={total_chunks}"
+            ),
+        });
+    }
 
     let mut total_bytes_read: u64 = 0;
     let mut total_dups: u64 = 0;
@@ -1516,10 +1533,21 @@ fn run(
             } else {
                 0.0
             };
+            // #99 PR10 — surface the bar position alongside chunk
+            // position so a paste-back of the log lets us correlate
+            // what the user sees in the GUI against engine state.
+            let n_now = files_hashed.load(Ordering::Relaxed);
+            let adjusted_done_now = n_now.saturating_add(restored_skipped);
+            let adjusted_total_now = total_to_hash.saturating_add(restored_skipped);
+            let bar_pct = if adjusted_total_now > 0 {
+                (adjusted_done_now as f64 / adjusted_total_now as f64) * 100.0
+            } else {
+                0.0
+            };
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Info,
                 message: format!(
-                    "cache so far: {total_cache_hits} hit(s), {total_cache_drift_misses} drift miss(es), {} fresh hash(es) — {hit_rate_so_far:.1}% hit rate (chunk {}/{})",
+                    "cache so far: {total_cache_hits} hit(s), {total_cache_drift_misses} drift miss(es), {} fresh hash(es) — {hit_rate_so_far:.1}% hit rate (chunk {}/{}) · bar {bar_pct:.2}% ({adjusted_done_now}/{adjusted_total_now} files, restored_dup_skip={restored_skipped})",
                     total_so_far.saturating_sub(total_cache_hits),
                     i + 1,
                     total_chunks,
