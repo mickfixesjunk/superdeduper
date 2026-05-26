@@ -118,15 +118,11 @@ pub struct ArchiveActionSummary {
 
 impl ArchiveActionSummary {
     pub fn failed_count(&self) -> u64 {
-        self.failed_access_denied_count
-            + self.failed_cross_device_count
-            + self.failed_other_count
+        self.failed_access_denied_count + self.failed_cross_device_count + self.failed_other_count
     }
 
     pub fn failed_bytes(&self) -> u64 {
-        self.failed_access_denied_bytes
-            + self.failed_cross_device_bytes
-            + self.failed_other_bytes
+        self.failed_access_denied_bytes + self.failed_cross_device_bytes + self.failed_other_bytes
     }
 
     /// Categorise an `std::io::Error` from the move/copy/remove path

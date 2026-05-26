@@ -62,10 +62,7 @@ pub enum WalkEvent<'a> {
     /// is the canonicalised target (when known). Identity equality
     /// is on the underlying `DirIdentity` — same filesystem-level
     /// directory, regardless of how many alias paths reach it.
-    SymlinkCycleSkipped {
-        from: &'a Path,
-        target: PathBuf,
-    },
+    SymlinkCycleSkipped { from: &'a Path, target: PathBuf },
 }
 
 pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {

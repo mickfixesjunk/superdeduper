@@ -6,12 +6,12 @@ pub mod alpha_warning;
 pub mod archive_summary_modal;
 #[cfg(feature = "telemetry")]
 pub mod badge_multiplier_detail;
-pub mod exclusions_safe_defaults_banner;
 #[cfg(feature = "telemetry")]
 pub mod badge_wall;
 pub mod cache_banner;
 pub mod channel_banner;
 pub mod drive_scope;
+pub mod exclusions_safe_defaults_banner;
 pub mod funnel;
 pub mod groups_table;
 pub mod header;

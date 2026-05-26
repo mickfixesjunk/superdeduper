@@ -635,10 +635,7 @@ fn print_exclusion_packs() {
             .unwrap_or_else(|| format!("{:?}", id).to_lowercase());
         let safe = PresetPackId::SAFE_DEFAULTS.contains(&id);
         let marker = if safe { " (safe-defaults ON)" } else { "" };
-        println!(
-            "  {kebab}  —  {}{marker}",
-            id.label(),
-        );
+        println!("  {kebab}  —  {}{marker}", id.label(),);
         println!(
             "    {} extension{}, {} path pattern{}",
             pack.extensions.len(),

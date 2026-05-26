@@ -459,9 +459,7 @@ impl SuperdeduperApp {
         let current_settings = self.persisted.settings.clone();
         // Surface a worker-status line so the user sees motion
         // during the multi-MB JSON read.
-        let _ = tx.send(EngineEvent::Status(
-            "Restoring previous scan…".to_string(),
-        ));
+        let _ = tx.send(EngineEvent::Status("Restoring previous scan…".to_string()));
         std::thread::Builder::new()
             .name("superdeduper-resume-load".into())
             .spawn(move || {
@@ -497,20 +495,17 @@ impl SuperdeduperApp {
                         return;
                     }
                 };
-                let source_size_bytes =
-                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let source_size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 // Worker pre-loads the results-store sidecar so the
                 // UI thread doesn't have to do a second disk read.
                 // Use the CHECKPOINT's roots+settings here (not the
                 // pre-snapshot) — accept_resume promises "restore
                 // what was paused"; the checkpoint is canonical.
-                let saved_results = crate::gui::results_store::load_matching(
-                    &cp.roots,
-                    &cp.settings,
-                )
-                .ok()
-                .flatten()
-                .map(Box::new);
+                let saved_results =
+                    crate::gui::results_store::load_matching(&cp.roots, &cp.settings)
+                        .ok()
+                        .flatten()
+                        .map(Box::new);
                 // The pre-snapshot of current_roots / current_settings
                 // is unused on the success path (checkpoint wins) but
                 // kept around so a future ResumeTier classification
@@ -1016,10 +1011,7 @@ impl SuperdeduperApp {
     /// or scan-only no-submission flow), no install registration,
     /// or zero reclaimed bytes (`moved_bytes == 0`).
     #[cfg(feature = "telemetry")]
-    fn spawn_action_patch_for_archive(
-        &self,
-        summary: crate::gui::archive::ArchiveActionSummary,
-    ) {
+    fn spawn_action_patch_for_archive(&self, summary: crate::gui::archive::ArchiveActionSummary) {
         let submission_id = match crate::leaderboard::submission::peek_pending_submission_id() {
             Some(id) => id,
             None => {
@@ -1027,12 +1019,11 @@ impl SuperdeduperApp {
                 return;
             }
         };
-        let actions = match crate::leaderboard::action_submission::actions_summary_from_archive(
-            &summary,
-        ) {
-            Some(m) => m,
-            None => return, // zero bytes; nothing to credit
-        };
+        let actions =
+            match crate::leaderboard::action_submission::actions_summary_from_archive(&summary) {
+                Some(m) => m,
+                None => return, // zero bytes; nothing to credit
+            };
         let state = match crate::leaderboard::install::load() {
             Ok(Some(s)) if s.registered => s,
             _ => {
@@ -1056,12 +1047,11 @@ impl SuperdeduperApp {
                 return;
             }
         };
-        let actions = match crate::leaderboard::action_submission::actions_summary_from_dedupe(
-            &summary,
-        ) {
-            Some(m) => m,
-            None => return,
-        };
+        let actions =
+            match crate::leaderboard::action_submission::actions_summary_from_dedupe(&summary) {
+                Some(m) => m,
+                None => return,
+            };
         let state = match crate::leaderboard::install::load() {
             Ok(Some(s)) if s.registered => s,
             _ => {
@@ -1179,10 +1169,9 @@ impl SuperdeduperApp {
                 // because their inputs.scan_id wouldn't change the
                 // row state (it already has a submission_id).
                 if let Some(scan_id) = inputs.scan_id.as_deref() {
-                    if let Err(e) = crate::scan_history::set_submission_id(
-                        scan_id,
-                        submission_id.clone(),
-                    ) {
+                    if let Err(e) =
+                        crate::scan_history::set_submission_id(scan_id, submission_id.clone())
+                    {
                         tracing::warn!(
                             error = %e,
                             scan_id = %scan_id,
@@ -1825,9 +1814,7 @@ impl SuperdeduperApp {
                                         sync_elapsed_ms,
                                     );
                                 }
-                                crate::gui::events::ResumeHydrateOutcome::PathFailed {
-                                    reason,
-                                } => {
+                                crate::gui::events::ResumeHydrateOutcome::PathFailed { reason } => {
                                     self.state.push_log(
                                         crate::gui::events::LogLevel::Warn,
                                         format!(
@@ -2034,13 +2021,12 @@ impl SuperdeduperApp {
             return;
         }
         let title = match mode {
-            ArchiveMode::Move => "Pick a folder to archive duplicates into (Move — reclaims source)",
+            ArchiveMode::Move => {
+                "Pick a folder to archive duplicates into (Move — reclaims source)"
+            }
             ArchiveMode::Copy => "Pick a folder to copy duplicates into (Copy — source untouched)",
         };
-        let dest = match rfd::FileDialog::new()
-            .set_title(title)
-            .pick_folder()
-        {
+        let dest = match rfd::FileDialog::new().set_title(title).pick_folder() {
             Some(p) => p,
             None => return, // user cancelled the dialog
         };
@@ -2837,7 +2823,11 @@ impl SuperdeduperApp {
                         processed += 1;
                     }
                 }
-                let label = if summary.user_stopped { "stopped" } else { "complete" };
+                let label = if summary.user_stopped {
+                    "stopped"
+                } else {
+                    "complete"
+                };
                 let done = summary.ok_count;
                 let failed = summary.failed_count;
                 let _ = tx.send(EngineEvent::ActionFinished {
@@ -2949,7 +2939,11 @@ impl SuperdeduperApp {
                         let _ = crate::gui::results_store::save(&state);
                     }
                 }
-                let label = if summary.user_stopped { "stopped" } else { "complete" };
+                let label = if summary.user_stopped {
+                    "stopped"
+                } else {
+                    "complete"
+                };
                 let _ = tx.send(EngineEvent::ActionFinished {
                     summary: format!(
                         "Action {label} · {} done, {} failed.",
@@ -3169,9 +3163,7 @@ impl eframe::App for SuperdeduperApp {
         // the modal (so they can see the contents without losing
         // the failure breakdown).
         if let Some(summary) = self.pending_archive_summary.clone() {
-            if let Some(choice) =
-                crate::gui::widgets::archive_summary_modal::show(ctx, &summary)
-            {
+            if let Some(choice) = crate::gui::widgets::archive_summary_modal::show(ctx, &summary) {
                 use crate::gui::widgets::archive_summary_modal::ArchiveSummaryChoice;
                 match choice {
                     ArchiveSummaryChoice::Done => {
@@ -3294,9 +3286,7 @@ impl eframe::App for SuperdeduperApp {
                 });
             });
             if confirm {
-                eprintln!(
-                    "destructive-modal: user confirmed via DELETE input; dispatching action"
-                );
+                eprintln!("destructive-modal: user confirmed via DELETE input; dispatching action");
                 self.pending_destructive = None;
                 self.destructive_confirm_input.clear();
                 self.dispatch_group_action_unchecked(action, true);
@@ -3334,9 +3324,7 @@ impl eframe::App for SuperdeduperApp {
         // dismissed by either button. "See what's filtered" pops
         // Settings → Exclusions tab and also marks dismissed.
         if !self.persisted.settings.dismissed_v0_2_7_exclusion_banner {
-            if let Some(action) =
-                crate::gui::widgets::exclusions_safe_defaults_banner::show(ctx)
-            {
+            if let Some(action) = crate::gui::widgets::exclusions_safe_defaults_banner::show(ctx) {
                 use crate::gui::widgets::exclusions_safe_defaults_banner::BannerAction;
                 self.persisted.settings.dismissed_v0_2_7_exclusion_banner = true;
                 if matches!(action, BannerAction::OpenSettings) {
@@ -3522,9 +3510,7 @@ impl eframe::App for SuperdeduperApp {
                 .get(&crate::gui::events::Stage::Tier1Head)
                 .map(|c| c.total)
                 .unwrap_or(self.state.overall.done);
-            let signals = self
-                .sparkles
-                .tick(sparkle_input, self.last_bar_fill);
+            let signals = self.sparkles.tick(sparkle_input, self.last_bar_fill);
             // Resume catch-up sounds intentionally removed — the
             // synth attempts didn't land. Scan-finish chime in
             // state.rs is untouched.
@@ -4269,7 +4255,11 @@ mod try_archive_move_tests {
             },
         );
         assert!(result.is_err());
-        assert_eq!(remove_called.get(), 0, "remove_file should not be called when copy failed");
+        assert_eq!(
+            remove_called.get(),
+            0,
+            "remove_file should not be called when copy failed"
+        );
         assert_eq!(cleanup_failures.get(), 0);
     }
 
@@ -4294,7 +4284,10 @@ mod try_archive_move_tests {
         );
         assert!(result.is_ok());
         assert!(!copy_called.get(), "rename succeeded; copy must not run");
-        assert!(!remove_called.get(), "rename succeeded; remove must not run");
+        assert!(
+            !remove_called.get(),
+            "rename succeeded; remove must not run"
+        );
     }
 
     /// Cross-device happy path: rename fails, copy succeeds, delete

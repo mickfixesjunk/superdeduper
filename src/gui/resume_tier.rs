@@ -60,7 +60,9 @@ impl ResumeTier {
         match self {
             ResumeTier::Full => "Resume previous scan",
             ResumeTier::Warm => "Resume — engine updated, re-validating from cold cache",
-            ResumeTier::InventoryOnly => "Settings changed — keeping the file list, redoing analysis",
+            ResumeTier::InventoryOnly => {
+                "Settings changed — keeping the file list, redoing analysis"
+            }
             ResumeTier::Marker => "Resume previous scan (was paused before any duplicates found)",
             ResumeTier::Fresh => "Start fresh — no resumable state",
         }
@@ -253,7 +255,11 @@ mod tests {
         }
     }
 
-    fn ctx_with(roots: Vec<RootEntry>, settings: ScanSettings, schema_drift: bool) -> SessionContext {
+    fn ctx_with(
+        roots: Vec<RootEntry>,
+        settings: ScanSettings,
+        schema_drift: bool,
+    ) -> SessionContext {
         SessionContext {
             roots,
             settings,
@@ -313,10 +319,7 @@ mod tests {
         current_settings.paranoid = true;
         let cp = checkpoint_with(roots.clone(), prior_settings, vec![synthetic_dup()], true);
         let ctx = ctx_with(roots, current_settings, false);
-        assert_eq!(
-            classify_resume_tier(&cp, &ctx),
-            ResumeTier::InventoryOnly
-        );
+        assert_eq!(classify_resume_tier(&cp, &ctx), ResumeTier::InventoryOnly);
     }
 
     #[test]

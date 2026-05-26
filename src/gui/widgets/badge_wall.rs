@@ -44,9 +44,7 @@ pub enum BadgeWallAction {
     /// different modal (the install-list panel vs the standard
     /// grant-detail popup); when the achievement has count = 1,
     /// fall through to `TileClicked` semantics.
-    TileClickedMultiplier {
-        achievement_id: String,
-    },
+    TileClickedMultiplier { achievement_id: String },
 }
 
 /// Render the badge wall inside the caller's UI region. Returns
