@@ -42,6 +42,76 @@ pub mod tier4;
 
 use std::path::Path;
 
+/// Profiling instrumentation for the audio Tier-4 hot loop. Behind
+/// a runtime check on env var SUPERDEDUPER_AUDIO_PROFILE so it adds
+/// zero meaningful cost when off (one branch-not-taken per phase
+/// per chunk). Thread-local accumulators so it's correct under
+/// rayon par_iter — Tier-4's normal call shape.
+///
+/// Phases tracked:
+///   decode   — Symphonia next_packet + decoder.decode()
+///   mixdown  — sample-format match arm + mono mix-down
+///   resample — rubato process_into_buffer / process_partial_into_buffer
+///   pcm      — f32 → i16 clamp+round map into pcm_buf
+///   chroma   — chromaprint consume()
+///
+/// Snapshot via [`profile::snapshot`] after a batch of `hash_file`
+/// calls on a single thread; reset between batches with
+/// [`profile::reset`]. See `examples/audio_profile.rs` for a working
+/// driver.
+///
+/// Why this exists: the 2026-05-26 audio-resample-opt arc proved
+/// that "rubato is the bottleneck" assumptions were wrong — profile
+/// data showed Symphonia decode at 60-65% on MP3/OGG, with rubato
+/// always #3 at most. Permanent instrumentation makes the next
+/// "where does audio dedup spend its time?" question a 30-second
+/// answer instead of a 30-minute reinstrument cycle.
+pub mod profile {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+
+    /// Returns true iff SUPERDEDUPER_AUDIO_PROFILE is set in the
+    /// process environment. Cached after first read.
+    pub fn enabled() -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var("SUPERDEDUPER_AUDIO_PROFILE").is_ok())
+    }
+
+    thread_local! {
+        pub static T_DECODE: Cell<u64> = const { Cell::new(0) };
+        pub static T_MIXDOWN: Cell<u64> = const { Cell::new(0) };
+        pub static T_RESAMPLE: Cell<u64> = const { Cell::new(0) };
+        pub static T_PCM: Cell<u64> = const { Cell::new(0) };
+        pub static T_CHROMA: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[inline]
+    pub fn add(slot: &'static std::thread::LocalKey<Cell<u64>>, micros: u64) {
+        slot.with(|c| c.set(c.get() + micros));
+    }
+
+    /// Snapshot current thread's accumulators (micros) as
+    /// (decode, mixdown, resample, pcm, chroma).
+    pub fn snapshot() -> (u64, u64, u64, u64, u64) {
+        (
+            T_DECODE.with(|c| c.get()),
+            T_MIXDOWN.with(|c| c.get()),
+            T_RESAMPLE.with(|c| c.get()),
+            T_PCM.with(|c| c.get()),
+            T_CHROMA.with(|c| c.get()),
+        )
+    }
+
+    /// Zero all phase accumulators on the current thread.
+    pub fn reset() {
+        T_DECODE.with(|c| c.set(0));
+        T_MIXDOWN.with(|c| c.set(0));
+        T_RESAMPLE.with(|c| c.set(0));
+        T_PCM.with(|c| c.set(0));
+        T_CHROMA.with(|c| c.set(0));
+    }
+}
+
 /// Audio extensions Tier-4 will fingerprint. Matches spec §3 v1
 /// scope, minus OPUS + WMA (deferred — symphonia core doesn't
 /// decode them; needs FDK-AAC / libopus adapters that we haven't
@@ -181,7 +251,16 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
     // through rubato + push the i16-converted output into chromaprint.
     let mut mono_buf: Vec<f32> = Vec::with_capacity(RESAMPLE_CHUNK * 4);
 
+    // Profiling: see the `profile` module above. One env-var check
+    // once per file; zero meaningful cost when off.
+    let profile_on = profile::enabled();
+
     loop {
+        let t_decode_start = if profile_on {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -198,10 +277,18 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
             Err(SymphoniaError::DecodeError(_)) => continue, // tolerate single-packet corruption
             Err(e) => return Err(HashError::Decode(e)),
         };
+        if let Some(t) = t_decode_start {
+            profile::add(&profile::T_DECODE, t.elapsed().as_micros() as u64);
+        }
         // Mix down to mono f32 per AcoustID recipe: average channels
         // (sum/n_channels, NOT sum — avoids clipping headroom loss).
         let ch_count = decoded.spec().channels.count();
         let frames = decoded.frames();
+        let t_mix_start = if profile_on {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         match decoded {
             AudioBufferRef::F32(buf) => {
                 if ch_count == 1 {
@@ -258,20 +345,47 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
                 }
             }
         }
+        if let Some(t) = t_mix_start {
+            profile::add(&profile::T_MIXDOWN, t.elapsed().as_micros() as u64);
+        }
 
         // Drain in RESAMPLE_CHUNK-sized blocks through rubato.
         while mono_buf.len() >= RESAMPLE_CHUNK {
             let chunk: Vec<f32> = mono_buf.drain(..RESAMPLE_CHUNK).collect();
             let input: [&[f32]; 1] = [&chunk];
+            let t_resample_start = if profile_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let resampled = resampler
                 .process(&input, None)
                 .map_err(|e| HashError::Chromaprint(format!("rubato process: {e}")))?;
+            if let Some(t) = t_resample_start {
+                profile::add(&profile::T_RESAMPLE, t.elapsed().as_micros() as u64);
+            }
             let out_mono = &resampled[0];
+            let t_pcm_start = if profile_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let pcm: Vec<i16> = out_mono
                 .iter()
                 .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
                 .collect();
+            if let Some(t) = t_pcm_start {
+                profile::add(&profile::T_PCM, t.elapsed().as_micros() as u64);
+            }
+            let t_chroma_start = if profile_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             chroma.consume(&pcm);
+            if let Some(t) = t_chroma_start {
+                profile::add(&profile::T_CHROMA, t.elapsed().as_micros() as u64);
+            }
         }
     }
 
