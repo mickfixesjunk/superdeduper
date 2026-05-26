@@ -109,8 +109,9 @@ pub fn average_hamming_distance(a: &AudioFingerprint, b: &AudioFingerprint) -> f
 ///   corrupt file, DRM-locked container).
 /// * Chromaprint internal failure (rare).
 pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
+    use rubato::Resampler;
     use std::fs::File;
-    use symphonia::core::audio::{AudioBufferRef, Signal};
+    use symphonia::core::audio::{AudioBufferRef, SampleBuffer, Signal};
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::FormatOptions;
@@ -144,16 +145,41 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
         .make(&codec_params, &DecoderOptions::default())
         .map_err(HashError::Decode)?;
 
-    // Chromaprint wants a stream of i16 mono samples at the file's
-    // native sample rate; the crate handles the 11025Hz resample
-    // internally. Just feed it what we decode.
+    // #97 v2 — Pre-normalize to mono 11025 Hz int16 PCM before the
+    // chromaprint feed per AcoustID best-practice. v1 (reverted
+    // dc3dfe9 → a480120) had two bugs caught by testrunner's PCM-diff
+    // at 2026-05-26T14:50Z + 14:55Z: (a) the `_ => continue` arm
+    // silently dropped any sample format other than F32/S16 — 24-bit
+    // FLAC decodes to S32, so lossless variants never reached
+    // chromaprint, and (b) the symphonia `pcm` codec was missing from
+    // Cargo features so WAV files failed `decoder.make()` upstream
+    // of any of this code. v2 fixes both: `pcm` is now in features
+    // (Cargo.toml); and the match arms below cover F32/S16 zero-copy
+    // fast paths plus a SampleBuffer<f32> fallback for every other
+    // sample format symphonia can produce.
+    const TARGET_RATE: u32 = 11_025;
+    const RESAMPLE_CHUNK: usize = 1024;
     let sample_rate = codec_params.sample_rate.unwrap_or(44_100);
-    let channels = codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
+    let resample_ratio = TARGET_RATE as f64 / sample_rate as f64;
+
+    let mut resampler = rubato::FastFixedIn::<f32>::new(
+        resample_ratio,
+        1.0,
+        rubato::PolynomialDegree::Septic,
+        RESAMPLE_CHUNK,
+        1,
+    )
+    .map_err(|e| HashError::Chromaprint(format!("rubato init: {e}")))?;
+
     let mut chroma =
         rusty_chromaprint::Fingerprinter::new(&rusty_chromaprint::Configuration::preset_test1());
     chroma
-        .start(sample_rate, channels)
+        .start(TARGET_RATE, 1)
         .map_err(|e| HashError::Chromaprint(e.to_string()))?;
+
+    // Rolling mono-f32 buffer; drain RESAMPLE_CHUNK at a time
+    // through rubato + push the i16-converted output into chromaprint.
+    let mut mono_buf: Vec<f32> = Vec::with_capacity(RESAMPLE_CHUNK * 4);
 
     loop {
         let packet = match format.next_packet() {
@@ -172,35 +198,99 @@ pub fn hash_file(path: &Path) -> Result<AudioFingerprint, HashError> {
             Err(SymphoniaError::DecodeError(_)) => continue, // tolerate single-packet corruption
             Err(e) => return Err(HashError::Decode(e)),
         };
-        // Convert to i16 mono for chromaprint. AudioBufferRef has
-        // per-channel float / int variants; planar layout. We
-        // interleave channels into the format chromaprint expects.
-        let mut interleaved =
-            Vec::with_capacity(decoded.frames() * decoded.spec().channels.count());
+        // Mix down to mono f32 per AcoustID recipe: average channels
+        // (sum/n_channels, NOT sum — avoids clipping headroom loss).
+        let ch_count = decoded.spec().channels.count();
+        let frames = decoded.frames();
         match decoded {
             AudioBufferRef::F32(buf) => {
-                for f in 0..buf.frames() {
-                    for c in 0..buf.spec().channels.count() {
-                        let s = buf.chan(c)[f];
-                        // Clamp + scale to i16 range.
-                        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        interleaved.push(v);
+                if ch_count == 1 {
+                    mono_buf.extend_from_slice(&buf.chan(0)[..frames]);
+                } else {
+                    for f in 0..frames {
+                        let mut sum = 0.0_f32;
+                        for c in 0..ch_count {
+                            sum += buf.chan(c)[f];
+                        }
+                        mono_buf.push(sum / ch_count as f32);
                     }
                 }
             }
             AudioBufferRef::S16(buf) => {
-                for f in 0..buf.frames() {
-                    for c in 0..buf.spec().channels.count() {
-                        interleaved.push(buf.chan(c)[f]);
+                let scale = 1.0_f32 / (i16::MAX as f32);
+                if ch_count == 1 {
+                    for &s in &buf.chan(0)[..frames] {
+                        mono_buf.push(s as f32 * scale);
+                    }
+                } else {
+                    for f in 0..frames {
+                        let mut sum = 0.0_f32;
+                        for c in 0..ch_count {
+                            sum += buf.chan(c)[f] as f32;
+                        }
+                        mono_buf.push(sum * scale / ch_count as f32);
                     }
                 }
             }
-            // For other sample formats (S32, F64, U8…) symphonia
-            // can convert; we'd add explicit handling per format
-            // if user demand surfaces. Skip for v1.
-            _ => continue,
+            // #97 v2 — SampleBuffer<f32> fallback handles S32 (24-bit
+            // FLAC + 24-bit WAV), S24, S8, U8, U16, F64. One extra
+            // allocation per packet (~kBs); audio tier hashes
+            // thousands of files per scan at most so the overhead is
+            // negligible. v1's `_ => continue` silent drop is the
+            // bug this arm closes.
+            other => {
+                let spec = *other.spec();
+                let mut sb = SampleBuffer::<f32>::new(frames as u64, spec);
+                sb.copy_interleaved_ref(other);
+                let samples = sb.samples();
+                if ch_count == 1 {
+                    mono_buf.extend_from_slice(&samples[..frames]);
+                } else {
+                    let mut idx = 0;
+                    for _ in 0..frames {
+                        let mut sum = 0.0_f32;
+                        for _ in 0..ch_count {
+                            sum += samples[idx];
+                            idx += 1;
+                        }
+                        mono_buf.push(sum / ch_count as f32);
+                    }
+                }
+            }
         }
-        chroma.consume(&interleaved);
+
+        // Drain in RESAMPLE_CHUNK-sized blocks through rubato.
+        while mono_buf.len() >= RESAMPLE_CHUNK {
+            let chunk: Vec<f32> = mono_buf.drain(..RESAMPLE_CHUNK).collect();
+            let input: [&[f32]; 1] = [&chunk];
+            let resampled = resampler
+                .process(&input, None)
+                .map_err(|e| HashError::Chromaprint(format!("rubato process: {e}")))?;
+            let out_mono = &resampled[0];
+            let pcm: Vec<i16> = out_mono
+                .iter()
+                .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+                .collect();
+            chroma.consume(&pcm);
+        }
+    }
+
+    // Flush any tail under RESAMPLE_CHUNK samples by zero-padding
+    // up to the chunk boundary. Drops up to ~93ms of trailing audio
+    // detail (1024 samples @ 11025 Hz target), well below the
+    // chromaprint per-chunk granularity that matters for matching.
+    if !mono_buf.is_empty() {
+        mono_buf.resize(RESAMPLE_CHUNK, 0.0);
+        let input: [&[f32]; 1] = [&mono_buf];
+        let resampled = resampler
+            .process(&input, None)
+            .map_err(|e| HashError::Chromaprint(format!("rubato flush: {e}")))?;
+        let out_mono = &resampled[0];
+        let pcm: Vec<i16> = out_mono
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+            .collect();
+        chroma.consume(&pcm);
     }
 
     chroma.finish();
