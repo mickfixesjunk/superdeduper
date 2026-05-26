@@ -160,7 +160,40 @@ where
             &mut visited_dirs,
         )?;
     }
+    // #70 (v0.2.12 P2) — defensive walker-side path dedup. assert_unique_paths
+    // in src/pipeline/mod.rs:86 is a debug_assert against the same-path-twice
+    // class of bug, but that's a panic-at-emit-time net. This pass closes the
+    // hole one layer upstream: any duplicate path produced by overlapping
+    // roots (e.g. `scan C:\Users C:\Users\Mick`), by a reparse-point junction
+    // that visited_dirs missed, or by any other multi-input pathological
+    // alias never reaches the size-grouping stage, let alone the assert. Each
+    // dedup'd entry fires WalkEvent::EntrySkipped so the user can see in the
+    // engine log that their roots overlapped (telemetry counter increments
+    // via cfg.exclusion_counters automatically).
+    out = dedup_by_path(out, &mut callback);
     Ok(out)
+}
+
+/// #70 — Drop FileEntry rows whose .path appears twice. Keeps the first
+/// occurrence; emits WalkEvent::EntrySkipped for each duplicate dropped so
+/// the engine log shows the overlap. O(n) with a HashSet<PathBuf>.
+fn dedup_by_path<F>(entries: Vec<FileEntry>, callback: &mut F) -> Vec<FileEntry>
+where
+    F: FnMut(WalkEvent<'_>),
+{
+    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(entries.len());
+    let mut deduped = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if seen.insert(entry.path.clone()) {
+            deduped.push(entry);
+        } else {
+            callback(WalkEvent::EntrySkipped {
+                path: &entry.path,
+                reason: "duplicate path (overlapping roots or unresolved alias)",
+            });
+        }
+    }
+    deduped
 }
 
 /// Single-file positional root path — mirror the filter logic from
@@ -1066,5 +1099,79 @@ mod inode_identity_tests {
         let (ino_b, _) = inode_identity(&fs::metadata(&b).unwrap());
         assert_ne!(ino_a, ino_b, "distinct files must have distinct file_refs");
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod dedup_by_path_tests {
+    //! #70 (v0.2.12 P2) — Walker-side path dedup unit tests. Pin the
+    //! contract directly so a regression that re-introduces duplicate
+    //! paths in the inventory output trips on `cargo test`, not on a
+    //! user-visible same-path-twice GUI group.
+
+    use super::*;
+    use crate::inventory::placeholder::PlaceholderState;
+
+    fn entry(p: &str) -> FileEntry {
+        FileEntry {
+            path: PathBuf::from(p),
+            size: 1024,
+            mtime: 0,
+            file_ref: 0,
+            parent_ref: 0,
+            usn: 0,
+            attributes: 0,
+            volume_guid: None,
+            placeholder: PlaceholderState::default(),
+        }
+    }
+
+    #[test]
+    fn no_duplicates_pass_through_unchanged() {
+        let input = vec![entry("/a"), entry("/b"), entry("/c")];
+        let mut dropped = 0u32;
+        let out = dedup_by_path(input, &mut |ev| {
+            if matches!(ev, WalkEvent::EntrySkipped { .. }) {
+                dropped += 1;
+            }
+        });
+        assert_eq!(out.len(), 3);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn duplicate_paths_dropped_after_first_occurrence() {
+        let input = vec![entry("/a"), entry("/b"), entry("/a"), entry("/c")];
+        let mut dropped_paths: Vec<PathBuf> = Vec::new();
+        let out = dedup_by_path(input, &mut |ev| {
+            if let WalkEvent::EntrySkipped { path, .. } = ev {
+                dropped_paths.push(path.to_path_buf());
+            }
+        });
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out.iter().map(|e| e.path.as_path()).collect::<Vec<_>>(),
+            vec![Path::new("/a"), Path::new("/b"), Path::new("/c")]
+        );
+        assert_eq!(dropped_paths, vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn empty_input_yields_empty_output() {
+        let out = dedup_by_path(Vec::new(), &mut |_| {});
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn all_duplicates_collapses_to_one() {
+        let input = vec![entry("/x"), entry("/x"), entry("/x"), entry("/x")];
+        let mut dropped = 0u32;
+        let out = dedup_by_path(input, &mut |ev| {
+            if matches!(ev, WalkEvent::EntrySkipped { .. }) {
+                dropped += 1;
+            }
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(dropped, 3);
     }
 }
