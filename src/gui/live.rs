@@ -1221,7 +1221,7 @@ fn run(
         if cancel.load(Ordering::Relaxed) {
             if let Some(p) = &checkpoint_path {
                 checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
-        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                if let Err(e) = checkpoint::save(p, &checkpoint_state) {
                     let _ = tx.send(EngineEvent::Log {
                         level: LogLevel::Warn,
                         message: format!("checkpoint save failed: {e}"),
@@ -1424,7 +1424,7 @@ fn run(
                 // exact bug that breaks resume after a mid-hash cancel.
                 if let Some(p) = &checkpoint_path {
                     checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
-        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                    if let Err(e) = checkpoint::save(p, &checkpoint_state) {
                         let _ = tx.send(EngineEvent::Log {
                             level: LogLevel::Warn,
                             message: format!("checkpoint save failed: {e}"),
