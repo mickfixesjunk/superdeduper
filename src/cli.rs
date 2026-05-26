@@ -706,20 +706,27 @@ pub enum ShareValue {
 /// Scan-mode dropdown per #25 + #26. User picks ONE mode per scan
 /// per Mick's 2026-05-24 directive.
 ///
-/// V1 only `Exact` actually drives the pipeline; `Image` and `Audio`
-/// are placeholders that surface a stderr warning + fall through to
-/// `Exact`. Lets us land the dropdown infra so the future Tier-4
-/// integration just flips the dispatch without churning the CLI.
+/// All three variants drive the pipeline today. `Image` requires the
+/// `similar-images` cargo feature; `Audio` requires `similar-audio`.
+/// Both are on in the shipped release binaries. Source builds without
+/// the matching feature hard-error at scan start per the build-gotcha
+/// chore (#97 v2 follow-up) rather than silently fall through.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum ScanMode {
     /// Byte-identical dedup — today's behaviour. Default.
     #[default]
     Exact,
-    /// Perceptual image similarity (T1.2, #25). CLI parses today;
-    /// pipeline integration ships in a follow-up.
+    /// Perceptual image similarity (T1.2, #25). Tier-4 dHash/aHash/pHash
+    /// over JPEG / PNG / WebP / GIF / BMP / TIFF / ICO files. Threshold
+    /// via `--image-similarity-threshold`; algorithm via
+    /// `--image-hash-algorithm`. Requires the `similar-images` feature.
     Image,
-    /// Acoustic audio fingerprinting (T1.3, #26). CLI parses today;
-    /// pipeline integration ships in a follow-up.
+    /// Acoustic audio fingerprinting (T1.3, #26). Tier-4 chromaprint
+    /// over MP3 / FLAC / WAV / OGG / M4A / AAC files. Threshold via
+    /// `--audio-similarity-threshold` (avg Hamming bits/chunk). Files
+    /// shorter than chromaprint's ~30s floor process via byte-identical
+    /// tier only and are reported in the scan-finish summary. Requires
+    /// the `similar-audio` feature.
     Audio,
 }
 
