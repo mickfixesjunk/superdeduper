@@ -932,22 +932,23 @@ fn run(
             }
         },
     });
-    // #100 — surface cache state at Stage 4 start so a resume run
-    // where the cache appears NOT to fast-forward (Mick's
-    // "restarted at 0" report) can be diagnosed without waiting
-    // for the scan-finish summary. If `rows` is high (~tens of
-    // thousands) but the bar still appears to crawl, the issue is
-    // visibility/threshold-tuning, not cache-not-persisted. If
-    // `rows` is near zero, the cache was wiped or never populated.
-    //
-    // #99 PR7 — also capture the row count as a hint for the
-    // initial OverallProgress emit below. Rows ≈ "files
-    // previously hashed in some prior session" — for a same-
-    // corpus resume, these will mostly cache-hit on the current
-    // scan. Clamped against `total_to_hash` (rows can exceed the
-    // current candidate set if the cache holds entries from
-    // earlier scans of unrelated paths).
-    let cache_estimated_hits: u64 = if let Some(c) = &cache {
+    // #100 — surface cache state at Stage 4 start so resume-run
+    // diagnostics don't have to wait for scan-finish summary.
+    // PR8 — keep the diagnostic emit but DROP PR7's bar-credit
+    // logic. PR7 used cache_rows as an initial bar offset, but:
+    //   (a) it over-credits — the cache holds rows from earlier
+    //       sessions of this corpus, not just the just-killed
+    //       scan, so Mick's count showed ~10% higher than reality
+    //   (b) the max() floor froze the bar for the cache-hit
+    //       window, making it LOOK like nothing was happening
+    // The accurate position comes from cache hits as they
+    // actually fire during Stage 4 — bar climbs continuously,
+    // no over-credit, no freeze. Trade-off accepted: bar starts
+    // at restored_skipped (4%) and climbs through cache hits to
+    // the prior position over ~minutes (SQLite mutex bottleneck
+    // caps per-file lookup throughput). Pre-flight bulk cache
+    // load is the v0.2.11 perf fix that makes this near-instant.
+    if let Some(c) = &cache {
         if let Ok(cache_path) = crate::cache::default_cache_path() {
             if let Ok(stats) = c.lock().stats(&cache_path) {
                 let _ = tx.send(EngineEvent::Log {
@@ -959,16 +960,9 @@ fn run(
                         stats.bytes_on_disk
                     ),
                 });
-                stats.rows
-            } else {
-                0
             }
-        } else {
-            0
         }
-    } else {
-        0
-    };
+    }
     let mut total_cache_hits: u64 = 0;
     // #99 PR3 — Tally of files whose cache row existed but
     // invalidated at lookup time (size / mtime / usn drift). Summed
@@ -989,23 +983,17 @@ fn run(
         "Stage 4 — hashing {} chunk(s)…",
         total_chunks
     )));
-    // #99 PR6+PR7 — bar reflects prior position with TWO credits:
-    //   (PR6) restored_skipped: files in restored dup groups,
-    //         filtered out of size_groups above (Stage 4 won't
-    //         process them; they're already-confirmed).
-    //   (PR7) cache_estimated_hits.min(total_to_hash): clamped
-    //         row count from the cache. Most of these will fire
-    //         as cache hits during Stage 4; the in-loop emit
-    //         uses `max(cache_estimated_hits, actual_hits)` so
-    //         the bar doesn't drop below this initial position
-    //         even if actual hit count lags briefly.
-    let cache_credit = cache_estimated_hits.min(total_to_hash);
-    let initial_done = restored_skipped.saturating_add(cache_credit);
-    let stage4_total = total_to_hash.saturating_add(restored_skipped);
+    // #99 PR6+PR8 — bar reflects prior position via the
+    // restored_skipped credit only (files in restored dup groups,
+    // filtered out of size_groups above). PR7's cache_credit
+    // addition was reverted — see the PR8 comment block on the
+    // cache-stats emit above for the rationale. Bar climbs
+    // continuously through cache hits from this initial position
+    // as the per-file callback bumps `n` (cached + fresh alike).
     let _ = tx.try_send(EngineEvent::OverallProgress {
         stage: OverallStage::Hashing,
-        done: initial_done,
-        total: stage4_total,
+        done: restored_skipped,
+        total: total_to_hash.saturating_add(restored_skipped),
         eta_secs: None,
     });
 
@@ -1149,15 +1137,8 @@ fn run(
         let total_to_hash_inner = total_to_hash;
         let hashing_started_inner = hashing_started;
         // #99 PR6 — capture the resume skip count so the in-loop
-        // OverallProgress emit can offset `done` + `total` by it.
+        // OverallProgress emit offsets `done` + `total` by it.
         let progress_restored_skipped = restored_skipped;
-        // #99 PR7 — capture the cache-credit estimate so the bar's
-        // `done` value never drops below `restored_skipped +
-        // cache_credit` even if actual cache-hit count lags behind
-        // the estimate. The bar starts at the prior position and
-        // climbs from there as fresh hashes (or extra cache hits)
-        // accumulate.
-        let progress_cache_credit = cache_credit;
         let progress_diag = diag.clone();
         let progress_tier_counts = [
             Arc::clone(&tier_counts[0]),
@@ -1258,23 +1239,16 @@ fn run(
             // Headline OverallProgress + ETA: only Tier 1 advances.
             if counts_for_progress && n.is_multiple_of(100) {
                 let elapsed = hashing_started_inner.elapsed().as_secs_f32();
-                // #99 PR6+PR7 — bar position math:
-                //   done = restored_skipped + max(cache_credit, n)
+                // #99 PR6+PR8 — bar math:
+                //   done = restored_skipped + n
                 //   total = total_to_hash + restored_skipped
-                //
-                // PR6 contributed restored_skipped (files in
-                // already-confirmed dup groups, filtered out of
-                // size_groups). PR7 contributes cache_credit (the
-                // cache-row-count estimate). Using max() ensures
-                // the bar never drops below the cache_credit floor
-                // — for the first 60-100 chunks of a resume, n
-                // grows steadily but stays below cache_credit
-                // (because actual cache hits are bumping n at
-                // ~cached-throughput speed). After cache exhausts,
-                // n continues to climb past cache_credit via fresh
-                // hashes, and the max() naturally yields to n.
-                let bar_n = n.max(progress_cache_credit);
-                let adjusted_done = bar_n.saturating_add(progress_restored_skipped);
+                // restored_skipped credits files in already-
+                // confirmed dup groups (PR6); n bumps for every
+                // Tier 1 callback (cache hits + fresh hashes
+                // alike), so the bar climbs continuously from
+                // restored_skipped through the cache-hit window
+                // (visibly) and into the fresh-hash window.
+                let adjusted_done = n.saturating_add(progress_restored_skipped);
                 let adjusted_total = total_to_hash_inner
                     .saturating_add(progress_restored_skipped);
                 let frac = if total_to_hash_inner > 0 {
