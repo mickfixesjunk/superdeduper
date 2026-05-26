@@ -1,6 +1,6 @@
 [package]
 name = "superdeduper"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 rust-version = "1.87"
 description = "superdeduper — the fastest duplicate file finder for Windows / NTFS."
@@ -32,7 +32,7 @@ blake3 = { version = "1", features = ["rayon"] }
 # unpushed working copy, add to a (gitignored) `.cargo/config.toml`:
 #   [patch."https://github.com/mickfixesjunk/river5"]
 #   river5 = { path = "../river5" }
-river5 = { git = "https://github.com/mickfixesjunk/river5", rev = "f3a3ddb790673cc3c7c1518f67e03ad11fd56fc6" }
+river5 = { git = "https://github.com/mickfixesjunk/river5", rev = "35533ced58c0c29f28726fdd355ace8d51c28e8b" }
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 hashbrown = "0.14"
@@ -102,8 +102,25 @@ image_hasher = { version = "3", optional = true }
 # significant; we enable the codec features matching spec §3
 # (mp3, aac, flac, wav, ogg-vorbis, opus, plus the matching
 # containers).
-symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3", "aac", "flac", "wav", "vorbis", "ogg", "isomp4"] }
+# #97 v2: `wav` enables only the RIFF container prober; the PCM
+# codec decoder is the SEPARATE `pcm` feature. Without it, WAV
+# files probe but `decoder.make()` returns Unsupported and
+# `hash_file()` drops them silently — testrunner's PCM-diff at
+# 14:55Z 2026-05-26 caught the regression as zero PCM-DUMP markers
+# for any .wav variant in the AT1 corpus.
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3", "aac", "flac", "wav", "pcm", "vorbis", "ogg", "isomp4"] }
 rusty-chromaprint = { version = "0.3", optional = true }
+# #97 v2 — Pre-normalise decoded audio to mono 11025 Hz int16 PCM
+# before the chromaprint feed per AcoustID best-practice. The crate's
+# internal resampler was empirically lossier than fpcalc's reference
+# (testrunner CD3/CD4 verdict 2026-05-26), causing lossless ↔ lossy
+# variants to drift past τ=5. Pre-normalising with our own rubato
+# instance (FastFixedIn polynomial) and feeding chromaprint with a
+# fixed (11025, 1) start lifts same-source recall on the diagnostic
+# corpus. Reverted in v0.2.11 because of a paired bug (#97 v1
+# silent-dropped 24-bit S32); reland in #97 v2 alongside the
+# SampleBuffer<f32> fallback arm.
+rubato = { version = "0.16", optional = true }
 
 [features]
 default = []
@@ -134,7 +151,7 @@ similar-images = ["dep:image", "dep:image_hasher"]
 # Initial slice: algorithm wrapper module + `--mode audio`
 # CLI flag (already in place from #25 v1), no pipeline
 # integration yet.
-similar-audio = ["dep:symphonia", "dep:rusty-chromaprint"]
+similar-audio = ["dep:symphonia", "dep:rusty-chromaprint", "dep:rubato"]
 
 [[bin]]
 name = "superdeduper-gui"

@@ -1607,11 +1607,27 @@ fn run(
             delta: 0,
             total: confirmed,
         });
+        // #104 Gap 3 — surface cache-hit progress in the live Status
+        // bar (not just the every-10-chunk Log line) so a user
+        // watching a paused-then-resumed scan can see fast-forward
+        // happening in real-time. Only included when the cache is
+        // doing meaningful work (resume situation); fresh scans
+        // would just show "0 cached" noise otherwise.
+        let fresh_so_far = tier_count_total[0]
+            .saturating_add(tier_count_total[1])
+            .saturating_add(tier_count_total[2])
+            .saturating_add(tier_count_total[3]);
+        let cache_suffix = if total_cache_hits > 0 || predicted_cache_hits > 0 {
+            format!(" · {total_cache_hits} cached / {fresh_so_far} fresh")
+        } else {
+            String::new()
+        };
         let _ = tx.try_send(EngineEvent::Status(format!(
-            "Hashing chunk {}/{} · {} duplicate group(s) so far",
+            "Hashing chunk {}/{} · {} duplicate group(s) so far{}",
             i + 1,
             total_chunks,
-            total_dups
+            total_dups,
+            cache_suffix
         )));
         // #100 — periodic cache-stats emit during Stage 4 so a user
         // watching a resume run can see in real-time whether the

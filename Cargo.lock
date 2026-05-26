@@ -3711,7 +3711,7 @@ dependencies = [
 [[package]]
 name = "river5"
 version = "0.1.0"
-source = "git+https://github.com/mickfixesjunk/river5?rev=f3a3ddb790673cc3c7c1518f67e03ad11fd56fc6#f3a3ddb790673cc3c7c1518f67e03ad11fd56fc6"
+source = "git+https://github.com/mickfixesjunk/river5?rev=35533ced58c0c29f28726fdd355ace8d51c28e8b#35533ced58c0c29f28726fdd355ace8d51c28e8b"
 dependencies = [
  "cc",
 ]
@@ -4249,7 +4249,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superdeduper"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4274,6 +4274,7 @@ dependencies = [
  "rfd",
  "river5",
  "rodio",
+ "rubato",
  "rusqlite",
  "rusty-chromaprint",
  "serde",
@@ -4311,6 +4312,7 @@ dependencies = [
  "symphonia-bundle-flac",
  "symphonia-bundle-mp3",
  "symphonia-codec-aac",
+ "symphonia-codec-pcm",
  "symphonia-codec-vorbis",
  "symphonia-core",
  "symphonia-format-isomp4",
@@ -4350,6 +4352,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c263845aa86881416849c1729a54c7f55164f8b96111dba59de46849e73a790"
 dependencies = [
  "lazy_static",
+ "log",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-codec-pcm"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e89d716c01541ad3ebe7c91ce4c8d38a7cf266a3f7b2f090b108fb0cb031d95"
+dependencies = [
  "log",
  "symphonia-core",
 ]

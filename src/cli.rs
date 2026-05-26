@@ -99,6 +99,16 @@ pub enum Command {
     #[command(subcommand)]
     Account(AccountCommand),
 
+    /// #94 — Drain locally-recorded scan-history rows whose
+    /// submission_state is `pending` to the leaderboard backend.
+    /// Closes the CLI auto-submit gap that the GUI Resubmit button
+    /// already covers — `superdeduper scan` records the payload but
+    /// doesn't POST it; this subcommand does the POST for every
+    /// such row in one shot. Idempotent: already-submitted rows
+    /// are skipped (state-driven, not re-POSTed).
+    #[cfg(feature = "telemetry")]
+    SubmitPending(SubmitPendingArgs),
+
     /// #38 v1 — inspect or maintain the local scan history. Tester
     /// surface; cross-validates the persistence layer without
     /// requiring filesystem spelunking.
@@ -109,6 +119,25 @@ pub enum Command {
     /// containment-integration test harness shells out to.
     #[command(subcommand)]
     Debug(DebugCommand),
+}
+
+/// #94 — Arguments for `superdeduper submit-pending`.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Args)]
+pub struct SubmitPendingArgs {
+    /// Only drain rows recorded on this channel. Defaults to all
+    /// channels — drains prod + dev + local pending rows in one
+    /// pass. Use `--channel dev` if you only want to flush dev
+    /// records (e.g. CI test runs that shouldn't bleed into the
+    /// prod leaderboard).
+    #[arg(long, value_name = "CHANNEL")]
+    pub channel: Option<String>,
+
+    /// Don't POST anything. Print what would be submitted (scan_id,
+    /// channel, recorded reclaim bytes), then exit 0. Useful for
+    /// confirming the set before draining.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]

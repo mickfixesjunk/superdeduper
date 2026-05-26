@@ -59,6 +59,8 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Achievements(cmd) => run_achievements(cmd),
         #[cfg(feature = "telemetry")]
         Command::Account(cmd) => run_account(cmd),
+        #[cfg(feature = "telemetry")]
+        Command::SubmitPending(args) => run_submit_pending(args),
         Command::ScanHistory(cmd) => run_scan_history(cmd),
     }
 }
@@ -550,6 +552,192 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
         }
         Err(e) => Err(anyhow::anyhow!("registration failed: {e:?}")),
     }
+}
+
+/// #94 — `superdeduper submit-pending`. Drains every scan-history
+/// row with `submission_state = Pending` to the leaderboard. The
+/// payload + signing key are already captured in the row (via
+/// `submission_payload` + `built_with_install_id` per #41); this
+/// subcommand resolves the channel, loads the matching install,
+/// and POSTs via the existing `submit_recorded_payload` flow that
+/// the GUI Resubmit button already uses. Closes the auto-submit
+/// gap testrunner surfaced in v0.2.8 #79 empirical testing.
+#[cfg(feature = "telemetry")]
+fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use superdeduper::channel::{self, Channel};
+    use superdeduper::leaderboard::install;
+    use superdeduper::leaderboard::submission::{self, SubmitOutcome};
+    use superdeduper::scan_history::{self, SubmissionState};
+
+    // threshold_secs = 0 → return ALL pending rows regardless of
+    // age. Callers wanting an age-gate (skip very recent scans)
+    // would use list_pending_older_than directly; the CLI here is
+    // intentionally aggressive — if it's pending, drain it.
+    let pending = scan_history::list_pending_older_than(0)?;
+
+    // Channel filter (--channel dev / prod / local) + drop rows
+    // without a captured payload (v1/v2 rows from before #41
+    // landed) — those CAN'T be submitted; the local copy is the
+    // only record. Surface them in the dry-run output so users
+    // know the row exists but is unsubmittable.
+    let want_channel = args.channel.as_deref();
+    let (eligible, unsubmittable): (Vec<_>, Vec<_>) = pending
+        .into_iter()
+        .filter(|r| want_channel.is_none_or(|c| r.channel == c))
+        .partition(|r| r.submission_payload.is_some() && r.built_with_install_id.is_some());
+
+    if !unsubmittable.is_empty() {
+        eprintln!(
+            "{} pending row(s) with no captured payload — these were recorded \
+             before payload-persistence (#41) landed; skipping:",
+            unsubmittable.len()
+        );
+        for r in &unsubmittable {
+            eprintln!("  - {} (channel: {})", r.scan_id, r.channel);
+        }
+    }
+
+    if eligible.is_empty() {
+        println!("No drainable pending submissions.");
+        return Ok(());
+    }
+
+    println!("Found {} pending submission(s) to drain:", eligible.len());
+    for r in &eligible {
+        let reclaim = humansize::format_size(r.reclaimable_bytes, humansize::BINARY);
+        println!(
+            "  {} channel={:<6} reclaim={:>10}  ({} group(s), {} file(s))",
+            r.scan_id, r.channel, reclaim, r.total_dups, r.total_files,
+        );
+    }
+
+    if args.dry_run {
+        println!("\n(dry-run — no POST sent)");
+        return Ok(());
+    }
+
+    println!();
+    let mut submitted: u64 = 0;
+    let mut duplicate: u64 = 0;
+    let mut rejected: u64 = 0;
+    let mut transient: u64 = 0;
+    for record in eligible {
+        let chan: Channel = record
+            .channel
+            .parse()
+            .with_context(|| format!("parse channel slug `{}`", record.channel))?;
+        let server_url = channel::server_url_for(chan);
+        let install_state = match install::load_for(chan)? {
+            Some(s) if s.registered => s,
+            Some(_) => {
+                eprintln!(
+                    "  ✗ {} skipped — install for channel `{}` is not registered. \
+                     Run `superdeduper register --channel {}` first.",
+                    record.scan_id,
+                    chan.as_slug(),
+                    chan.as_slug()
+                );
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+            None => {
+                eprintln!(
+                    "  ✗ {} skipped — no install state for channel `{}`. \
+                     Run `superdeduper register --channel {}` first.",
+                    record.scan_id,
+                    chan.as_slug(),
+                    chan.as_slug()
+                );
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+        };
+        let payload = record.submission_payload.as_ref().expect("filtered above");
+        let built_with = record
+            .built_with_install_id
+            .as_ref()
+            .expect("filtered above");
+        let outcome =
+            submission::submit_recorded_payload(&install_state, payload, built_with, server_url);
+        match outcome {
+            SubmitOutcome::Accepted { submission_id, .. } => {
+                scan_history::update_submission_state(
+                    &record.scan_id,
+                    SubmissionState::Submitted,
+                    true,
+                )?;
+                submitted = submitted.saturating_add(1);
+                println!(
+                    "  ✓ {} accepted (submission_id={})",
+                    record.scan_id, submission_id
+                );
+            }
+            SubmitOutcome::DuplicateNoChange => {
+                scan_history::update_submission_state(
+                    &record.scan_id,
+                    SubmissionState::Submitted,
+                    true,
+                )?;
+                duplicate = duplicate.saturating_add(1);
+                println!(
+                    "  • {} already-on-file (409 DuplicateNoChange) — marking submitted",
+                    record.scan_id
+                );
+            }
+            SubmitOutcome::Rejected { status, reason } => {
+                scan_history::update_submission_state(
+                    &record.scan_id,
+                    SubmissionState::Failed,
+                    true,
+                )?;
+                rejected = rejected.saturating_add(1);
+                eprintln!(
+                    "  ✗ {} rejected (status={}, reason={})",
+                    record.scan_id, status, reason
+                );
+            }
+            SubmitOutcome::Transient { reason } => {
+                // Bump attempt_count but DON'T transition to Failed —
+                // transient failures (5xx / network) get retried on
+                // the next CLI run. Failed is reserved for terminal
+                // 4xx rejections.
+                scan_history::update_submission_state(
+                    &record.scan_id,
+                    SubmissionState::Pending,
+                    true,
+                )?;
+                transient = transient.saturating_add(1);
+                eprintln!(
+                    "  · {} transient (reason={}) — will retry on next run",
+                    record.scan_id, reason
+                );
+            }
+            SubmitOutcome::FlaggedForReview { .. } => {
+                // submit_recorded_payload doesn't emit this variant
+                // (it's set by the GUI "Submit for review" flow),
+                // but match must be exhaustive; treat as Submitted
+                // since the review queue has the payload.
+                scan_history::update_submission_state(
+                    &record.scan_id,
+                    SubmissionState::Submitted,
+                    true,
+                )?;
+                submitted = submitted.saturating_add(1);
+                println!("  ✓ {} queued for review", record.scan_id);
+            }
+        }
+    }
+
+    let total = submitted + duplicate + rejected + transient;
+    println!(
+        "\n{} drained: {} accepted, {} already-on-file, {} rejected, {} transient.",
+        total, submitted, duplicate, rejected, transient
+    );
+    if rejected > 0 || transient > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 /// G-track: `superdeduper config show` / `superdeduper config set-share`.

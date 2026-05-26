@@ -79,11 +79,53 @@ pub fn show(ui: &mut Ui, state: &UiState) {
         return;
     }
 
+    // #104 Gap 2 — pin `resume diag:` lines above the rolling tail.
+    // Pre-#104, the rolling 500-entry render plus the 1024-entry log
+    // cap meant the 5–6 resume diagnostic emits at scan-start rolled
+    // out of view within seconds, making the user unable to inspect
+    // tier classification or cache state mid-scan. We now collect
+    // those entries into a pinned non-scrolling section above the
+    // scrollable region and exclude them from the rolling-tail to
+    // avoid double-render.
+    let resume_diag_entries: Vec<&crate::gui::state::LogEntry> = state
+        .logs
+        .iter()
+        .filter(|e| e.message.starts_with("resume diag:"))
+        .collect();
+    if !resume_diag_entries.is_empty() {
+        for entry in &resume_diag_entries {
+            let (tag, color) = match entry.level {
+                LogLevel::Info => ("info ", theme::TEXT_LO),
+                LogLevel::Warn => ("warn ", theme::WARN),
+                LogLevel::Error => ("error", theme::HOT),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📌").small());
+                ui.label(RichText::new(tag).color(color).monospace().small().strong());
+                ui.label(
+                    RichText::new(&entry.message)
+                        .color(theme::TEXT_HI)
+                        .monospace()
+                        .small(),
+                );
+            });
+        }
+        ui.separator();
+    }
+
+    // Collecting first because `.rev().take(500).rev()` requires
+    // DoubleEndedIterator which `.filter()` doesn't preserve.
+    let non_resume: Vec<&crate::gui::state::LogEntry> = state
+        .logs
+        .iter()
+        .filter(|e| !e.message.starts_with("resume diag:"))
+        .collect();
+    let tail_start = non_resume.len().saturating_sub(500);
     ScrollArea::vertical()
         .id_salt("log-panel")
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            for entry in state.logs.iter().rev().take(500).rev() {
+            for entry in &non_resume[tail_start..] {
                 let (tag, color) = match entry.level {
                     LogLevel::Info => ("info ", theme::TEXT_LO),
                     LogLevel::Warn => ("warn ", theme::WARN),

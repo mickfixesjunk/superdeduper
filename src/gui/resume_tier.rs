@@ -58,7 +58,13 @@ impl ResumeTier {
     /// confidence.
     pub fn modal_label(self) -> &'static str {
         match self {
-            ResumeTier::Full => "Resume previous scan",
+            // #104 Gap 1 — Full-tier label was identical to the
+            // pre-PR2 generic copy ("Resume previous scan"), so users
+            // on the most-common tier saw no visible signal that the
+            // new modal behaviour was active. "Continue scan" reads
+            // as a distinct verb-shape from "Resume" + reinforces the
+            // "fast continuation" blurb above the button.
+            ResumeTier::Full => "Continue scan",
             ResumeTier::Warm => "Resume — engine updated, re-validating from cold cache",
             ResumeTier::InventoryOnly => {
                 "Settings changed — keeping the file list, redoing analysis"
