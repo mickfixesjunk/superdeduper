@@ -999,6 +999,36 @@ fn run(
     let mut total_cache_drift_misses: u64 = 0;
     let mut total_cache_writes: u64 = 0;
 
+    // #99 PR11 — Pre-flight predicted-hit count against the warm
+    // map. Lets the initial Stage-4 OverallProgress emit JUMP the
+    // bar to the pre-kill position immediately instead of climbing
+    // up to it over the fast-forward window. PR7 attempted this
+    // using raw cache_rows as credit, but over-counted because the
+    // cache table can hold rows for files not in the current scan;
+    // PR11 lookups each laid file against the warm map and counts
+    // only true Hit outcomes (size+mtime+usn match), so the credit
+    // matches the actual fast-forward exactly.
+    let predicted_cache_hits: u64 = if let Some(c) = &cache {
+        let preflight_started = Instant::now();
+        let keys: Vec<crate::cache::CacheKey> = laid
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .filter_map(|f| crate::pipeline::hash::cache_key(f, cfg.hash_algo))
+            .collect();
+        let key_count = keys.len();
+        let hits = c.lock().predict_hits(&keys);
+        let _ = tx.send(EngineEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Resume pre-flight: {hits} predicted cache hit(s) over {key_count} laid file(s) in {} ms — bar will be credited at frame-zero so it doesn't climb during fast-forward",
+                preflight_started.elapsed().as_millis()
+            ),
+        });
+        hits
+    } else {
+        0
+    };
+
     // Smaller chunks → more frequent updates between chunks. We also
     // wire a per-file progress callback into the hasher so the UI
     // animates *within* a chunk, not just between them.
@@ -1017,9 +1047,14 @@ fn run(
     // cache-stats emit above for the rationale. Bar climbs
     // continuously through cache hits from this initial position
     // as the per-file callback bumps `n` (cached + fresh alike).
+    // #99 PR11 — initial done credits restored_skipped (PR6) +
+    // predicted_cache_hits (PR11). On a fresh scan both are 0 and
+    // the bar starts at the origin; on a resume, both jump the bar
+    // straight to the pre-kill position before chunk 1 runs.
+    let initial_done = restored_skipped.saturating_add(predicted_cache_hits);
     let _ = tx.try_send(EngineEvent::OverallProgress {
         stage: OverallStage::Hashing,
-        done: restored_skipped,
+        done: initial_done,
         total: total_to_hash.saturating_add(restored_skipped),
         eta_secs: None,
     });
@@ -1029,14 +1064,14 @@ fn run(
     {
         let initial_adjusted_total = total_to_hash.saturating_add(restored_skipped);
         let initial_bar_pct = if initial_adjusted_total > 0 {
-            (restored_skipped as f64 / initial_adjusted_total as f64) * 100.0
+            (initial_done as f64 / initial_adjusted_total as f64) * 100.0
         } else {
             0.0
         };
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
             message: format!(
-                "Stage 4 bar frame-zero: bar {initial_bar_pct:.2}% ({restored_skipped}/{initial_adjusted_total} files) · total_to_hash={total_to_hash}, restored_dup_skip={restored_skipped}, total_chunks={total_chunks}"
+                "Stage 4 bar frame-zero: bar {initial_bar_pct:.2}% ({initial_done}/{initial_adjusted_total} files) · total_to_hash={total_to_hash}, restored_dup_skip={restored_skipped}, predicted_cache_hits={predicted_cache_hits}, total_chunks={total_chunks}"
             ),
         });
     }
@@ -1183,6 +1218,12 @@ fn run(
         // #99 PR6 — capture the resume skip count so the in-loop
         // OverallProgress emit offsets `done` + `total` by it.
         let progress_restored_skipped = restored_skipped;
+        // #99 PR11 — capture the pre-flight predicted-hit count so
+        // the in-loop emit can floor `done` at the pre-credited
+        // position. Bar stays at the credit during fast-forward
+        // (n < predicted), then climbs normally once disk-bound
+        // work begins (n > predicted).
+        let progress_predicted_cache_hits = predicted_cache_hits;
         let progress_diag = diag.clone();
         let progress_tier_counts = [
             Arc::clone(&tier_counts[0]),
@@ -1292,7 +1333,15 @@ fn run(
                 // alike), so the bar climbs continuously from
                 // restored_skipped through the cache-hit window
                 // (visibly) and into the fresh-hash window.
-                let adjusted_done = n.saturating_add(progress_restored_skipped);
+                // #99 PR11 — floor `done` at the pre-credited
+                // position. Without the max(), `done` would dip
+                // back to (n + restored) at chunk 1 (n=0), undoing
+                // the frame-zero jump and producing a visible
+                // bar-drop. With it, the bar stays at the credit
+                // until actual n catches up, then climbs naturally.
+                let adjusted_done = n
+                    .saturating_add(progress_restored_skipped)
+                    .max(progress_restored_skipped.saturating_add(progress_predicted_cache_hits));
                 let adjusted_total = total_to_hash_inner
                     .saturating_add(progress_restored_skipped);
                 let frac = if total_to_hash_inner > 0 {
@@ -1536,8 +1585,12 @@ fn run(
             // #99 PR10 — surface the bar position alongside chunk
             // position so a paste-back of the log lets us correlate
             // what the user sees in the GUI against engine state.
+            // PR11 — same floor as the in-loop emit so the log %
+            // matches the GUI %.
             let n_now = files_hashed.load(Ordering::Relaxed);
-            let adjusted_done_now = n_now.saturating_add(restored_skipped);
+            let adjusted_done_now = n_now
+                .saturating_add(restored_skipped)
+                .max(restored_skipped.saturating_add(predicted_cache_hits));
             let adjusted_total_now = total_to_hash.saturating_add(restored_skipped);
             let bar_pct = if adjusted_total_now > 0 {
                 (adjusted_done_now as f64 / adjusted_total_now as f64) * 100.0
@@ -1547,7 +1600,7 @@ fn run(
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Info,
                 message: format!(
-                    "cache so far: {total_cache_hits} hit(s), {total_cache_drift_misses} drift miss(es), {} fresh hash(es) — {hit_rate_so_far:.1}% hit rate (chunk {}/{}) · bar {bar_pct:.2}% ({adjusted_done_now}/{adjusted_total_now} files, restored_dup_skip={restored_skipped})",
+                    "cache so far: {total_cache_hits} hit(s), {total_cache_drift_misses} drift miss(es), {} fresh hash(es) — {hit_rate_so_far:.1}% hit rate (chunk {}/{}) · bar {bar_pct:.2}% ({adjusted_done_now}/{adjusted_total_now} files, restored_dup_skip={restored_skipped}, predicted_cache_hits={predicted_cache_hits})",
                     total_so_far.saturating_sub(total_cache_hits),
                     i + 1,
                     total_chunks,
