@@ -664,6 +664,22 @@ fn render_keep_strategy(ui: &mut egui::Ui, settings: &mut ScanSettings) {
              each group stays the keeper. Deterministic but \
              arbitrary on Windows where directory order varies.",
         ),
+        (
+            KeepStrategy::InReference,
+            "In-reference — favour the copy under a reference root",
+            "Reference roots (mark them in the Roots panel via the \
+             Ref checkbox) are NEVER destructive-targeted regardless \
+             of strategy — that protection runs at action time. This \
+             strategy is the keeper-pick layer on top: when a group \
+             contains both reference and non-reference files, the \
+             reference-root file is the keeper. For groups where no \
+             member is under a reference root, the Smart picker fires \
+             as a fallback so you still get a sensible pick instead \
+             of an error. Pair this with reference-root marking when \
+             you have a curated canonical tree (photo archive, \
+             gold-master backup) and want everything outside it \
+             treated as a dupe.",
+        ),
     ];
 
     let active = settings.keep_strategy;
