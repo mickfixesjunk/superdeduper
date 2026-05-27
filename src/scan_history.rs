@@ -512,29 +512,80 @@ pub fn find_by_submission_id(submission_id: &str) -> io::Result<Option<ScanRecor
 }
 
 /// #82 — Stamp the reclaim-side fields onto a ScanRecord when
-/// the PATCH succeeds. Idempotent / overwrites — multi-PATCH on
-/// the same scan keeps `reclaim_at_unix` from the FIRST success
-/// (set only when None) and updates `reclaim_updated_at_unix` +
-/// the byte fields to the latest values. Returns true if a row
-/// matched.
+/// the PATCH succeeds. Returns true if a row matched.
+///
+/// **Accumulates per-key** (#122 / #123). Each PATCH carries only
+/// the bytes for the most recent action; prior overwriting clobbered
+/// earlier action credit in the same scan (e.g. Recycle then Archive
+/// landed only the Archive bytes). Now `action_breakdown[k]` adds
+/// the new `bytes` to the existing value per key, and
+/// `actually_reclaimed_bytes` is recomputed as the sum across keys.
+/// `reclaim_at_unix` stays sticky to the first PATCH;
+/// `reclaim_updated_at_unix` advances on every call.
 pub fn update_reclaim_for_submission(
     submission_id: &str,
-    actually_reclaimed_bytes: u64,
-    action_breakdown: BTreeMap<String, u64>,
+    additional_action_breakdown: BTreeMap<String, u64>,
 ) -> io::Result<bool> {
     let mut record = match find_by_submission_id(submission_id)? {
         Some(r) => r,
         None => return Ok(false),
     };
+    accumulate_reclaim_in_place(&mut record, &additional_action_breakdown);
+    record_completed(&record)?;
+    Ok(true)
+}
+
+/// #122 / #123 — Local-only history credit. Writes the action
+/// breakdown onto the LATEST scan record (the row representing the
+/// current session's most recent scan), regardless of whether a
+/// submission has happened yet. This closes the trust loop:
+///
+/// 1. user scans
+/// 2. user runs Recycle / Archive / Hardlink BEFORE submitting
+/// 3. local action_breakdown updates immediately → History panel
+///    shows "Reclaimed" column straight away
+/// 4. user submits later → PATCH lands → the same per-key
+///    accumulation in `update_reclaim_for_submission` (now additive)
+///    folds in the same bytes again only if web also sees them. To
+///    avoid double-counting from the local path PLUS the PATCH path,
+///    the PATCH side is gated by `submission_id` (only fires after
+///    submit); local side targets the row by scan_id directly so the
+///    two paths never both write the same delta to the same row.
+///
+/// Returns the updated record (so callers can surface the new
+/// totals) when a row was found, `None` otherwise (e.g. no scans
+/// yet recorded).
+pub fn record_local_action_for_latest_scan(
+    additional_action_breakdown: &BTreeMap<String, u64>,
+) -> io::Result<Option<ScanRecord>> {
+    if additional_action_breakdown.is_empty() {
+        return Ok(None);
+    }
+    let mut all = list()?;
+    let Some(mut record) = all.drain(..).next() else {
+        return Ok(None);
+    };
+    accumulate_reclaim_in_place(&mut record, additional_action_breakdown);
+    record_completed(&record)?;
+    Ok(Some(record))
+}
+
+/// Shared per-key accumulation logic used by both the PATCH path
+/// (`update_reclaim_for_submission`) and the local path
+/// (`record_local_action_for_latest_scan`). Bumps each key by the
+/// supplied delta, recomputes `actually_reclaimed_bytes` as the
+/// fresh sum, stamps timestamps. Caller writes back.
+fn accumulate_reclaim_in_place(record: &mut ScanRecord, additional: &BTreeMap<String, u64>) {
     let now = unix_now();
     if record.reclaim_at_unix.is_none() {
         record.reclaim_at_unix = Some(now);
     }
     record.reclaim_updated_at_unix = Some(now);
-    record.actually_reclaimed_bytes = actually_reclaimed_bytes;
-    record.action_breakdown = action_breakdown;
-    record_completed(&record)?;
-    Ok(true)
+    for (k, v) in additional {
+        let entry = record.action_breakdown.entry(k.clone()).or_insert(0);
+        *entry = entry.saturating_add(*v);
+    }
+    record.actually_reclaimed_bytes = record.action_breakdown.values().sum();
 }
 
 /// #41 — list every row whose `submission_state == Pending` and
@@ -972,12 +1023,13 @@ mod tests {
         let found = find_by_submission_id(&sid).unwrap().unwrap();
         assert_eq!(found.scan_id, scan_id);
 
-        // update_reclaim stamps the bytes + breakdown.
+        // update_reclaim accumulates per-key + recomputes the
+        // headline `actually_reclaimed_bytes` from the new map.
         let mut breakdown = BTreeMap::new();
         breakdown.insert("deleted_to_recycle_bytes".to_string(), 8 * 1024 * 1024);
         breakdown.insert("hardlink_replaced_bytes".to_string(), 4 * 1024 * 1024);
-        let total = breakdown.values().sum();
-        let ok = update_reclaim_for_submission(&sid, total, breakdown.clone()).unwrap();
+        let total: u64 = breakdown.values().sum();
+        let ok = update_reclaim_for_submission(&sid, breakdown.clone()).unwrap();
         assert!(ok);
         let after_reclaim = load(&scan_id).unwrap().unwrap();
         assert!(after_reclaim.reclaim_at_unix.is_some());
@@ -985,15 +1037,16 @@ mod tests {
         assert_eq!(after_reclaim.actually_reclaimed_bytes, total);
         assert_eq!(after_reclaim.action_breakdown, breakdown);
 
-        // Idempotent re-update keeps reclaim_at_unix from the first
-        // call + updates reclaim_updated_at_unix.
+        // #122 / #123 — second PATCH ACCUMULATES per-key rather than
+        // overwriting. Adding `archived_bytes: 99_999` to a row that
+        // already has recycle + hardlink credit lands all three.
         let first_at = after_reclaim.reclaim_at_unix.unwrap();
         let mut breakdown2 = BTreeMap::new();
         breakdown2.insert("archived_bytes".to_string(), 99_999);
         // Need a noticeable wait between updates so the second
         // reclaim_updated_at_unix can differ from the first.
         std::thread::sleep(std::time::Duration::from_secs(1));
-        update_reclaim_for_submission(&sid, 99_999, breakdown2.clone()).unwrap();
+        update_reclaim_for_submission(&sid, breakdown2.clone()).unwrap();
         let after2 = load(&scan_id).unwrap().unwrap();
         assert_eq!(
             after2.reclaim_at_unix,
@@ -1004,14 +1057,109 @@ mod tests {
             after2.reclaim_updated_at_unix.unwrap() >= first_at,
             "reclaim_updated_at_unix bumps to latest",
         );
-        assert_eq!(after2.actually_reclaimed_bytes, 99_999);
-        assert_eq!(after2.action_breakdown, breakdown2);
+        // All three keys present after the additive second PATCH.
+        assert_eq!(
+            after2
+                .action_breakdown
+                .get("deleted_to_recycle_bytes")
+                .copied(),
+            Some(8 * 1024 * 1024),
+        );
+        assert_eq!(
+            after2
+                .action_breakdown
+                .get("hardlink_replaced_bytes")
+                .copied(),
+            Some(4 * 1024 * 1024),
+        );
+        assert_eq!(
+            after2.action_breakdown.get("archived_bytes").copied(),
+            Some(99_999),
+        );
+        assert_eq!(after2.actually_reclaimed_bytes, total + 99_999);
+
+        // Additive repeat: same key arrives twice (e.g. user
+        // recycles in two batches). Second call adds, doesn't
+        // overwrite.
+        let mut breakdown3 = BTreeMap::new();
+        breakdown3.insert("deleted_to_recycle_bytes".to_string(), 2 * 1024 * 1024);
+        update_reclaim_for_submission(&sid, breakdown3).unwrap();
+        let after3 = load(&scan_id).unwrap().unwrap();
+        assert_eq!(
+            after3
+                .action_breakdown
+                .get("deleted_to_recycle_bytes")
+                .copied(),
+            Some(10 * 1024 * 1024),
+            "same key accumulates across PATCHes",
+        );
 
         // Missing row → Ok(false).
         let none = set_submission_id("does-not-exist", "xyz".into()).unwrap();
         assert!(!none);
-        let none2 = update_reclaim_for_submission("not-a-real-id", 0, BTreeMap::new()).unwrap();
+        let none2 = update_reclaim_for_submission("not-a-real-id", BTreeMap::new()).unwrap();
         assert!(!none2);
+    }
+
+    /// #122 / #123 — `record_local_action_for_latest_scan` writes
+    /// action credit to the most recent ScanRecord regardless of
+    /// submit/submission_id state. Closes the trust loop for users
+    /// who act before submitting.
+    #[test]
+    fn record_local_action_for_latest_scan_round_trips() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _td = isolate("local-action-credit");
+        let scan_id = new_scan_id();
+        let r = ScanRecord::new_finished(
+            scan_id.clone(),
+            1_700_000_000,
+            "prod",
+            vec![],
+            10,
+            5,
+            0,
+            123_456,
+            BTreeMap::new(),
+        );
+        record_completed(&r).unwrap();
+
+        // First action — local credit lands on the latest row,
+        // no submission_id needed.
+        let mut delta = BTreeMap::new();
+        delta.insert("deleted_to_recycle_bytes".to_string(), 1_024);
+        let updated = record_local_action_for_latest_scan(&delta)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.scan_id, scan_id);
+        assert!(updated.reclaim_at_unix.is_some());
+        assert_eq!(updated.actually_reclaimed_bytes, 1_024);
+        assert_eq!(
+            updated
+                .action_breakdown
+                .get("deleted_to_recycle_bytes")
+                .copied(),
+            Some(1_024),
+        );
+
+        // Second action — accumulates against the same row.
+        let mut delta2 = BTreeMap::new();
+        delta2.insert("hardlink_replaced_bytes".to_string(), 2_048);
+        record_local_action_for_latest_scan(&delta2)
+            .unwrap()
+            .unwrap();
+        let after = load(&scan_id).unwrap().unwrap();
+        assert_eq!(after.actually_reclaimed_bytes, 1_024 + 2_048);
+        assert_eq!(after.action_breakdown.len(), 2);
+
+        // Empty delta — no-op (don't bump reclaim_at_unix or write
+        // an unnecessary file).
+        let nop = record_local_action_for_latest_scan(&BTreeMap::new()).unwrap();
+        assert!(nop.is_none());
+
+        // No scans recorded → Ok(None), not error.
+        let _td2 = isolate("local-action-empty");
+        let none = record_local_action_for_latest_scan(&delta).unwrap();
+        assert!(none.is_none());
     }
 
     /// #41 — `prune_older_than(0)` is a no-op (used by GUI when the
