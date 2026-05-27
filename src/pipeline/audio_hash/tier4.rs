@@ -78,14 +78,15 @@ pub struct AudioDecodeWarning {
     pub path: std::path::PathBuf,
     /// One of: `"corrupt_header"`, `"mid_stream_corrupt"`,
     /// `"truncated"`, `"empty_file"`, `"decoder_panic"`,
-    /// `"unknown"`. Stable wire shape per #119 spec §"Engine
-    /// metadata contract"; testdesign's regression tests pattern-
-    /// match on these strings.
+    /// `"unknown"`. Stable wire shape — additions to the set
+    /// require a #serde(default)-compatible bump and downstream
+    /// consumers gracefully fall back to `"unknown"` for kinds
+    /// they don't recognise.
     pub kind: String,
     /// Human-readable detail — the underlying decoder's error
     /// message, the panic payload, or a synthesised "X is 0 bytes"
-    /// line for empty files. CLI surface renders this; testdesign
-    /// asserts on substrings (e.g. "aac" / "ics" for the panic).
+    /// line for empty files. The CLI surface renders this verbatim;
+    /// no consumer pattern-matches on its content.
     pub detail: String,
 }
 
@@ -147,10 +148,12 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
                 Ok(Err(e)) => {
                     let detail = e.to_string();
                     // Heuristic kind classification from the
-                    // decoder's error message. Symphonia errors
-                    // typically include "eof" / "header" / "frame"
-                    // / "crc" hints; testdesign's W1-W6 fixtures
-                    // map deterministically to one of these.
+                    // decoder's error message. The substring
+                    // matches are case-insensitive against
+                    // common symphonia error phrasings; the
+                    // `unknown` fallback prevents silent
+                    // miscategorisation when symphonia adds a
+                    // new error class we haven't seen.
                     let lower = detail.to_lowercase();
                     let kind = if lower.contains("eof") || lower.contains("truncat") {
                         "truncated"
@@ -388,8 +391,7 @@ mod tests {
         let w = &out.decode_warnings[0];
         assert_eq!(w.path, p);
         // Kind must be one of the stable wire strings — see the
-        // AudioDecodeWarning docstring. testdesign's W1-W6 regress
-        // against this enum.
+        // AudioDecodeWarning docstring.
         assert!(
             matches!(
                 w.kind.as_str(),
