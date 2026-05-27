@@ -573,9 +573,18 @@ impl UiState {
                 // UiState doesn't own the resume bundle.
             }
             EngineEvent::FileActionCompleted { src, outcome } => {
-                let matched = duplicates_contain_path(&self.duplicates, &src);
-                apply_file_action_to_duplicates(&mut self.duplicates, &src, outcome);
-                if !matched {
+                // #114 — apply returns None when no group contained
+                // the path. Previously we did a separate
+                // `duplicates_contain_path` precheck (a second full
+                // O(N_groups × M_files) scan with the same logic) to
+                // power the diagnostic eprintln below. That doubled
+                // the per-event cost — visible during bulk safe-
+                // rename on big scans where the UI lag grew with
+                // event count. Apply now reports `matched` directly,
+                // so one scan covers both correctness + diagnostic.
+                let outcome_dbg =
+                    apply_file_action_to_duplicates(&mut self.duplicates, &src, outcome);
+                if outcome_dbg.is_none() {
                     // Diagnostic — surfaces the rare "action
                     // completed on path X but no group entry
                     // matched" case. Hypotheses if this fires:
@@ -634,15 +643,6 @@ pub fn inode_aware_savings(g: &DuplicateGroupSummary) -> u64 {
     g.size.saturating_mul(unique - 1)
 }
 
-/// #83 — Returns `true` if `src` appears in any group's `files`
-/// vec. Used as a diagnostic-only precheck: a missed lookup is
-/// the symptom of a real bug class (worker emits a path that
-/// doesn't byte-match the scan-time path), worth logging rather
-/// than silently no-op'ing.
-fn duplicates_contain_path(duplicates: &[DuplicateGroupSummary], src: &std::path::Path) -> bool {
-    duplicates.iter().any(|g| g.files.iter().any(|p| p == src))
-}
-
 /// #83 — Update `state.duplicates` in response to a per-file action
 /// completion. Path is the join key (workers don't preserve indices
 /// back to the in-memory groups vec). Behaviour per outcome:
@@ -658,20 +658,32 @@ fn duplicates_contain_path(duplicates: &[DuplicateGroupSummary], src: &std::path
 ///   the entry with a per-file "shared" badge instead of culling it
 ///   so the user has visual evidence the action ran on that row.
 ///
-/// Returns the number of groups removed by this call (useful for
-/// tests + for future scan-summary deltas). A group is "removed"
-/// when it falls below 2 files after a Removed/StorageDeduplicated
-/// outcome.
+/// Returns `Some(group_removed_count)` (0 or 1) when the path matched
+/// an entry, `None` when no group contained it. Callers use the
+/// `None` arm for diagnostic logging (#114 — avoids a second linear
+/// scan that doubled per-event cost during bulk safe-rename).
+///
+/// Cost is O(N_groups × avg M_files_per_group). On a 10K-group scan
+/// with bulk safe-rename of 10K files that's ~100M comparisons per
+/// scan, visible as progressive UI lag. v0.2.14 followup: keep a
+/// `HashMap<PathBuf, (group_idx, file_idx)>` index alongside
+/// `duplicates` so this becomes O(1) per event. Tracked as a
+/// dedicated perf branch; deferred from v0.2.13.1 to keep the patch
+/// scope contained (the index has its own invariants to maintain
+/// across all mutation paths — Removed-group renumbering, group
+/// clears, scan restarts).
 pub fn apply_file_action_to_duplicates(
     duplicates: &mut Vec<DuplicateGroupSummary>,
     src: &std::path::Path,
     outcome: crate::gui::events::FileActionOutcome,
-) -> usize {
+) -> Option<usize> {
     use crate::gui::events::FileActionOutcome;
     let mut groups_removed = 0usize;
     let mut group_idx_to_remove: Option<usize> = None;
+    let mut matched = false;
     for (gi, group) in duplicates.iter_mut().enumerate() {
         if let Some(fi) = group.files.iter().position(|p| p == src) {
+            matched = true;
             match outcome {
                 FileActionOutcome::Renamed { new_path } => {
                     group.files[fi] = new_path;
@@ -690,7 +702,11 @@ pub fn apply_file_action_to_duplicates(
         duplicates.remove(gi);
         groups_removed = 1;
     }
-    groups_removed
+    if matched {
+        Some(groups_removed)
+    } else {
+        None
+    }
 }
 
 /// Human-readable wallclock formatter shared by the header tile and
@@ -976,7 +992,7 @@ mod apply_file_action_tests {
                 new_path: PathBuf::from("/dupe-1.bin.duplicate"),
             },
         );
-        assert_eq!(removed, 0);
+        assert_eq!(removed, Some(0));
         assert_eq!(dups.len(), 1);
         assert_eq!(dups[0].files.len(), 3);
         assert_eq!(
@@ -994,7 +1010,7 @@ mod apply_file_action_tests {
             &PathBuf::from("/dupe-1.bin"),
             FileActionOutcome::Removed,
         );
-        assert_eq!(removed, 0, "group still has 2 files, so it stays");
+        assert_eq!(removed, Some(0), "group still has 2 files, so it stays");
         assert_eq!(dups.len(), 1);
         assert_eq!(dups[0].files.len(), 2);
         assert_eq!(dups[0].files[0], PathBuf::from("/keeper.bin"));
@@ -1015,7 +1031,7 @@ mod apply_file_action_tests {
             &PathBuf::from("/dupe-2.bin"),
             FileActionOutcome::Removed,
         );
-        assert_eq!(removed_groups, 1);
+        assert_eq!(removed_groups, Some(1));
         assert!(dups.is_empty(), "single-file group should vanish");
     }
 
@@ -1031,7 +1047,7 @@ mod apply_file_action_tests {
             &PathBuf::from("/dupe-1.bin"),
             FileActionOutcome::StorageDeduplicated,
         );
-        assert_eq!(removed, 0);
+        assert_eq!(removed, Some(0));
         assert_eq!(dups[0].files.len(), 2);
     }
 
@@ -1041,13 +1057,16 @@ mod apply_file_action_tests {
         // culled by an earlier event in the same Go batch. The
         // helper should be a silent no-op in that case rather
         // than panicking or scrambling the table.
+        // #114 — the `None` return distinguishes "no group contained
+        // this path" from "matched + removed 0 groups", so callers
+        // can log a single diagnostic without a second linear scan.
         let mut dups = vec![group3()];
         let removed = apply_file_action_to_duplicates(
             &mut dups,
             &PathBuf::from("/not-in-any-group.bin"),
             FileActionOutcome::Removed,
         );
-        assert_eq!(removed, 0);
+        assert_eq!(removed, None);
         assert_eq!(dups[0].files.len(), 3, "untouched group");
     }
 }
