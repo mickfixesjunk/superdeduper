@@ -3554,55 +3554,71 @@ impl eframe::App for SuperdeduperApp {
             .min_width(240.0)
             .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
             .show(ctx, |ui| {
-                // Render the "cached scan available" banner before
-                // the scan controls so it's visible above the Start
-                // button. The banner is a no-op when no cache exists
-                // for the current roots OR when the user has
-                // settings.always_use_cache enabled.
-                crate::gui::widgets::cache_banner::show(
-                    ui,
-                    &mut self.state,
-                    self.persisted.settings.always_use_cache,
-                );
-                // #25 v2.5: scan-mode dropdown above the Roots panel
-                // per spec §3.8 ("top of scan-config panel"). Selection
-                // lives on `self.scan_mode` — session-sticky, NOT
-                // persisted across launches per spec.
-                crate::gui::widgets::scan_mode_picker::show(
-                    ui,
-                    &mut self.scan_mode,
-                    self.is_scanning,
-                );
-                ui.add_space(6.0);
-                let roots_action =
-                    roots_panel::show(ui, &self.persisted.roots, self.is_scanning, self.can_resume);
-                if let Some(a) = roots_action {
-                    self.dispatch_root_action(a);
-                }
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(6.0);
-                funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
+                // #115 — wrap the whole sidebar in a vertical
+                // ScrollArea so the badge wall (and anything else
+                // below the fold) is reachable on lower-res screens.
+                // Before this wrap, ~1366×768 and smaller pushed the
+                // badges below the viewport with no scroll affordance.
+                // auto_shrink([false, false]) keeps the panel at full
+                // width + height even when content is short.
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Render the "cached scan available" banner before
+                        // the scan controls so it's visible above the Start
+                        // button. The banner is a no-op when no cache exists
+                        // for the current roots OR when the user has
+                        // settings.always_use_cache enabled.
+                        crate::gui::widgets::cache_banner::show(
+                            ui,
+                            &mut self.state,
+                            self.persisted.settings.always_use_cache,
+                        );
+                        // #25 v2.5: scan-mode dropdown above the Roots panel
+                        // per spec §3.8 ("top of scan-config panel"). Selection
+                        // lives on `self.scan_mode` — session-sticky, NOT
+                        // persisted across launches per spec.
+                        crate::gui::widgets::scan_mode_picker::show(
+                            ui,
+                            &mut self.scan_mode,
+                            self.is_scanning,
+                        );
+                        ui.add_space(6.0);
+                        let roots_action = roots_panel::show(
+                            ui,
+                            &self.persisted.roots,
+                            self.is_scanning,
+                            self.can_resume,
+                        );
+                        if let Some(a) = roots_action {
+                            self.dispatch_root_action(a);
+                        }
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
 
-                // §10.4 badge-wall: bottom-left always-visible
-                // achievements grid. Auto-degrades to §10.5 mini-
-                // widget when the sidebar is narrower than ~280 px
-                // (3 tile-columns won't fit).
-                #[cfg(feature = "telemetry")]
-                {
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    let state = crate::leaderboard::catalog::peek_state();
-                    let action = if ui.available_width() < 280.0 {
-                        crate::gui::widgets::badge_wall::show_mini(ui, &state)
-                    } else {
-                        crate::gui::widgets::badge_wall::show(ui, &state)
-                    };
-                    if let Some(a) = action {
-                        self.dispatch_badge_wall_action(a);
-                    }
-                }
+                        // §10.4 badge-wall: bottom-left always-visible
+                        // achievements grid. Auto-degrades to §10.5 mini-
+                        // widget when the sidebar is narrower than ~280 px
+                        // (3 tile-columns won't fit).
+                        #[cfg(feature = "telemetry")]
+                        {
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            let state = crate::leaderboard::catalog::peek_state();
+                            let action = if ui.available_width() < 280.0 {
+                                crate::gui::widgets::badge_wall::show_mini(ui, &state)
+                            } else {
+                                crate::gui::widgets::badge_wall::show(ui, &state)
+                            };
+                            if let Some(a) = action {
+                                self.dispatch_badge_wall_action(a);
+                            }
+                        }
+                    });
             });
 
         CentralPanel::default()
