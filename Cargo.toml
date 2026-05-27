@@ -212,7 +212,18 @@ egui_kittest = { version = "0.32", features = ["wgpu", "snapshot"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# `panic = "unwind"` (Rust default) — the `audio_hash::tier4`
+# pipeline uses `std::panic::catch_unwind` to shield the scan from
+# upstream decoder panics (notably the symphonia-codec-aac 0.5.5
+# panic at aac/ics/mod.rs:242:17 surfaced on D:\Dropbox during the
+# v0.2.13 audio bench). Under `panic = "abort"` (which this profile
+# previously used) catch_unwind is a no-op — the abort runtime
+# fires before any unwinding code can run, so a single broken file
+# kills the whole scan. Cost of `unwind`: ~5-10% larger binary
+# (unwind tables) and ~1-3% slower (disabled abort fast-path
+# optimization). For a disk-IO-bound dedup tool the perf cost is
+# below the noise floor; the shield is the whole point.
+panic = "unwind"
 strip = "symbols"
 
 [profile.bench]
