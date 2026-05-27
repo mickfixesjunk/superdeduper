@@ -13,6 +13,7 @@ use egui::{Context, RichText, Window};
 use crate::gui::checkpoint::CheckpointSummary;
 use crate::gui::resume_tier::ResumeTier;
 use crate::gui::theme;
+use crate::path_display::for_user_display;
 
 /// What the user picked. `None` ⇒ keep showing the modal until they
 /// pick something; the rest of the UI stays disabled.
@@ -61,7 +62,7 @@ pub fn show(ctx: &Context, summary: &CheckpointSummary, tier: ResumeTier) -> Opt
         for (i, r) in summary.roots.iter().take(4).enumerate() {
             let star = if r.is_reference { "★ " } else { "  " };
             ui.label(
-                RichText::new(format!("{star}{}", r.path.display()))
+                RichText::new(format!("{star}{}", for_user_display(&r.path)))
                     .color(theme::TEXT_LO)
                     .monospace()
                     .small(),

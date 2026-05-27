@@ -18,6 +18,7 @@ use egui::{Context, RichText, Window};
 
 use crate::gui::checkpoint::CheckpointSummary;
 use crate::gui::theme;
+use crate::path_display::for_user_display;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsDriftChoice {
@@ -67,7 +68,7 @@ pub fn show(ctx: &Context, summary: &CheckpointSummary) -> Option<SettingsDriftC
         for r in summary.roots.iter().take(4) {
             let star = if r.is_reference { "★ " } else { "  " };
             ui.label(
-                RichText::new(format!("{star}{}", r.path.display()))
+                RichText::new(format!("{star}{}", for_user_display(&r.path)))
                     .color(theme::TEXT_LO)
                     .monospace()
                     .small(),

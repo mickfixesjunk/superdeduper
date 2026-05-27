@@ -12,6 +12,7 @@ use egui::{vec2, RichText, Ui};
 
 use crate::gui::state::RootEntry;
 use crate::gui::theme;
+use crate::path_display::for_user_display;
 
 /// Actions the panel asks the App to take this frame.
 #[derive(Debug, Clone)]
@@ -72,7 +73,7 @@ pub fn show(
                     action = Some(RootsAction::ToggleReference(i));
                 }
 
-                let path_str = root.path.to_string_lossy();
+                let path_str = for_user_display(&root.path);
                 let color = if root.is_reference {
                     theme::WARN
                 } else {
@@ -84,7 +85,7 @@ pub fn show(
                         .monospace()
                         .small(),
                 ))
-                .on_hover_text(path_str.as_ref());
+                .on_hover_text(&path_str);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Big red X — was a small grey ✕ which the user
