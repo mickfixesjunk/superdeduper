@@ -23,9 +23,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::schema::SchemaVersioned;
 use crate::Result;
 
 pub const ARCHIVE_SCHEMA: &str = "superdeduper.archive.v1";
+
+/// #92 — Family name (no `.vN` suffix) for the canonical schema
+/// policy. The on-disk `schema` field still carries the combined
+/// `name.vN` form for back-compat with v1 manifests; the
+/// [`SchemaVersioned`] impl parses that combined form so the
+/// archive store joins the canonical policy without rewriting
+/// every existing on-disk manifest.
+const ARCHIVE_SCHEMA_NAME: &str = "superdeduper.archive";
+const ARCHIVE_SCHEMA_VERSION: u32 = 1;
 
 /// One archive run = one of these JSON files. Filename pattern:
 /// `superdeduper-archive-manifest-<ISO-timestamp>.json` so multiple
@@ -36,6 +46,38 @@ pub struct ArchiveManifest {
     pub created_at_unix: u64,
     pub destination: PathBuf,
     pub entries: Vec<ArchiveManifestEntry>,
+}
+
+/// #92 — Canonical schema-discipline impl. Parses the combined
+/// `schema` field's `name.vN` form into the (name, version) pair
+/// the [`crate::schema`] policy enforces. Unparseable strings
+/// surface as `schema_name() == self.schema` + `schema_version()
+/// == 0`, which [`crate::schema::check`] rejects as
+/// `UnsupportedVersion { got: 0 }`.
+impl SchemaVersioned for ArchiveManifest {
+    const SCHEMA_NAME: &'static str = ARCHIVE_SCHEMA_NAME;
+
+    fn schema_name(&self) -> &str {
+        // Split on the last `.v`; everything before is the family
+        // name. If no `.v` suffix is present the whole string
+        // counts as the name (and schema_version returns 0, which
+        // schema::check rejects).
+        match self.schema.rfind(".v") {
+            Some(i) => &self.schema[..i],
+            None => &self.schema,
+        }
+    }
+
+    fn schema_version(&self) -> u32 {
+        self.schema
+            .rfind(".v")
+            .and_then(|i| self.schema[i + 2..].parse::<u32>().ok())
+            .unwrap_or(0)
+    }
+
+    fn current_version() -> u32 {
+        ARCHIVE_SCHEMA_VERSION
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,18 +190,20 @@ pub enum ArchiveFailureBucket {
 
 /// Parse a manifest from disk. Errors are returned verbatim so the
 /// caller can surface the message to the user.
+///
+/// #92 — Schema check goes through `crate::schema::check` so the
+/// archive store follows the canonical persistence-discipline
+/// policy (exact match on family + version; no permissive
+/// starts_with). The combined `schema: "superdeduper.archive.v1"`
+/// wire field is parsed by the [`SchemaVersioned`] impl, so v1
+/// manifests written before this change still load cleanly.
 pub fn load_manifest(path: &Path) -> Result<ArchiveManifest> {
     let bytes = std::fs::read(path)?;
     let manifest: ArchiveManifest = serde_json::from_slice(&bytes)?;
-    if manifest.schema != ARCHIVE_SCHEMA {
-        return Err(crate::Error::ConfigInvalid {
-            field: "archive-manifest:schema",
-            reason: format!(
-                "unknown archive manifest schema {:?} (this build understands {})",
-                manifest.schema, ARCHIVE_SCHEMA
-            ),
-        });
-    }
+    crate::schema::check(&manifest).map_err(|e| crate::Error::ConfigInvalid {
+        field: "archive-manifest:schema",
+        reason: e.to_string(),
+    })?;
     Ok(manifest)
 }
 
