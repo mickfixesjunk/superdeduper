@@ -533,9 +533,12 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
         (None, _) => install::new_unregistered(server_url),
     };
 
+    // #58 — route the profile URL through the active channel's
+    // frontend so dev/local installs print the right host.
+    let frontend = superdeduper::channel::frontend_url_for(superdeduper::channel::active_channel());
     if state.registered {
         println!(
-            "Already registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}",
+            "Already registered. install_id = {}\nProfile: {frontend}/profile/{}",
             state.install_id, state.install_id
         );
         return Ok(());
@@ -545,7 +548,7 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
     match registration::register_cli(&mut state) {
         Ok(()) => {
             println!(
-                "Registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}\nUse `superdeduper config show` to see current share preference.",
+                "Registered. install_id = {}\nProfile: {frontend}/profile/{}\nUse `superdeduper config show` to see current share preference.",
                 state.install_id, state.install_id
             );
             Ok(())

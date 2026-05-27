@@ -139,6 +139,28 @@ pub fn server_url_for(channel: Channel) -> &'static str {
     }
 }
 
+/// #58 — Map a channel to its public FRONTEND base URL (the user-
+/// facing web site, distinct from the API backend). Used by every
+/// GUI affordance that opens the browser at a sd web property:
+/// "View on leaderboard", "Open profile", vanity-URL links, etc.
+///
+/// Without this, GUI buttons on a dev install navigate to
+/// `superdeduper.io` (prod) where the install_id can't be found —
+/// surfaced to the user as a 404.
+///
+/// Channel → frontend URL mapping mirrors the API URL pattern:
+/// the wildcard-cert constraint that drove `dev-api.superdeduper.io`
+/// doesn't apply to the frontend (which sits behind Cloudflare
+/// Pages on the apex domain), so the frontend gets the more natural
+/// `dev.superdeduper.io` form.
+pub fn frontend_url_for(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Prod => "https://superdeduper.io",
+        Channel::Dev => "https://dev.superdeduper.io",
+        Channel::Local => "http://localhost:5173",
+    }
+}
+
 /// Default cap path for the user-facing TOML config file holding
 /// the persisted channel (and any future `[network]` settings).
 ///

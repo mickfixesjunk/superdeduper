@@ -1425,9 +1425,14 @@ impl SuperdeduperApp {
                 self.pending_badge_multiplier_detail = Some(achievement_id);
             }
             BadgeWallAction::OpenProfile => {
+                // #58 — route through the active channel's frontend URL
+                // so dev installs open dev.superdeduper.io (where the
+                // install_id actually exists in dev DDB) instead of
+                // hitting prod's 404.
+                let frontend = crate::channel::frontend_url_for(crate::channel::active_channel());
                 let url = match install::load() {
-                    Ok(Some(s)) => format!("https://superdeduper.io/profile/{}", s.install_id),
-                    _ => "https://superdeduper.io/".to_string(),
+                    Ok(Some(s)) => format!("{frontend}/profile/{}", s.install_id),
+                    _ => format!("{frontend}/"),
                 };
                 open_url_in_browser(&url);
             }
