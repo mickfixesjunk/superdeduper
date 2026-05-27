@@ -459,7 +459,14 @@ pub enum ImageHashAlgoArg {
     /// Difference hash — robust on procedural / screenshot content;
     /// pair with `--image-similarity-threshold 5`.
     Dhash,
-    /// Perceptual (DCT) hash — default; best on real photos.
+    /// Double-gradient hash (slug retained as "phash" for back-compat
+    /// with existing scan JSON + cache rows). Despite the historical
+    /// name, this is NOT a true DCT pHash — it's `image_hasher`'s
+    /// `HashAlg::DoubleGradient`, an extension of dHash that adds a
+    /// vertical-gradient pass. Real photo accuracy is good; dHash is
+    /// usually competitive at a fraction of the cost. See
+    /// `pipeline::image_hash::Algorithm::DoubleGradient` for the full
+    /// story.
     #[default]
     Phash,
 }
@@ -470,7 +477,7 @@ impl From<ImageHashAlgoArg> for crate::pipeline::image_hash::Algorithm {
         match v {
             ImageHashAlgoArg::Ahash => Self::AverageHash,
             ImageHashAlgoArg::Dhash => Self::DifferenceHash,
-            ImageHashAlgoArg::Phash => Self::PerceptualHash,
+            ImageHashAlgoArg::Phash => Self::DoubleGradient,
         }
     }
 }

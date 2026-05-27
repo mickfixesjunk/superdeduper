@@ -43,20 +43,29 @@ pub enum Algorithm {
     /// ship dHash as default."
     #[default]
     DifferenceHash,
-    /// Discrete-Cosine-Transform hash. Best robustness for
-    /// rotation + heavy edits at higher CPU cost.
-    PerceptualHash,
+    /// Double-gradient hash from `image_hasher::HashAlg::DoubleGradient`.
+    /// Despite the historical slug `"phash"`, this is NOT a
+    /// Discrete-Cosine-Transform pHash — it's the double-gradient
+    /// extension of dHash that captures gradient transitions in both
+    /// horizontal AND vertical directions. The slug stays "phash"
+    /// for back-compat with persisted scan JSON + cache rows; the
+    /// docstring + variant name now match what the code actually
+    /// does. If true DCT-based pHash ever lands, it gets a new
+    /// variant + slug; the existing "phash" wire encoding belongs
+    /// to DoubleGradient permanently.
+    DoubleGradient,
 }
 
 impl Algorithm {
     /// Stable lowercase slug for CLI + JSON serialization. Matches
     /// the values the `--mode` enum + the future Tier-4 schema
-    /// will surface.
+    /// will surface. `"phash"` is back-compat shorthand for
+    /// [`Algorithm::DoubleGradient`]; see that variant's docstring.
     pub fn as_slug(self) -> &'static str {
         match self {
             Self::AverageHash => "ahash",
             Self::DifferenceHash => "dhash",
-            Self::PerceptualHash => "phash",
+            Self::DoubleGradient => "phash",
         }
     }
 
@@ -64,7 +73,7 @@ impl Algorithm {
         match self {
             Self::AverageHash => HashAlg::Mean,
             Self::DifferenceHash => HashAlg::Gradient,
-            Self::PerceptualHash => HashAlg::DoubleGradient,
+            Self::DoubleGradient => HashAlg::DoubleGradient,
         }
     }
 }
@@ -203,7 +212,7 @@ mod tests {
         // --image-similarity-algorithm CLI flag. Don't churn them.
         assert_eq!(Algorithm::AverageHash.as_slug(), "ahash");
         assert_eq!(Algorithm::DifferenceHash.as_slug(), "dhash");
-        assert_eq!(Algorithm::PerceptualHash.as_slug(), "phash");
+        assert_eq!(Algorithm::DoubleGradient.as_slug(), "phash");
     }
 
     #[test]
@@ -272,7 +281,7 @@ mod tests {
         for algo in [
             Algorithm::AverageHash,
             Algorithm::DifferenceHash,
-            Algorithm::PerceptualHash,
+            Algorithm::DoubleGradient,
         ] {
             let h = hash_image(&img, algo);
             // Not asserting specific value — just that it's
