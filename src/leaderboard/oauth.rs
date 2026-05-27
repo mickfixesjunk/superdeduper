@@ -578,35 +578,15 @@ fn fill_random_bytes(buf: &mut [u8]) {
     }
 }
 
-/// Base64url-no-pad encoder per RFC 4648 §5. Inline rather than
-/// pulling the `base64` crate: ~15 lines, no allocation surprises.
+/// #135 — Base64url-no-pad encoder per RFC 4648 §5. Was inline
+/// (~30 LOC). Now delegates to the `base64` crate's
+/// URL_SAFE_NO_PAD engine (transitively in Cargo.lock via ureq;
+/// promoted to a direct dep). Same RFC 4648 §5 alphabet + same
+/// no-pad behaviour; the existing known-vectors test (line ~1952)
+/// pins byte-equivalence.
 fn base64url_nopad(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 4);
-    let mut i = 0;
-    while i + 3 <= bytes.len() {
-        let n = (bytes[i] as u32) << 16 | (bytes[i + 1] as u32) << 8 | (bytes[i + 2] as u32);
-        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-        out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
-        out.push(ALPHA[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-    match bytes.len() - i {
-        2 => {
-            let n = (bytes[i] as u32) << 16 | (bytes[i + 1] as u32) << 8;
-            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
-        }
-        1 => {
-            let n = (bytes[i] as u32) << 16;
-            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-        }
-        _ => {}
-    }
-    out
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Fixed-port range for the OAuth loopback. Discord (and some

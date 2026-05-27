@@ -4267,6 +4267,7 @@ name = "superdeduper"
 version = "0.2.16"
 dependencies = [
  "anyhow",
+ "base64",
  "blake3",
  "bytes",
  "clap",

@@ -33,6 +33,11 @@ blake3 = { version = "1", features = ["rayon"] }
 #   [patch."https://github.com/mickfixesjunk/river5"]
 #   river5 = { path = "../river5" }
 river5 = { git = "https://github.com/mickfixesjunk/river5", rev = "35533ced58c0c29f28726fdd355ace8d51c28e8b" }
+# #135 — base64 URL_SAFE_NO_PAD encoder for OAuth PKCE challenge.
+# Already in Cargo.lock transitively (ureq pulls it); promoting to a
+# direct dep so the import is explicit, swapping out the hand-rolled
+# base64url_nopad in oauth.rs.
+base64 = "0.22"
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 hashbrown = "0.14"
