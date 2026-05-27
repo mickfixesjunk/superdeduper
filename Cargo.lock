@@ -4303,6 +4303,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-script",
  "ureq",
+ "url",
  "uuid",
  "windows 0.58.0",
 ]

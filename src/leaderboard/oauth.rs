@@ -984,20 +984,20 @@ struct CallbackPayload {
 
 /// Pull `code`, `state`, and `error` out of the request line's
 /// query string (`/oauth-callback?code=...&state=...&error=...`).
-/// Tolerates missing fields + URL-encoded values.
+/// Tolerates missing fields + URL-encoded values. Uses
+/// `url::form_urlencoded::parse` so `%XX` + `+` decoding matches the
+/// WHATWG URL spec (the hand-rolled decoder this replaced silently
+/// truncated trailing single-`%` sequences and treated non-ASCII
+/// bytes as Latin-1 chars — `form_urlencoded` decodes UTF-8 instead).
 fn parse_callback_query(path_and_query: &str) -> CallbackPayload {
     let mut out = CallbackPayload::default();
     let qs = match path_and_query.split_once('?') {
         Some((_, q)) => q,
         None => return out,
     };
-    for pair in qs.split('&') {
-        let (k, v) = match pair.split_once('=') {
-            Some(p) => p,
-            None => continue,
-        };
-        let decoded = url_decode(v);
-        match k {
+    for (k, v) in url::form_urlencoded::parse(qs.as_bytes()) {
+        let decoded = v.into_owned();
+        match k.as_ref() {
             "code" => out.code = Some(decoded),
             "state" => out.state = Some(decoded),
             "error" => out.error = Some(decoded),
@@ -1018,39 +1018,6 @@ fn parse_callback_query(path_and_query: &str) -> CallbackPayload {
         }
     }
     out
-}
-
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'+' {
-            out.push(' ');
-            i += 1;
-            continue;
-        }
-        if b == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
-                out.push((hi * 16 + lo) as char);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b as char);
-        i += 1;
-    }
-    out
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// POST the auth code to the engine backend's exchange endpoint
