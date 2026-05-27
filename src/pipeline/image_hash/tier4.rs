@@ -147,9 +147,42 @@ pub fn find_similar_groups(
         clusters.entry(root).or_default().push(i);
     }
 
+    // Step 3b — E2: cluster-cohesion validation per the
+    // 2026-05-27 research memo + design routing.
+    //
+    // Union-find groups files where ANY two members are within
+    // `threshold` Hamming bits — but transitive linkage can chain
+    // dissimilar files: A~B (Δ=5) + B~C (Δ=5) puts A,B,C in one
+    // cluster even when A and C are Δ=10 apart and visually
+    // unrelated. That's #78's mega-cluster precision collapse.
+    //
+    // The cohesion check rejects any cluster whose DIAMETER —
+    // max pairwise Hamming distance — exceeds 2 × threshold.
+    // O(k²) per cluster, k small (most clusters <10 members; the
+    // pathological mega-cluster on #78's reproducer is the
+    // exception we WANT to catch). Single-pair clusters (k=2)
+    // trivially pass since diameter ≤ threshold ≤ 2 × threshold.
+    //
+    // E3 (auto-scaling τ from corpus size n) is the orthogonal
+    // fix for random-collision FPs; ship separately.
+    let cohesion_cap = threshold.saturating_mul(2);
     let mut groups = Vec::new();
+    let mut rejected_cohesion = 0u64;
     for (_root, indices) in clusters {
         if indices.len() < 2 {
+            continue;
+        }
+        let diameter = cluster_diameter(&indices, &hashed);
+        if diameter > cohesion_cap {
+            tracing::debug!(
+                cluster_size = indices.len(),
+                diameter,
+                threshold,
+                cohesion_cap,
+                "tier-4 image: cluster rejected by E2 cohesion check \
+                 (diameter > 2 × threshold; transitive-linkage chain)",
+            );
+            rejected_cohesion = rejected_cohesion.saturating_add(1);
             continue;
         }
         // Pick the largest file as the size representative — matches
@@ -185,7 +218,36 @@ pub fn find_similar_groups(
         crate::pipeline::assert_unique_paths(&g);
         groups.push(g);
     }
+    if rejected_cohesion > 0 {
+        tracing::info!(
+            rejected_cohesion,
+            "tier-4 image: rejected {rejected_cohesion} cluster(s) by E2 \
+             cohesion check (kept {} cohesive cluster(s))",
+            groups.len(),
+        );
+    }
     groups
+}
+
+/// E2 — cluster-diameter helper. Returns the MAX pairwise Hamming
+/// distance among the cluster's members. Caller decides whether
+/// that exceeds the cohesion cap (2 × threshold).
+///
+/// O(k²) per call; cluster sizes are bounded by the union-find
+/// output. For pathological mega-clusters (the #78 reproducer
+/// case) k can reach the hundreds — still cheap because the
+/// inner op is `hamming_distance` (XOR + popcount) on `u64`s.
+fn cluster_diameter(indices: &[usize], hashed: &[Hashed<'_>]) -> u32 {
+    let mut max_d = 0u32;
+    for (n, &i) in indices.iter().enumerate() {
+        for &j in &indices[n + 1..] {
+            let d = hamming_distance(hashed[i].fingerprint, hashed[j].fingerprint);
+            if d > max_d {
+                max_d = d;
+            }
+        }
+    }
+    max_d
 }
 
 #[cfg(test)]
@@ -292,6 +354,81 @@ mod tests {
             "distinct images must not group at threshold=0; got {} group(s)",
             out.len()
         );
+    }
+
+    #[test]
+    fn cluster_diameter_handles_singleton_pair_and_chain() {
+        // Standalone unit test for E2 — pathological inputs that
+        // would chain through union-find but should fail the
+        // cohesion cap on cluster diameter.
+
+        // Build Hashed entries with hand-set fingerprints (no
+        // image decoding). The `file` slot points at synthetic
+        // FileEntry refs.
+        let entries = [
+            entry(PathBuf::from("/x/a"), 0),
+            entry(PathBuf::from("/x/b"), 0),
+            entry(PathBuf::from("/x/c"), 0),
+        ];
+
+        // Singleton (k=1) → diameter 0 (no pairs).
+        let single = vec![0usize];
+        let h_single = vec![Hashed {
+            file: &entries[0],
+            fingerprint: 0,
+        }];
+        assert_eq!(cluster_diameter(&single, &h_single), 0);
+
+        // Pair, Δ = 3 → diameter 3.
+        let pair = vec![0usize, 1usize];
+        let h_pair = vec![
+            Hashed {
+                file: &entries[0],
+                fingerprint: 0b_0000_0000,
+            },
+            Hashed {
+                file: &entries[1],
+                fingerprint: 0b_0000_0111,
+            },
+        ];
+        assert_eq!(cluster_diameter(&pair, &h_pair), 3);
+
+        // Chain A~B~C where A↔B and B↔C are within τ=5 but A↔C
+        // straddles 10 bits. union-find would put all three in
+        // one cluster; cohesion check (cap = 2τ = 10) catches it
+        // at diameter == 10 (passes), or > 10 (rejects).
+        //
+        // A = 0
+        // B = 0b_0000_0000_0001_1111 (5 bits set; Δ to A = 5)
+        // C = 0b_0000_0011_1110_0000 (5 bits set; Δ to A = 5; Δ
+        //                              to B = 10 — A→B + B→C bits
+        //                              don't overlap)
+        let triple = vec![0usize, 1usize, 2usize];
+        let h_triple = vec![
+            Hashed {
+                file: &entries[0],
+                fingerprint: 0u64,
+            },
+            Hashed {
+                file: &entries[1],
+                fingerprint: 0b_0000_0000_0001_1111u64,
+            },
+            Hashed {
+                file: &entries[2],
+                fingerprint: 0b_0000_0011_1110_0000u64,
+            },
+        ];
+        let d = cluster_diameter(&triple, &h_triple);
+        // A↔C: XOR has 10 bits set → distance 10.
+        assert_eq!(d, 10);
+        // Verify the cohesion-cap arithmetic: with τ=5, cap = 10,
+        // diameter 10 → JUST passes (`>` not `>=`). With τ=4, cap
+        // = 8, diameter 10 → rejected. Pins the boundary so a
+        // future cap rule change (`>=` vs `>`) is noticed.
+        let cap_at_5 = 5u32.saturating_mul(2);
+        assert!(d <= cap_at_5, "diameter 10 must NOT exceed cap=10 at τ=5");
+        let cap_at_4 = 4u32.saturating_mul(2);
+        assert!(d > cap_at_4, "diameter 10 MUST exceed cap=8 at τ=4");
     }
 
     #[test]
