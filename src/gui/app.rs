@@ -3408,10 +3408,11 @@ impl eframe::App for SuperdeduperApp {
         let mut want_settings = false;
         let mut menu_action: Option<MenuAction> = None;
         // Brand strip: shield logo + "SuperDeDuper" name above
-        // the menubar (Mick 2026-05-25T03:45Z). Dedicated panel
-        // so the menubar stays compact; logo runs ~84px tall, the
-        // shield's transparent PNG shows the PANEL_DEEP through
-        // its negative space.
+        // the menubar (Mick 2026-05-25T03:45Z; resized 2026-05-27
+        // per #121 — logo bumped ~2.5× and vertical-centered beside
+        // the wordmark). Dedicated panel so the menubar stays
+        // compact; the shield's transparent PNG shows PANEL_DEEP
+        // through its negative space.
         TopBottomPanel::top("brand")
             .frame(
                 Frame::default()
@@ -3419,21 +3420,24 @@ impl eframe::App for SuperdeduperApp {
                     .inner_margin(egui::vec2(12.0, 6.0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Image::new(egui::include_image!("../../assets/sdd-color-shield.png"))
-                            .max_size(egui::vec2(84.0, 84.0)),
-                    );
-                    ui.add_space(12.0);
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Image::new(egui::include_image!(
+                                "../../assets/sdd-color-shield.png"
+                            ))
+                            .max_size(egui::vec2(220.0, 220.0)),
+                        );
+                        ui.add_space(16.0);
                         ui.label(
                             egui::RichText::new("SuperDeDuper")
                                 .color(theme::TEXT_HI)
                                 .strong()
                                 .size(36.0),
                         );
-                    });
-                });
+                    },
+                );
             });
 
         TopBottomPanel::top("menubar")
