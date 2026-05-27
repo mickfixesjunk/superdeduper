@@ -156,6 +156,41 @@ pub enum ScanHistoryCommand {
         #[arg(value_name = "SCAN_ID")]
         scan_id: String,
     },
+    /// #56 — Replay a captured submission payload against its
+    /// recorded channel's server URL. Useful for retrying after a
+    /// network failure or for headless CI re-submit workflows.
+    ///
+    /// Pass either a specific `<SCAN_ID>` to resubmit one row, or
+    /// `--pending` to drain every row whose `submission_state` is
+    /// still `Pending` (in newest-first order). Returns non-zero
+    /// when ANY targeted row failed; standard out carries per-row
+    /// status lines.
+    #[cfg(feature = "telemetry")]
+    Resubmit {
+        /// 32-hex scan_id from `scan-history list`. Mutually
+        /// exclusive with `--pending`.
+        #[arg(value_name = "SCAN_ID", conflicts_with = "pending")]
+        scan_id: Option<String>,
+        /// Resubmit every row whose `submission_state` is currently
+        /// `Pending`. Same semantics as `superdeduper submit-pending`
+        /// but kept here for surface symmetry — testrunner uses this
+        /// to exercise the resubmit-by-row path without driving the
+        /// GUI launch modal.
+        #[arg(long)]
+        pending: bool,
+    },
+    /// #56 — Prune scan-history records older than a given duration.
+    /// Mirrors the GUI Settings → Privacy → "Auto-prune older than"
+    /// flow but runs once on demand from the CLI. Useful for
+    /// scripted retention enforcement on headless deployments.
+    Prune {
+        /// Maximum age in days. Rows with `started_at_unix` older
+        /// than `<now> - days*86400` are deleted. Pass `0` to make
+        /// the call a no-op (the GUI uses 0 as the "forever — never
+        /// prune" sentinel).
+        #[arg(value_name = "DAYS")]
+        days: u32,
+    },
 }
 
 /// G-track CLI subcommands for `superdeduper account`.
