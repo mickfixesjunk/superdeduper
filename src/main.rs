@@ -710,21 +710,30 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
 fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Result<()> {
     use anyhow::Context;
     use superdeduper::channel::{self, Channel};
+    use superdeduper::cli::OutputFormat;
     use superdeduper::leaderboard::install;
     use superdeduper::leaderboard::submission::{self, SubmitOutcome};
     use superdeduper::scan_history::{self, SubmissionState};
 
-    // threshold_secs = 0 → return ALL pending rows regardless of
-    // age. Callers wanting an age-gate (skip very recent scans)
-    // would use list_pending_older_than directly; the CLI here is
-    // intentionally aggressive — if it's pending, drain it.
+    // #109 F25 — JSON output gates EVERYTHING through the
+    // accumulator. Text output still streams per-row to stdout/err
+    // for tail-friendliness; the accumulator drives the closing
+    // summary either way.
+    let json_mode = matches!(args.format, OutputFormat::Json);
+    let say = |line: &str| {
+        if !json_mode {
+            println!("{line}");
+        }
+    };
+    let warn = |line: &str| {
+        if !json_mode {
+            eprintln!("{line}");
+        }
+    };
+
+    // threshold_secs = 0 → return ALL pending rows regardless of age.
     let pending = scan_history::list_pending_older_than(0)?;
 
-    // Channel filter (--channel dev / prod / local) + drop rows
-    // without a captured payload (v1/v2 rows from before #41
-    // landed) — those CAN'T be submitted; the local copy is the
-    // only record. Surface them in the dry-run output so users
-    // know the row exists but is unsubmittable.
     let want_channel = args.channel.as_deref();
     let (eligible, unsubmittable): (Vec<_>, Vec<_>) = pending
         .into_iter()
@@ -732,40 +741,83 @@ fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Res
         .partition(|r| r.submission_payload.is_some() && r.built_with_install_id.is_some());
 
     if !unsubmittable.is_empty() {
-        eprintln!(
+        warn(&format!(
             "{} pending row(s) with no captured payload — these were recorded \
              before payload-persistence (#41) landed; skipping:",
             unsubmittable.len()
-        );
+        ));
         for r in &unsubmittable {
-            eprintln!("  - {} (channel: {})", r.scan_id, r.channel);
+            warn(&format!("  - {} (channel: {})", r.scan_id, r.channel));
         }
     }
 
+    let mut report = SubmitPendingReport {
+        unsubmittable: unsubmittable
+            .iter()
+            .map(|r| UnsubmittableRow {
+                scan_id: r.scan_id.clone(),
+                channel: r.channel.clone(),
+                reason: "no_captured_payload".to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+
     if eligible.is_empty() {
-        println!("No drainable pending submissions.");
+        if json_mode {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            say("No drainable pending submissions.");
+        }
         return Ok(());
     }
 
-    println!("Found {} pending submission(s) to drain:", eligible.len());
+    say(&format!(
+        "Found {} pending submission(s) to drain:",
+        eligible.len()
+    ));
     for r in &eligible {
         let reclaim = humansize::format_size(r.reclaimable_bytes, humansize::BINARY);
-        println!(
+        say(&format!(
             "  {} channel={:<6} reclaim={:>10}  ({} group(s), {} file(s))",
             r.scan_id, r.channel, reclaim, r.total_dups, r.total_files,
-        );
+        ));
     }
 
     if args.dry_run {
-        println!("\n(dry-run — no POST sent)");
+        report.dry_run = true;
+        report.records = eligible
+            .iter()
+            .map(|r| RecordOutcome {
+                scan_id: r.scan_id.clone(),
+                channel: r.channel.clone(),
+                outcome: "dry_run".to_string(),
+                detail: None,
+                submission_id: None,
+            })
+            .collect();
+        if json_mode {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            say("\n(dry-run — no POST sent)");
+        }
         return Ok(());
     }
 
-    println!();
-    let mut submitted: u64 = 0;
-    let mut duplicate: u64 = 0;
-    let mut rejected: u64 = 0;
-    let mut transient: u64 = 0;
+    say("");
+    // #109 F27 — local state-update failures used to `?`-propagate out
+    // and abort the remaining drain. The POST already succeeded
+    // (server has the row); next run's `submit_recorded_payload`
+    // returns DuplicateNoChange and self-corrects. Log + continue
+    // so other rows still drain.
+    let log_state_err = |action: &str, scan_id: &str, e: &std::io::Error| {
+        tracing::warn!(
+            error = %e,
+            scan_id = %scan_id,
+            action = %action,
+            "scan_history: local state update failed; next run will reconcile",
+        );
+    };
     for record in eligible {
         let chan: Channel = record
             .channel
@@ -774,26 +826,21 @@ fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Res
         let server_url = channel::server_url_for(chan);
         let install_state = match install::load_for(chan)? {
             Some(s) if s.registered => s,
-            Some(_) => {
-                eprintln!(
-                    "  ✗ {} skipped — install for channel `{}` is not registered. \
-                     Run `superdeduper register --channel {}` first.",
-                    record.scan_id,
+            Some(_) | None => {
+                let detail = format!(
+                    "install for channel `{}` is not registered — run `superdeduper register --channel {}` first",
                     chan.as_slug(),
                     chan.as_slug()
                 );
-                rejected = rejected.saturating_add(1);
-                continue;
-            }
-            None => {
-                eprintln!(
-                    "  ✗ {} skipped — no install state for channel `{}`. \
-                     Run `superdeduper register --channel {}` first.",
-                    record.scan_id,
-                    chan.as_slug(),
-                    chan.as_slug()
-                );
-                rejected = rejected.saturating_add(1);
+                warn(&format!("  ✗ {} skipped — {detail}", record.scan_id));
+                report.records.push(RecordOutcome {
+                    scan_id: record.scan_id.clone(),
+                    channel: record.channel.clone(),
+                    outcome: "skipped_not_registered".to_string(),
+                    detail: Some(detail),
+                    submission_id: None,
+                });
+                report.rejected = report.rejected.saturating_add(1);
                 continue;
             }
         };
@@ -806,90 +853,185 @@ fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Res
             submission::submit_recorded_payload(&install_state, payload, built_with, server_url);
         match outcome {
             SubmitOutcome::Accepted { submission_id, .. } => {
-                // #124 — stamp submission_id + transition state in one
-                // atomic helper so this CLI path can't drift back into
-                // the same "forgot the second half" trap the GUI live
-                // path had. mark_submitted preserves attempt_count
-                // (no bump) since this is a successful submit, not a
-                // retry.
-                scan_history::mark_submitted(&record.scan_id, submission_id.clone())?;
-                submitted = submitted.saturating_add(1);
-                println!(
+                if let Err(e) = scan_history::mark_submitted(&record.scan_id, submission_id.clone())
+                {
+                    log_state_err("mark_submitted", &record.scan_id, &e);
+                }
+                report.submitted = report.submitted.saturating_add(1);
+                report.records.push(RecordOutcome {
+                    scan_id: record.scan_id.clone(),
+                    channel: record.channel.clone(),
+                    outcome: "accepted".to_string(),
+                    detail: None,
+                    submission_id: Some(submission_id.clone()),
+                });
+                say(&format!(
                     "  ✓ {} accepted (submission_id={})",
                     record.scan_id, submission_id
-                );
+                ));
             }
             SubmitOutcome::DuplicateNoChange => {
-                scan_history::update_submission_state(
+                if let Err(e) = scan_history::update_submission_state(
                     &record.scan_id,
                     SubmissionState::Submitted,
                     true,
-                )?;
-                duplicate = duplicate.saturating_add(1);
-                println!(
+                ) {
+                    log_state_err("duplicate_no_change", &record.scan_id, &e);
+                }
+                report.duplicate = report.duplicate.saturating_add(1);
+                report.records.push(RecordOutcome {
+                    scan_id: record.scan_id.clone(),
+                    channel: record.channel.clone(),
+                    outcome: "duplicate_no_change".to_string(),
+                    detail: None,
+                    submission_id: None,
+                });
+                say(&format!(
                     "  • {} already-on-file (409 DuplicateNoChange) — marking submitted",
                     record.scan_id
-                );
+                ));
             }
             SubmitOutcome::Rejected { status, reason } => {
-                scan_history::update_submission_state(
+                if let Err(e) = scan_history::update_submission_state(
                     &record.scan_id,
                     SubmissionState::Failed,
                     true,
-                )?;
-                rejected = rejected.saturating_add(1);
-                eprintln!(
-                    "  ✗ {} rejected (status={}, reason={})",
-                    record.scan_id, status, reason
-                );
+                ) {
+                    log_state_err("rejected", &record.scan_id, &e);
+                }
+                report.rejected = report.rejected.saturating_add(1);
+                report.records.push(RecordOutcome {
+                    scan_id: record.scan_id.clone(),
+                    channel: record.channel.clone(),
+                    outcome: "rejected".to_string(),
+                    detail: Some(format!("status={status} reason={reason}")),
+                    submission_id: None,
+                });
+                warn(&format!(
+                    "  ✗ {} rejected (status={status}, reason={reason})",
+                    record.scan_id
+                ));
             }
             SubmitOutcome::Transient { reason } => {
-                // #117 — keep Pending so the next CLI run retries,
-                // but after MAX_RESUBMIT_ATTEMPTS transient failures
-                // give up and mark Failed. Without the cap, a broken
-                // backend kept the same row stuck in Pending forever
-                // (both CLI + GUI surfaces). The GUI launch-modal in
-                // particular re-nagged on every restart.
                 let prior_attempts = scan_history::load(&record.scan_id)?
                     .map(|r| r.attempt_count)
                     .unwrap_or(0);
                 let new_state = scan_history::transient_outcome_state(prior_attempts);
-                scan_history::update_submission_state(&record.scan_id, new_state, true)?;
-                transient = transient.saturating_add(1);
-                let suffix = match new_state {
-                    SubmissionState::Failed => " — retry cap reached, marked Failed",
-                    _ => " — will retry on next run",
+                if let Err(e) =
+                    scan_history::update_submission_state(&record.scan_id, new_state, true)
+                {
+                    log_state_err("transient", &record.scan_id, &e);
+                }
+                report.transient = report.transient.saturating_add(1);
+                let cap_reached = matches!(new_state, SubmissionState::Failed);
+                let suffix = if cap_reached {
+                    " — retry cap reached, marked Failed"
+                } else {
+                    " — will retry on next run"
                 };
-                eprintln!(
-                    "  · {} transient (reason={}){}",
-                    record.scan_id, reason, suffix
-                );
+                report.records.push(RecordOutcome {
+                    scan_id: record.scan_id.clone(),
+                    channel: record.channel.clone(),
+                    outcome: if cap_reached {
+                        "transient_cap_reached".to_string()
+                    } else {
+                        "transient".to_string()
+                    },
+                    detail: Some(reason.clone()),
+                    submission_id: None,
+                });
+                warn(&format!(
+                    "  · {} transient (reason={reason}){suffix}",
+                    record.scan_id
+                ));
             }
             SubmitOutcome::FlaggedForReview { .. } => {
-                // submit_recorded_payload doesn't emit this variant
-                // (it's set by the GUI "Submit for review" flow),
-                // but match must be exhaustive; treat as Submitted
-                // since the review queue has the payload.
-                scan_history::update_submission_state(
+                if let Err(e) = scan_history::update_submission_state(
                     &record.scan_id,
                     SubmissionState::Submitted,
                     true,
-                )?;
-                submitted = submitted.saturating_add(1);
-                println!("  ✓ {} queued for review", record.scan_id);
+                ) {
+                    log_state_err("flagged_for_review", &record.scan_id, &e);
+                }
+                report.submitted = report.submitted.saturating_add(1);
+                report.records.push(RecordOutcome {
+                    scan_id: record.scan_id.clone(),
+                    channel: record.channel.clone(),
+                    outcome: "flagged_for_review".to_string(),
+                    detail: None,
+                    submission_id: None,
+                });
+                say(&format!("  ✓ {} queued for review", record.scan_id));
             }
         }
     }
 
-    let total = submitted + duplicate + rejected + transient;
-    println!(
-        "\n{} drained: {} accepted, {} already-on-file, {} rejected, {} transient.",
-        total, submitted, duplicate, rejected, transient
-    );
-    if rejected > 0 || transient > 0 {
+    let total = report.submitted + report.duplicate + report.rejected + report.transient;
+    report.total = total;
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        say(&format!(
+            "\n{} drained: {} accepted, {} already-on-file, {} rejected, {} transient.",
+            total, report.submitted, report.duplicate, report.rejected, report.transient
+        ));
+    }
+    if report.rejected > 0 || report.transient > 0 {
         std::process::exit(2);
     }
     Ok(())
+}
+
+/// #109 F25 — JSON-shape output for `submit-pending`. Mirrors the
+/// human-readable text stream + adds machine-parseable per-row
+/// records so integration tests don't have to string-match the
+/// per-row print lines.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Default, serde::Serialize)]
+struct SubmitPendingReport {
+    /// True when --dry-run was passed; records is populated with
+    /// the planned set but no POSTs fired.
+    #[serde(default)]
+    dry_run: bool,
+    /// Sum of submitted + duplicate + rejected + transient. Zero
+    /// before any work happens (dry-run or no-eligible-rows).
+    total: u64,
+    submitted: u64,
+    duplicate: u64,
+    rejected: u64,
+    transient: u64,
+    /// Per-row drain outcome. Order matches the order of submission
+    /// (newest-first per `list_pending_older_than`'s sort).
+    records: Vec<RecordOutcome>,
+    /// Rows that were Pending but couldn't be drained (no captured
+    /// payload — v1/v2 rows pre-#41). Local-only; never sent.
+    unsubmittable: Vec<UnsubmittableRow>,
+}
+
+#[cfg(feature = "telemetry")]
+#[derive(Debug, serde::Serialize)]
+struct RecordOutcome {
+    scan_id: String,
+    channel: String,
+    /// One of: `accepted`, `duplicate_no_change`, `rejected`,
+    /// `transient`, `transient_cap_reached`, `flagged_for_review`,
+    /// `skipped_not_registered`, `dry_run`.
+    outcome: String,
+    /// Free-text detail (rejection reason, transient error, etc.).
+    /// `None` when no extra detail applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    /// Server-issued submission_id on `accepted` outcomes only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submission_id: Option<String>,
+}
+
+#[cfg(feature = "telemetry")]
+#[derive(Debug, serde::Serialize)]
+struct UnsubmittableRow {
+    scan_id: String,
+    channel: String,
+    reason: String,
 }
 
 /// G-track: `superdeduper config show` / `superdeduper config set-share`.
