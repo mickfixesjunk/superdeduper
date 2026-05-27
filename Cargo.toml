@@ -49,6 +49,13 @@ toml = "0.8"
 # audited RustCrypto crate; non-optional so the debug helper
 # compiles in `--no-default-features` builds.
 sha2 = "0.10"
+# OAuth callback query-string parsing (loopback redirect handler).
+# #135 — Replaces a hand-rolled url_decode + hex_nibble pair with
+# `url::form_urlencoded::parse`, the de facto Rust URL crate (audited,
+# matches WHATWG URL spec, already pulled in transitively via several
+# deps so no real blast-radius cost). Tiny surface use; could be
+# feature-gated on `telemetry` if cargo-bloat surfaces a regression.
+url = "2.5"
 
 # GUI deps — optional, gated behind the `gui` feature.
 eframe = { version = "0.32", optional = true, default-features = false, features = [
