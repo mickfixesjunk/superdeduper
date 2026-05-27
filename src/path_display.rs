@@ -9,10 +9,17 @@
 //! The engine uses verbatim paths internally to bypass the Win32
 //! MAX_PATH limit. Surfacing them as-is to the user is jarring —
 //! every "open in Explorer" / "select-keeper" UX shows the
-//! `\\?\` prefix that nobody recognises. Three independent GUI
-//! call sites (preview pane, groups-table row, scan-finished
-//! Log) each had their own identical `format_path` /
-//! `display_path` impl; this module consolidates.
+//! `\\?\` prefix that nobody recognises. Several independent GUI
+//! call sites each had their own identical `format_path` /
+//! `display_path` impl; this module consolidates. Current GUI
+//! surfaces routed through `for_user_display`:
+//!
+//! * groups-table dupe row + keeper row (#118)
+//! * preview pane header
+//! * scan-finished Log
+//! * roots panel
+//! * resume modal
+//! * settings-drift modal
 //!
 //! ## What's NOT in scope
 //!
@@ -23,6 +30,12 @@
 //! ever decide JSON/CSV should also be verbatim-stripped, that's a
 //! wire-format change + a coordinated web-side update; out of
 //! scope for this consolidation.
+//!
+//! `gui::app` Log-panel message lines (many `path.display()` /
+//! `path.to_string_lossy()` callsites in archive/copy/move/manifest
+//! status messages) still render verbatim. They're cosmetic + don't
+//! show on the dupe view that prompted #118; tracked for a v0.2.14
+//! Log-panel sweep rather than bundled here.
 
 use std::path::Path;
 

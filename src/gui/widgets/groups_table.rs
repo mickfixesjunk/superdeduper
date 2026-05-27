@@ -721,7 +721,7 @@ pub fn show_filtered(
                             row.col(|ui| {
                                 let label = keeper
                                     .as_ref()
-                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .map(|p| format_path(p))
                                     .unwrap_or_default();
                                 let arrow = if is_open { "▾ " } else { "▸ " };
                                 if ui
