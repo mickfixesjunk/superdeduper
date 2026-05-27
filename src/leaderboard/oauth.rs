@@ -1681,7 +1681,19 @@ fn try_open_browser(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::str::FromStr;
+
+    /// Shared serialisation gate for any test that reads or
+    /// mutates a process-wide env var the oauth module consults.
+    /// Today: `SUPERDEDUPER_OAUTH_MOCK_BASE_URL` only. As
+    /// testrunner's V1-V6 integration matures and more
+    /// env-touching tests land, every one of them must acquire
+    /// this same mutex via `let _g = ENV_SERIAL.lock();` at the
+    /// top — Rust's parallel test runner schedules across this
+    /// module's tests, and concurrent set_var / read can race.
+    /// Mirrors `scan_history`'s SERIAL-Mutex<()> pattern.
+    static ENV_SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn provider_round_trips_slug() {
@@ -2113,17 +2125,18 @@ mod tests {
     /// hardcoded provider URLs. Used by testrunner's V1-V6 to
     /// point the engine at a local mock server.
     ///
-    /// The env-var check is process-wide; this test is serialised
-    /// against any other env-touching test via the existing
-    /// SERIAL mutex pattern other engine tests use. None of the
-    /// other oauth tests touch this var, so a plain set+unset
-    /// pattern is safe here.
+    /// Acquires `ENV_SERIAL` so any future test reading
+    /// `SUPERDEDUPER_OAUTH_MOCK_BASE_URL` (e.g. forthcoming V2-V6
+    /// integration tests against `build_auth_url`) can do the
+    /// same and stay race-free under `--test-threads=4`.
     #[test]
     fn oauth_authorize_endpoint_uses_mock_base_url_when_set() {
         const VAR: &str = "SUPERDEDUPER_OAUTH_MOCK_BASE_URL";
-        // SAFETY: tests in this module run serially within a
-        // single binary; cargo schedules across binaries but no
-        // other oauth test touches this var.
+        let _guard = ENV_SERIAL.lock();
+        // SAFETY: process-wide env state; serialised against
+        // other readers in this module via ENV_SERIAL above.
+        // cargo schedules tests across binaries but no other
+        // binary touches this var today.
         let prior = std::env::var(VAR).ok();
         unsafe { std::env::set_var(VAR, "http://localhost:8080/oauth/"); }
         let google_url = oauth_authorize_endpoint(Provider::Google);
