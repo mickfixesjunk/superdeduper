@@ -972,10 +972,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     // Wall-clock UNIX seconds for the scan_history record — same
     // pattern as `gui::live::run()` so CLI + GUI scans both persist
     // history rows with comparable timestamps.
-    let started_at_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let started_at_unix = superdeduper::time::now_unix_secs();
     // Tell the user which content-hash core is actually linked. For
     // BLAKE3 this is just the compile-time crate version; for
     // River5 it's whatever the upstream lib reports via

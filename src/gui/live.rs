@@ -108,10 +108,7 @@ fn run(
     // monotonic + opaque; we need a UNIX timestamp the scan_history
     // persistence layer can sort + display). One reading, threaded
     // through to the ScanFinished hook below.
-    let started_at_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let started_at_unix = crate::time::now_unix_secs();
     // Diagnostics report file — fresh per scan. Failure to open it
     // doesn't kill the scan; we just lose self-debug telemetry.
     let diag = DiagnosticsLog::open();

@@ -67,7 +67,7 @@ impl ResultsState {
     ) -> Self {
         Self {
             schema: SCHEMA.into(),
-            saved_at_unix: now_unix(),
+            saved_at_unix: crate::time::now_unix_secs(),
             roots,
             settings,
             fingerprints,
@@ -211,13 +211,6 @@ fn fingerprints_match(a: &RootFingerprint, b: &RootFingerprint) -> bool {
     }
     // mtime is the most sensitive signal; require an exact match.
     a.max_mtime_unix == b.max_mtime_unix
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

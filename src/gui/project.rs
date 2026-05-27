@@ -228,10 +228,7 @@ pub fn load_recents() -> Result<RecentProjects> {
 
 pub fn touch_recent(path: &Path, name: &str) -> Result<()> {
     let mut recents = load_recents().unwrap_or_default();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::time::now_unix_secs();
     // Drop any existing entry for this path, then insert at the
     // front so the recents list is MRU-ordered.
     recents.entries.retain(|e| e.path != path);

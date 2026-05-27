@@ -241,7 +241,7 @@ pub fn run_probes(target_paths: Vec<PathBuf>, skip_io: bool) -> anyhow::Result<D
 
     let report = DiagnoseReport {
         schema: "superdeduper.diagnose.v2",
-        timestamp_unix: now_unix(),
+        timestamp_unix: crate::time::now_unix_i64(),
         target_paths: target_paths
             .iter()
             .map(|p| p.display().to_string())
@@ -296,7 +296,7 @@ impl PreflightLog {
     fn line(&mut self, tag: &str, body: &str) {
         if let Some(f) = self.file.as_mut() {
             use std::io::Write;
-            let ts = now_unix();
+            let ts = crate::time::now_unix_i64();
             let _ = writeln!(f, "{ts}  {tag:<20}  {body}");
             let _ = f.flush();
         }
@@ -502,13 +502,6 @@ impl Drop for ScratchGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 fn probe_system() -> SystemInfo {

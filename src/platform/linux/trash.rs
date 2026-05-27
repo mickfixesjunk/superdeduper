@@ -42,7 +42,6 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{PlatformError, PlatformResult};
 
@@ -147,7 +146,7 @@ fn trash_root() -> PlatformResult<PathBuf> {
 /// GNOME / KDE produce).
 fn build_trashinfo(original: &Path) -> String {
     let path_escaped = url_escape_for_trashinfo(&original.to_string_lossy());
-    let date = iso8601_local_seconds(now_unix_local());
+    let date = iso8601_local_seconds(crate::time::now_unix_i64());
     format!("[Trash Info]\nPath={path_escaped}\nDeletionDate={date}\n",)
 }
 
@@ -204,35 +203,10 @@ fn pick_unique_name(
     ))
 }
 
-/// Wall-clock seconds since epoch (local, not UTC — XDG Trash uses
-/// local time in the DeletionDate field).
-fn now_unix_local() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Render a unix timestamp as `YYYY-MM-DDTHH:MM:SS` (no timezone).
 /// XDG Trash spec is loose on TZ — most implementations omit it.
-/// Hand-rolled to avoid pulling chrono just for one format string.
 fn iso8601_local_seconds(unix: i64) -> String {
-    let days = unix.div_euclid(86_400);
-    let secs = unix.rem_euclid(86_400);
-    let h = (secs / 3_600) as u32;
-    let m = ((secs % 3_600) / 60) as u32;
-    let s = (secs % 60) as u32;
-    // Howard Hinnant civil-from-days.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    let (year, mo, day, h, m, s) = crate::time::unix_to_ymdhms(unix);
     format!("{year:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}")
 }
 

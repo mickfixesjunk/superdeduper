@@ -284,33 +284,12 @@ fn now_iso8601_ms() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = now.as_secs();
     let ms = now.subsec_millis();
-    let (year, month, day, hour, min, sec) = epoch_to_ymd_hms(secs);
+    let (year, month, day, hour, min, sec) = crate::time::unix_to_ymdhms(now.as_secs() as i64);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         year, month, day, hour, min, sec, ms
     )
-}
-
-/// Local epoch-to-Y/M/D-H/M/S converter so action_receipt has zero
-/// external date deps. Civil-from-days algorithm by Howard Hinnant.
-fn epoch_to_ymd_hms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
-    let z = secs as i64 / 86_400 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i32 + era as i32 * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp.wrapping_sub(9) };
-    let year = if m <= 2 { y + 1 } else { y };
-    let sec_of_day = (secs % 86_400) as u32;
-    let hour = sec_of_day / 3_600;
-    let min = (sec_of_day % 3_600) / 60;
-    let sec = sec_of_day % 60;
-    (year, m, d, hour, min, sec)
 }
 
 #[cfg(test)]
@@ -414,13 +393,13 @@ mod tests {
     #[test]
     fn iso8601_format_is_correct_shape() {
         // Known epoch second: 2020-01-01T00:00:00Z = 1577836800.
-        let (y, m, d, h, mi, s) = epoch_to_ymd_hms(1_577_836_800);
+        let (y, m, d, h, mi, s) = crate::time::unix_to_ymdhms(1_577_836_800);
         assert_eq!((y, m, d, h, mi, s), (2020, 1, 1, 0, 0, 0));
         // 2000-02-29T12:34:56Z = 951827696 (leap-year edge case).
-        let (y, m, d, h, mi, s) = epoch_to_ymd_hms(951_827_696);
+        let (y, m, d, h, mi, s) = crate::time::unix_to_ymdhms(951_827_696);
         assert_eq!((y, m, d, h, mi, s), (2000, 2, 29, 12, 34, 56));
         // 1970-01-01T00:00:00Z = 0 (epoch itself).
-        let (y, m, d, h, mi, s) = epoch_to_ymd_hms(0);
+        let (y, m, d, h, mi, s) = crate::time::unix_to_ymdhms(0);
         assert_eq!((y, m, d, h, mi, s), (1970, 1, 1, 0, 0, 0));
     }
 

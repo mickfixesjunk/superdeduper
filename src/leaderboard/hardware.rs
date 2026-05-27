@@ -138,7 +138,11 @@ fn platform_detect_disk_class() -> Option<String> {
                 continue;
             }
             let rotational_path = entry.path().join("queue").join("rotational");
-            match std::fs::read_to_string(&rotational_path).ok().as_deref().map(str::trim) {
+            match std::fs::read_to_string(&rotational_path)
+                .ok()
+                .as_deref()
+                .map(str::trim)
+            {
                 Some("0") => any_ssd = true,
                 Some("1") => any_hdd = true,
                 _ => {}

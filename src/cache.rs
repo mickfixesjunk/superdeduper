@@ -571,7 +571,7 @@ impl Cache {
     }
 
     pub fn store(&self, key: &CacheKey, hashes: &CachedHashes) -> Result<()> {
-        let now = now_unix();
+        let now = crate::time::now_unix_i64();
         // Tier columns use COALESCE on conflict so a single-tier
         // write doesn't clobber the others. The hash pipeline calls
         // `store` once per tier with only that tier populated; the
@@ -617,7 +617,7 @@ impl Cache {
     /// a successful scan so the next run can ask the USN journal for a
     /// delta instead of re-reading every file.
     pub fn set_volume_usn(&self, volume_guid: &str, usn: i64) -> Result<()> {
-        let now = now_unix();
+        let now = crate::time::now_unix_i64();
         self.conn.execute(
             "INSERT INTO volumes(volume_guid, last_usn, last_seen) VALUES (?1, ?2, ?3)
              ON CONFLICT(volume_guid) DO UPDATE SET last_usn = excluded.last_usn, last_seen = excluded.last_seen",
@@ -904,14 +904,6 @@ impl Cache {
             bytes_on_disk,
         })
     }
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// #99 PR2 — Read-only schema-version observation. Tells the
@@ -1298,7 +1290,7 @@ mod tests {
         let meta = InventoryMeta {
             journal_id: 1,
             last_usn: 100,
-            captured_at_unix: now_unix(),
+            captured_at_unix: crate::time::now_unix_i64(),
         };
         // Three records covering the cases that matter:
         // * No reparse point — reparse_tag = None
