@@ -33,6 +33,7 @@ pub mod path_display;
 pub mod pipeline;
 pub mod platform;
 pub mod scan_history;
+pub mod schema;
 pub mod time;
 pub mod winapi_wrappers;
 
