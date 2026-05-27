@@ -119,6 +119,44 @@ done
   superdeduper-gui-windows-x86_64.exe > SHA256SUMS)
 cp -v "$ARCHIVE_DIR/SHA256SUMS" "$LATEST_DIR/SHA256SUMS"
 
+# HEAD-drift guard: if the working tree was switched to a different
+# branch DURING the build (e.g. a user kicking off the script in the
+# background then `git switch`ing for the next task), cargo will have
+# compiled source from the new branch, but ARCHIVE_DIR + LATEST.txt's
+# dir-label still reflects the START sha. Result: mislabeled binaries,
+# false-FAIL test reports against a binary that doesn't have the
+# fix the dir name claims.
+#
+# Bail loudly + don't drop. The caller can re-run with the working
+# tree held steady. (sdd-testwin 2026-05-27T07:51Z R3 re-verify
+# caught this class against the fix/33 build that compiled from
+# feat/56 source despite the f55b6bf dir label.)
+END_SHA="$(git rev-parse --short=7 HEAD)"
+if [[ "$END_SHA" != "$SHA" ]]; then
+  END_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  cat >&2 <<EOF
+==================================================================
+ERROR: HEAD drifted during build
+       script started at: ${SHA} (branch '${BRANCH}')
+       HEAD is now:       ${END_SHA} (branch '${END_BRANCH}')
+
+cargo compiled source from '${END_BRANCH}' (whichever branch was
+checked out when each compile unit's source was read), but
+ARCHIVE_DIR + LATEST.txt would label this drop as '${SHA}'.
+
+That mislabel is exactly the failure mode that produces "the test
+ran against a binary missing my fix" false-FAIL reports. Bailing
+before writing the drop.
+
+To recover:
+1. \`git switch <branch-you-actually-want>\`
+2. Re-run scripts/cross-build-drop.sh
+3. Don't switch branches while it's running
+==================================================================
+EOF
+  exit 1
+fi
+
 # LATEST.txt sidecar — `cat /mnt/c/.../LATEST.txt` answers
 # "what version is this drop?" in one command. Single file
 # per drop, no filename clutter, no GC needed. Per Mick
