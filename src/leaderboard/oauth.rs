@@ -482,6 +482,27 @@ fn discord_client_id(channel: Channel) -> Option<&'static str> {
     }
 }
 
+/// #57 — Env-override for the OAuth provider authorize endpoint.
+/// When `SUPERDEDUPER_OAUTH_MOCK_BASE_URL` is set, returns
+/// `<base>/<provider_slug>` (e.g. `http://localhost:8080/google`).
+/// Otherwise returns the canonical Google / Discord URL.
+///
+/// Used by testrunner's V1-V6 integration suite to point the
+/// engine at a local mock server with sequenced responses. The
+/// override is env-only (not a CLI flag) so the surface stays
+/// small + matches existing test-mode patterns; `--integration-
+/// test-mode` and `--channel local` are the existing analogues.
+fn oauth_authorize_endpoint(provider: Provider) -> String {
+    if let Ok(base) = std::env::var("SUPERDEDUPER_OAUTH_MOCK_BASE_URL") {
+        let trimmed = base.trim_end_matches('/');
+        return format!("{trimmed}/{}", provider.as_slug());
+    }
+    match provider {
+        Provider::Google => "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+        Provider::Discord => "https://discord.com/api/oauth2/authorize".to_string(),
+    }
+}
+
 /// Build the provider's auth URL for the active channel.
 /// Returns the URL + the PKCE code_verifier for Google
 /// (`None` for Discord — Discord OAuth doesn't require PKCE).
@@ -498,14 +519,14 @@ pub fn build_auth_url(
             let verifier = pkce_verifier();
             let challenge = pkce_challenge(&verifier);
             let url = format!(
-                "https://accounts.google.com/o/oauth2/v2/auth\
-                 ?client_id={}\
+                "{}?client_id={}\
                  &response_type=code\
                  &scope={}\
                  &redirect_uri={}\
                  &state={}\
                  &code_challenge={}\
                  &code_challenge_method=S256",
+                oauth_authorize_endpoint(provider),
                 urlencode(client_id),
                 urlencode("openid email profile"),
                 urlencode(redirect_uri),
@@ -518,12 +539,12 @@ pub fn build_auth_url(
             let client_id =
                 discord_client_id(channel).ok_or(OauthError::NoClientId { provider, channel })?;
             let url = format!(
-                "https://discord.com/api/oauth2/authorize\
-                 ?client_id={}\
+                "{}?client_id={}\
                  &response_type=code\
                  &scope={}\
                  &redirect_uri={}\
                  &state={}",
+                oauth_authorize_endpoint(provider),
                 urlencode(client_id),
                 urlencode("identify"),
                 urlencode(redirect_uri),
@@ -2085,6 +2106,44 @@ mod tests {
         match AccountStatus::Anonymous {
             AccountStatus::Anonymous => {}
             AccountStatus::Linked { .. } => panic!("anonymous mapped wrong"),
+        }
+    }
+
+    /// #57 — Env-override base URL takes precedence over the
+    /// hardcoded provider URLs. Used by testrunner's V1-V6 to
+    /// point the engine at a local mock server.
+    ///
+    /// The env-var check is process-wide; this test is serialised
+    /// against any other env-touching test via the existing
+    /// SERIAL mutex pattern other engine tests use. None of the
+    /// other oauth tests touch this var, so a plain set+unset
+    /// pattern is safe here.
+    #[test]
+    fn oauth_authorize_endpoint_uses_mock_base_url_when_set() {
+        const VAR: &str = "SUPERDEDUPER_OAUTH_MOCK_BASE_URL";
+        // SAFETY: tests in this module run serially within a
+        // single binary; cargo schedules across binaries but no
+        // other oauth test touches this var.
+        let prior = std::env::var(VAR).ok();
+        unsafe { std::env::set_var(VAR, "http://localhost:8080/oauth/"); }
+        let google_url = oauth_authorize_endpoint(Provider::Google);
+        let discord_url = oauth_authorize_endpoint(Provider::Discord);
+        // Trailing slash on the base should be stripped.
+        assert_eq!(google_url, "http://localhost:8080/oauth/google");
+        assert_eq!(discord_url, "http://localhost:8080/oauth/discord");
+        unsafe { std::env::remove_var(VAR); }
+        // Without the override, canonical URLs return.
+        assert_eq!(
+            oauth_authorize_endpoint(Provider::Google),
+            "https://accounts.google.com/o/oauth2/v2/auth",
+        );
+        assert_eq!(
+            oauth_authorize_endpoint(Provider::Discord),
+            "https://discord.com/api/oauth2/authorize",
+        );
+        // Restore prior env state for the rest of the suite.
+        if let Some(v) = prior {
+            unsafe { std::env::set_var(VAR, v); }
         }
     }
 }
