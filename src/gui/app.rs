@@ -4207,23 +4207,20 @@ fn iso_timestamp_for_filename() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}-{m:02}-{s:02}Z")
 }
 
-/// Open a URL in the user's default browser. Per-OS shell-out;
-/// non-blocking. Failure logs to stderr and is otherwise silent —
-/// this is invoked from UI button clicks, no good way to surface
-/// "browser refused to launch" inline.
+/// Open a URL in the user's default browser. Per #73 — was a
+/// third copy of the per-OS browser-launch dispatch logic (after
+/// captcha.rs + oauth.rs migrated to the platform helper);
+/// delegates to [`crate::platform::open_url`] so the Windows path
+/// uses `ShellExecuteW` (the `cmd /c start` form mangles URLs
+/// containing `&`, which is exactly the OAuth-callback shape).
+///
+/// Failure logs to stderr and is otherwise silent — this is
+/// invoked from UI button clicks, no good way to surface "browser
+/// refused to launch" inline.
 #[cfg(feature = "telemetry")]
 fn open_url_in_browser(url: &str) {
-    let result = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .spawn()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
-    };
-    if let Err(e) = result {
-        eprintln!("failed to open browser to {url}: {e}");
+    if let Err(e) = crate::platform::open_url(url) {
+        eprintln!("failed to open browser to {url}: {e:?}");
     }
 }
 
