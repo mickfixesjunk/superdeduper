@@ -138,6 +138,15 @@ pub struct SubmitPendingArgs {
     /// confirming the set before draining.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+
+    /// #109 F25 — Output format. `text` (default) prints the
+    /// human-readable per-row + summary stream the GUI mirrors.
+    /// `json` emits a single object with the per-row outcomes +
+    /// totals, so integration tests + shell scripts don't have
+    /// to string-match the human stream. Same format-flag pattern
+    /// as `scan`, `dedupe`, `diagnose`, `scan-history list`.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Subcommand)]
