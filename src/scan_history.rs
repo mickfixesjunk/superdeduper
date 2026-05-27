@@ -483,10 +483,38 @@ pub fn update_submission_state(
     Ok(true)
 }
 
-/// #82 — Stash the server-issued `submission_id` on the row that
-/// just submitted. Called from the GUI's submit-worker thread on
-/// `SubmitOutcome::Accepted`. Returns true if a row matched + was
-/// updated; false if the scan_id has been pruned or never existed.
+/// #124 — Atomically mark a scan as accepted by the server: stamp
+/// the server-issued submission_id AND transition
+/// `submission_state` to `Submitted`. Returns true if a row matched.
+///
+/// The original `set_submission_id` only stamped the id; the live-
+/// submit Accepted path called it without also transitioning state,
+/// so the History UI showed "Pending" until the user manually
+/// clicked Resubmit. Combining the two operations into one helper
+/// makes it impossible for a future caller to do half the work and
+/// closes the bug class — the cure for "someone forgot the second
+/// half" is to not have a second half.
+///
+/// Callers: GUI live-submit Accepted handler + CLI submit-pending
+/// Accepted path. The resubmit-from-history flow keeps using
+/// [`update_submission_state`] directly because the submission_id
+/// is already on the row.
+pub fn mark_submitted(scan_id: &str, submission_id: String) -> io::Result<bool> {
+    let mut record = match load(scan_id)? {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    record.submission_id = Some(submission_id);
+    record.submission_state = SubmissionState::Submitted;
+    record_completed(&record)?;
+    Ok(true)
+}
+
+/// #82 — Stash the server-issued `submission_id` on the row WITHOUT
+/// touching submission_state. Retained for any caller that
+/// intentionally wants to decouple id-stamp from state-transition;
+/// new callers should prefer [`mark_submitted`] which closes the
+/// #124 bug class.
 pub fn set_submission_id(scan_id: &str, submission_id: String) -> io::Result<bool> {
     let mut record = match load(scan_id)? {
         Some(r) => r,
@@ -982,6 +1010,45 @@ mod tests {
         let missing = update_submission_state("does-not-exist", SubmissionState::Failed, true)
             .expect("missing row is not an error");
         assert!(!missing);
+    }
+
+    /// #124 — `mark_submitted` atomically stamps submission_id AND
+    /// transitions submission_state to Submitted. Pins the contract
+    /// that closes the bug class where callers might do only one half.
+    #[test]
+    fn mark_submitted_round_trip() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _td = isolate("mark-submitted");
+        let scan_id = new_scan_id();
+        let r = ScanRecord::new_finished(
+            scan_id.clone(),
+            1_700_000_000,
+            "prod",
+            vec![],
+            5,
+            2,
+            0,
+            1024,
+            BTreeMap::new(),
+        );
+        record_completed(&r).unwrap();
+
+        // Fresh row: Pending + no submission_id.
+        let before = load(&scan_id).unwrap().unwrap();
+        assert_eq!(before.submission_state, SubmissionState::Pending);
+        assert_eq!(before.submission_id, None);
+
+        // mark_submitted does BOTH in one call.
+        let sid = "srv-issued-12345".to_string();
+        let ok = mark_submitted(&scan_id, sid.clone()).unwrap();
+        assert!(ok);
+        let after = load(&scan_id).unwrap().unwrap();
+        assert_eq!(after.submission_state, SubmissionState::Submitted);
+        assert_eq!(after.submission_id.as_deref(), Some(sid.as_str()));
+
+        // Missing row → Ok(false), not error.
+        let none = mark_submitted("does-not-exist", "x".into()).unwrap();
+        assert!(!none);
     }
 
     /// #82 — `set_submission_id` round-trip plus `find_by_submission_id`

@@ -1169,14 +1169,21 @@ impl SuperdeduperApp {
                 // scan-finish; resubmit-from-history flows skip
                 // because their inputs.scan_id wouldn't change the
                 // row state (it already has a submission_id).
+                // #124 — atomically stamp submission_id + transition
+                // submission_state to Submitted. The prior two-step
+                // shape (set_submission_id + later update_submission_state)
+                // had a latent bug: this caller never did the second
+                // half, so the History UI showed Pending until manual
+                // resubmit. mark_submitted closes the bug class by
+                // doing both as one operation.
                 if let Some(scan_id) = inputs.scan_id.as_deref() {
                     if let Err(e) =
-                        crate::scan_history::set_submission_id(scan_id, submission_id.clone())
+                        crate::scan_history::mark_submitted(scan_id, submission_id.clone())
                     {
                         tracing::warn!(
                             error = %e,
                             scan_id = %scan_id,
-                            "scan_history: set_submission_id failed (non-fatal)",
+                            "scan_history: mark_submitted failed (non-fatal)",
                         );
                     }
                 }
@@ -1191,6 +1198,28 @@ impl SuperdeduperApp {
                     | submission::SubmitOutcome::DuplicateNoChange
             ) {
                 let _ = submission::take_pending();
+            }
+            // #124 — DuplicateNoChange (409) is also a "server has it"
+            // outcome from the user's POV: the row is on the leaderboard
+            // even if THIS POST didn't re-create the record. Transition
+            // the history row to Submitted so the user doesn't see a
+            // stuck Pending. (Accepted is handled inline above where
+            // the submission_id is also stamped onto the row; this branch
+            // covers 409 where no new submission_id is issued.)
+            if matches!(&outcome, submission::SubmitOutcome::DuplicateNoChange) {
+                if let Some(scan_id) = inputs.scan_id.as_deref() {
+                    if let Err(e) = crate::scan_history::update_submission_state(
+                        scan_id,
+                        crate::scan_history::SubmissionState::Submitted,
+                        false,
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            scan_id = %scan_id,
+                            "scan_history: 409 state transition failed (non-fatal)",
+                        );
+                    }
+                }
             }
             if let submission::SubmitOutcome::Transient { reason } = &outcome {
                 eprintln!("leaderboard: submit transient ({reason}); enqueueing");
