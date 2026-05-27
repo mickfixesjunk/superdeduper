@@ -76,29 +76,54 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
     // Step 1: filter to audio extensions + hash each. Hash failures
     // drop silently with a tracing::debug! so triage has a trail.
     let mut short_skipped_count: u64 = 0;
+    // `catch_unwind` wraps the per-file fingerprint call so an upstream
+    // decoder panic (notably the symphonia-codec-aac 0.5.5 panic at
+    // `aac/ics/mod.rs:242:17` — index 64 out of bounds for len 64,
+    // surfaced on D:\Dropbox during the v0.2.13 audio bench) doesn't
+    // kill the whole Tier-4 stage. The file gets logged + dropped the
+    // same way a normal hash-failure does. Symphonia 0.5 → 0.6 bump is
+    // queued separately; this is the short-term shield.
     let hashed: Vec<Hashed<'_>> = inventory
         .iter()
         .filter(|f| is_audio_file(&f.path))
-        .filter_map(|f| match hash_file(&f.path) {
-            Ok(fp) if !fp.is_empty() => Some(Hashed {
-                file: f,
-                fingerprint: fp,
-            }),
-            Ok(_) => {
-                tracing::debug!(
-                    path = %f.path.display(),
-                    "tier-4 audio: empty fingerprint; skipping (likely <30s of decoded audio)",
-                );
-                short_skipped_count = short_skipped_count.saturating_add(1);
-                None
-            }
-            Err(e) => {
-                tracing::debug!(
-                    path = %f.path.display(),
-                    error = %e,
-                    "tier-4 audio: skip (hash failed)",
-                );
-                None
+        .filter_map(|f| {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hash_file(&f.path)));
+            match res {
+                Ok(Ok(fp)) if !fp.is_empty() => Some(Hashed {
+                    file: f,
+                    fingerprint: fp,
+                }),
+                Ok(Ok(_)) => {
+                    tracing::debug!(
+                        path = %f.path.display(),
+                        "tier-4 audio: empty fingerprint; skipping (likely <30s of decoded audio)",
+                    );
+                    short_skipped_count = short_skipped_count.saturating_add(1);
+                    None
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        path = %f.path.display(),
+                        error = %e,
+                        "tier-4 audio: skip (hash failed)",
+                    );
+                    None
+                }
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
+                    tracing::warn!(
+                        path = %f.path.display(),
+                        panic = %msg,
+                        "tier-4 audio: skip (decoder panic — likely symphonia upstream bug)",
+                    );
+                    None
+                }
             }
         })
         .collect();
