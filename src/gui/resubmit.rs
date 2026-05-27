@@ -165,3 +165,72 @@ pub fn request_resubmit(scan_id: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+/// #125 — Queue several scan_ids for sequential resubmit. Spawns a
+/// short-lived coordinator thread that walks the list in order and
+/// calls [`request_resubmit`] for each one, waiting for the in-flight
+/// slot to clear between rows. The worker's per-resubmit semantics
+/// are unchanged (still serial, still claims the global slot); the
+/// coordinator just feeds it row by row instead of dropping every
+/// row after the first.
+///
+/// Returns immediately with the row count handed to the coordinator;
+/// observers poll [`drain_outcome`] each frame as usual — one
+/// outcome lands per row, in submitted order.
+///
+/// Coordinator handles transient races (slot busy from an unrelated
+/// click) by re-trying request_resubmit on a 500ms tick. If a row
+/// fails to start with a permanent error (record missing, no payload,
+/// cross-install), the coordinator skips it + logs to stderr; the
+/// remaining rows still drain. The whole batch finishes within at
+/// most `rows * (resubmit_wallclock + 500ms)` wall.
+pub fn request_resubmit_batch(scan_ids: Vec<String>) -> usize {
+    let count = scan_ids.len();
+    if count == 0 {
+        return 0;
+    }
+    std::thread::Builder::new()
+        .name("superdeduper-resubmit-coordinator".into())
+        .spawn(move || {
+            for scan_id in scan_ids {
+                // Try to claim the slot. If another resubmit is in
+                // flight (e.g. user double-clicked Resubmit on a
+                // single row while a batch is also draining), back
+                // off + retry. Hard caps are intentional: the user
+                // can always close + reopen the app to abort.
+                let mut attempts = 0u32;
+                loop {
+                    match request_resubmit(&scan_id) {
+                        Ok(()) => break,
+                        Err(e) => {
+                            // If the error is "another resubmit in
+                            // flight" we wait + retry. Other errors
+                            // (record missing, no payload, etc.)
+                            // are permanent for this row; skip it.
+                            if e.contains("already in flight") && attempts < 600 {
+                                attempts += 1;
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                continue;
+                            }
+                            eprintln!("resubmit-batch: skipping {scan_id} ({e})");
+                            break;
+                        }
+                    }
+                }
+                // Wait for THIS scan's resubmit to finish (slot
+                // returns to None) before queueing the next. Bound
+                // each row to 5 min wallclock so a hung HTTP doesn't
+                // deadlock the coordinator forever.
+                let started = std::time::Instant::now();
+                while in_flight_scan_id().as_deref() == Some(scan_id.as_str()) {
+                    if started.elapsed() > std::time::Duration::from_secs(300) {
+                        eprintln!("resubmit-batch: {scan_id} exceeded 5min wall; moving on");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        })
+        .ok();
+    count
+}

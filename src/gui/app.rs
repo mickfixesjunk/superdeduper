@@ -3117,19 +3117,22 @@ impl eframe::App for SuperdeduperApp {
                 use crate::gui::widgets::resubmit_prompt_modal::ResubmitPromptChoice;
                 match choice {
                     ResubmitPromptChoice::ResubmitAll => {
-                        // Kick the first row through the worker;
-                        // History panel surfaces per-row state +
-                        // (when v2.1 lands) auto-chains the rest.
-                        // For now, the user can click Resubmit on
-                        // the History tab for any rows the worker
-                        // didn't get to.
-                        if let Some(first) = rows.first() {
-                            if let Err(e) = crate::gui::resubmit::request_resubmit(&first.scan_id) {
-                                self.state.push_log(
-                                    crate::gui::events::LogLevel::Warn,
-                                    format!("Couldn't start resubmit: {e}"),
-                                );
-                            }
+                        // #125 — queue every listed row through the
+                        // coordinator so all pending submissions
+                        // drain serially (not just the first). The
+                        // History panel surfaces per-row state as
+                        // each row finishes; the coordinator handles
+                        // slot contention + bounded per-row wait.
+                        let scan_ids: Vec<String> =
+                            rows.iter().map(|r| r.scan_id.clone()).collect();
+                        let queued = crate::gui::resubmit::request_resubmit_batch(scan_ids);
+                        if queued > 0 {
+                            self.state.push_log(
+                                crate::gui::events::LogLevel::Info,
+                                format!(
+                                    "Queued {queued} pending submission(s) for resubmit. Watch the History tab for per-row outcomes."
+                                ),
+                            );
                         }
                         self.persisted.results_tab = ResultsTab::History;
                     }
