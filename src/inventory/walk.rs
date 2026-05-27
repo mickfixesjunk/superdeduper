@@ -546,6 +546,18 @@ where
             metadata
         };
 
+        // #116 — superdeduper's own footprint should never appear in
+        // dedup results, regardless of user exclusion settings. Skip
+        // diagnose-scratch dirs, safe-rename'd dups, and reflink
+        // atomic-temp files unconditionally.
+        if is_superdeduper_self_path(&path) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "superdeduper self-footprint",
+            });
+            continue;
+        }
+
         if metadata.is_dir() {
             // T1.7: cycle detection is centralised at walk-top
             // (visited-set insert + named event emission). We just
@@ -709,6 +721,18 @@ where
             return Ok(());
         }
         let path = dir.join(&entry.name);
+
+        // #116 — superdeduper's own footprint should never appear in
+        // dedup results, regardless of user exclusion settings. Skip
+        // diagnose-scratch dirs, safe-rename'd dups, and reflink
+        // atomic-temp files unconditionally.
+        if is_superdeduper_self_path(&path) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "superdeduper self-footprint",
+            });
+            continue;
+        }
 
         // For reparse-point entries, fetch the actual tag so we can
         // tell symlinks (handled specially per --follow-links) from
@@ -892,6 +916,33 @@ fn path_passes_globs(path: &Path, cfg: &ScanConfig) -> bool {
         }
     }
     true
+}
+
+/// #116 — superdeduper's own scratch / marker paths. Walker skips
+/// these unconditionally so we never scan our own working data:
+///
+/// * directories whose name starts with `.superdeduper-` — the
+///   diagnose scratch space (`.superdeduper-diagnose-scratch`) Mick
+///   reported in the dupes list, plus any future `.superdeduper-*/`
+///   variants we add (cache, profile dumps, etc.) without needing
+///   to update this filter.
+/// * files whose name ends with `.superdeduper` — safe-rename'd
+///   duplicates (per `dedupe::SAFE_RENAME_SUFFIX`). Without this,
+///   a re-scan after safe-rename would surface every renamed dup
+///   as its own copy of the original.
+/// * files whose name ends with `.superdeduper-clone-tmp` —
+///   reflink atomic-via-tmp-rename intermediates. Normally gone
+///   before any scan but a crash mid-reflink can leave them.
+///
+/// Engine-controlled; users can't opt out (and shouldn't need to —
+/// these are never user files).
+fn is_superdeduper_self_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    name.starts_with(".superdeduper-")
+        || name.ends_with(".superdeduper")
+        || name.ends_with(".superdeduper-clone-tmp")
 }
 
 /// Returns `true` if the file should be dropped per Settings →
@@ -1173,5 +1224,89 @@ mod dedup_by_path_tests {
         });
         assert_eq!(out.len(), 1);
         assert_eq!(dropped, 3);
+    }
+}
+
+#[cfg(test)]
+mod self_footprint_tests {
+    use super::is_superdeduper_self_path;
+    use std::path::Path;
+
+    #[test]
+    fn skips_diagnose_scratch_dir() {
+        let p = Path::new("/some/drive/.superdeduper-diagnose-scratch");
+        assert!(is_superdeduper_self_path(p));
+    }
+
+    #[test]
+    fn skips_diagnose_scratch_dir_with_trailing_content() {
+        // Walker calls `is_superdeduper_self_path` on the dir entry
+        // itself before recursing — so leaf-name match is what counts.
+        let p = Path::new("/some/drive/.superdeduper-diagnose-scratch");
+        assert!(is_superdeduper_self_path(p));
+    }
+
+    #[test]
+    fn skips_future_dotsuperdeduper_dash_variants() {
+        // Prefix match so we don't need to update the filter every time
+        // we add a new self-managed dir (cache, profile dumps, etc.).
+        for name in [
+            ".superdeduper-cache",
+            ".superdeduper-logs",
+            ".superdeduper-profile-dumps",
+        ] {
+            let p = Path::new("/x").join(name);
+            assert!(is_superdeduper_self_path(&p), "should skip: {name}");
+        }
+    }
+
+    #[test]
+    fn skips_safe_renamed_dup_files() {
+        // dedupe::SAFE_RENAME_SUFFIX = ".superdeduper". A safe-rename'd
+        // dup like `photo.jpg.superdeduper` must never resurface in a
+        // re-scan as a copy of `photo.jpg`.
+        let p = Path::new("/u/photo.jpg.superdeduper");
+        assert!(is_superdeduper_self_path(p));
+    }
+
+    #[test]
+    fn skips_reflink_clone_tmp() {
+        let p = Path::new("/u/.foo.superdeduper-clone-tmp");
+        assert!(is_superdeduper_self_path(p));
+    }
+
+    #[test]
+    fn passes_through_normal_files() {
+        for p in [
+            "/home/user/photo.jpg",
+            "/home/user/document.pdf",
+            "/home/user/.bashrc",
+            "/home/user/.config/foo.toml",
+            "/u/superdeduper-not-prefixed.txt",
+        ] {
+            assert!(
+                !is_superdeduper_self_path(Path::new(p)),
+                "should not skip: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_bare_dotsuperdeduper_dir() {
+        // `.superdeduper` (channel module's per-user data dir) lives
+        // under `data_dir()` so it's not normally walked. But if a
+        // user adds their home as a scan root, the leaf-name suffix
+        // match still catches it via the `.superdeduper` ends_with
+        // arm — we don't want to scan our own data dir either.
+        let p = Path::new("/u/.superdeduper");
+        assert!(is_superdeduper_self_path(p));
+    }
+
+    #[test]
+    fn handles_empty_and_non_utf8_paths_without_panic() {
+        // Walker can encounter non-utf8 path components on Linux;
+        // `file_name().to_str()` returns None and we pass through.
+        let p = Path::new("");
+        assert!(!is_superdeduper_self_path(p));
     }
 }
