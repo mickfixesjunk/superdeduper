@@ -104,12 +104,14 @@ fn detect_is_dev_drive() -> bool {
 #[cfg(target_os = "windows")]
 fn platform_detect_is_dev_drive() -> Option<bool> {
     // Probe the system volume (the drive Windows booted from).
-    // GetSystemDirectoryW returns its full path; we keep just the
-    // drive-letter prefix and check that volume's persistent flags.
-    // Most Dev Drives ARE the system volume (Windows 11 24H2
-    // recommends configuring `C:\` as a Dev Drive for build
-    // workloads) so this is the right first probe; a multi-volume
-    // walk is Phase 3.1 if Mick needs sidecar-volume detection.
+    // GetSystemDirectoryW returns its full path (e.g.
+    // "C:\\Windows\\System32"); we extract the drive letter and
+    // probe THAT volume's persistent flags, which handles the rare
+    // non-C system-drive case (multi-OS / custom installs /
+    // letter-remapped configs) honestly instead of hard-assuming
+    // C:. Most Dev Drives ARE the system volume per Windows 11
+    // 24H2 docs; a multi-volume walk is Phase 3.1 if Mick needs
+    // sidecar-volume detection later.
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{
@@ -121,9 +123,13 @@ fn platform_detect_is_dev_drive() -> Option<bool> {
     };
     use windows::Win32::System::IO::DeviceIoControl;
 
-    // `\\?\C:` form (no trailing backslash; CreateFileW + FSCTL
+    // `\\?\<letter>:` device path (no trailing backslash; CreateFileW + FSCTL
     // need the volume device path, not a directory path).
-    let path: Vec<u16> = "\\\\?\\C:\0".encode_utf16().collect();
+    let device_path = system_volume_device_path()?;
+    let path: Vec<u16> = device_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
@@ -164,6 +170,36 @@ fn platform_detect_is_dev_drive() -> Option<bool> {
     }
     ok.ok()?;
     Some((output.VolumeFlags & PERSISTENT_VOLUME_STATE_DEV_VOLUME) != 0)
+}
+
+/// Resolve the Windows system volume's device path —
+/// `\\?\<letter>:` form. Reads the system directory via
+/// `GetSystemDirectoryW`, extracts the first character (drive
+/// letter), and assembles the device-path form CreateFileW + the
+/// FSCTL_QUERY_PERSISTENT_VOLUME_STATE wire expect.
+///
+/// Returns `None` if the system directory is shorter than 2 chars
+/// (impossible on any real Windows install) or doesn't start
+/// with a drive letter (e.g. a UNC system root — vanishingly
+/// rare; not worth the extra parsing here).
+#[cfg(target_os = "windows")]
+fn system_volume_device_path() -> Option<String> {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260]; // MAX_PATH
+    let written = unsafe { GetSystemDirectoryW(Some(&mut buf)) };
+    if written == 0 {
+        return None;
+    }
+    let sysdir = String::from_utf16_lossy(&buf[..written as usize]);
+    let mut chars = sysdir.chars();
+    let letter = chars.next()?;
+    if chars.next() != Some(':') {
+        return None;
+    }
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(format!("\\\\?\\{}:", letter.to_ascii_uppercase()))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -256,6 +292,7 @@ fn platform_detect_disk_class() -> Option<String> {
 /// Gen2 = 5.0 — both far too slow to be a primary NVMe today; we
 /// leave them as None so the caller falls back to "SATA-SSD" or
 /// "HDD" via the rotational check).
+#[cfg(target_os = "linux")]
 fn pcie_gts_to_gen(gts: f64) -> Option<u8> {
     // Use an epsilon comparison; sysfs sometimes reports 32.0 vs
     // 31.5 etc.
