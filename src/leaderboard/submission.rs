@@ -299,35 +299,56 @@ pub fn submit_recorded_payload(
         }
     };
 
-    // #60 — server's clock_skew sanity check rejects any payload
-    // whose `timestamp` field differs from the server's wall clock
-    // by more than 5 minutes. Resubmits are STALE by definition —
-    // the captured payload's timestamp is from scan-finish time,
-    // possibly hours / days before the resubmit click.
+    // #60 — durable fix per design's option (a). Wrap the captured
+    // payload in an outer envelope signed with a fresh outer
+    // timestamp; the server inspects `outer_timestamp` for the
+    // clock_skew sanity check (resubmits are stale by definition,
+    // so the original payload's inner timestamp can be hours / days
+    // old). Identity / install_id / run_uuid checks still operate
+    // on `original_payload` — byte-for-byte preserved for replay
+    // fidelity.
     //
-    // Engine-side stopgap: refresh the `timestamp` field to a
-    // fresh ISO-8601 value before signing. The signature is still
-    // genuine (HMAC against the install_key, which only the
-    // install holds), so replay-attack resistance is unchanged.
-    // Other identity / content checks operate on install_id +
-    // run_uuid + the rest of the payload — all unchanged.
+    // Envelope shape:
+    //   { outer_timestamp: <fresh ISO-8601>,
+    //     replay_of_scan_id: <scan_id from history row, may be null>,
+    //     original_payload: { ... whole captured payload ... } }
     //
-    // This isn't the durable fix per #60's design discussion
-    // (lean (a): wrapper envelope signed with fresh outer
-    // timestamp, original payload preserved byte-for-byte for
-    // replay fidelity). Once web + design align on (a) vs (b)
-    // separate /submit/replay endpoint vs (c) explicit
-    // `replay_of_scan_id` field, swap this stopgap.
+    // HMAC covers the envelope. Replay-attack resistance: only the
+    // holder of install_key can compute the signature, and the
+    // signature binds the envelope (containing original_payload)
+    // to the install — a stolen payload re-wrapped by an attacker
+    // with their own install_key still fails the install_id check
+    // inside original_payload against their account.
     //
-    // Cross-ref: #60 (joint engine + web fix).
-    let mut refreshed = payload.clone();
-    if let Some(obj) = refreshed.as_object_mut() {
-        obj.insert(
-            "timestamp".to_string(),
-            serde_json::Value::String(now_iso8601()),
-        );
-    }
-    let body = hmac_signer::canonical_body(&refreshed);
+    // Replaces the v0.2.10-era stopgap (timestamp-refresh-then-sign
+    // at commit 31f38a3) which mutated the payload before signing
+    // — semantically odd because the payload was no longer
+    // byte-identical to the captured one. The envelope pattern
+    // keeps the captured payload preserved + adds the freshness
+    // signal alongside.
+    //
+    // Web side: reads outer_timestamp when present; falls back to
+    // payload.client_timestamp for forward compat with old engine
+    // builds (per design 14:29Z greenlight on web's fail-safe).
+    //
+    // `replay_of_scan_id` carries the scan_history scan_id when
+    // available so server-side analytics can distinguish first-
+    // submit vs resubmit without parsing the inner payload. The
+    // captured submission_payload may already include scan_id under
+    // `result_summary.scan_id` — but threading it at the envelope
+    // level makes the resubmit-vs-fresh distinction explicit + cheap
+    // for the server to inspect.
+    let replay_of_scan_id = payload
+        .get("result_summary")
+        .and_then(|rs| rs.get("scan_id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let envelope = serde_json::json!({
+        "outer_timestamp": now_iso8601(),
+        "replay_of_scan_id": replay_of_scan_id,
+        "original_payload": payload,
+    });
+    let body = hmac_signer::canonical_body(&envelope);
     let signature = hmac_signer::sign(&install_key, &body);
 
     let url = format!("{}/api/v1/submit", server_url.trim_end_matches('/'));
@@ -1009,17 +1030,19 @@ mod tests {
         }
     }
 
-    /// #60 — submit_recorded_payload refreshes the `timestamp` field
-    /// before signing so the server's clock_skew sanity check
-    /// doesn't reject every resubmit. We can't drive the actual POST
-    /// (no server in unit tests), so this verifies the
-    /// payload-mutation step that produces the canonical body the
-    /// signature is computed over.
+    /// #60 — submit_recorded_payload wraps the captured payload in
+    /// an outer envelope signed with a fresh outer_timestamp. We
+    /// can't drive the actual POST (no server in unit tests), so
+    /// this verifies the envelope-construction step that produces
+    /// the canonical body the signature is computed over.
+    ///
+    /// Pre-#60 (commit 31f38a3): the function MUTATED the captured
+    /// payload's `timestamp` field. New behaviour (commit at #60-
+    /// durable): the captured payload is preserved byte-for-byte
+    /// inside the envelope; the freshness signal lives at
+    /// `outer_timestamp`.
     #[test]
-    fn submit_recorded_payload_refreshes_timestamp_before_signing() {
-        // Hand-craft a "previously captured" payload with an
-        // OBVIOUSLY stale timestamp (1970-01-01) — exactly the
-        // shape #41 v2 persists on a scan-history row.
+    fn submit_recorded_payload_wraps_in_outer_envelope() {
         let captured = serde_json::json!({
             "schema_version": "v1",
             "client_version": "0.2.2",
@@ -1027,48 +1050,83 @@ mod tests {
             "timestamp": "1970-01-01T00:00:00Z",
             "hardware": {},
             "run_shape": {},
-            "result_summary": {},
+            "result_summary": {
+                "scan_id": "scan-uuid-123",
+            },
         });
-        // Mimic the mutation submit_recorded_payload performs.
-        let mut refreshed = captured.clone();
-        if let Some(obj) = refreshed.as_object_mut() {
-            obj.insert(
-                "timestamp".to_string(),
-                serde_json::Value::String(now_iso8601()),
-            );
-        }
-        let original_ts = captured
-            .get("timestamp")
+        // Mimic the envelope-construction submit_recorded_payload
+        // performs.
+        let replay_of_scan_id = captured
+            .get("result_summary")
+            .and_then(|rs| rs.get("scan_id"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let envelope = serde_json::json!({
+            "outer_timestamp": now_iso8601(),
+            "replay_of_scan_id": replay_of_scan_id,
+            "original_payload": captured.clone(),
+        });
+
+        // outer_timestamp is fresh
+        let outer_ts = envelope
+            .get("outer_timestamp")
             .and_then(|v| v.as_str())
-            .unwrap()
-            .to_string();
-        let new_ts = refreshed
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .unwrap()
-            .to_string();
-        assert_eq!(original_ts, "1970-01-01T00:00:00Z");
-        assert_ne!(new_ts, original_ts, "timestamp must be refreshed");
-        // New timestamp must be fresh (within the last 60 seconds).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        // Pull the year out of the new ts; it should be >= 2026.
-        let year: u32 = new_ts[..4].parse().unwrap();
+            .unwrap();
+        let year: u32 = outer_ts[..4].parse().unwrap();
         assert!(
             year >= 2026,
-            "refreshed timestamp must be a current year, got: {new_ts}"
+            "outer_timestamp must be a current year, got: {outer_ts}"
         );
-        let _ = now;
-        // Other captured fields must survive unchanged.
+
+        // replay_of_scan_id propagated from the captured payload
         assert_eq!(
-            refreshed.get("install_id").and_then(|v| v.as_str()),
+            envelope.get("replay_of_scan_id").and_then(|v| v.as_str()),
+            Some("scan-uuid-123"),
+            "envelope must carry replay_of_scan_id when result_summary.scan_id is present",
+        );
+
+        // Original payload preserved byte-for-byte (including the
+        // stale 1970 timestamp — the inner is for identity, the
+        // outer is for freshness).
+        let preserved = envelope.get("original_payload").unwrap();
+        assert_eq!(
+            preserved.get("timestamp").and_then(|v| v.as_str()),
+            Some("1970-01-01T00:00:00Z"),
+            "original_payload.timestamp must survive unchanged"
+        );
+        assert_eq!(
+            preserved.get("install_id").and_then(|v| v.as_str()),
             Some("test-install")
         );
         assert_eq!(
-            refreshed.get("client_version").and_then(|v| v.as_str()),
+            preserved.get("client_version").and_then(|v| v.as_str()),
             Some("0.2.2")
+        );
+    }
+
+    /// #60 — when the captured payload doesn't carry a scan_id
+    /// (older payload shapes), the envelope's replay_of_scan_id
+    /// lands as JSON null rather than failing or omitting the field.
+    #[test]
+    fn submit_recorded_envelope_handles_missing_scan_id() {
+        let captured = serde_json::json!({
+            "install_id": "test",
+            "timestamp": "2020-01-01T00:00:00Z",
+            "result_summary": {},
+        });
+        let replay_of_scan_id = captured
+            .get("result_summary")
+            .and_then(|rs| rs.get("scan_id"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let envelope = serde_json::json!({
+            "outer_timestamp": now_iso8601(),
+            "replay_of_scan_id": replay_of_scan_id,
+            "original_payload": captured,
+        });
+        assert!(
+            envelope.get("replay_of_scan_id").unwrap().is_null(),
+            "envelope must include replay_of_scan_id as null when not in captured payload",
         );
     }
 
