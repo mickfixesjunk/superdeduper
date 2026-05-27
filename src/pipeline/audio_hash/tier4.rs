@@ -54,10 +54,40 @@ struct Hashed<'a> {
 /// identical matching ran independently first; this counter just
 /// surfaces the perceptual-tier opt-out so the user understands
 /// the behavior.
+///
+/// #119 — `decode_warnings` carries one entry per audio file
+/// that hit a real decode error (corrupt header / mid-stream
+/// flip / panic) — distinct from the short-skip counter which is
+/// "valid file, just too short for chromaprint." The user sees
+/// these as warning lines in CLI output and (future) badge
+/// overlays in GUI dupe rows.
 #[derive(Debug, Default)]
 pub struct AudioTier4Result {
     pub groups: Vec<DuplicateGroup>,
     pub short_skipped_count: u64,
+    pub decode_warnings: Vec<AudioDecodeWarning>,
+}
+
+/// #119 — one record per audio file whose decode failed or
+/// panicked. Surfaced via the scan output JSON / text + (future)
+/// the GUI badge widget. Captures enough context for the user to
+/// understand WHY a file didn't fingerprint without being a hard
+/// failure — silent skip is the anti-pattern this fixes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AudioDecodeWarning {
+    pub path: std::path::PathBuf,
+    /// One of: `"corrupt_header"`, `"mid_stream_corrupt"`,
+    /// `"truncated"`, `"empty_file"`, `"decoder_panic"`,
+    /// `"unknown"`. Stable wire shape — additions to the set
+    /// require a #serde(default)-compatible bump and downstream
+    /// consumers gracefully fall back to `"unknown"` for kinds
+    /// they don't recognise.
+    pub kind: String,
+    /// Human-readable detail — the underlying decoder's error
+    /// message, the panic payload, or a synthesised "X is 0 bytes"
+    /// line for empty files. The CLI surface renders this verbatim;
+    /// no consumer pattern-matches on its content.
+    pub detail: String,
 }
 
 /// Take an inventory, hash every audio file in it, group by
@@ -73,20 +103,34 @@ pub struct AudioTier4Result {
 /// job) plus the count of files filtered for being too short to
 /// fingerprint per #102.
 pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier4Result {
-    // Step 1: filter to audio extensions + hash each. Hash failures
-    // drop silently with a tracing::debug! so triage has a trail.
+    // Step 1: filter to audio extensions + hash each. Decode
+    // failures + panics get recorded as AudioDecodeWarning (#119)
+    // instead of silent-dropping; empty fingerprints (file shorter
+    // than chromaprint's ~30s window) stay on the short_skipped
+    // counter — that's a valid file, not a decode failure.
     let mut short_skipped_count: u64 = 0;
-    // `catch_unwind` wraps the per-file fingerprint call so an upstream
-    // decoder panic (notably the symphonia-codec-aac 0.5.5 panic at
-    // `aac/ics/mod.rs:242:17` — index 64 out of bounds for len 64,
-    // surfaced on D:\Dropbox during the v0.2.13 audio bench) doesn't
-    // kill the whole Tier-4 stage. The file gets logged + dropped the
-    // same way a normal hash-failure does. Symphonia 0.5 → 0.6 bump is
-    // queued separately; this is the short-term shield.
+    let mut decode_warnings: Vec<AudioDecodeWarning> = Vec::new();
     let hashed: Vec<Hashed<'_>> = inventory
         .iter()
         .filter(|f| is_audio_file(&f.path))
         .filter_map(|f| {
+            // Pre-decode edge case: zero-byte files (extension-
+            // valid but no bytes). Surface as a warning rather
+            // than hand it to symphonia, which would error
+            // mid-probe with an unhelpful message.
+            if let Ok(meta) = std::fs::metadata(&f.path) {
+                if meta.len() == 0 {
+                    decode_warnings.push(AudioDecodeWarning {
+                        path: f.path.clone(),
+                        kind: "empty_file".to_string(),
+                        detail: "file is 0 bytes".to_string(),
+                    });
+                    return None;
+                }
+            }
+            // `catch_unwind` shields the scan from upstream decoder
+            // panics (notably the symphonia-codec-aac 0.5.5 panic
+            // at `aac/ics/mod.rs:242:17`).
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hash_file(&f.path)));
             match res {
                 Ok(Ok(fp)) if !fp.is_empty() => Some(Hashed {
@@ -102,11 +146,35 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
                     None
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(
+                    let detail = e.to_string();
+                    // Heuristic kind classification from the
+                    // decoder's error message. The substring
+                    // matches are case-insensitive against
+                    // common symphonia error phrasings; the
+                    // `unknown` fallback prevents silent
+                    // miscategorisation when symphonia adds a
+                    // new error class we haven't seen.
+                    let lower = detail.to_lowercase();
+                    let kind = if lower.contains("eof") || lower.contains("truncat") {
+                        "truncated"
+                    } else if lower.contains("header") || lower.contains("streaminfo") {
+                        "corrupt_header"
+                    } else if lower.contains("frame") || lower.contains("crc") {
+                        "mid_stream_corrupt"
+                    } else {
+                        "unknown"
+                    };
+                    tracing::warn!(
                         path = %f.path.display(),
-                        error = %e,
-                        "tier-4 audio: skip (hash failed)",
+                        kind,
+                        error = %detail,
+                        "tier-4 audio: decode failed",
                     );
+                    decode_warnings.push(AudioDecodeWarning {
+                        path: f.path.clone(),
+                        kind: kind.to_string(),
+                        detail,
+                    });
                     None
                 }
                 Err(payload) => {
@@ -120,8 +188,13 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
                     tracing::warn!(
                         path = %f.path.display(),
                         panic = %msg,
-                        "tier-4 audio: skip (decoder panic — likely symphonia upstream bug)",
+                        "tier-4 audio: decoder panic — likely symphonia upstream bug",
                     );
+                    decode_warnings.push(AudioDecodeWarning {
+                        path: f.path.clone(),
+                        kind: "decoder_panic".to_string(),
+                        detail: msg,
+                    });
                     None
                 }
             }
@@ -132,6 +205,7 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
         return AudioTier4Result {
             groups: Vec::new(),
             short_skipped_count,
+            decode_warnings,
         };
     }
 
@@ -227,6 +301,7 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
     AudioTier4Result {
         groups,
         short_skipped_count,
+        decode_warnings,
     }
 }
 
@@ -269,6 +344,63 @@ mod tests {
         let out = find_similar_groups(&inv, 5.0);
         assert!(out.groups.is_empty());
         assert_eq!(out.short_skipped_count, 0);
+        assert!(out.decode_warnings.is_empty());
+    }
+
+    /// #119 W6 — zero-byte audio file produces an
+    /// `empty_file` decode warning (not a silent skip, not a
+    /// short_skipped count).
+    #[test]
+    fn zero_byte_audio_file_yields_empty_file_warning() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("zero.flac");
+        std::fs::write(&p, b"").unwrap();
+        let inv = vec![entry(p.clone(), 0)];
+        let out = find_similar_groups(&inv, 5.0);
+        assert!(out.groups.is_empty());
+        assert_eq!(out.short_skipped_count, 0);
+        assert_eq!(out.decode_warnings.len(), 1);
+        let w = &out.decode_warnings[0];
+        assert_eq!(w.path, p);
+        assert_eq!(w.kind, "empty_file");
+        assert!(
+            w.detail.contains("0 bytes"),
+            "detail should mention 0 bytes, got: {}",
+            w.detail
+        );
+    }
+
+    /// #119 W3 — garbage-bytes file with .flac extension hits
+    /// symphonia's decode path + produces a decode_warning. The
+    /// kind heuristic maps the symphonia error message to one of
+    /// the stable wire strings.
+    #[test]
+    fn corrupt_audio_file_yields_decode_warning() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("garbage.flac");
+        // Some non-empty garbage bytes — symphonia will reject
+        // these at probe time. The exact error message varies by
+        // symphonia version; we don't pin a specific kind, just
+        // that ONE of the AudioDecodeWarning slots fires.
+        std::fs::write(&p, vec![0xAB; 256]).unwrap();
+        let inv = vec![entry(p.clone(), 256)];
+        let out = find_similar_groups(&inv, 5.0);
+        assert!(out.groups.is_empty());
+        assert_eq!(out.short_skipped_count, 0);
+        assert_eq!(out.decode_warnings.len(), 1);
+        let w = &out.decode_warnings[0];
+        assert_eq!(w.path, p);
+        // Kind must be one of the stable wire strings — see the
+        // AudioDecodeWarning docstring.
+        assert!(
+            matches!(
+                w.kind.as_str(),
+                "corrupt_header" | "truncated" | "mid_stream_corrupt" | "unknown"
+            ),
+            "unexpected kind: {}",
+            w.kind,
+        );
+        assert!(!w.detail.is_empty(), "detail should not be empty");
     }
 
     // Synthesising real audio files in unit tests is heavy + slow
