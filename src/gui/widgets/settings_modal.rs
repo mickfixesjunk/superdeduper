@@ -8,8 +8,8 @@
 //! * **Engine** — content hash, size filters, threads, paths
 //! * **Cache** — persistent cache + per-scan banner controls
 //! * **Keep Strategy** — which-file-to-keep picker per duplicate group
-//! * **Safety** — paranoid verify, destructive-action confirmation,
-//!   system-path permission
+//! * **Safety** — destructive-action confirmation, system-path
+//!   permission
 //! * **Pre-flight** — skip the score-card modal before scans
 
 use egui::{Context, RichText};
@@ -698,18 +698,11 @@ fn render_keep_strategy(ui: &mut egui::Ui, settings: &mut ScanSettings) {
 }
 
 fn render_safety(ui: &mut egui::Ui, settings: &mut ScanSettings) {
-    ui.heading("Verification");
-    ui.checkbox(
-        &mut settings.paranoid,
-        "Paranoid byte-by-byte confirm before reporting",
-    )
-    .on_hover_text(
-        "Hash collisions are astronomically unlikely, but if ON, \
-         every confirmed duplicate group does a final byte-by-byte \
-         compare before being reported. Doubles I/O for the dupe \
-         set but eliminates the residual collision risk entirely.",
-    );
-    ui.add_space(12.0);
+    // #131 — "Paranoid byte-by-byte confirm" checkbox removed:
+    // the underlying pipeline stage was a no-op stub that never
+    // verified anything. Real byte-by-byte verification is a
+    // v0.3.x feature scope; when it lands it gets a fresh name +
+    // hover-text that matches what the code actually does.
 
     ui.heading("Destructive actions");
     let bypass_on = settings.bypass_destructive_confirmation;

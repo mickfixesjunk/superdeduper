@@ -1253,11 +1253,11 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         );
     }
 
-    let duplicates = if cfg.paranoid {
-        pipeline::confirm::paranoid_verify(duplicates).context("paranoid verification failed")?
-    } else {
-        duplicates
-    };
+    // #131 — `--paranoid` byte-by-byte verification was deleted; the
+    // flag claimed a safety feature that didn't exist (no-op stub
+    // since v0; never implemented). Real byte-by-byte verification
+    // is a v0.3.x feature scope behind its own design. Until then,
+    // post-Tier-3 duplicates flow through unchanged.
 
     // #25 T1.2 Tier-4 — perceptual image similarity. Runs ONLY when
     // `--mode image` was set + the `similar-images` feature is on.

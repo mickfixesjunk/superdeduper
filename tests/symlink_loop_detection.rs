@@ -39,7 +39,6 @@ fn cfg_with(roots: Vec<PathBuf>, follow_links: bool) -> ScanConfig {
         include: None,
         exclude: None,
         format: superdeduper::cli::OutputFormat::Text,
-        paranoid: false,
         use_cache: false,
         use_format_aware: false,
         threads: 2,

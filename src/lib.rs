@@ -9,8 +9,9 @@
 //! 3. [`pipeline::layout`] — Stage 3: resolve physical extents, detect
 //!    hardlinks and reflinks, compute the LCN sort key.
 //! 4. [`pipeline::hash`] — Stage 4: progressive Tier 0–3 hashing.
-//! 5. [`pipeline::confirm`] — Stage 5: optional paranoid byte compare and
-//!    final output formatting.
+//! 5. Final output formatting. (The previous Stage 5 `pipeline::confirm`
+//!    byte-by-byte verification stub was removed in #131; real
+//!    byte-by-byte verification is a v0.3.x feature scope.)
 //!
 //! The [`winapi_wrappers`] module hides every `unsafe` FFI call behind a safe
 //! Rust API. No `unsafe` code is permitted elsewhere in the crate.

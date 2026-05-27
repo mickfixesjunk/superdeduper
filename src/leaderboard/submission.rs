@@ -173,7 +173,10 @@ pub const ACTION_BYTES_KEY_HARDLINK_REPLACED: &str = "hardlink_replaced_bytes";
 // append. Reserved bits stay 0 until claimed.
 pub const FEATURE_BIT_CACHE: u64 = 1 << 0;
 pub const FEATURE_BIT_FORMAT_AWARE: u64 = 1 << 1;
-pub const FEATURE_BIT_PARANOID: u64 = 1 << 2;
+// Bit 2 reserved — formerly `FEATURE_BIT_PARANOID`, removed in #131
+// (v0.2.16) along with the no-op `--paranoid` flag. Stay 0 until a
+// future feature claims it; do not reuse for an unrelated meaning,
+// historical submissions stored this bit semantically.
 pub const FEATURE_BIT_FOLLOW_LINKS: u64 = 1 << 3;
 pub const FEATURE_BIT_ALLOW_SYSTEM_PATHS: u64 = 1 << 4;
 pub const FEATURE_BIT_ALLOW_RECALL_ON_READ: u64 = 1 << 5;
