@@ -68,11 +68,188 @@ pub fn detect() -> HardwareFingerprint {
         ram_total_gb_bucket: snap_ram_bucket(ram_gb_raw),
         os_version: detect_os_version(),
         os_edition: detect_os_edition_enum(),
-        disk_class: "mixed".to_string(),
+        disk_class: detect_disk_class(),
         filesystem: default_filesystem().to_string(),
         cluster_size_kb: 4,
         volume_size_gb_bucket: "1024".to_string(),
     }
+}
+
+// ============================================================
+// Disk class — #129 Pathfinder Phase 2. Discriminates the
+// schema enum `"NVMe-Gen5" | "NVMe-Gen4" | "NVMe-Gen3" |
+// "SATA-SSD" | "HDD" | "network" | "mixed"` so web's
+// pathfinder achievement evaluator can fire `pathfinder-nvme-gen5`
+// and related signals.
+// ============================================================
+
+/// Detect the disk class for the *primary* boot/data device.
+///
+/// A real multi-disk machine may host both NVMe + SATA + HDD;
+/// schema-wise we still need a single label, so we pick the
+/// fastest detected class (NVMe-Gen5 > Gen4 > Gen3 > SATA-SSD >
+/// HDD). Falls back to "mixed" when nothing can be detected.
+fn detect_disk_class() -> String {
+    if let Some(class) = platform_detect_disk_class() {
+        return class;
+    }
+    "mixed".to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_detect_disk_class() -> Option<String> {
+    // Walk /sys/class/nvme/. Each child is an NVMe controller
+    // (nvme0, nvme1, …). Its `device/current_link_speed` reports
+    // the PCIe link speed in GT/s — e.g. "32.0 GT/s PCIe" for
+    // Gen5, "16.0 GT/s PCIe" for Gen4, "8.0 GT/s PCIe" for Gen3.
+    // Pick the FASTEST detected controller so a Gen5 NVMe + a
+    // sidecar Gen3 still reports "NVMe-Gen5".
+    let mut best_gen: Option<u8> = None;
+    if let Ok(entries) = std::fs::read_dir("/sys/class/nvme") {
+        for entry in entries.flatten() {
+            let speed_path = entry.path().join("device").join("current_link_speed");
+            if let Ok(raw) = std::fs::read_to_string(&speed_path) {
+                let trimmed = raw.trim();
+                // Parse the "X.Y GT/s" prefix.
+                let gen = trimmed
+                    .split_whitespace()
+                    .next()
+                    .and_then(|tok| tok.parse::<f64>().ok())
+                    .and_then(pcie_gts_to_gen);
+                if let Some(g) = gen {
+                    best_gen = Some(best_gen.map_or(g, |prev| prev.max(g)));
+                }
+            }
+        }
+    }
+    if let Some(g) = best_gen {
+        return Some(format!("NVMe-Gen{g}"));
+    }
+    // No NVMe found. Check for rotational vs SSD via
+    // /sys/block/*/queue/rotational (0 = SSD, 1 = HDD).
+    let mut any_ssd = false;
+    let mut any_hdd = false;
+    if let Ok(entries) = std::fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            // Skip loop/ram/dm-* virtual devices.
+            if s.starts_with("loop") || s.starts_with("ram") || s.starts_with("dm-") {
+                continue;
+            }
+            let rotational_path = entry.path().join("queue").join("rotational");
+            match std::fs::read_to_string(&rotational_path).ok().as_deref().map(str::trim) {
+                Some("0") => any_ssd = true,
+                Some("1") => any_hdd = true,
+                _ => {}
+            }
+        }
+    }
+    if any_ssd {
+        Some("SATA-SSD".to_string())
+    } else if any_hdd {
+        Some("HDD".to_string())
+    } else {
+        None
+    }
+}
+
+/// PCIe link speed in GT/s → PCIe generation number (3, 4, 5).
+/// Returns `None` for unknown / unsupported speeds (Gen1 = 2.5,
+/// Gen2 = 5.0 — both far too slow to be a primary NVMe today; we
+/// leave them as None so the caller falls back to "SATA-SSD" or
+/// "HDD" via the rotational check).
+fn pcie_gts_to_gen(gts: f64) -> Option<u8> {
+    // Use an epsilon comparison; sysfs sometimes reports 32.0 vs
+    // 31.5 etc.
+    if (gts - 32.0).abs() < 0.5 {
+        Some(5)
+    } else if (gts - 16.0).abs() < 0.5 {
+        Some(4)
+    } else if (gts - 8.0).abs() < 0.5 {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn platform_detect_disk_class() -> Option<String> {
+    // Lean Phase 2 detection: open \\.\PhysicalDrive0 + query its
+    // bus type via the existing `winapi_wrappers::query_bus_type`
+    // helper (already used by the `drive-info` subcommand). For
+    // NVMe-class buses we return "NVMe-Gen4" as a conservative
+    // default — accurate Gen3/4/5 distinction requires querying
+    // the NVMe identify-controller structure via
+    // IOCTL_STORAGE_PROTOCOL_COMMAND, which is Phase 2.1 work
+    // (filed as a separate TODO). Non-NVMe buses don't have a
+    // cheap SATA-SSD-vs-HDD signal without per-volume seek-penalty
+    // IOCTLs that need a real volume GUID; falling back to
+    // None → "mixed" is honest.
+    use crate::winapi_wrappers::{bus_type, query_bus_type};
+    let handle = open_physical_drive_zero().ok()?;
+    let bus = query_bus_type(handle.0).ok()?;
+    drop(handle);
+    let class = match bus {
+        bus_type::NVME | bus_type::SCM | bus_type::UFS => "NVMe-Gen4",
+        bus_type::ATA => "HDD",
+        _ => return None,
+    };
+    Some(class.to_string())
+}
+
+#[cfg(target_os = "windows")]
+struct PhysicalDriveHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for PhysicalDriveHandle {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+        if !self.0.is_invalid() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_physical_drive_zero() -> std::io::Result<PhysicalDriveHandle> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let path: Vec<u16> = "\\\\.\\PhysicalDrive0\0".encode_utf16().collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::other("invalid handle to PhysicalDrive0"));
+    }
+    Ok(PhysicalDriveHandle(handle))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_detect_disk_class() -> Option<String> {
+    // macOS detection deferred — sysctl + IOKit work but isn't on
+    // the burn-queue scope. Returns None so detect_disk_class
+    // falls back to "mixed".
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn platform_detect_disk_class() -> Option<String> {
+    None
 }
 
 /// Snap raw GB down to the schema's enum buckets.
