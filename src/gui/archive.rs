@@ -253,3 +253,89 @@ pub fn restore_one(entry: &ArchiveManifestEntry) -> RestoreOutcome {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{check, CheckError, SchemaVersioned};
+
+    fn manifest(schema: &str) -> ArchiveManifest {
+        ArchiveManifest {
+            schema: schema.to_string(),
+            created_at_unix: 0,
+            destination: PathBuf::from("/tmp/dest"),
+            entries: Vec::new(),
+        }
+    }
+
+    /// #92 — Parser edge cases for the combined `schema.vN` field
+    /// the `SchemaVersioned` impl parses at load-check time. The 5
+    /// cases here pin the behaviour the rest of the engine expects:
+    /// well-formed v1 accepts; any malformed variant routes to a
+    /// structured `CheckError` (never silent acceptance).
+    #[test]
+    fn parser_accepts_well_formed_v1() {
+        let m = manifest("superdeduper.archive.v1");
+        assert_eq!(m.schema_name(), "superdeduper.archive");
+        assert_eq!(m.schema_version(), 1);
+        assert!(check(&m).is_ok());
+    }
+
+    #[test]
+    fn parser_no_version_suffix_yields_zero_version() {
+        let m = manifest("superdeduper.archive");
+        assert_eq!(m.schema_name(), "superdeduper.archive");
+        assert_eq!(m.schema_version(), 0);
+        match check(&m) {
+            Err(CheckError::UnsupportedVersion { got: 0, .. }) => {}
+            other => panic!("expected UnsupportedVersion {{ got: 0 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_empty_v_suffix_yields_zero_version() {
+        let m = manifest("superdeduper.archive.v");
+        assert_eq!(m.schema_name(), "superdeduper.archive");
+        assert_eq!(m.schema_version(), 0);
+        assert!(matches!(
+            check(&m),
+            Err(CheckError::UnsupportedVersion { got: 0, .. }),
+        ));
+    }
+
+    #[test]
+    fn parser_non_numeric_v_suffix_yields_zero_version() {
+        let m = manifest("superdeduper.archive.vfoo");
+        assert_eq!(m.schema_name(), "superdeduper.archive");
+        assert_eq!(m.schema_version(), 0);
+        assert!(matches!(
+            check(&m),
+            Err(CheckError::UnsupportedVersion { got: 0, .. }),
+        ));
+    }
+
+    #[test]
+    fn parser_wrong_family_routes_to_wrong_schema() {
+        let m = manifest("otherapp.archive.v1");
+        assert_eq!(m.schema_name(), "otherapp.archive");
+        assert_eq!(m.schema_version(), 1);
+        match check(&m) {
+            Err(CheckError::WrongSchema { expected, got }) => {
+                assert_eq!(expected, "superdeduper.archive");
+                assert_eq!(got, "otherapp.archive");
+            }
+            other => panic!("expected WrongSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_future_version_routes_to_unsupported() {
+        let m = manifest("superdeduper.archive.v99");
+        assert_eq!(m.schema_name(), "superdeduper.archive");
+        assert_eq!(m.schema_version(), 99);
+        match check(&m) {
+            Err(CheckError::UnsupportedVersion { got: 99, .. }) => {}
+            other => panic!("expected UnsupportedVersion {{ got: 99 }}, got {other:?}"),
+        }
+    }
+}
