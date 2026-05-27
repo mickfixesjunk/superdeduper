@@ -49,7 +49,7 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
         Arc::new(AtomicBool::new(false)),
         None,
         crate::cli::ScanMode::Exact,
-        5,
+        crate::cli::ImageSimilarityThresholdArg::Fixed(5),
         crate::cli::ImageHashAlgoArg::default(),
         5.0,
     )
@@ -63,7 +63,7 @@ pub fn spawn_with_settings(
     cancel: Arc<AtomicBool>,
     defender_rtp_pre: Option<bool>,
     scan_mode: crate::cli::ScanMode,
-    image_similarity_threshold: u32,
+    image_similarity_threshold: crate::cli::ImageSimilarityThresholdArg,
     image_hash_algorithm: crate::cli::ImageHashAlgoArg,
     audio_similarity_threshold: f64,
 ) -> thread::JoinHandle<()> {
@@ -99,7 +99,7 @@ fn run(
     cancel: Arc<AtomicBool>,
     _defender_rtp_pre: Option<bool>,
     scan_mode: crate::cli::ScanMode,
-    image_similarity_threshold: u32,
+    image_similarity_threshold: crate::cli::ImageSimilarityThresholdArg,
     image_hash_algorithm: crate::cli::ImageHashAlgoArg,
     audio_similarity_threshold: f64,
 ) -> crate::Result<()> {
@@ -2010,11 +2010,23 @@ fn run(
     if matches!(scan_mode, crate::cli::ScanMode::Image) {
         if let Some(inv) = inventory_for_tier4.as_deref() {
             let algo: crate::pipeline::image_hash::Algorithm = image_hash_algorithm.into();
+            // E3 (#78): resolve auto-threshold from the count of
+            // image-extension files in the inventory. Same shape as
+            // main.rs's CLI scan-path resolution; comment there has
+            // the n-vs-decoded-n discussion.
+            let n_images = inv
+                .iter()
+                .filter(|f| crate::pipeline::image_hash::tier4::is_image_file(&f.path))
+                .count() as u64;
+            let resolved_threshold = image_similarity_threshold.resolve(
+                crate::pipeline::image_hash::tier4::DEFAULT_THRESHOLD,
+                n_images,
+            );
             let t_tier4 = std::time::Instant::now();
             let tier4_groups = crate::pipeline::image_hash::tier4::find_similar_groups(
                 inv,
                 algo,
-                image_similarity_threshold,
+                resolved_threshold,
             );
             let n_groups = tier4_groups.len();
             for g in tier4_groups {
@@ -2041,7 +2053,7 @@ fn run(
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Info,
                 message: format!(
-                    "Tier-4 perceptual ({}): {n_groups} group(s) within {image_similarity_threshold} bits ({} ms)",
+                    "Tier-4 perceptual ({}): {n_groups} group(s) within {resolved_threshold} bits ({} ms; n_images={n_images}, requested={image_similarity_threshold})",
                     algo.as_slug(),
                     t_tier4.elapsed().as_millis()
                 ),
