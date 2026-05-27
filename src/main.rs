@@ -1086,12 +1086,8 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
             placeholders = skipped.len(),
             "stage 2-4 skipped: --placeholders-only set"
         );
-        let mut writer: Box<dyn Write> = match &cfg.output {
-            Some(p) => Box::new(BufWriter::new(
-                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-            )),
-            None => Box::new(BufWriter::new(io::stdout().lock())),
-        };
+        let mut writer = output::open_writer(cfg.output.as_deref())
+            .with_context(|| output_context(cfg.output.as_deref()))?;
         output::write(writer.as_mut(), cfg.format, &[], &skipped)?;
         writer.flush()?;
         return Ok(());
@@ -1334,12 +1330,8 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     #[cfg(not(feature = "similar-audio"))]
     let _ = audio_similarity_threshold;
 
-    let mut writer: Box<dyn Write> = match &cfg.output {
-        Some(p) => Box::new(BufWriter::new(
-            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-        )),
-        None => Box::new(BufWriter::new(io::stdout().lock())),
-    };
+    let mut writer = output::open_writer(cfg.output.as_deref())
+        .with_context(|| output_context(cfg.output.as_deref()))?;
     output::write(writer.as_mut(), cfg.format, &duplicates, &skipped)?;
     writer.flush()?;
 
@@ -1509,12 +1501,8 @@ fn run_force_hash_mode(
     );
 
     // Write empty groups[] JSON for compatibility.
-    let mut writer: Box<dyn Write> = match &cfg.output {
-        Some(p) => Box::new(BufWriter::new(
-            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-        )),
-        None => Box::new(BufWriter::new(io::stdout().lock())),
-    };
+    let mut writer = output::open_writer(cfg.output.as_deref())
+        .with_context(|| output_context(cfg.output.as_deref()))?;
     output::write(writer.as_mut(), cfg.format, &[], skipped)?;
     writer.flush()?;
     Ok(())
@@ -1585,6 +1573,17 @@ fn run_cache(cmd: CacheCommand) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// #137 — anyhow-context string for an `open_writer` failure.
+/// `Some(p)` → "creating <path>"; `None` (stdout) → "opening stdout
+/// writer". Used at every `output::open_writer` call site so users
+/// see the precise filesystem path the failure mentions.
+fn output_context(output: Option<&std::path::Path>) -> String {
+    match output {
+        Some(p) => format!("creating {}", p.display()),
+        None => "opening stdout writer".to_string(),
+    }
 }
 
 fn init_logging(verbose: u8, quiet: bool) {

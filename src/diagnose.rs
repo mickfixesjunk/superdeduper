@@ -473,13 +473,16 @@ pub fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
     let report = run_probes(vec![target_path], args.skip_io)?;
 
     use std::io::Write;
-    let mut writer: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(std::io::BufWriter::new(
-            std::fs::File::create(p)
-                .map_err(|e| anyhow::anyhow!("creating {}: {}", p.display(), e))?,
-        )),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
-    };
+    // #137 — shared writer-dispatch helper. Was a hand-rolled
+    // 5-line stanza here + at 3 sites in main.rs; now reaches into
+    // crate::output::open_writer.
+    let mut writer = crate::output::open_writer(args.output.as_deref()).map_err(|e| {
+        let where_to = match &args.output {
+            Some(p) => format!("creating {}", p.display()),
+            None => "opening stdout writer".to_string(),
+        };
+        anyhow::anyhow!("{where_to}: {e}")
+    })?;
     match args.format {
         crate::cli::OutputFormat::Json => {
             serde_json::to_writer_pretty(&mut writer, &report)

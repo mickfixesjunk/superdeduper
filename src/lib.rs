@@ -12,8 +12,13 @@
 //! 5. [`pipeline::confirm`] — Stage 5: optional paranoid byte compare and
 //!    final output formatting.
 //!
-//! The [`winapi_wrappers`] module hides every `unsafe` FFI call behind a safe
-//! Rust API. No `unsafe` code is permitted elsewhere in the crate.
+//! The [`winapi_wrappers`] module hides every Windows `unsafe` FFI call
+//! behind a safe Rust API. Other `unsafe` blocks exist where the
+//! cross-platform syscall surface requires them — e.g. CPUID intrinsics
+//! in `leaderboard::hardware`, `libc::statfs` on Linux — each kept
+//! minimal + commented at the call site. #134: the prior claim of "no
+//! unsafe elsewhere in the crate" was aspirational and false by grep;
+//! the policy is "unsafe is justified at the call site," not "absent."
 
 pub mod action_receipt;
 pub mod cache;
@@ -43,12 +48,21 @@ pub mod gui;
 #[cfg(feature = "telemetry")]
 pub mod leaderboard;
 
-/// Crate-internal helper so feature-gated callers (gui::live) can
-/// compute the corpus signature hash without taking a direct dep on
-/// the leaderboard module's path. Mirrors the implementation in
-/// `leaderboard::submission`'s payload-build flow but lives at the
-/// crate root so engine-side code can reach it without the
-/// `leaderboard::` prefix.
+/// Crate-internal helper that hashes a scan corpus's size-bucket
+/// histogram into a stable identifier the leaderboard payload's
+/// `corpus_sig` field carries. Lives at the crate root so
+/// `gui::live` can call it without taking a direct dep on the
+/// leaderboard module.
+///
+/// #132 — the prefix label used to say `sha256:` despite the
+/// underlying hasher being BLAKE3 (a documentation lie). Output
+/// bytes unchanged; just labeled honestly. Server never validated
+/// the prefix specifically — it's an identifier the backend treats
+/// as opaque — so the change is label-only.
+///
+/// Earlier doc claimed this "mirrors the implementation in
+/// `leaderboard::submission`'s payload-build flow" — that's stale.
+/// This IS the implementation; nothing in submission.rs duplicates it.
 #[cfg(feature = "telemetry")]
 #[doc(hidden)]
 pub fn leaderboard_corpus_sig(sizes: &[u64]) -> String {
@@ -72,7 +86,7 @@ pub fn leaderboard_corpus_sig(sizes: &[u64]) -> String {
         hasher.update(&count.to_le_bytes());
         hasher.update(b"\n");
     }
-    format!("sha256:{}", hasher.finalize().to_hex())
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 pub use error::{Error, Result};

@@ -1,6 +1,6 @@
 //! Output formatting for scan results.
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use serde::Serialize;
@@ -8,6 +8,22 @@ use serde::Serialize;
 use crate::cli::OutputFormat;
 use crate::pipeline::{DuplicateGroup, SkippedFile};
 use crate::Result;
+
+/// #137 — shared helper for the "stdout-or-file" output dispatch
+/// the four CLI emit paths all reach for (run_scan, run_dedupe,
+/// run_diagnose, and the --placeholders-only short-circuit). Returns
+/// a buffered `Box<dyn Write>` ready for the formatter to write into.
+///
+/// Caller is responsible for adding error context via
+/// `anyhow::Context` / similar if they want a "creating <path>"
+/// message in the failure mode — the helper returns the raw
+/// `io::Result` so it's reusable in non-anyhow callers too.
+pub fn open_writer(output: Option<&Path>) -> std::io::Result<Box<dyn Write>> {
+    match output {
+        Some(p) => Ok(Box::new(BufWriter::new(std::fs::File::create(p)?))),
+        None => Ok(Box::new(BufWriter::new(std::io::stdout().lock()))),
+    }
+}
 
 #[derive(Serialize)]
 struct Report<'a> {
