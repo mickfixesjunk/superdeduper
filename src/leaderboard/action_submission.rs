@@ -300,23 +300,21 @@ pub fn spawn_submit_worker(
                         lifetime_bytes_reclaimed,
                         newly_granted_achievements,
                     } => {
-                        // #82 — stamp the reclaim figures back onto
-                        // the matching ScanRecord so the History
-                        // tab renders the two-row scan+reclaim
-                        // shape. Sum the action_keys for the
-                        // "actually reclaimed" headline; pass the
-                        // full map as the action_breakdown sub-line.
-                        let actually_reclaimed_bytes: u64 =
-                            actions_taken_summary.values().sum();
-                        if let Err(e) = crate::scan_history::update_reclaim_for_submission(
-                            &submission_id,
-                            actually_reclaimed_bytes,
-                            actions_taken_summary.clone(),
-                        ) {
-                            eprintln!(
-                                "scan_history: update_reclaim_for_submission failed for {submission_id} ({e})"
-                            );
-                        }
+                        // #122 / #123 — local action credit now
+                        // lands in the History row via the new
+                        // `record_local_action_for_latest_scan` path
+                        // in app.rs (fires regardless of submit
+                        // state). Removing the duplicate
+                        // `update_reclaim_for_submission` call here
+                        // avoids double-counting: the local path
+                        // already added these bytes; the server
+                        // separately tracks them in DDB; PATCH
+                        // success just confirms server received the
+                        // credit, no local mutation needed. The helper
+                        // itself stays available for resubmit-from-
+                        // history flows that need to populate a
+                        // pre-fix row.
+                        let _ = (&actions_taken_summary, &submission_id);
                         store_status(ActionSubmissionStatus::Credited {
                             lifetime_bytes_reclaimed,
                             newly_granted_achievements,

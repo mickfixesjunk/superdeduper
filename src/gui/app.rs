@@ -1857,6 +1857,20 @@ impl SuperdeduperApp {
                             // hands the rollup off to the next-frame
                             // render so the modal opens automatically.
                             self.pending_archive_summary = Some(summary.clone());
+                            // #122 / #123 — local history credit
+                            // FIRST, independent of submission state.
+                            // User sees the History "Reclaimed" column
+                            // update immediately even if they haven't
+                            // submitted yet.
+                            if summary.moved_bytes > 0 {
+                                let mut delta = std::collections::BTreeMap::new();
+                                delta.insert("archived_bytes".to_string(), summary.moved_bytes);
+                                if let Err(e) =
+                                    crate::scan_history::record_local_action_for_latest_scan(&delta)
+                                {
+                                    tracing::warn!(error = %e, "scan_history: local archive credit failed");
+                                }
+                            }
                             // #79 — credit the reclaim bytes via PATCH
                             // /api/v1/submit/{id}/actions. Runs only
                             // when we have a signed-in install AND an
@@ -1867,6 +1881,25 @@ impl SuperdeduperApp {
                             self.spawn_action_patch_for_archive(summary.clone());
                         }
                         EngineEvent::DedupeActionSummary(summary) => {
+                            // #122 / #123 — local history credit
+                            // FIRST, independent of submission state.
+                            // The PATCH below covers leaderboard
+                            // credit (server-side); the local record
+                            // is the source of truth for what the
+                            // History panel renders.
+                            if let Some(key) = summary.locked_action_key() {
+                                if summary.ok_bytes > 0 {
+                                    let mut delta = std::collections::BTreeMap::new();
+                                    delta.insert(key.to_string(), summary.ok_bytes);
+                                    if let Err(e) =
+                                        crate::scan_history::record_local_action_for_latest_scan(
+                                            &delta,
+                                        )
+                                    {
+                                        tracing::warn!(error = %e, "scan_history: local dedupe credit failed");
+                                    }
+                                }
+                            }
                             // #79 — same credit path for non-archive
                             // actions (Recycle / Remove / Hardlink /
                             // Reflink). SafeRename is non-credited
