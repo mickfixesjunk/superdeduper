@@ -21,21 +21,26 @@
 //! * resume modal
 //! * settings-drift modal
 //!
-//! ## What's NOT in scope
+//! ## Scope as of #74
 //!
-//! `src/output.rs`'s `display_path` (JSON / CSV emit) intentionally
-//! does NOT strip the verbatim prefix. The output goes to programmatic
-//! consumers (web's history ingest, dedupe action_receipt records)
-//! where the canonical Win32 path form may be load-bearing. If we
-//! ever decide JSON/CSV should also be verbatim-stripped, that's a
-//! wire-format change + a coordinated web-side update; out of
-//! scope for this consolidation.
+//! All user-visible path display surfaces now route through this
+//! helper: CLI JSON / text / report emit (`src/output.rs` —
+//! migrated #74), GUI dupe rows / preview pane / scan-finished log
+//! (#73), and the various Log-panel message-line callsites in
+//! `gui::app`. The argument for unifying the CLI path: long paths
+//! that came through the verbatim-prefix walker share the same
+//! wire form short paths have always used, so any downstream
+//! consumer that processed the short form already accepts the
+//! long form post-strip without breakage.
 //!
-//! `gui::app` Log-panel message lines (many `path.display()` /
-//! `path.to_string_lossy()` callsites in archive/copy/move/manifest
-//! status messages) still render verbatim. They're cosmetic + don't
-//! show on the dupe view that prompted #118; tracked for a v0.2.14
-//! Log-panel sweep rather than bundled here.
+//! ## Out of scope (intentionally)
+//!
+//! `dedupe::action_receipt` records use the canonical Win32 path
+//! form internally for inode-tracking + ACL audits; that subsurface
+//! stays verbatim because the downstream integration-test asserter
+//! pins the exact path bytes. If a future migration ever surfaces
+//! receipt records to the user (rare — they're test-mode-only
+//! today), that's the moment to revisit.
 
 use std::path::Path;
 

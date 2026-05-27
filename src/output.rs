@@ -309,8 +309,14 @@ fn summarize(groups: &[DuplicateGroup], skipped: &[SkippedFile]) -> Summary {
     }
 }
 
+/// #74 — Delegates to the crate-root `path_display::for_user_display`
+/// so CLI + GUI surfaces render paths identically (the same
+/// `\\?\` strip rules apply). The prior local impl skipped the
+/// strip, so JSON / text output carried verbatim-prefixed paths
+/// while the GUI showed them clean — F2 audit class. Single
+/// helper is the canonical surface now.
 fn display_path(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+    crate::path_display::for_user_display(p)
 }
 
 fn io_err(e: impl std::error::Error) -> crate::Error {
