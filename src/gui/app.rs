@@ -886,10 +886,15 @@ impl SuperdeduperApp {
             self.cancel.clone(),
             defender_rtp_pre,
             self.scan_mode,
-            10, // image_similarity_threshold — TODO add a Settings input
-            // when v3 ships the GUI threshold control. Default 10 matches
-            // the CLI default (#87, phash-tuned for photo corpora).
-            crate::cli::ImageHashAlgoArg::default(), // phash; Settings TODO too.
+            // #127 hotfix — was hardcoded `10` (phash-tuned) which
+            // diverged from the CLI v0.2.13 revert to dhash+τ=5.
+            // Same scan against same corpus produced different
+            // result-sets via CLI vs GUI — F1-class data-loss
+            // divergence. ImageHashAlgoArg enum default is now
+            // Dhash (matching CLI default).
+            5, // image_similarity_threshold — TODO add a Settings input
+            // when v3 ships the GUI threshold control.
+            crate::cli::ImageHashAlgoArg::default(), // Dhash post-#127; Settings TODO.
             5.0, // audio_similarity_threshold — same Settings TODO.
         );
     }

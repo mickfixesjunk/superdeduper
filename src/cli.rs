@@ -456,11 +456,15 @@ pub enum HashAlgoArg {
 pub enum ImageHashAlgoArg {
     /// Average hash — cheap, prefilter-only.
     Ahash,
-    /// Difference hash — robust on procedural / screenshot content;
-    /// pair with `--image-similarity-threshold 5`.
-    Dhash,
-    /// Perceptual (DCT) hash — default; best on real photos.
+    /// Difference hash — cross-corpus reliable; default since v0.2.13
+    /// (#87 revert per Mick's "75% crop is similar, NOT a duplicate"
+    /// scope call). Pair with `--image-similarity-threshold 5`.
     #[default]
+    Dhash,
+    /// Perceptual (DCT) hash — had a recall edge on small no-variant
+    /// photo retests but fails AT2 (false-positive flood) on variant-
+    /// augmented corpora at every tested threshold. Use only when the
+    /// corpus is photo-heavy AND single-variant.
     Phash,
 }
 
