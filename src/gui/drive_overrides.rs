@@ -88,8 +88,7 @@ fn write_atomic(path: &Path, value: &DriveOverrides) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| crate::Error::other(format!("drive-overrides encode: {e}")))?;
+    let bytes = serde_json::to_vec_pretty(value)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)?;

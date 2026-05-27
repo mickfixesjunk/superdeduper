@@ -978,7 +978,7 @@ impl SchemaState {
 
 #[cfg(windows)]
 pub fn default_cache_path() -> Result<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA").map_err(|_| Error::other("LOCALAPPDATA not set"))?;
+    let local = std::env::var("LOCALAPPDATA").map_err(|_| Error::EnvVarMissing("LOCALAPPDATA"))?;
     Ok(PathBuf::from(local).join("superdeduper").join("cache.db"))
 }
 
@@ -987,7 +987,7 @@ pub fn default_cache_path() -> Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(xdg).join("superdeduper").join("cache.db"));
     }
-    let home = std::env::var("HOME").map_err(|_| Error::other("HOME not set"))?;
+    let home = std::env::var("HOME").map_err(|_| Error::EnvVarMissing("HOME"))?;
     Ok(PathBuf::from(home)
         .join(".cache")
         .join("superdeduper")

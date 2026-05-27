@@ -145,25 +145,26 @@ pub fn save(
 /// rather than erroring.
 pub fn load(dir: &Path) -> Result<(ProjectFile, Vec<DuplicateGroupSummary>)> {
     let project_bytes = std::fs::read(dir.join("project.json"))?;
-    let project: ProjectFile = serde_json::from_slice(&project_bytes)
-        .map_err(|e| crate::Error::other(format!("project.json parse: {e}")))?;
+    let project: ProjectFile = serde_json::from_slice(&project_bytes)?;
     if project.schema != PROJECT_SCHEMA {
-        return Err(crate::Error::other(format!(
-            "unknown project schema {:?} (this build understands {})",
-            project.schema, PROJECT_SCHEMA
-        )));
+        return Err(crate::Error::ConfigInvalid {
+            field: "project.json:schema",
+            reason: format!(
+                "unknown project schema {:?} (this build understands {})",
+                project.schema, PROJECT_SCHEMA
+            ),
+        });
     }
 
     let dups_path = dir.join("duplicates.json");
     let duplicates: Vec<DuplicateGroupSummary> = if dups_path.exists() {
         let bytes = std::fs::read(&dups_path)?;
-        let dups: DuplicatesFile = serde_json::from_slice(&bytes)
-            .map_err(|e| crate::Error::other(format!("duplicates.json parse: {e}")))?;
+        let dups: DuplicatesFile = serde_json::from_slice(&bytes)?;
         if dups.schema != DUPLICATES_SCHEMA {
-            return Err(crate::Error::other(format!(
-                "unknown duplicates schema {:?}",
-                dups.schema
-            )));
+            return Err(crate::Error::ConfigInvalid {
+                field: "duplicates.json:schema",
+                reason: format!("unknown duplicates schema {:?}", dups.schema),
+            });
         }
         dups.duplicates
     } else {
@@ -185,8 +186,7 @@ pub fn default_bundle_name(roots: &[RootEntry]) -> String {
 }
 
 fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| crate::Error::other(format!("json encode {}: {e}", path.display())))?;
+    let bytes = serde_json::to_vec_pretty(value)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)?;

@@ -180,13 +180,12 @@ mod dedupe_action_summary_tests {
 /// `tracing`.
 pub fn run(args: &DedupeArgs) -> Result<Outcome> {
     let raw = fs::read_to_string(&args.results_file)?;
-    let results: ResultsFile = serde_json::from_str(&raw)
-        .map_err(|e| Error::other(format!("parsing results file: {e}")))?;
+    let results: ResultsFile = serde_json::from_str(&raw)?;
     if !results.schema.starts_with("superdeduper.scan") {
-        return Err(Error::other(format!(
-            "unknown results schema `{}`",
-            results.schema
-        )));
+        return Err(Error::ConfigInvalid {
+            field: "results-file:schema",
+            reason: format!("unknown results schema `{}`", results.schema),
+        });
     }
 
     let references = canonical_set(&[]); // reference set is part of the scan; reserved.
@@ -473,14 +472,16 @@ fn pick_keeper(
             }
         }
         KeepStrategy::InReference => {
-            return Err(Error::other(
-                "--strategy in-reference requires reference paths in the scan",
-            ));
+            return Err(Error::ConfigInvalid {
+                field: "--strategy",
+                reason: "in-reference requires reference paths in the scan".into(),
+            });
         }
         KeepStrategy::Interactive => {
-            return Err(Error::other(
-                "--strategy interactive is not yet implemented",
-            ));
+            return Err(Error::ConfigInvalid {
+                field: "--strategy",
+                reason: "interactive is not yet implemented".into(),
+            });
         }
         KeepStrategy::Smart => {
             // #68 — single source of truth for Smart-keeper tiebreak

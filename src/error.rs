@@ -55,6 +55,26 @@ pub enum Error {
     #[error("operation not supported on this platform: {0}")]
     Unsupported(&'static str),
 
+    /// #136 — Required environment variable missing. Callers
+    /// matching this variant can branch on `var_name` without
+    /// having to parse a format string.
+    #[error("required environment variable not set: {0}")]
+    EnvVarMissing(&'static str),
+
+    /// #136 — User-facing config invariant violated (CLI arg, scan
+    /// settings, exclusion-config compile). `field` names the input
+    /// that drove the rejection; `reason` is the human message.
+    /// Matching on this variant alone is enough for callers to
+    /// distinguish config errors from I/O / cache / platform errors.
+    #[error("invalid configuration for `{field}`: {reason}")]
+    ConfigInvalid { field: &'static str, reason: String },
+
+    /// #136 — JSON round-trip failure (encode or decode). Wraps
+    /// `serde_json::Error` so callers can downcast for the underlying
+    /// line/column/category instead of parsing the message.
+    #[error("JSON serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
     #[error("{0}")]
     Other(String),
 }
