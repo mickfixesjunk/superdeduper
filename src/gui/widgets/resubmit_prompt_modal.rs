@@ -57,15 +57,23 @@ pub fn show(ctx: &Context, rows: &[ScanRecord]) -> Option<ResubmitPromptChoice> 
 
         // Compact row preview. Cap at 5 so the modal doesn't get
         // oversized when a user comes back from a multi-week trip.
+        // #117 — surface `attempt_count` so users can tell at a glance
+        // if a row has been retried unsuccessfully (vs. is genuinely
+        // fresh-untried-since-the-original-scan).
         let max_rows = 5;
         for r in rows.iter().take(max_rows) {
+            let attempt_suffix = match r.attempt_count {
+                0 => String::new(),
+                n => format!(" · {} attempt(s) so far", n),
+            };
             ui.label(
                 RichText::new(format!(
-                    "• {} — {} root(s), {} group(s), channel {}",
+                    "• {} — {} root(s), {} group(s), channel {}{}",
                     super::scan_history_panel::format_unix_local(r.started_at_unix),
                     r.roots.len(),
                     r.total_dups,
                     r.submission_channel.as_deref().unwrap_or(&r.channel),
+                    attempt_suffix,
                 ))
                 .color(theme::TEXT_LO)
                 .small()
