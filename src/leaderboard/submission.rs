@@ -494,7 +494,7 @@ pub fn review_dir() -> std::io::Result<PathBuf> {
 pub fn archive_attempt(inputs: &SubmissionInputs, install_id: &str, outcome: &SubmitOutcome) {
     let body = build_payload(inputs, install_id);
     let entry = ArchivedSubmission {
-        archived_at_unix: now_unix(),
+        archived_at_unix: crate::time::now_unix_i64(),
         archived_at_iso: now_iso8601(),
         run_uuid: inputs.run_uuid.clone(),
         install_id: install_id.to_string(),
@@ -526,7 +526,7 @@ pub fn flag_for_review(
 ) -> std::io::Result<(PathBuf, Option<String>)> {
     let body = build_payload(inputs, &state.install_id);
     let entry = ReviewSubmission {
-        flagged_at_unix: now_unix(),
+        flagged_at_unix: crate::time::now_unix_i64(),
         flagged_at_iso: now_iso8601(),
         run_uuid: inputs.run_uuid.clone(),
         install_id: state.install_id.clone(),
@@ -753,12 +753,16 @@ pub fn enqueue(
     let payload = build_payload(inputs, install_id);
     let body = hmac_signer::canonical_body(&payload);
     let body_hash_prefix = blake3::hash(&body).to_hex();
-    let filename = format!("{}-{}.json", now_unix(), &body_hash_prefix.as_str()[..8]);
+    let filename = format!(
+        "{}-{}.json",
+        crate::time::now_unix_i64(),
+        &body_hash_prefix.as_str()[..8]
+    );
     let path = dir.join(filename);
     let stored = QueuedSubmission {
         body: String::from_utf8_lossy(&body).into_owned(),
         signature: signature.to_string(),
-        enqueued_at_unix: now_unix(),
+        enqueued_at_unix: crate::time::now_unix_i64(),
     };
     std::fs::write(&path, serde_json::to_vec_pretty(&stored)?)?;
     Ok(path)
@@ -792,41 +796,22 @@ struct QueuedSubmission {
     enqueued_at_unix: i64,
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// RFC 3339 / ISO 8601 UTC timestamp of "now" with seconds
 /// precision, e.g. `"2026-05-24T05:42:33Z"`. Backend schema requires
 /// `timestamp` in this format (string with format: date-time).
 fn now_iso8601() -> String {
-    iso8601_from_unix(now_unix())
+    crate::time::now_iso8601()
 }
 
 /// Render a unix timestamp (seconds since epoch) as RFC 3339 UTC.
-/// Hand-rolled (no chrono dep) using the same Howard Hinnant
-/// civil-from-days algorithm we already use in gui::app for the
-/// project-bundle stamp.
+/// Delegates to `crate::time::unix_to_ymdhms` (Howard Hinnant
+/// civil-from-days) so this and other call sites share a single
+/// implementation post-#91. Test-only — runtime callers use
+/// [`now_iso8601`] which goes via `crate::time::now_iso8601` end to
+/// end.
+#[cfg(test)]
 fn iso8601_from_unix(unix: i64) -> String {
-    let days = unix.div_euclid(86_400);
-    let secs = unix.rem_euclid(86_400);
-    let h = (secs / 3_600) as u32;
-    let m = ((secs % 3_600) / 60) as u32;
-    let s = (secs % 60) as u32;
-    // Civil-from-days (days since 1970-01-01) — Howard Hinnant.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    let (year, mo, day, h, m, s) = crate::time::unix_to_ymdhms(unix);
     format!("{year:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 

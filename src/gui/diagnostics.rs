@@ -282,27 +282,6 @@ fn chrono_like_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // Convert unix seconds → YYYY-MM-DDThh:mm:ssZ via a tiny gmtime.
-    // We avoid pulling chrono; this is good enough for a log header.
-    let (year, month, day, h, m, s) = unix_to_ymdhms(secs);
+    let (year, month, day, h, m, s) = crate::time::unix_to_ymdhms(secs as i64);
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-/// Minimal civil-from-days; enough for log headers. From Howard
-/// Hinnant's algorithm.
-fn unix_to_ymdhms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
-    let h = ((secs % 86_400) / 3600) as u32;
-    let m = ((secs % 3600) / 60) as u32;
-    let s = (secs % 60) as u32;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
-    (year, mo, d, h, m, s)
 }

@@ -424,30 +424,11 @@ fn show_last_outcome_banner(ui: &mut Ui) {
     ui.add_space(4.0);
 }
 
-/// Render a Unix timestamp as `YYYY-MM-DD HH:MM`. Local-time intent
-/// but we're not pulling chrono for v1 — emit UTC and let the user
-/// mentally adjust. v2 can swap in chrono or jiff once we adopt it
-/// elsewhere.
+/// Render a Unix timestamp as `YYYY-MM-DD HH:MM` (UTC). Local-time
+/// intent but we're not pulling chrono for v1 — emit UTC and let
+/// the user mentally adjust.
 pub(crate) fn format_unix_local(secs: u64) -> String {
-    // Convert seconds since 1970 to date components. Same arithmetic
-    // as `iso8601_local_seconds` in src/platform/linux/trash.rs, kept
-    // local here to avoid pulling a Linux-only path into a Windows
-    // build. Constants reference Howard Hinnant's
-    // chrono-compatible civil_from_days algorithm.
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let h = rem / 3600;
-    let m = (rem / 60) % 60;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    let (year, mo, day, h, m, _) = crate::time::unix_to_ymdhms(secs as i64);
     format!("{year:04}-{mo:02}-{day:02} {h:02}:{m:02}")
 }
 

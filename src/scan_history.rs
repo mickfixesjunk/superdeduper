@@ -285,7 +285,7 @@ impl ScanRecord {
             schema_version: CURRENT_SCHEMA_VERSION,
             scan_id,
             started_at_unix,
-            completed_at_unix: Some(unix_now()),
+            completed_at_unix: Some(crate::time::now_unix_secs()),
             // submission_channel mirrors channel at construction
             // time so the v3 resubmit pipeline has a stable
             // routing target even if the user switches channels
@@ -476,7 +476,7 @@ pub fn update_submission_state(
     };
     record.submission_state = state;
     if increment_attempt {
-        record.last_attempt_at_unix = Some(unix_now());
+        record.last_attempt_at_unix = Some(crate::time::now_unix_secs());
         record.attempt_count = record.attempt_count.saturating_add(1);
     }
     record_completed(&record)?;
@@ -604,7 +604,7 @@ pub fn record_local_action_for_latest_scan(
 /// supplied delta, recomputes `actually_reclaimed_bytes` as the
 /// fresh sum, stamps timestamps. Caller writes back.
 fn accumulate_reclaim_in_place(record: &mut ScanRecord, additional: &BTreeMap<String, u64>) {
-    let now = unix_now();
+    let now = crate::time::now_unix_secs();
     if record.reclaim_at_unix.is_none() {
         record.reclaim_at_unix = Some(now);
     }
@@ -625,7 +625,7 @@ fn accumulate_reclaim_in_place(record: &mut ScanRecord, additional: &BTreeMap<St
 /// don't want to nag the user about a Pending row that just
 /// finished 30 seconds ago in this session.
 pub fn list_pending_older_than(threshold_secs: u64) -> io::Result<Vec<ScanRecord>> {
-    let now = unix_now();
+    let now = crate::time::now_unix_secs();
     let cutoff = now.saturating_sub(threshold_secs);
     let mut out: Vec<ScanRecord> = list()?
         .into_iter()
@@ -661,7 +661,7 @@ pub fn prune_older_than(retention_secs: u64) -> io::Result<u64> {
     if retention_secs == 0 {
         return Ok(0);
     }
-    let now = unix_now();
+    let now = crate::time::now_unix_secs();
     let cutoff = now.saturating_sub(retention_secs);
     let mut pruned = 0u64;
     for record in list()? {
@@ -681,13 +681,6 @@ pub fn prune_older_than(retention_secs: u64) -> io::Result<u64> {
 
 pub fn history_dir() -> io::Result<PathBuf> {
     Ok(data_dir()?.join("scan-history"))
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn io_err(e: impl std::error::Error) -> io::Error {
@@ -1272,7 +1265,7 @@ mod tests {
         );
         let fresh = ScanRecord::new_finished(
             new_scan_id(),
-            unix_now(), // right now
+            crate::time::now_unix_secs(), // right now
             "prod",
             vec![],
             1,
@@ -1300,7 +1293,7 @@ mod tests {
         // Three rows: aged-pending (should match), fresh-pending
         // (should not — under threshold), aged-submitted (should
         // not — wrong state).
-        let now = unix_now();
+        let now = crate::time::now_unix_secs();
         let aged_pending = ScanRecord {
             started_at_unix: now.saturating_sub(3_600),
             completed_at_unix: Some(now.saturating_sub(3_500)),

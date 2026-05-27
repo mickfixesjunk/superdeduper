@@ -75,7 +75,7 @@ impl Checkpoint {
     pub fn new(roots: Vec<RootEntry>, settings: ScanSettings) -> Self {
         Self {
             schema: "superdeduper.checkpoint.v1".into(),
-            created_at_unix: now_unix(),
+            created_at_unix: crate::time::now_unix_secs(),
             roots,
             settings,
             completed_hashes: Vec::new(),
@@ -195,33 +195,10 @@ pub fn mark_corrupt(path: &Path) -> Result<Option<PathBuf>> {
 
 fn iso_timestamp_now() -> String {
     // Filename-safe ISO-8601 in UTC: 2026-05-20T13-45-22Z.
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, mo, d, h, mi, s) = unix_to_ymdhms(secs);
+    // (Hyphens between time components — colons aren't valid in
+    // Windows filenames.)
+    let (y, mo, d, h, mi, s) = crate::time::unix_to_ymdhms(crate::time::now_unix_i64());
     format!("{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}Z")
-}
-
-fn unix_to_ymdhms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
-    // Same civil-from-days dance as diagnostics::unix_to_ymdhms; we
-    // duplicate it here to keep checkpoint.rs free of cross-module
-    // ordering dependencies.
-    let days = (secs / 86_400) as i64;
-    let h = ((secs % 86_400) / 3600) as u32;
-    let m = ((secs % 3600) / 60) as u32;
-    let s = (secs % 60) as u32;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
-    (year, mo, day, h, m, s)
 }
 
 pub fn delete(path: &Path) -> Result<()> {
@@ -230,13 +207,6 @@ pub fn delete(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::Io(e)),
     }
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

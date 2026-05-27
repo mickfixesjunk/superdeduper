@@ -2285,7 +2285,7 @@ impl SuperdeduperApp {
                 ));
                 let manifest = crate::gui::archive::ArchiveManifest {
                     schema: crate::gui::archive::ARCHIVE_SCHEMA.into(),
-                    created_at_unix: now_unix(),
+                    created_at_unix: crate::time::now_unix_secs(),
                     destination: dest.clone(),
                     entries: manifest_entries,
                 };
@@ -3420,24 +3420,19 @@ impl eframe::App for SuperdeduperApp {
                     .inner_margin(egui::vec2(12.0, 6.0)),
             )
             .show(ctx, |ui| {
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Image::new(egui::include_image!(
-                                "../../assets/sdd-color-shield.png"
-                            ))
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../../assets/sdd-color-shield.png"))
                             .max_size(egui::vec2(220.0, 220.0)),
-                        );
-                        ui.add_space(16.0);
-                        ui.label(
-                            egui::RichText::new("SuperDeDuper")
-                                .color(theme::TEXT_HI)
-                                .strong()
-                                .size(36.0),
-                        );
-                    },
-                );
+                    );
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("SuperDeDuper")
+                            .color(theme::TEXT_HI)
+                            .strong()
+                            .size(36.0),
+                    );
+                });
             });
 
         TopBottomPanel::top("menubar")
@@ -4200,30 +4195,11 @@ fn compose_archive_path(dest: &Path, src: &Path) -> PathBuf {
 }
 
 /// Filename-safe ISO-8601 in UTC: 2026-05-20T14-22-43Z.
+/// (Hyphens between time components — colons aren't valid in
+/// Windows filenames.)
 fn iso_timestamp_for_filename() -> String {
-    let secs = now_unix();
-    let days = (secs / 86_400) as i64;
-    let h = ((secs % 86_400) / 3600) as u32;
-    let m = ((secs % 3600) / 60) as u32;
-    let s = (secs % 60) as u32;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (y + if mo <= 2 { 1 } else { 0 }) as i32;
-    format!("{year:04}-{mo:02}-{day:02}T{h:02}-{m:02}-{s:02}Z")
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    let (y, mo, d, h, m, s) = crate::time::unix_to_ymdhms(crate::time::now_unix_i64());
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}-{m:02}-{s:02}Z")
 }
 
 /// Open a URL in the user's default browser. Per-OS shell-out;
