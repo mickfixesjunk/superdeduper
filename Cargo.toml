@@ -182,6 +182,14 @@ path = "src/bin/hash_repro.rs"
 name = "superdeduper-dir-probe"
 path = "src/bin/dir_probe.rs"
 
+# #88 Phase 1 — libc::statfs for filesystem-magic-number detection
+# on Linux (pathfinder-refs / network-pioneer signal classes).
+# Already pulled in transitively by other crates; promoting to a
+# direct target-gated dep so the import is explicit + the version
+# is pinned across upstream churn.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [

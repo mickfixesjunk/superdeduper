@@ -60,6 +60,24 @@ pub struct HardwareFingerprint {
 }
 
 pub fn detect() -> HardwareFingerprint {
+    detect_with_root_hint(None)
+}
+
+/// #88 Phase 1 — detect() with optional scan-root path used as a
+/// hint for filesystem-class detection. When the caller knows which
+/// path they're about to scan (the GUI submit flow, the CLI submit
+/// flow, etc.), passing the first root here unlocks the
+/// pathfinder-refs / network-pioneer signal classes by letting the
+/// engine probe that path's filesystem instead of returning the
+/// default "NTFS"-on-Windows / "other"-elsewhere placeholder.
+///
+/// Settings-modal previews + tests that want a hardware fingerprint
+/// without a scan-root context call [`detect`] directly; their
+/// `filesystem` field stays the platform default.
+///
+/// Future phases (separate P0 issues): disk_class proper detection
+/// via Windows WMI / Linux /sys/class/nvme; Windows Dev Drive flag.
+pub fn detect_with_root_hint(root_hint: Option<&std::path::Path>) -> HardwareFingerprint {
     let cpu_threads = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
@@ -68,6 +86,9 @@ pub fn detect() -> HardwareFingerprint {
     // at least 1.
     let cpu_cores = (cpu_threads / 2).max(1);
     let ram_gb_raw = detect_ram_gb().unwrap_or(16);
+    let filesystem = root_hint
+        .and_then(detect_filesystem)
+        .unwrap_or_else(|| default_filesystem().to_string());
     HardwareFingerprint {
         cpu_model_string: detect_cpu_model(),
         cpu_cores,
@@ -77,7 +98,7 @@ pub fn detect() -> HardwareFingerprint {
         os_version: detect_os_version(),
         os_edition: detect_os_edition_enum(),
         disk_class: detect_disk_class(),
-        filesystem: default_filesystem().to_string(),
+        filesystem,
         cluster_size_kb: 4,
         volume_size_gb_bucket: "1024".to_string(),
         is_dev_drive: detect_is_dev_drive(),
@@ -408,6 +429,172 @@ fn default_filesystem() -> &'static str {
     } else {
         "other"
     }
+}
+
+/// #88 Phase 1 — Detect the filesystem hosting `path` and map it to
+/// the backend schema's enum: `"NTFS" | "ReFS" | "exFAT" | "FAT32" |
+/// "network-SMB" | "other"`.
+///
+/// Path-prefix-based network detection runs first because it's
+/// cheap and doesn't require an FS syscall: UNC `\\server\share`,
+/// `smb://...`, `nfs://...` short-circuit to `"network-SMB"`.
+///
+/// Returns `None` when detection can't classify the path at all
+/// (path doesn't exist, permission denied, unknown FS); caller
+/// falls back to `default_filesystem()`.
+///
+/// Per-platform fallback:
+/// - Windows: `GetVolumeInformationW` returns the FS name string
+///   directly ("NTFS" / "ReFS" / "exFAT" / "FAT32" / etc.).
+/// - Linux: `statfs` exposes a 32-bit `f_type` magic; compare
+///   against known values (NTFS via ntfs-3g / ntfs3, SMB, NFS, etc).
+/// - macOS + other Unix: deferred — returns `None` so default
+///   ("other") wins.
+fn detect_filesystem(path: &std::path::Path) -> Option<String> {
+    // Network-share path-prefix check (works on every platform).
+    if let Some(s) = path.to_str() {
+        let s_lower = s.to_ascii_lowercase();
+        if s_lower.starts_with("smb://") || s_lower.starts_with("nfs://") {
+            return Some("network-SMB".to_string());
+        }
+        // Windows UNC: `\\server\share\...` (but NOT `\\?\` verbatim
+        // or `\\.\` device which are local-path forms).
+        if let Some(rest) = s.strip_prefix("\\\\") {
+            let first = rest.chars().next();
+            if first != Some('?') && first != Some('.') && !rest.is_empty() {
+                return Some("network-SMB".to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        detect_filesystem_windows(path)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        detect_filesystem_linux(path)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn detect_filesystem_windows(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    // GetVolumeInformationW takes a root-path string ending in `\`.
+    // Normalize: take the volume root from the supplied path. For
+    // `C:\foo\bar` → `C:\`. For UNC `\\server\share\...` →
+    // `\\server\share\`. For verbatim `\\?\C:\foo` → `\\?\C:\`.
+    let path_str = path.to_string_lossy();
+    let root = volume_root_from_path(&path_str)?;
+    let mut wide: Vec<u16> = std::ffi::OsString::from(&root)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // GetVolumeInformationW writes the FS name into a caller-
+    // supplied buffer. MAX_PATH (260) is the documented max for
+    // the FS name.
+    let mut fs_name_buf: [u16; 260] = [0; 260];
+    let mut volume_serial: u32 = 0;
+    let mut max_component: u32 = 0;
+    let mut fs_flags: u32 = 0;
+    // SAFETY: PCWSTR points at our null-terminated wide buffer
+    // which outlives the call. All output pointers are valid
+    // stack locations.
+    let result = unsafe {
+        GetVolumeInformationW(
+            PCWSTR(wide.as_mut_ptr()),
+            None,
+            Some(&mut volume_serial as *mut u32),
+            Some(&mut max_component as *mut u32),
+            Some(&mut fs_flags as *mut u32),
+            Some(&mut fs_name_buf),
+        )
+    };
+    if result.is_err() {
+        return None;
+    }
+    // Find the null terminator + decode to String.
+    let len = fs_name_buf.iter().position(|&c| c == 0).unwrap_or(0);
+    let fs_name = String::from_utf16_lossy(&fs_name_buf[..len]);
+    // Map raw Windows FS names to the schema's enum. Anything we
+    // don't recognise as a first-class type falls back to "other".
+    let mapped = match fs_name.as_str() {
+        "NTFS" => "NTFS",
+        "ReFS" => "ReFS",
+        "exFAT" => "exFAT",
+        "FAT32" | "FAT" => "FAT32",
+        _ => "other",
+    };
+    Some(mapped.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn volume_root_from_path(path: &str) -> Option<String> {
+    // `\\?\C:\foo` → `\\?\C:\`
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
+            return Some(format!(r"\\?\{}:\\", &rest[..1]));
+        }
+    }
+    // `\\server\share\...` → `\\server\share\` (but this is also
+    // the network-share case handled at the top of detect_filesystem;
+    // this is a defensive fallback if the prefix check missed).
+    if let Some(rest) = path.strip_prefix(r"\\") {
+        let mut parts = rest.splitn(3, '\\');
+        let (Some(server), Some(share)) = (parts.next(), parts.next()) else {
+            return None;
+        };
+        if server.is_empty() || share.is_empty() {
+            return None;
+        }
+        return Some(format!(r"\\{}\{}\", server, share));
+    }
+    // `C:\foo\bar` → `C:\`
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        return Some(format!(r"{}:\\", &path[..1]));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn detect_filesystem_linux(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    // statfs f_type magic numbers from linux/magic.h. NTFS goes
+    // through FUSE-ntfs3 / kernel-ntfs3; both report distinguishable
+    // magics. ReFS doesn't have a Linux driver in mainline; deferred.
+    // Coverage targets pathfinder's signal classes; rare local FS
+    // types fall back to "other" which is also a valid schema value.
+    const SMB_SUPER_MAGIC: i64 = 0x517B;
+    const SMB2_MAGIC_NUMBER: i64 = 0xFE534D42;
+    const NFS_SUPER_MAGIC: i64 = 0x6969;
+    const NTFS_SB_MAGIC: i64 = 0x5346544E; // "NTFS" little-endian
+    const NTFS3_SUPER_MAGIC: i64 = 0x7366746E;
+    const FAT_FS_MAGIC: i64 = 0x4006;
+    const MSDOS_SUPER_MAGIC: i64 = 0x4D44;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid null-terminated C string;
+    // buf is a stack-allocated zeroed statfs.
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut buf as *mut libc::statfs) };
+    if rc != 0 {
+        return None;
+    }
+    let ty = buf.f_type as i64;
+    let mapped = match ty {
+        SMB_SUPER_MAGIC | SMB2_MAGIC_NUMBER | NFS_SUPER_MAGIC => "network-SMB",
+        NTFS_SB_MAGIC | NTFS3_SUPER_MAGIC => "NTFS",
+        FAT_FS_MAGIC | MSDOS_SUPER_MAGIC => "FAT32",
+        _ => "other",
+    };
+    Some(mapped.to_string())
 }
 
 // ============================================================
@@ -800,6 +987,36 @@ fn read_registry_string(subkey: &str, value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #88 Phase 1 — path-prefix-based network-share detection is
+    /// platform-independent + cheap; pin its behaviour across the
+    /// known patterns. Covers pathfinder's `network-pioneer` signal
+    /// class without needing a real network mount.
+    #[test]
+    fn detect_filesystem_network_share_prefix() {
+        let cases = [
+            (r"\\fileserver\public\report.pdf", true),
+            (r"\\corp.local\dfs\team", true),
+            ("smb://NAS/Media/movie.mkv", true),
+            ("nfs://10.0.0.1/export/home", true),
+            // verbatim `\\?\` prefix is local, not network
+            (r"\\?\C:\Users\Mick\Documents\photo.jpg", false),
+            // device-namespace `\\.\PhysicalDrive0` is local
+            (r"\\.\PhysicalDrive0", false),
+            // local Windows path
+            (r"C:\Users\Mick\Documents", false),
+            // local Linux path
+            ("/home/mick/Documents", false),
+        ];
+        for (path, expect_network) in cases {
+            let fs = detect_filesystem(std::path::Path::new(path));
+            let is_network = matches!(fs.as_deref(), Some("network-SMB"));
+            assert_eq!(
+                is_network, expect_network,
+                "path {path:?} expected network={expect_network}, got fs={fs:?}",
+            );
+        }
+    }
 
     #[test]
     fn snap_ram_bucket_rounds_down() {

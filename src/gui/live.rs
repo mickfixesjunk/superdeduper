@@ -1858,7 +1858,11 @@ fn run(
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             run_uuid: uuid::Uuid::new_v4().to_string(),
             scan_id: Some(scan_id_for_this_run.clone()),
-            hardware: hardware::detect(),
+            // #88 Phase 1 — pass the first scan root so filesystem
+            // detection has a real path to probe instead of falling
+            // back to the platform default. Unlocks pathfinder-refs
+            // + network-pioneer signal classes.
+            hardware: hardware::detect_with_root_hint(roots.first().map(|r| r.path.as_path())),
             run_shape: RunShape {
                 wall_clock_seconds,
                 bytes_scanned: total_bytes_read,
