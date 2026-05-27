@@ -232,7 +232,7 @@ mod tests {
             allow_recall_on_read: false,
             hash_algo: HashAlgoArg::River5,
             mode: crate::cli::ScanMode::Exact,
-            image_similarity_threshold: 10,
+            image_similarity_threshold: crate::cli::ImageSimilarityThresholdArg::Fixed(10),
             image_hash_algorithm: crate::cli::ImageHashAlgoArg::Phash,
             audio_similarity_threshold: 5.0,
             exclusions: crate::cli::ExclusionsToggle::On,

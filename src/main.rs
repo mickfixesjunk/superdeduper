@@ -1264,20 +1264,32 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     #[cfg(feature = "similar-images")]
     let duplicates = {
         use superdeduper::cli::ScanMode;
+        use superdeduper::pipeline::image_hash::tier4::is_image_file;
         use superdeduper::pipeline::image_hash::{tier4, Algorithm};
         let mut all = duplicates;
         if matches!(mode, ScanMode::Image) {
             if let Some(inv) = inventory_for_tier4.as_deref() {
                 let algo: Algorithm = image_hash_algorithm.into();
+                // E3 (#78): resolve auto-threshold using the count
+                // of image-extension files in the inventory. Exact
+                // n is "files that pass is_image_file"; this is the
+                // count seen by the tier-4 hash step (a slight
+                // overestimate of decoded n when a few images fail
+                // to decode, but close enough for the log10 scaling
+                // that auto uses).
+                let n_images = inv.iter().filter(|f| is_image_file(&f.path)).count() as u64;
+                let threshold =
+                    image_similarity_threshold.resolve(tier4::DEFAULT_THRESHOLD, n_images);
                 let t_tier4 = std::time::Instant::now();
-                let groups = tier4::find_similar_groups(inv, algo, image_similarity_threshold);
+                let groups = tier4::find_similar_groups(inv, algo, threshold);
                 let _ = writeln!(
                     io::stderr(),
-                    "stage 4 perceptual ({}): {} group(s) within {} bits ({} ms)",
+                    "stage 4 perceptual ({}): {} group(s) within {} bits ({} ms; n_images={})",
                     algo.as_slug(),
                     groups.len(),
-                    image_similarity_threshold,
+                    threshold,
                     t_tier4.elapsed().as_millis(),
+                    n_images,
                 );
                 all.extend(groups);
             }

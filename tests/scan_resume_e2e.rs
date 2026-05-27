@@ -90,7 +90,7 @@ fn drive_engine_until_done(
         cancel.clone(),
         None,
         superdeduper::cli::ScanMode::Exact,
-        5,
+        superdeduper::cli::ImageSimilarityThresholdArg::Fixed(5),
         superdeduper::cli::ImageHashAlgoArg::default(),
         5.0,
     );

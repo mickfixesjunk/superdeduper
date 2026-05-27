@@ -91,6 +91,37 @@ impl Algorithm {
 /// wider hashes we bump the schema.
 pub type ImageFingerprint = u64;
 
+/// #78 / E3 — Resolve the Hamming threshold from a default + the
+/// corpus size `n` (count of decoded image fingerprints).
+///
+/// Formula: `τ_eff = max(3, default_tau - floor(log10(n / 100)))`.
+/// Intuition: the expected random-collision FP rate scales with
+/// `n²`; dropping `τ` by 1 bit each order of magnitude past 100
+/// keeps the expected-FP-rate bounded as the corpus grows. The
+/// floor at 3 prevents τ from collapsing to zero on huge corpora
+/// where dHash's bit-precision tops out (5 bits per chunk per
+/// spec §2 calibration).
+///
+/// Anchor points (with default_tau = 5):
+/// - n ≤ 99   → τ_eff = 5 (no scaling)
+/// - n = 100  → τ_eff = 5 (log10(1.0) = 0)
+/// - n = 1000 → τ_eff = 4 (log10(10) = 1)
+/// - n = 10k  → τ_eff = 3 (log10(100) = 2; floored)
+/// - n = 100k → τ_eff = 3 (floored)
+///
+/// Behind `--image-similarity-threshold auto` per the spec. Ship-
+/// as-opt-in first; promotion to default gated on field results.
+pub fn tau_for_n(default_tau: u32, n: u64) -> u32 {
+    if n < 100 {
+        return default_tau.max(3);
+    }
+    // floor(log10(n / 100)) = number of orders of magnitude past
+    // 100. integer-arithmetic version avoids floats + matches
+    // the exact-integer boundary the docstring claims.
+    let scale = ((n / 100) as f64).log10().floor() as u32;
+    default_tau.saturating_sub(scale).max(3)
+}
+
 /// Compute a perceptual fingerprint for one image file.
 ///
 /// Decodes via the `image` crate (supports JPEG / PNG / WebP / GIF
@@ -204,6 +235,58 @@ mod tests {
     #[test]
     fn algorithm_default_is_dhash() {
         assert_eq!(Algorithm::default(), Algorithm::DifferenceHash);
+    }
+
+    #[test]
+    fn tau_for_n_no_scaling_under_100() {
+        // n < 100 → no scaling; default returned (or floor at 3).
+        assert_eq!(tau_for_n(5, 0), 5);
+        assert_eq!(tau_for_n(5, 1), 5);
+        assert_eq!(tau_for_n(5, 50), 5);
+        assert_eq!(tau_for_n(5, 99), 5);
+    }
+
+    #[test]
+    fn tau_for_n_anchor_points_match_docstring() {
+        // n=100 → floor(log10(1.0)) = 0 → no scaling.
+        assert_eq!(tau_for_n(5, 100), 5);
+        // n=999 → floor(log10(9.99)) = 0 → still no scaling.
+        assert_eq!(tau_for_n(5, 999), 5);
+        // n=1000 → floor(log10(10.0)) = 1 → -1 from default.
+        assert_eq!(tau_for_n(5, 1000), 4);
+        // n=10000 → floor(log10(100.0)) = 2 → -2 from default = 3.
+        assert_eq!(tau_for_n(5, 10_000), 3);
+        // n=100k → floor(log10(1000.0)) = 3; floored at 3.
+        assert_eq!(tau_for_n(5, 100_000), 3);
+        // n=10M → floored at 3 regardless.
+        assert_eq!(tau_for_n(5, 10_000_000), 3);
+    }
+
+    #[test]
+    fn tau_for_n_respects_default_when_default_below_3() {
+        // floor-at-3 logic: a default below 3 (pathological) still
+        // produces 3. Defends against future API misuse.
+        assert_eq!(tau_for_n(0, 0), 3);
+        assert_eq!(tau_for_n(2, 99), 3);
+        assert_eq!(tau_for_n(2, 100_000), 3);
+    }
+
+    #[test]
+    fn tau_for_n_with_larger_default() {
+        // A user-supplied higher default (say 10 for legacy phash
+        // recall) scales down by the same exponent.
+        assert_eq!(tau_for_n(10, 50), 10);
+        assert_eq!(tau_for_n(10, 100), 10);
+        assert_eq!(tau_for_n(10, 1_000), 9);
+        assert_eq!(tau_for_n(10, 10_000), 8);
+        assert_eq!(tau_for_n(10, 100_000), 7);
+        assert_eq!(tau_for_n(10, 1_000_000), 6);
+        assert_eq!(tau_for_n(10, 10_000_000), 5);
+        assert_eq!(tau_for_n(10, 100_000_000), 4);
+        // Eventually floors at 3 when the subtraction would push
+        // below 3 (scale=7 → 10-7=3; scale=8+ → still 3).
+        assert_eq!(tau_for_n(10, 1_000_000_000), 3);
+        assert_eq!(tau_for_n(10, 10_000_000_000), 3);
     }
 
     #[test]

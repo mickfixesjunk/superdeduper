@@ -391,8 +391,21 @@ pub struct ScanArgs {
     /// `--image-hash-algorithm phash --image-similarity-threshold 10`
     /// combination still works — it just doesn't generalize to corpora
     /// with per-source variant fan-out.
-    #[arg(long, value_name = "BITS", default_value_t = 5)]
-    pub image_similarity_threshold: u32,
+    ///
+    /// Accepts an integer (e.g. `5`) for a fixed threshold OR the
+    /// keyword `auto` for E3 (#78): the engine scales the default
+    /// threshold down by `floor(log10(n/100))` based on the count
+    /// of decoded image fingerprints (floor at 3). On a 100-image
+    /// corpus auto = default (5); 1k = 4; 10k = 3. Reduces the
+    /// random-collision FP rate at scale without losing recall on
+    /// small corpora. Ship-as-opt-in first; promotion to default
+    /// gated on field results.
+    #[arg(
+        long,
+        value_name = "BITS|auto",
+        default_value_t = ImageSimilarityThresholdArg::Fixed(5),
+    )]
+    pub image_similarity_threshold: ImageSimilarityThresholdArg,
 
     /// Perceptual-hash algorithm used by `--mode image` (#45).
     /// Defaults to `dhash` (row-pair Difference Hash) — cross-corpus
@@ -475,6 +488,70 @@ impl From<ImageHashAlgoArg> for crate::pipeline::image_hash::Algorithm {
             ImageHashAlgoArg::Dhash => Self::DifferenceHash,
             ImageHashAlgoArg::Phash => Self::DoubleGradient,
         }
+    }
+}
+
+/// #78 / E3 — `--image-similarity-threshold` CLI value.
+///
+/// Accepts either an integer (e.g. `5`) for a fixed threshold OR
+/// the keyword `auto`, in which case the engine scales the default
+/// threshold (5) down by `floor(log10(n/100))` based on the count
+/// of decoded image fingerprints (floored at 3). The auto formula
+/// keeps the random-collision FP rate bounded as corpus size grows
+/// without losing recall on small corpora.
+///
+/// Resolution to a concrete `u32` happens inside
+/// `pipeline::image_hash::tau_for_n` after Step 1 hashing, when
+/// `n` is known. See [`Self::resolve`] for the resolution helper.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImageSimilarityThresholdArg {
+    /// Engine scales τ from corpus size n at scan time.
+    Auto,
+    /// User-supplied fixed Hamming-distance threshold in bits.
+    Fixed(u32),
+}
+
+impl ImageSimilarityThresholdArg {
+    /// Resolve to a concrete bit count given the corpus size.
+    /// `Auto` → `tau_for_n(default_tau, n)`; `Fixed(b)` → `b`.
+    #[cfg(feature = "similar-images")]
+    pub fn resolve(self, default_tau: u32, n: u64) -> u32 {
+        match self {
+            Self::Auto => crate::pipeline::image_hash::tau_for_n(default_tau, n),
+            Self::Fixed(b) => b,
+        }
+    }
+
+    /// Non-feature-gated variant — used by callers that can't pull
+    /// in the `similar-images` feature but still need to thread the
+    /// CLI value through to a downstream consumer.
+    pub fn resolve_no_auto(self, default_when_auto: u32) -> u32 {
+        match self {
+            Self::Auto => default_when_auto,
+            Self::Fixed(b) => b,
+        }
+    }
+}
+
+impl std::fmt::Display for ImageSimilarityThresholdArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Fixed(b) => write!(f, "{b}"),
+        }
+    }
+}
+
+impl std::str::FromStr for ImageSimilarityThresholdArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        s.parse::<u32>()
+            .map(Self::Fixed)
+            .map_err(|e| format!("expected an integer (e.g. `5`) or the keyword `auto`: {e}"))
     }
 }
 
