@@ -892,7 +892,9 @@ impl SuperdeduperApp {
             // dhash + τ=5 is the cross-corpus operating point. Set
             // to Auto when Mick wants E3 auto-scaling in the GUI.
             crate::cli::ImageSimilarityThresholdArg::Fixed(5),
-            crate::cli::ImageHashAlgoArg::default(), // phash; Settings TODO too.
+            // dhash since the #127 default revert; Settings TODO
+            // when v3 ships the GUI algo control.
+            crate::cli::ImageHashAlgoArg::default(),
             5.0, // audio_similarity_threshold — same Settings TODO.
         );
     }

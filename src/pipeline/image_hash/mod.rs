@@ -115,10 +115,15 @@ pub fn tau_for_n(default_tau: u32, n: u64) -> u32 {
     if n < 100 {
         return default_tau.max(3);
     }
-    // floor(log10(n / 100)) = number of orders of magnitude past
-    // 100. integer-arithmetic version avoids floats + matches
-    // the exact-integer boundary the docstring claims.
-    let scale = ((n / 100) as f64).log10().floor() as u32;
+    // `u64::checked_ilog10` is the exact integer log10 — no float
+    // arithmetic, no platform libm variance (libm's log10(100.0)
+    // returns 2.0 on every system the project actually ships on,
+    // but the IEEE 754 spec doesn't mandate it; an integer ilog10
+    // is the correct primitive for an integer-domain scaling
+    // operation). Stable since Rust 1.67. `checked_ilog10` returns
+    // `None` only for 0; the `n < 100` early-return above means
+    // `n / 100 >= 1` here, so the unwrap_or(0) is defense-in-depth.
+    let scale = (n / 100).checked_ilog10().unwrap_or(0);
     default_tau.saturating_sub(scale).max(3)
 }
 
