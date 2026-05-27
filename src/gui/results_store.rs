@@ -90,8 +90,7 @@ pub fn save(state: &ResultsState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| Error::other(format!("results-state encode: {e}")))?;
+    let bytes = serde_json::to_vec_pretty(state)?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, &bytes)?;
     fs::rename(&tmp, &path)?;
@@ -105,8 +104,7 @@ pub fn load() -> Result<Option<ResultsState>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::Io(e)),
     };
-    let state: ResultsState = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::other(format!("results-state parse: {e}")))?;
+    let state: ResultsState = serde_json::from_slice(&bytes)?;
     if !state.schema.starts_with("superdeduper.results-state") {
         return Ok(None);
     }

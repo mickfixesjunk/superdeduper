@@ -104,8 +104,7 @@ pub fn load(path: &Path) -> Result<Option<Checkpoint>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::Io(e)),
     };
-    let cp: Checkpoint = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::other(format!("checkpoint parse: {e}")))?;
+    let cp: Checkpoint = serde_json::from_slice(&bytes)?;
     if !cp.schema.starts_with("superdeduper.checkpoint") {
         return Ok(None);
     }
@@ -116,8 +115,7 @@ pub fn save(path: &Path, cp: &Checkpoint) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec_pretty(cp)
-        .map_err(|e| Error::other(format!("checkpoint encode: {e}")))?;
+    let bytes = serde_json::to_vec_pretty(cp)?;
     // Atomic-ish write: write to .tmp then rename.
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &bytes)?;

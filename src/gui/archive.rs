@@ -150,13 +150,15 @@ pub enum ArchiveFailureBucket {
 /// caller can surface the message to the user.
 pub fn load_manifest(path: &Path) -> Result<ArchiveManifest> {
     let bytes = std::fs::read(path)?;
-    let manifest: ArchiveManifest = serde_json::from_slice(&bytes)
-        .map_err(|e| crate::Error::other(format!("archive manifest parse: {e}")))?;
+    let manifest: ArchiveManifest = serde_json::from_slice(&bytes)?;
     if manifest.schema != ARCHIVE_SCHEMA {
-        return Err(crate::Error::other(format!(
-            "unknown archive manifest schema {:?} (this build understands {})",
-            manifest.schema, ARCHIVE_SCHEMA
-        )));
+        return Err(crate::Error::ConfigInvalid {
+            field: "archive-manifest:schema",
+            reason: format!(
+                "unknown archive manifest schema {:?} (this build understands {})",
+                manifest.schema, ARCHIVE_SCHEMA
+            ),
+        });
     }
     Ok(manifest)
 }

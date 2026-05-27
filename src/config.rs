@@ -65,20 +65,27 @@ pub struct ScanConfig {
 impl ScanConfig {
     pub fn from_args(args: &ScanArgs) -> Result<Self> {
         if args.paths.is_empty() {
-            return Err(Error::other("at least one scan path is required"));
+            return Err(Error::ConfigInvalid {
+                field: "paths",
+                reason: "at least one scan path is required".into(),
+            });
         }
 
         let min_size = cli::parse_size(&args.min_size)?;
         let max_size = args.max_size.as_deref().map(cli::parse_size).transpose()?;
         let tier1_bytes = cli::parse_size(&args.tier1_bytes)?;
         if tier1_bytes == 0 {
-            return Err(Error::other("--tier1-bytes must be > 0"));
+            return Err(Error::ConfigInvalid {
+                field: "--tier1-bytes",
+                reason: "must be > 0".into(),
+            });
         }
         if let (Some(max), min) = (max_size, min_size) {
             if max < min {
-                return Err(Error::other(format!(
-                    "--max-size ({max}) is below --min-size ({min})",
-                )));
+                return Err(Error::ConfigInvalid {
+                    field: "--max-size",
+                    reason: format!("({max}) is below --min-size ({min})"),
+                });
             }
         }
 
@@ -149,8 +156,12 @@ fn build_cli_exclusion_policy(args: &ScanArgs) -> Result<crate::exclusions::Excl
             .position(|x| x == p)
             .unwrap_or(usize::MAX)
     });
-    ExclusionPolicy::compile(&config, &crate::exclusions::presets::BuiltinPresets)
-        .map_err(|e| Error::other(format!("exclusion config compile failed: {e}")))
+    ExclusionPolicy::compile(&config, &crate::exclusions::presets::BuiltinPresets).map_err(|e| {
+        Error::ConfigInvalid {
+            field: "exclusions",
+            reason: format!("compile failed: {e}"),
+        }
+    })
 }
 
 fn parse_pack_id(s: &str) -> Result<crate::exclusions::PresetPackId> {
@@ -161,10 +172,9 @@ fn parse_pack_id(s: &str) -> Result<crate::exclusions::PresetPackId> {
     // exclusion-packs` output.
     let kebab = s.trim().to_ascii_lowercase();
     let json = format!("\"{kebab}\"");
-    serde_json::from_str::<PresetPackId>(&json).map_err(|_| {
-        Error::other(format!(
-            "unknown preset pack id {s:?} — see --list-exclusion-packs"
-        ))
+    serde_json::from_str::<PresetPackId>(&json).map_err(|_| Error::ConfigInvalid {
+        field: "--exclusion-pack",
+        reason: format!("unknown preset pack id {s:?} — see --list-exclusion-packs"),
     })
 }
 
