@@ -662,11 +662,13 @@ fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Res
             submission::submit_recorded_payload(&install_state, payload, built_with, server_url);
         match outcome {
             SubmitOutcome::Accepted { submission_id, .. } => {
-                scan_history::update_submission_state(
-                    &record.scan_id,
-                    SubmissionState::Submitted,
-                    true,
-                )?;
+                // #124 — stamp submission_id + transition state in one
+                // atomic helper so this CLI path can't drift back into
+                // the same "forgot the second half" trap the GUI live
+                // path had. mark_submitted preserves attempt_count
+                // (no bump) since this is a successful submit, not a
+                // retry.
+                scan_history::mark_submitted(&record.scan_id, submission_id.clone())?;
                 submitted = submitted.saturating_add(1);
                 println!(
                     "  ✓ {} accepted (submission_id={})",
