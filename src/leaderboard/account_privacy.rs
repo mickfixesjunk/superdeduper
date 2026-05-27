@@ -7,12 +7,12 @@
 //!
 //! ## Wire shape
 //!
-//! GET `{server_url}/api/v1/account/me`
+//! GET `{server_url}/api/v1/profile/me`
 //!
 //! Response (relevant subset):
 //! ```json
 //! {
-//!   "privacy": {
+//!   "privacy_applied": {
 //!     "show_display_name": false,
 //!     "show_provider": false,
 //!     "show_avatar": false,
@@ -22,6 +22,13 @@
 //!   }
 //! }
 //! ```
+//!
+//! Originally `GET /api/v1/account/me` with the block keyed `privacy`;
+//! `/account/me` was never deployed (404 on prod + dev). #8 — switched
+//! to `/profile/me` which has carried this block from day one under
+//! the more-accurate `privacy_applied` name (it reflects "what privacy
+//! is being applied", populated with defaults even for unclaimed
+//! installs).
 //!
 //! PATCH `{server_url}/api/v1/account/privacy`
 //! X-Sd-Signature: <hmac>
@@ -76,9 +83,9 @@ pub enum PrivacyOutcome {
     Transient(String),
 }
 
-/// `GET /api/v1/account/me` and pull just the `privacy` block.
-/// Returns Default::default() (all OFF) when no `privacy` field is
-/// present so older server responses degrade gracefully.
+/// `GET /api/v1/profile/me` and pull just the `privacy_applied` block.
+/// Returns Default::default() (all OFF) when no `privacy_applied` field
+/// is present so older server responses degrade gracefully.
 pub fn fetch(state: &InstallState, server_url: &str) -> PrivacyOutcome {
     if !state.registered {
         return PrivacyOutcome::Unauthorised(
@@ -91,7 +98,7 @@ pub fn fetch(state: &InstallState, server_url: &str) -> PrivacyOutcome {
             return PrivacyOutcome::Rejected("install_key_hex malformed".to_string());
         }
     };
-    let url = format!("{}/api/v1/account/me", server_url.trim_end_matches('/'));
+    let url = format!("{}/api/v1/profile/me", server_url.trim_end_matches('/'));
     // GET still needs the install signature since this is the
     // account-private view (not the public profile).
     let canonical_marker = serde_json::json!({"install_id": state.install_id});
@@ -180,8 +187,15 @@ fn parse_response(resp: ureq::Response) -> PrivacyOutcome {
         }
     };
     // Accept either the bare PrivacyFlags shape (PATCH response)
-    // or a wrapped {privacy: PrivacyFlags} (GET /me response).
-    let flags_value = body.get("privacy").unwrap_or(&body).clone();
+    // or a wrapped {privacy_applied: PrivacyFlags} (GET /profile/me
+    // response). Older transitional servers may still emit `privacy`
+    // as an alias — try it as a fallback before degrading to all-off
+    // defaults so a partial rollout doesn't surface as Transient.
+    let flags_value = body
+        .get("privacy_applied")
+        .or_else(|| body.get("privacy"))
+        .unwrap_or(&body)
+        .clone();
     match serde_json::from_value::<PrivacyFlags>(flags_value) {
         Ok(flags) => PrivacyOutcome::Ok(flags),
         Err(e) => PrivacyOutcome::Transient(format!("flags parse failed: {e}")),
