@@ -129,7 +129,17 @@ pub fn request_resubmit(scan_id: &str) -> Result<(), String> {
                 SubmitOutcome::Rejected { .. } | SubmitOutcome::FlaggedForReview { .. } => {
                     SubmissionState::Failed
                 }
-                SubmitOutcome::Transient { .. } => SubmissionState::Pending,
+                SubmitOutcome::Transient { .. } => {
+                    // #117 — after MAX_RESUBMIT_ATTEMPTS transient failures,
+                    // give up and mark Failed so the launch-time modal stops
+                    // nagging. User can manually re-try from the History tab.
+                    let prior_attempts = scan_history::load(&scan_id_for_thread)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.attempt_count)
+                        .unwrap_or(0);
+                    scan_history::transient_outcome_state(prior_attempts)
+                }
             };
             if let Err(e) =
                 scan_history::update_submission_state(&scan_id_for_thread, new_state, true)

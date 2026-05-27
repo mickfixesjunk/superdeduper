@@ -698,19 +698,25 @@ fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Res
                 );
             }
             SubmitOutcome::Transient { reason } => {
-                // Bump attempt_count but DON'T transition to Failed —
-                // transient failures (5xx / network) get retried on
-                // the next CLI run. Failed is reserved for terminal
-                // 4xx rejections.
-                scan_history::update_submission_state(
-                    &record.scan_id,
-                    SubmissionState::Pending,
-                    true,
-                )?;
+                // #117 — keep Pending so the next CLI run retries,
+                // but after MAX_RESUBMIT_ATTEMPTS transient failures
+                // give up and mark Failed. Without the cap, a broken
+                // backend kept the same row stuck in Pending forever
+                // (both CLI + GUI surfaces). The GUI launch-modal in
+                // particular re-nagged on every restart.
+                let prior_attempts = scan_history::load(&record.scan_id)?
+                    .map(|r| r.attempt_count)
+                    .unwrap_or(0);
+                let new_state = scan_history::transient_outcome_state(prior_attempts);
+                scan_history::update_submission_state(&record.scan_id, new_state, true)?;
                 transient = transient.saturating_add(1);
+                let suffix = match new_state {
+                    SubmissionState::Failed => " — retry cap reached, marked Failed",
+                    _ => " — will retry on next run",
+                };
                 eprintln!(
-                    "  · {} transient (reason={}) — will retry on next run",
-                    record.scan_id, reason
+                    "  · {} transient (reason={}){}",
+                    record.scan_id, reason, suffix
                 );
             }
             SubmitOutcome::FlaggedForReview { .. } => {

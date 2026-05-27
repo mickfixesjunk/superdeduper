@@ -90,6 +90,35 @@ use crate::pipeline::{DuplicateGroup, SimilarityKind};
 /// state per row.
 pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
+/// #117 — cap on resubmit attempts for a single scan row. After this
+/// many transient (5xx / network) failures we transition the row from
+/// `Pending` to `Failed` so the app-start prompt stops nagging on
+/// every launch. The user can still trigger a manual re-attempt from
+/// the History tab if they believe the underlying issue is resolved.
+///
+/// 3 is a balance: enough to ride out a brief network blip across
+/// two app launches, few enough that a genuinely broken backend
+/// surfaces as Failed within a couple of restarts.
+pub const MAX_RESUBMIT_ATTEMPTS: u32 = 3;
+
+/// #117 — decide the new SubmissionState for a transient outcome
+/// based on the row's prior attempt_count. Used by both the GUI
+/// resubmit worker and the CLI submit-pending pass so retry-cap
+/// semantics stay identical across surfaces.
+///
+/// `prior_attempts` is the row's `attempt_count` BEFORE the current
+/// attempt has been recorded. Returns `Failed` when the about-to-be-
+/// recorded attempt would push the row to (or past) the cap, else
+/// `Pending` so the resubmit pipeline picks it up again on the next
+/// launch.
+pub fn transient_outcome_state(prior_attempts: u32) -> SubmissionState {
+    if prior_attempts.saturating_add(1) >= MAX_RESUBMIT_ATTEMPTS {
+        SubmissionState::Failed
+    } else {
+        SubmissionState::Pending
+    }
+}
+
 /// Submission state at the time the row was last touched.
 /// v1 only ever writes `Pending`; v2 will transition through the
 /// other states as the resubmit pipeline lands.
@@ -825,6 +854,41 @@ mod tests {
             out.is_empty(),
             "empty groups → empty map (avoids zero-padded keys)"
         );
+    }
+
+    /// #117 — `transient_outcome_state` keeps the row Pending for
+    /// the first MAX-1 transient attempts, then flips to Failed
+    /// once the about-to-be-recorded attempt would push the count
+    /// to (or past) MAX_RESUBMIT_ATTEMPTS.
+    #[test]
+    fn transient_outcome_caps_at_max_resubmit_attempts() {
+        // Before-recording counts. Each call asks "if the row has N
+        // prior attempts and we're about to record the (N+1)th
+        // transient, what state does the row land in?"
+        for prior in 0..(MAX_RESUBMIT_ATTEMPTS - 1) {
+            assert_eq!(
+                transient_outcome_state(prior),
+                SubmissionState::Pending,
+                "prior={prior} should still be Pending"
+            );
+        }
+        // The recording call that crosses the threshold + every
+        // subsequent attempt → Failed.
+        for prior in (MAX_RESUBMIT_ATTEMPTS - 1)..(MAX_RESUBMIT_ATTEMPTS + 5) {
+            assert_eq!(
+                transient_outcome_state(prior),
+                SubmissionState::Failed,
+                "prior={prior} should be Failed"
+            );
+        }
+    }
+
+    /// #117 — saturating_add inside the helper guards against u32
+    /// overflow even with absurd attempt counts. (Belt-and-braces;
+    /// we'd never reach u32::MAX legitimately.)
+    #[test]
+    fn transient_outcome_handles_saturated_attempts() {
+        assert_eq!(transient_outcome_state(u32::MAX), SubmissionState::Failed,);
     }
 
     /// #41 — update_submission_state flips the state + bumps
