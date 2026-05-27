@@ -321,8 +321,8 @@ mod tests {
         let roots = vec![root("/scan")];
         let mut prior_settings = ScanSettings::default();
         let mut current_settings = ScanSettings::default();
-        prior_settings.paranoid = false;
-        current_settings.paranoid = true;
+        prior_settings.use_format_aware = false;
+        current_settings.use_format_aware = true;
         let cp = checkpoint_with(roots.clone(), prior_settings, vec![synthetic_dup()], true);
         let ctx = ctx_with(roots, current_settings, false);
         assert_eq!(classify_resume_tier(&cp, &ctx), ResumeTier::InventoryOnly);
@@ -333,8 +333,8 @@ mod tests {
         let roots = vec![root("/scan")];
         let mut prior_settings = ScanSettings::default();
         let mut current_settings = ScanSettings::default();
-        prior_settings.paranoid = false;
-        current_settings.paranoid = true;
+        prior_settings.use_format_aware = false;
+        current_settings.use_format_aware = true;
         let cp = checkpoint_with(roots.clone(), prior_settings, vec![synthetic_dup()], false);
         let ctx = ctx_with(roots, current_settings, false);
         assert_eq!(classify_resume_tier(&cp, &ctx), ResumeTier::Fresh);
@@ -356,8 +356,8 @@ mod tests {
         let roots = vec![root("/scan")];
         let mut prior_settings = ScanSettings::default();
         let mut current_settings = ScanSettings::default();
-        prior_settings.paranoid = false;
-        current_settings.paranoid = true;
+        prior_settings.use_format_aware = false;
+        current_settings.use_format_aware = true;
         let cp = checkpoint_with(roots.clone(), prior_settings, vec![], false);
         let ctx = ctx_with(roots, current_settings, false);
         assert_eq!(classify_resume_tier(&cp, &ctx), ResumeTier::Marker);

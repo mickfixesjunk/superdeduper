@@ -123,13 +123,12 @@ fn run(
         d.log(
             "SCAN-START",
             format_args!(
-                "roots={} min_size={} format_aware={} use_cache={} paranoid={} threads={:?} \
+                "roots={} min_size={} format_aware={} use_cache={} threads={:?} \
                  hash_algo={} hash_impl={hash_impl}",
                 roots.len(),
                 settings.min_size_bytes,
                 settings.use_format_aware,
                 settings.use_cache,
-                settings.paranoid,
                 settings.threads,
                 settings.hash_algo.tag(),
             ),
@@ -251,8 +250,8 @@ fn run(
                         // Reuse the walker output (file list) but
                         // drop previous_duplicates — they were
                         // computed under different settings and
-                        // may not be valid (e.g., min_size/paranoid
-                        // changed → different group composition).
+                        // may not be valid (e.g., min_size changed
+                        // → different group composition).
                         let _ = tx.send(EngineEvent::Log {
                             level: LogLevel::Info,
                             message: "resume: settings changed since pause — reusing file inventory, redoing analysis".into(),
@@ -1803,7 +1802,7 @@ fn run(
             self, ResultSummary, RunShape, SubmissionInputs, FEATURE_BIT_ALLOW_RECALL_ON_READ,
             FEATURE_BIT_ALLOW_SYSTEM_PATHS, FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB,
             FEATURE_BIT_FOLLOW_LINKS, FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB,
-            FEATURE_BIT_PARANOID, FEATURE_BIT_REFERENCE_ROOTS,
+            FEATURE_BIT_REFERENCE_ROOTS,
         };
         // Discard the defender post probe; current backend schema
         // doesn't carry defender state. Keep the call commented in
@@ -1831,9 +1830,6 @@ fn run(
         }
         if settings.use_format_aware {
             features_bits |= FEATURE_BIT_FORMAT_AWARE;
-        }
-        if settings.paranoid {
-            features_bits |= FEATURE_BIT_PARANOID;
         }
         if cfg.follow_links {
             features_bits |= FEATURE_BIT_FOLLOW_LINKS;
@@ -2590,7 +2586,6 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         include,
         exclude,
         format: OutputFormat::Json,
-        paranoid: settings.paranoid,
         use_cache: settings.use_cache,
         use_format_aware: settings.use_format_aware,
         threads: settings.threads.unwrap_or_else(|| {

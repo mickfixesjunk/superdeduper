@@ -215,8 +215,8 @@ fn run_with_counters_inner(
     // corpus where Tier 1 + small Tier 3 dominate), so
     // oversubscription versus physical cores is a real win.
     // Keeping a separate pool from the global rayon means
-    // non-hash rayon usage (layout resolver, paranoid verify) keeps
-    // its CPU-sized parallelism.
+    // non-hash rayon usage (layout resolver, perceptual Tier-4)
+    // keeps its CPU-sized parallelism.
     let io_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.io_threads.max(1))
         .thread_name(|i| format!("superdeduper-io-{i}"))
@@ -1265,7 +1265,6 @@ mod tests {
             include: None,
             exclude: None,
             format: OutputFormat::Text,
-            paranoid: false,
             use_cache: false,
             use_format_aware: false,
             threads: 1,

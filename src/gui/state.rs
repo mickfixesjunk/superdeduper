@@ -37,6 +37,14 @@ pub struct ScanSettings {
     pub exclude_glob: String,
     pub use_format_aware: bool,
     pub use_cache: bool,
+    /// #131 — Deprecated. The `--paranoid` byte-by-byte verification
+    /// stage was a no-op stub; the flag and its read sites were
+    /// removed in v0.2.16. The field is kept here with
+    /// `#[serde(default, skip_serializing)]` so old persisted
+    /// configs deserialize cleanly and new writes drop it. Read by
+    /// nothing — do not introduce new readers; if real byte-by-byte
+    /// verification ships later it gets a fresh name.
+    #[serde(default, skip_serializing)]
     pub paranoid: bool,
     pub follow_links: bool,
     pub threads: Option<usize>,

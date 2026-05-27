@@ -53,7 +53,6 @@ fn mk_cfg(roots: Vec<PathBuf>) -> ScanConfig {
         include: None,
         exclude: None,
         format: OutputFormat::Text,
-        paranoid: false,
         use_cache: true,
         use_format_aware: false,
         threads: 2,

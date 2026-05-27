@@ -259,10 +259,6 @@ pub struct ScanArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 
-    /// Final byte-by-byte verification before reporting.
-    #[arg(long)]
-    pub paranoid: bool,
-
     /// Disable the persistent cache for this run.
     #[arg(long)]
     pub no_cache: bool,

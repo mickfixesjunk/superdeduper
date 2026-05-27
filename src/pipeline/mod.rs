@@ -3,7 +3,10 @@
 //! See the module-level docs on each submodule for what stage it owns.
 
 pub mod audio_hash;
-pub mod confirm;
+// #131 — `pipeline::confirm` was a no-op stub claiming byte-by-byte
+// verification; deleted with the rest of the --paranoid surface.
+// If real byte-by-byte verification ships later, the right home is
+// a new module name that doesn't carry the stub's history.
 pub mod grouping;
 pub mod hash;
 pub mod image_hash;
