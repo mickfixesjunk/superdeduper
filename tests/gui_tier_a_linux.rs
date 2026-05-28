@@ -26,8 +26,9 @@ use egui_kittest::kittest::Queryable;
 use superdeduper::gui::app::SuperdeduperApp;
 
 /// Build a scannable corpus in its OWN tempdir (NOT under the isolated XDG/HOME):
-/// 3 byte-identical 1 KiB files (a dup group) + 1 distinct file (cascade-safety
-/// negative control). Returns (corpus_dir, [keeper, loser_a, loser_b, distinct]).
+/// 3 byte-identical 8 KiB files (a dup group — 8 KiB clears the 4 KiB GUI
+/// min_size floor) + 1 distinct file (cascade-safety negative control).
+/// Returns (corpus_dir, [keeper, loser_a, loser_b, distinct]).
 fn make_dup_corpus(tag: &str) -> (PathBuf, [PathBuf; 4]) {
     let mut dir = std::env::temp_dir();
     dir.push(format!(
@@ -358,5 +359,103 @@ fn tier_a_g_saferename_renames_losers_preserves_keeper() {
     assert!(keeper.exists(), "STEP=effect: keeper must be preserved (DATA-LOSS GUARD)");
     assert!(distinct.exists(), "STEP=effect: distinct non-dup file must be untouched (cascade safety)");
     std::fs::remove_dir_all(&corpus).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Post-build scan driver shared by multi-root cells: dismiss the alpha modal,
+/// click the real Start scan, advance the async preflight, wait until the bulk
+/// "Go (N files)" button appears (table populated). Panics if it never populates.
+fn drive_scan_to_table(harness: &mut egui_kittest::Harness<'static, SuperdeduperApp>) {
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(harness, "Continue");
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(harness, "Start scan");
+    let mut ok = false;
+    for _ in 0..400 {
+        harness.step();
+        click_all(harness, "scan →");
+        if harness.query_all_by_label_contains("Go (").next().is_some() {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ok, "STEP=scan: groups table did not populate");
+}
+
+/// G-REFERENCE-PROTECTION (§4 GUI ref-protection / [[adversarial-keeper...]] §7.4
+/// GUI twin) — verifies v0.2.36 relocation #2: references are guarded AT THE GUI
+/// ACTION LAYER. Mark a root as a reference, scan a dup group that spans the
+/// reference file + 2 plain copies under a scan root, run a bulk destructive
+/// action, and assert the REFERENCE-root file is PRESERVED (guard_reference
+/// refused it) while a non-reference copy IS still actioned (selective — the
+/// gate isn't fail-closed-to-uselessness, the A5 negative-control discipline).
+#[test]
+fn tier_a_g_reference_protection_preserves_reference_file() {
+    let home = isolated_env("refguard");
+
+    // Two corpora: a SCAN root (2 plain dup copies) + a REFERENCE root (same
+    // content). 8 KiB clears the GUI min_size floor.
+    let base = std::env::temp_dir().join(format!(
+        "sdd-tier-a-refguard-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let scan_dir = base.join("scan");
+    let ref_dir = base.join("reference");
+    std::fs::create_dir_all(&scan_dir).unwrap();
+    std::fs::create_dir_all(&ref_dir).unwrap();
+    let mut blob = b"tier-a-reference-guard-content-".to_vec();
+    blob.resize(8192, 0);
+    let copy_a = scan_dir.join("copy_a.bin");
+    let copy_b = scan_dir.join("copy_b.bin");
+    let ref_file = ref_dir.join("source_of_truth.bin");
+    std::fs::write(&copy_a, &blob).unwrap();
+    std::fs::write(&copy_b, &blob).unwrap();
+    std::fs::write(&ref_file, &blob).unwrap();
+    let ref_sha = {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&ref_file).unwrap();
+        let mut v = Vec::new();
+        f.read_to_end(&mut v).unwrap();
+        v
+    };
+
+    let (sc, rc) = (scan_dir.clone(), ref_dir.clone());
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1400.0_f32, 900.0])
+        .build_eframe(move |cc| {
+            let mut app = SuperdeduperApp::new(cc);
+            app.add_root(sc.clone(), false); // scan root
+            app.add_root(rc.clone(), true); // REFERENCE root (is_reference = true)
+            app
+        });
+    drive_scan_to_table(&mut harness);
+
+    // Bulk permanent-delete across the group (spans the reference + the 2 copies).
+    drive_bulk_action(&mut harness, "Nuke dupes", "DELETE");
+
+    // Let the worker run, then assert. The load-bearing claim: the file under the
+    // REFERENCE root is preserved byte-identical (guard_reference refused to touch
+    // it). Negative control: at least one non-reference copy WAS actioned (so the
+    // gate refuses the reference without refusing everything).
+    let acted = run_until(&mut harness, || !copy_a.exists() || !copy_b.exists());
+    assert!(
+        ref_file.exists() && std::fs::read(&ref_file).unwrap() == ref_sha,
+        "STEP=effect: REFERENCE file under the reference root must be PRESERVED byte-identical (guard_reference) — exists={}",
+        ref_file.exists()
+    );
+    assert!(
+        acted,
+        "STEP=effect: a non-reference copy should still be actioned (gate must not be fail-closed-to-uselessness) — copy_a={} copy_b={}",
+        copy_a.exists(),
+        copy_b.exists()
+    );
+
+    std::fs::remove_dir_all(&base).ok();
     std::fs::remove_dir_all(&home).ok();
 }
