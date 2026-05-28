@@ -129,11 +129,16 @@ cost of every NIT cycle.
 
 > The engine walks with Windows verbatim paths internally
 > (`\\?\C:\…`, the long-path form that bypasses the Win32 `MAX_PATH`
-> limit). ANY code that string-matches, prefix-compares, or displays
-> a path MUST normalize that prefix first via
-> `path_display::for_user_display`. A raw `path.to_string_lossy()` is
-> `\\?\C:\Windows\…`, which silently fails to match `c:\windows`,
-> `C:/Windows/**`, and friends.
+> limit). **ANCHORED** path matches — `starts_with`, drive-anchored
+> globs (`C:/Windows/**`), equality, or structural counts like
+> `path.matches('/').count()` (depth) — MUST normalize that prefix
+> first via `path_display::for_user_display`: a raw
+> `to_string_lossy()` is `\\?\C:\Windows\…`, which silently fails a
+> `c:\windows` prefix-match and adds bogus segments to a slash-count.
+> **Substring** `.contains()` matches are leading-prefix-IMMUNE
+> (`//?/c:/$recycle.bin/…` still contains `$recycle.bin`) — normalizing
+> is harmless but optional there. When unsure which style it is,
+> normalize.
 
 This class has bitten three times: #34 (asserter normalization), #118
 (dupes display), and — escalating to a **safety guard** — F-CLI-4,
@@ -144,10 +149,13 @@ canonical stripper (handles the `\\?\` drive form + rewrites
 `\\?\UNC\` to `\\server\share`); route every path-comparison boundary
 through it.
 
-**Audited sites (2026-05-28):** `is_system_path` (fixed, F-CLI-4),
-`exclusions::evaluate` (hardened), `payload_meta` drive-root /
-network-share (already verbatim-aware), cache keys (inode/USN-keyed,
-immune). New path-matching code: add it to this list + route through
+**Audited sites (2026-05-28):** `is_system_path` (fixed, F-CLI-4 —
+anchored prefix-match), `exclusions::evaluate` (hardened — drive-anchored
+globs), `keep.rs::score_file` (routed through `for_user_display` — its
+substring location penalties were immune, but the `/`-count depth signal
+was prefix-skewed), `payload_meta` drive-root / network-share (already
+verbatim-aware), cache keys (inode/USN-keyed, immune). New path-matching
+code: add it to this list + route ANCHORED matches through
 `for_user_display`.
 
 ## Where these came from
