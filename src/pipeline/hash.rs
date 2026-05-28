@@ -471,6 +471,7 @@ fn run_group(
             // is one inode" interpretation that's correct here.
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
+            decode_warning_paths: Vec::new(),
         };
         super::assert_unique_paths(&g);
         return Ok(vec![g]);
@@ -539,6 +540,7 @@ fn run_group(
             link_equivalent: true,
             unique_inodes: 1,
             similarity_kind: SimilarityKind::ByteIdentical,
+            decode_warning_paths: Vec::new(),
         };
         super::assert_unique_paths(&g);
         out.push(g);
@@ -622,6 +624,7 @@ fn run_group(
             link_equivalent,
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
+            decode_warning_paths: Vec::new(),
         };
         super::assert_unique_paths(&g);
         out.push(g);

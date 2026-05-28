@@ -116,6 +116,7 @@ mod assert_unique_paths_tests {
             link_equivalent: false,
             unique_inodes: 0,
             similarity_kind: SimilarityKind::ByteIdentical,
+            decode_warning_paths: Vec::new(),
         }
     }
 
@@ -201,4 +202,12 @@ pub struct DuplicateGroup {
     /// v3 (older outputs land as ByteIdentical).
     #[serde(default)]
     pub similarity_kind: SimilarityKind,
+    /// #119 — Subset of `files` that carried an audio decode warning
+    /// (partial decode / corruption detected during fingerprinting).
+    /// Exists so a destructive-action consumer can treat these files
+    /// more cautiously than clean members. Populated only by the
+    /// audio Tier-4 pass; empty for byte-identical + image groups.
+    /// `#[serde(default)]` keeps older results JSON (no field) readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_warning_paths: Vec<PathBuf>,
 }

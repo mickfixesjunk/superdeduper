@@ -48,6 +48,9 @@ pub struct Outcome {
     pub skipped_reference: u64,
     pub skipped_system: u64,
     pub skipped_invalidated: u64,
+    /// #119 — files excluded from permanent `remove` because they
+    /// carried an audio decode warning at scan time (a-hybrid guard).
+    pub skipped_decode_warning: u64,
     pub failed: u64,
     pub bytes_reclaimed: u64,
 }
@@ -261,6 +264,46 @@ fn process_group(
             }
         }
 
+        // #119 a-hybrid guard: a file flagged with an audio decode
+        // warning at scan time is corrupt-but-decodable — exactly what
+        // the user should decide on, not silently lose. Exclude it from
+        // permanent `remove`; allow reversible `recycle` (+ other
+        // non-destructive actions) but surface the warning on the
+        // receipt. Applied before the dry-run branch so a preview
+        // reflects the same policy.
+        let decode_warning: Option<String> =
+            if group.decode_warning_paths.iter().any(|p| p == path) {
+                Some(
+                    "file carried an audio decode warning at scan time \
+                     (corrupt-but-decodable)"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+        if decode_warning.is_some() && matches!(args.action, DedupeAction::Remove) {
+            outcome.skipped_decode_warning += 1;
+            tracing::warn!(
+                group = idx + 1,
+                path = %path.display(),
+                "decode_warning: excluded from permanent removal (#119 a-hybrid guard)"
+            );
+            let mut r = crate::action_receipt::ActionReceipt::new(
+                crate::action_receipt::action_label(DedupeAction::Remove),
+                &path.display().to_string(),
+                &keeper.display().to_string(),
+                group.size,
+            );
+            r.outcome = "skipped_decode_warning".to_string();
+            r.decode_warning = Some(
+                "excluded from permanent removal: file flagged with an audio \
+                 decode warning at scan time"
+                    .to_string(),
+            );
+            let _ = receipts.emit(&r);
+            continue;
+        }
+
         if args.dry_run {
             tracing::info!(
                 group = idx + 1,
@@ -271,11 +314,13 @@ fn process_group(
             );
             outcome.executed += 1;
             outcome.bytes_reclaimed += group.size;
-            let _ = receipts.emit(&crate::action_receipt::ActionReceipt::dry_run(
+            let mut dr = crate::action_receipt::ActionReceipt::dry_run(
                 &path.display().to_string(),
                 &keeper.display().to_string(),
                 group.size,
-            ));
+            );
+            dr.decode_warning = decode_warning.clone();
+            let _ = receipts.emit(&dr);
             continue;
         }
 
@@ -305,6 +350,7 @@ fn process_group(
                     pre,
                     None,
                     trash_outcome,
+                    decode_warning,
                 );
             }
             Err(e) => {
@@ -325,6 +371,7 @@ fn process_group(
                     pre,
                     Some(err_str),
                     crate::platform::TrashOutcome::default(),
+                    decode_warning,
                 );
             }
         }
@@ -347,6 +394,7 @@ fn emit_action_receipt(
     pre: Option<(String, u64)>,
     error: Option<String>,
     trash_outcome: crate::platform::TrashOutcome,
+    decode_warning: Option<String>,
 ) {
     use crate::action_receipt::{
         action_label, read_inode_and_nlink, ActionReceipt, RecycleBinEntry,
@@ -425,6 +473,8 @@ fn emit_action_receipt(
             DedupeAction::Reflink | DedupeAction::SafeRename => 0,
         };
     }
+
+    receipt.decode_warning = decode_warning;
 
     let _ = receipts.emit(&receipt);
 }
@@ -898,6 +948,7 @@ mod tests {
             link_equivalent: false,
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
+            decode_warning_paths: Vec::new(),
         }
     }
 
@@ -967,6 +1018,136 @@ mod tests {
         write_file(&f, b"bye");
         action_remove(&f).unwrap();
         assert!(!f.exists());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // #119 a-hybrid guard: a group member flagged with a decode
+    // warning is excluded from permanent `remove` but allowed for
+    // reversible `recycle`.
+    fn flagged_group(size: u64, files: Vec<PathBuf>, flagged: Vec<PathBuf>) -> DuplicateGroup {
+        let mut g = group(size, files);
+        g.decode_warning_paths = flagged;
+        g
+    }
+
+    #[test]
+    fn flagged_file_excluded_from_permanent_remove() {
+        let d = tmpdir();
+        let keeper = d.join("keeper.flac");
+        let dupe = d.join("corrupt_dupe.flac");
+        write_file(&keeper, b"same");
+        write_file(&dupe, b"same");
+        let r = results(vec![flagged_group(
+            4,
+            vec![keeper.clone(), dupe.clone()],
+            vec![dupe.clone()],
+        )]);
+        let path = write_results(&d, &r);
+        let args = make_args(path, false, DedupeAction::Remove);
+        let outcome = run(&args).unwrap();
+        assert_eq!(
+            outcome.skipped_decode_warning, 1,
+            "flagged dupe must be counted as skipped"
+        );
+        assert_eq!(outcome.executed, 0, "nothing should be removed");
+        assert!(keeper.exists(), "keeper untouched");
+        assert!(
+            dupe.exists(),
+            "flagged dupe must NOT be permanently removed"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn flagged_file_allowed_for_recycle() {
+        // The guard must NOT exclude a flagged file from `recycle`
+        // (reversible) — it should reach perform_action and carry the
+        // decode_warning onto its receipt. Whether the XDG-trash move
+        // physically succeeds in the test env is covered separately by
+        // recycle_action_uses_xdg_trash_on_linux; here we assert the
+        // guard boundary (not excluded + warning surfaced), which is
+        // environment-independent.
+        let d = tmpdir();
+        let keeper = d.join("keeper.flac");
+        let dupe = d.join("corrupt_dupe.flac");
+        write_file(&keeper, b"same");
+        write_file(&dupe, b"same");
+        let r = results(vec![flagged_group(
+            4,
+            vec![keeper.clone(), dupe.clone()],
+            vec![dupe.clone()],
+        )]);
+        let path = write_results(&d, &r);
+        let receipt_path = d.join("receipts.jsonl");
+        let args = DedupeArgs {
+            results_file: path,
+            strategy: KeepStrategy::First,
+            action: DedupeAction::Recycle,
+            mode: crate::cli::ScanMode::Exact,
+            dry_run: false,
+            allow_system_paths: false,
+            allow_destructive_on_deduped: false,
+            integration_test_mode: true,
+            receipt_file: Some(receipt_path.clone()),
+        };
+        let outcome = run(&args).unwrap();
+        assert_eq!(
+            outcome.skipped_decode_warning, 0,
+            "recycle is allowed for flagged files — must not be guard-excluded"
+        );
+        assert_eq!(
+            outcome.executed + outcome.failed,
+            1,
+            "the flagged dupe must reach the recycle action, not be skipped"
+        );
+        assert!(keeper.exists(), "keeper untouched");
+        let receipts = fs::read_to_string(&receipt_path).unwrap();
+        assert!(
+            receipts.contains("decode_warning"),
+            "recycle receipt must surface the decode_warning, got: {receipts}"
+        );
+        assert!(
+            !receipts.contains("skipped_decode_warning"),
+            "recycle must NOT be recorded as a skip, got: {receipts}"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn flagged_remove_receipt_records_skip_and_warning() {
+        let d = tmpdir();
+        let keeper = d.join("keeper.flac");
+        let dupe = d.join("corrupt_dupe.flac");
+        write_file(&keeper, b"same");
+        write_file(&dupe, b"same");
+        let r = results(vec![flagged_group(
+            4,
+            vec![keeper.clone(), dupe.clone()],
+            vec![dupe.clone()],
+        )]);
+        let path = write_results(&d, &r);
+        let receipt_path = d.join("receipts.jsonl");
+        let args = DedupeArgs {
+            results_file: path,
+            strategy: KeepStrategy::First,
+            action: DedupeAction::Remove,
+            mode: crate::cli::ScanMode::Exact,
+            dry_run: false,
+            allow_system_paths: false,
+            allow_destructive_on_deduped: false,
+            integration_test_mode: true,
+            receipt_file: Some(receipt_path.clone()),
+        };
+        run(&args).unwrap();
+        let receipts = fs::read_to_string(&receipt_path).unwrap();
+        assert!(
+            receipts.contains("skipped_decode_warning"),
+            "receipt must record the skip outcome, got: {receipts}"
+        );
+        assert!(
+            receipts.contains("decode_warning"),
+            "receipt must surface the decode_warning, got: {receipts}"
+        );
         fs::remove_dir_all(&d).ok();
     }
 
