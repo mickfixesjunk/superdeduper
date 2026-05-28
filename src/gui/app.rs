@@ -4403,3 +4403,62 @@ mod try_archive_move_tests {
         assert!(v[0].ends_with("src.bin"), "src should be the one removed");
     }
 }
+
+/// GUI keeper-safety seed cell — drives the GUI dispatch seam
+/// (`run_one_dedupe_action`, the exact fn the GUI workers call per file)
+/// to prove the GUI delete path runs the keeper-identity gate. Uses an
+/// NTFS/Unix hardlink as a portable keeper-alias (same physical file-id);
+/// sdd-testwin adds the NTFS-specific `\\?\` / 8.3 / junction alias
+/// variants on real disk. testdesign expands this into the full
+/// egui_kittest keeper-safety matrix (#153 Tier C); this seed unblocks
+/// the portable case on `cargo test --features gui`.
+#[cfg(test)]
+mod keeper_safety_gui_tests {
+    use super::run_one_dedupe_action;
+    use crate::cli::DedupeAction;
+    use std::fs;
+
+    fn tmpdir() -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "sdd-gui-keeper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn gui_dispatch_refuses_keeper_alias_on_remove() {
+        let d = tmpdir();
+        let keeper = d.join("keeper.bin");
+        let alias = d.join("alias.bin");
+        fs::write(&keeper, b"same").unwrap();
+        // Hardlink => `alias` is the SAME physical file as the keeper
+        // (shared file-id) — the keeper reached via an alias.
+        fs::hard_link(&keeper, &alias).unwrap();
+        // The exact dispatch the GUI Go button flows through.
+        let r = run_one_dedupe_action(DedupeAction::Remove, &alias, &keeper);
+        assert!(
+            r.is_err(),
+            "GUI remove of a keeper-alias must be refused by the action-layer gate"
+        );
+        assert!(
+            keeper.exists() && alias.exists(),
+            "DATA-LOSS GUARD (GUI path): neither name removed when the target is the keeper"
+        );
+        // A genuinely distinct file is NOT over-refused.
+        let other = d.join("other.bin");
+        fs::write(&other, b"same").unwrap();
+        assert!(
+            run_one_dedupe_action(DedupeAction::Remove, &other, &keeper).is_ok(),
+            "a distinct file must dedupe normally via the GUI dispatch"
+        );
+        assert!(!other.exists(), "the distinct file was removed");
+        fs::remove_dir_all(&d).ok();
+    }
+}
