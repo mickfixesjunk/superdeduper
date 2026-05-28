@@ -2576,7 +2576,7 @@ impl SuperdeduperApp {
                 let mut skipped = 0u64;
                 let mut renamed_paths: Vec<PathBuf> = Vec::new();
                 let mut processed = 0u64;
-                'outer: for (_keeper, dupes) in &groups {
+                'outer: for (keeper, dupes) in &groups {
                     for d in dupes {
                         if cancel.load(Ordering::Relaxed) {
                             action_summary.user_stopped = true;
@@ -2590,7 +2590,7 @@ impl SuperdeduperApp {
                             current: Some(d.display().to_string()),
                         });
                         let size = measure_action_size(d);
-                        match crate::dedupe::action_safe_rename(d) {
+                        match crate::dedupe::action_safe_rename(d, Some(keeper)) {
                             Ok(()) => {
                                 action_summary.ok_count += 1;
                                 action_summary.ok_bytes += size;
@@ -2794,7 +2794,7 @@ impl SuperdeduperApp {
             .map(|r| r.path.clone())
             .collect();
         let hide_unreclaimable = self.groups_state.hide_unreclaimable;
-        let groups: Vec<Vec<PathBuf>> = self
+        let groups: Vec<(PathBuf, Vec<PathBuf>)> = self
             .state
             .duplicates
             .iter()
@@ -2819,11 +2819,14 @@ impl SuperdeduperApp {
                 if dupes.is_empty() {
                     None
                 } else {
-                    Some(dupes)
+                    // Carry the keeper (files[0]) alongside its dupes so the
+                    // action-layer keeper-identity gate can refuse a dupe that
+                    // resolves (via an alias) to the keeper.
+                    Some((g.files[0].clone(), dupes))
                 }
             })
             .collect();
-        let total: u64 = groups.iter().map(|d| d.len() as u64).sum();
+        let total: u64 = groups.iter().map(|(_, dupes)| dupes.len() as u64).sum();
         let action_label = format!(
             "{label_emoji} · {total} file(s) across {} group(s)",
             groups.len()
@@ -2844,7 +2847,7 @@ impl SuperdeduperApp {
                     user_stopped: false,
                 };
                 let mut processed = 0u64;
-                'outer: for dupes in &groups {
+                'outer: for (keeper, dupes) in &groups {
                     for d in dupes {
                         if cancel.load(Ordering::Relaxed) {
                             summary.user_stopped = true;
@@ -2856,8 +2859,8 @@ impl SuperdeduperApp {
                         });
                         let size = measure_action_size(d);
                         let r = match action {
-                            DedupeAction::Recycle => crate::dedupe::action_recycle(d),
-                            DedupeAction::Remove => crate::dedupe::action_remove(d),
+                            DedupeAction::Recycle => crate::dedupe::action_recycle(d, Some(keeper)),
+                            DedupeAction::Remove => crate::dedupe::action_remove(d, Some(keeper)),
                             // Other variants aren't valid for bulk-
                             // destructive here; treat as a no-op +
                             // failure so the caller sees an
@@ -2957,13 +2960,7 @@ impl SuperdeduperApp {
                     // is one stat call per file. fs::metadata fail
                     // ⇒ size 0; logged but doesn't abort the action.
                     let size = measure_action_size(d);
-                    let r = match action {
-                        DedupeAction::Recycle => crate::dedupe::action_recycle(d),
-                        DedupeAction::Hardlink => crate::dedupe::action_hardlink(d, &keeper),
-                        DedupeAction::Remove => crate::dedupe::action_remove(d),
-                        DedupeAction::Reflink => crate::dedupe::action_reflink(d, &keeper),
-                        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(d),
-                    };
+                    let r = run_one_dedupe_action(action, d, &keeper);
                     match r {
                         Ok(()) => {
                             summary.ok_count += 1;
@@ -4106,6 +4103,28 @@ fn measure_action_size(path: &Path) -> u64 {
 /// without round-tripping through dedupe.rs internals. Kept
 /// separate to avoid pulling the dedupe::safe_rename_unguarded
 /// signature change into this PR.
+/// Single-file action dispatch used by the GUI action workers — the
+/// keeper-safety SEAM. Every GUI destructive action flows through here,
+/// mapping the action to its guarded `dedupe::action_*` with the group's
+/// keeper, so the keeper-identity gate fires with the right keeper context.
+/// Exposed so testdesign's egui_kittest keeper-safety cells can prove the
+/// click → dispatch → guard path end-to-end (a unit test on `action_*`
+/// alone wouldn't prove the GUI threads the keeper) — the GUI worker calls
+/// exactly this, so driving it exercises the real wiring.
+pub fn run_one_dedupe_action(
+    action: DedupeAction,
+    target: &Path,
+    keeper: &Path,
+) -> crate::Result<()> {
+    match action {
+        DedupeAction::Recycle => crate::dedupe::action_recycle(target, Some(keeper)),
+        DedupeAction::Remove => crate::dedupe::action_remove(target, Some(keeper)),
+        DedupeAction::Hardlink => crate::dedupe::action_hardlink(target, keeper),
+        DedupeAction::Reflink => crate::dedupe::action_reflink(target, keeper),
+        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(target, Some(keeper)),
+    }
+}
+
 fn safe_renamed_path(src: &Path) -> PathBuf {
     let name = src
         .file_name()
@@ -4382,5 +4401,64 @@ mod try_archive_move_tests {
         let v = removed_paths.take();
         assert_eq!(v.len(), 1, "remove_file should run once (on src)");
         assert!(v[0].ends_with("src.bin"), "src should be the one removed");
+    }
+}
+
+/// GUI keeper-safety seed cell — drives the GUI dispatch seam
+/// (`run_one_dedupe_action`, the exact fn the GUI workers call per file)
+/// to prove the GUI delete path runs the keeper-identity gate. Uses an
+/// NTFS/Unix hardlink as a portable keeper-alias (same physical file-id);
+/// sdd-testwin adds the NTFS-specific `\\?\` / 8.3 / junction alias
+/// variants on real disk. testdesign expands this into the full
+/// egui_kittest keeper-safety matrix (#153 Tier C); this seed unblocks
+/// the portable case on `cargo test --features gui`.
+#[cfg(test)]
+mod keeper_safety_gui_tests {
+    use super::run_one_dedupe_action;
+    use crate::cli::DedupeAction;
+    use std::fs;
+
+    fn tmpdir() -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "sdd-gui-keeper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn gui_dispatch_refuses_keeper_alias_on_remove() {
+        let d = tmpdir();
+        let keeper = d.join("keeper.bin");
+        let alias = d.join("alias.bin");
+        fs::write(&keeper, b"same").unwrap();
+        // Hardlink => `alias` is the SAME physical file as the keeper
+        // (shared file-id) — the keeper reached via an alias.
+        fs::hard_link(&keeper, &alias).unwrap();
+        // The exact dispatch the GUI Go button flows through.
+        let r = run_one_dedupe_action(DedupeAction::Remove, &alias, &keeper);
+        assert!(
+            r.is_err(),
+            "GUI remove of a keeper-alias must be refused by the action-layer gate"
+        );
+        assert!(
+            keeper.exists() && alias.exists(),
+            "DATA-LOSS GUARD (GUI path): neither name removed when the target is the keeper"
+        );
+        // A genuinely distinct file is NOT over-refused.
+        let other = d.join("other.bin");
+        fs::write(&other, b"same").unwrap();
+        assert!(
+            run_one_dedupe_action(DedupeAction::Remove, &other, &keeper).is_ok(),
+            "a distinct file must dedupe normally via the GUI dispatch"
+        );
+        assert!(!other.exists(), "the distinct file was removed");
+        fs::remove_dir_all(&d).ok();
     }
 }

@@ -1897,6 +1897,13 @@ fn run_dedupe(args: DedupeArgs) -> anyhow::Result<()> {
             outcome.skipped_placeholder,
         )?;
     }
+    if outcome.skipped_keeper_identity > 0 {
+        writeln!(
+            stderr,
+            "Refused (resolves to the keeper): {} — a member was the keeper reached via a path alias; destructive action refused to avoid deleting the keeper.",
+            outcome.skipped_keeper_identity,
+        )?;
+    }
     writeln!(
         stderr,
         "Reclaimed (planned): {}",

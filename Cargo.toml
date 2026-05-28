@@ -228,8 +228,10 @@ tempfile = "3.10"
 # Headless egui harness for widget-render tests (see docs/testing/gui.md).
 # Tracks egui 0.32; bump in lockstep with the main egui pin. The `wgpu`
 # + `snapshot` features enable PNG-rendering for the side-artifact
-# Mick + design asked for.
-egui_kittest = { version = "0.32", features = ["wgpu", "snapshot"] }
+# Mick + design asked for. `eframe` enables Harness::build_eframe(...) so
+# the #153 Tier-A GUI cells can drive the real SuperdeduperApp (eframe::App)
+# headless (click -> worker -> FS effect); dev-only, no release impact.
+egui_kittest = { version = "0.32", features = ["wgpu", "snapshot", "eframe"] }
 
 [profile.release]
 opt-level = 3
