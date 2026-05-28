@@ -330,7 +330,23 @@ fn run(
                 .sum()
         })
         .unwrap_or(0);
+    // #108-extended — Web's sanity checks require ALL run_shape
+    // totals (bytes, files, wall_clock) to be chain-cumulative
+    // together, not just bytes. Otherwise cumulative-bytes /
+    // per-spawn-wall computes as absurd throughput on resume + the
+    // backend rejects with 422. Pre-seed the file count + wall
+    // clock the same way as bytes.
+    let prior_cumulative_files_scanned: u64 = prior
+        .as_ref()
+        .map(|p| p.cumulative_files_scanned)
+        .unwrap_or(0);
+    let prior_cumulative_wall_clock_seconds: u64 = prior
+        .as_ref()
+        .map(|p| p.cumulative_wall_clock_seconds)
+        .unwrap_or(0);
     checkpoint_state.cumulative_bytes_scanned = prior_cumulative_bytes_scanned;
+    checkpoint_state.cumulative_files_scanned = prior_cumulative_files_scanned;
+    checkpoint_state.cumulative_wall_clock_seconds = prior_cumulative_wall_clock_seconds;
 
     // Inventory state carried over from a prior pause: lets us skip
     // Stage 1 entirely and jump straight to size-grouping. Empty
@@ -1217,6 +1233,14 @@ fn run(
         if cancel.load(Ordering::Relaxed) {
             if let Some(p) = &checkpoint_path {
                 checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
+                // #108-extended — preserve files + wall_clock
+                // cumulatively across resume chains too, so the
+                // backend's throughput + IOPS sanity checks
+                // (which divide by wall_clock) don't trip when
+                // bytes is cumulative but the others are per-spawn.
+                checkpoint_state.cumulative_files_scanned = total_files;
+                checkpoint_state.cumulative_wall_clock_seconds =
+                    _scan_started_at.elapsed().as_secs() + prior_cumulative_wall_clock_seconds;
                 if let Err(e) = checkpoint::save(p, &checkpoint_state) {
                     let _ = tx.send(EngineEvent::Log {
                         level: LogLevel::Warn,
@@ -1420,6 +1444,14 @@ fn run(
                 // exact bug that breaks resume after a mid-hash cancel.
                 if let Some(p) = &checkpoint_path {
                     checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
+                    // #108-extended — preserve files + wall_clock
+                    // cumulatively across resume chains too, so the
+                    // backend's throughput + IOPS sanity checks
+                    // (which divide by wall_clock) don't trip when
+                    // bytes is cumulative but the others are per-spawn.
+                    checkpoint_state.cumulative_files_scanned = total_files;
+                    checkpoint_state.cumulative_wall_clock_seconds =
+                        _scan_started_at.elapsed().as_secs() + prior_cumulative_wall_clock_seconds;
                     if let Err(e) = checkpoint::save(p, &checkpoint_state) {
                         let _ = tx.send(EngineEvent::Log {
                             level: LogLevel::Warn,
@@ -1808,7 +1840,15 @@ fn run(
         let _ = _defender_rtp_pre;
         // Wall-clock as seconds (number) per schema. Same `_`-prefix
         // reasoning as the param above.
-        let wall_clock_seconds = _scan_started_at.elapsed().as_secs_f64();
+        //
+        // #108-extended — payload's wall_clock_seconds must be
+        // chain-cumulative so the backend's throughput sanity check
+        // (bytes_scanned / wall_clock_seconds ≤ disk_class_ceiling)
+        // doesn't 422-reject the payload on resume chains. bytes is
+        // cumulative via 51e4e1c's pre-bump; wall_clock here adds
+        // the prior cumulative on top of this spawn's elapsed.
+        let wall_clock_seconds =
+            _scan_started_at.elapsed().as_secs_f64() + prior_cumulative_wall_clock_seconds as f64;
         let hash_algorithm = match settings.hash_algo {
             crate::pipeline::hash::HashAlgo::Blake3 => "blake3",
             crate::pipeline::hash::HashAlgo::River5 => "river5-aes-ni",

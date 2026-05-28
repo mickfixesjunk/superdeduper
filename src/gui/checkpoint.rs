@@ -69,6 +69,27 @@ pub struct Checkpoint {
     /// the leaderboard payload) until the user pauses again.
     #[serde(default)]
     pub cumulative_bytes_scanned: u64,
+    /// #108-extended — Files counted cumulatively across resume
+    /// sessions. Same shape + same rationale as
+    /// `cumulative_bytes_scanned`: payload's `files_scanned` must
+    /// be chain-cumulative so the backend's
+    /// `files_scanned / wall_clock_seconds ≤ disk_class_iops_ceiling`
+    /// sanity check doesn't trip when bytes is cumulative but files
+    /// is per-spawn. `#[serde(default)]` keeps old checkpoints
+    /// loadable.
+    #[serde(default)]
+    pub cumulative_files_scanned: u64,
+    /// #108-extended — Wall-clock seconds spent scanning,
+    /// cumulatively across resume sessions. Saved at every pause
+    /// point. On resume, the new spawn's `scan_started_at` is
+    /// shifted backward by this value so `Instant::now() -
+    /// shifted_start` produces the cumulative wall-clock at any
+    /// point. Backend's two throughput sanity checks
+    /// (`bytes_scanned / wall_clock`, `files_scanned / wall_clock`)
+    /// both depend on this being cumulative together with the byte
+    /// + file counters.
+    #[serde(default)]
+    pub cumulative_wall_clock_seconds: u64,
 }
 
 impl Checkpoint {
@@ -82,6 +103,8 @@ impl Checkpoint {
             previous_duplicates: Vec::new(),
             saved_inventory: None,
             cumulative_bytes_scanned: 0,
+            cumulative_files_scanned: 0,
+            cumulative_wall_clock_seconds: 0,
         }
     }
 
