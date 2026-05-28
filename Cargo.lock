@@ -4283,6 +4283,7 @@ dependencies = [
  "humansize",
  "image",
  "image_hasher",
+ "libc",
  "parking_lot",
  "proptest",
  "rayon",
