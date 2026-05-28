@@ -132,7 +132,7 @@ fn platform_detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> Option<b
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::Win32::System::Ioctl::{
         FILE_FS_PERSISTENT_VOLUME_INFORMATION, FSCTL_QUERY_PERSISTENT_VOLUME_STATE,
@@ -140,8 +140,14 @@ fn platform_detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> Option<b
     };
     use windows::Win32::System::IO::DeviceIoControl;
 
-    // `\\?\<letter>:` device path (no trailing backslash; CreateFileW + FSCTL
-    // need the volume device path, not a directory path).
+    // `\\.\<letter>:` VOLUME-DEVICE path — the device namespace, NOT the
+    // `\\?\` file/long-path namespace. The persistent-volume-state
+    // FSCTL needs a volume-device handle; a `\\?\F:` open yields a
+    // dir/file-style handle and the FSCTL fails (ERROR_INVALID_PARAMETER
+    // 87 on F:, INVALID_USER_BUFFER 1784 on C:) — which the old code
+    // swallowed to is_dev_drive=false, masking it on C: but breaking it
+    // on a real Dev Drive. Mirrors open_physical_drive_zero's
+    // \\.\PhysicalDrive0 + FILE_ATTRIBUTE_NORMAL device-open pattern.
     let device_path = root_hint
         .and_then(volume_device_path_for)
         .or_else(system_volume_device_path)?;
@@ -156,7 +162,7 @@ fn platform_detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> Option<b
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_ATTRIBUTE_NORMAL,
             None,
         )
     }
@@ -192,7 +198,7 @@ fn platform_detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> Option<b
 }
 
 /// Resolve the Windows system volume's device path —
-/// `\\?\<letter>:` form. Reads the system directory via
+/// `\\.\<letter>:` form. Reads the system directory via
 /// `GetSystemDirectoryW`, extracts the first character (drive
 /// letter), and assembles the device-path form CreateFileW + the
 /// FSCTL_QUERY_PERSISTENT_VOLUME_STATE wire expect.
@@ -218,10 +224,10 @@ fn system_volume_device_path() -> Option<String> {
     if !letter.is_ascii_alphabetic() {
         return None;
     }
-    Some(format!("\\\\?\\{}:", letter.to_ascii_uppercase()))
+    Some(format!("\\\\.\\{}:", letter.to_ascii_uppercase()))
 }
 
-/// F-CLI-5 — derive the `\\?\<letter>:` volume device path for an
+/// F-CLI-5 — derive the `\\.\<letter>:` volume device path for an
 /// arbitrary (scanned) path, so is_dev_drive probes the volume the
 /// user actually scanned rather than the boot volume. Normalizes the
 /// Windows verbatim prefix first (S15) so a `\\?\F:\…` root reads the
@@ -235,7 +241,7 @@ fn volume_device_path_for(path: &std::path::Path) -> Option<String> {
     if chars.next() != Some(':') || !letter.is_ascii_alphabetic() {
         return None;
     }
-    Some(format!("\\\\?\\{}:", letter.to_ascii_uppercase()))
+    Some(format!("\\\\.\\{}:", letter.to_ascii_uppercase()))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1217,21 +1223,21 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn volume_device_path_extracts_drive_from_scanned_root() {
         use std::path::Path;
-        // F-CLI-5: derive \\?\<letter>: from the SCANNED root so
+        // F-CLI-5: derive \\.\<letter>: from the SCANNED root so
         // is_dev_drive probes that volume, not the boot volume.
         assert_eq!(
             volume_device_path_for(Path::new(r"F:\Projects\foo")).as_deref(),
-            Some(r"\\?\F:")
+            Some(r"\\.\F:")
         );
         // Verbatim-prefixed root reads the real drive letter (S15).
         assert_eq!(
             volume_device_path_for(Path::new(r"\\?\F:\Projects")).as_deref(),
-            Some(r"\\?\F:")
+            Some(r"\\.\F:")
         );
         // Lowercase drive letter is normalised to upper.
         assert_eq!(
             volume_device_path_for(Path::new(r"d:\data")).as_deref(),
-            Some(r"\\?\D:")
+            Some(r"\\.\D:")
         );
         // UNC / non-drive roots aren't Dev Drives → None.
         assert!(volume_device_path_for(Path::new(r"\\server\share\x")).is_none());
