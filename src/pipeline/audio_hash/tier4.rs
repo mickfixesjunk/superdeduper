@@ -284,11 +284,16 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
             .first()
             .copied()
             .unwrap_or(0) as u64;
-        let mut files: Vec<_> = indices
+        // #147 — keep path + scan-time size paired through the sort so
+        // file_sizes stays index-aligned with files.
+        let mut file_pairs: Vec<(std::path::PathBuf, u64)> = indices
             .iter()
-            .map(|&i| hashed[i].file.path.clone())
+            .map(|&i| (hashed[i].file.path.clone(), hashed[i].file.size))
             .collect();
-        files.sort();
+        file_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let files: Vec<std::path::PathBuf> =
+            file_pairs.iter().map(|(p, _)| p.clone()).collect();
+        let file_sizes: Vec<u64> = file_pairs.iter().map(|(_, s)| *s).collect();
         // #119 — members of THIS group that hit a decode warning.
         let decode_warning_paths: Vec<std::path::PathBuf> = files
             .iter()
@@ -302,6 +307,7 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
             link_equivalent: false,
             unique_inodes: indices.len() as u64,
             decode_warning_paths,
+            file_sizes,
             // GH #54 — was `PerceptualImage` in the v1 placeholder
             // (so the GUI marker still surfaced "review carefully");
             // testrunner's AT6 caught the inconsistency between

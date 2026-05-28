@@ -202,11 +202,18 @@ pub fn find_similar_groups(
             .min_by_key(|&&i| hashed[i].file.path.as_os_str())
             .unwrap_or(&indices[0]);
         let canonical_fp = hashed[canonical_idx].fingerprint;
-        let mut files: Vec<_> = indices
+        // #147 — keep path + scan-time size paired through the sort so
+        // file_sizes stays index-aligned with files (perceptual members
+        // differ in size, so the changed-since-scan guard needs per-file
+        // sizes, not the group representative).
+        let mut file_pairs: Vec<(std::path::PathBuf, u64)> = indices
             .iter()
-            .map(|&i| hashed[i].file.path.clone())
+            .map(|&i| (hashed[i].file.path.clone(), hashed[i].file.size))
             .collect();
-        files.sort();
+        file_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let files: Vec<std::path::PathBuf> =
+            file_pairs.iter().map(|(p, _)| p.clone()).collect();
+        let file_sizes: Vec<u64> = file_pairs.iter().map(|(_, s)| *s).collect();
         let g = DuplicateGroup {
             size: max_size,
             content_hash: format!("perceptual-{canonical_fp:016x}"),
@@ -216,6 +223,7 @@ pub fn find_similar_groups(
             similarity_kind: SimilarityKind::PerceptualImage,
             // Image groups never carry audio decode warnings.
             decode_warning_paths: Vec::new(),
+            file_sizes,
         };
         crate::pipeline::assert_unique_paths(&g);
         groups.push(g);

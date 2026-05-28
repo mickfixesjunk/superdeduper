@@ -249,8 +249,15 @@ fn process_group(
             continue;
         }
 
-        // Re-verify the file hasn't changed since the scan.
-        match validate_file(path, group.size) {
+        // Re-verify the file hasn't changed since the scan. #147 — use
+        // THIS member's recorded scan-time size, not the group
+        // representative (`group.size` is the largest member for
+        // perceptual groups, so size-varying members would be wrongly
+        // rejected). Falls back to `group.size` when per-file sizes
+        // weren't recorded (older results JSON / byte-identical groups,
+        // where every member equals `group.size` anyway).
+        let expected_size = group.file_sizes.get(i).copied().unwrap_or(group.size);
+        match validate_file(path, expected_size) {
             Ok(()) => {}
             Err(e) => {
                 outcome.skipped_invalidated += 1;
@@ -955,6 +962,7 @@ mod tests {
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
             decode_warning_paths: Vec::new(),
+            file_sizes: Vec::new(),
         }
     }
 
@@ -1153,6 +1161,40 @@ mod tests {
         assert!(
             receipts.contains("decode_warning"),
             "receipt must surface the decode_warning, got: {receipts}"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // #147 — perceptual group members have different real sizes; the
+    // changed-since-scan guard must check each against ITS recorded
+    // size, not the group representative (the largest member). Pre-fix
+    // the smaller non-keeper was rejected as "size changed" and the
+    // whole perceptual-dedup workflow silently no-op'd.
+    #[test]
+    fn perceptual_member_validated_against_own_size_not_group_rep() {
+        let d = tmpdir();
+        let keeper = d.join("a_keeper.flac"); // 100 bytes, group representative
+        let dupe = d.join("b_dupe.flac"); // 50 bytes — differs from group.size
+        write_file(&keeper, &vec![0u8; 100]);
+        write_file(&dupe, &vec![0u8; 50]);
+        let mut g = group(100, vec![keeper.clone(), dupe.clone()]);
+        g.similarity_kind = SimilarityKind::PerceptualAudio;
+        // index-aligned with files: [keeper=100, dupe=50]
+        g.file_sizes = vec![100, 50];
+        let r = results(vec![g]);
+        let path = write_results(&d, &r);
+        // dry-run exercises validation without depending on the recycle
+        // backend; KeepStrategy::First keeps the 100-byte keeper, so the
+        // 50-byte dupe is the member that pre-fix failed against size=100.
+        let args = make_args(path, true, DedupeAction::Recycle);
+        let outcome = run(&args).unwrap();
+        assert_eq!(
+            outcome.skipped_invalidated, 0,
+            "the 50-byte perceptual member must validate against its own size, not group.size=100"
+        );
+        assert_eq!(
+            outcome.executed, 1,
+            "the non-keeper member should validate + be actioned"
         );
         fs::remove_dir_all(&d).ok();
     }
