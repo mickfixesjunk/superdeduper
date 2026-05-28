@@ -1065,9 +1065,21 @@ fn create_hard_link(new_link: &Path, existing: &Path) -> Result<()> {
     let mut ex: Vec<u16> = existing.as_os_str().encode_wide().collect();
     ex.push(0);
     // SAFETY: both buffers are null-terminated and outlive the call.
-    let _: std::result::Result<_, WinError> =
+    let r: std::result::Result<(), WinError> =
         unsafe { CreateHardLinkW(PCWSTR(nl.as_ptr()), PCWSTR(ex.as_ptr()), None) };
-    Ok(())
+    match r {
+        Ok(()) => Ok(()),
+        // CRITICAL (data-loss guard): do NOT swallow the failure. The
+        // caller (`replace_with_hardlink`) renames the original aside to
+        // `.tmp` and deletes it ONLY on Ok — so reporting a false success
+        // here makes it delete the original when no link was created.
+        // Surface the Win32 code as an io::Error (HRESULT low word) so the
+        // dedupe layer can classify ERROR_NOT_SAME_DEVICE (17) as a
+        // cross-volume refusal; the caller's Err-arm restores the original.
+        Err(e) => Err(Error::Io(std::io::Error::from_raw_os_error(
+            (e.code().0 & 0xFFFF) as i32,
+        ))),
+    }
 }
 
 #[cfg(test)]

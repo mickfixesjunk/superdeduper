@@ -1890,6 +1890,13 @@ fn run_dedupe(args: DedupeArgs) -> anyhow::Result<()> {
             outcome.skipped_decode_warning,
         )?;
     }
+    if outcome.skipped_placeholder > 0 {
+        writeln!(
+            stderr,
+            "Refused (cloud placeholder / reparse): {} — these were left untouched to avoid recalling or corrupting non-resident data.",
+            outcome.skipped_placeholder,
+        )?;
+    }
     writeln!(
         stderr,
         "Reclaimed (planned): {}",
