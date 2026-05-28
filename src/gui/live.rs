@@ -1951,7 +1951,22 @@ fn run(
                 duplicate_bytes_reclaimable: reclaimable_inode.min(total_bytes_read),
                 largest_single_group_bytes: largest_group_bytes.min(total_bytes_read),
                 actions_taken_summary: std::collections::BTreeMap::new(),
-                placeholder_skip_count: None,
+                // #142 follow-up — populate placeholder_skip_count
+                // from the running counters so the GUI submission
+                // matches the CLI's. Pre-fix the field always
+                // shipped None despite the data being available;
+                // wire parity restored. `placeholder_skip_bytes`
+                // stays None until the tier guard threads the
+                // per-placeholder byte total (separate follow-up).
+                placeholder_skip_count: {
+                    let n = placeholders_blocked_recall_total
+                        .saturating_add(placeholders_blocked_other_reparse_total);
+                    if n > 0 {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                },
                 placeholder_skip_bytes: None,
             },
         };
