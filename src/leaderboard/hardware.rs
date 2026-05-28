@@ -130,7 +130,7 @@ fn platform_detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> Option<b
     // letter; fall back to the system volume when there's no root hint
     // (e.g. a hardware-only detect with no scan in flight).
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
@@ -158,7 +158,11 @@ fn platform_detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> Option<b
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
-            0,
+            // F-CLI-5 — GENERIC_READ, not 0: the persistent-volume-state
+            // FSCTL needs read access on the volume-device handle.
+            // access=0 opens but the FSCTL then fails ERROR_INVALID_FUNCTION
+            // (1) — sdd-testwin verified DEV_VOLUME=true with GENERIC_READ.
+            GENERIC_READ.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
