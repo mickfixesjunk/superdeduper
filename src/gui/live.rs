@@ -804,40 +804,10 @@ fn run(
     // Without the `telemetry` feature this is a no-op + the
     // payload code path is also gated off, so the Vec stays as
     // a zero-cost empty slot.
+    // #149 — shared with the CLI scan path so neither can drift.
     #[cfg(feature = "telemetry")]
-    let easter_egg_hits: Vec<String> = {
-        use crate::leaderboard::install;
-        use crate::leaderboard::predicates::{evaluate_all, PredicateContext};
-        let all_paths: Vec<&std::path::Path> = files.iter().map(|e| e.path.as_path()).collect();
-        // FILETIME (100ns ticks since 1601-01-01) → Unix seconds.
-        // Inverse of inventory::walk::filetime_ticks. `mtime == 0`
-        // is the walker's "unknown" sentinel; surface as None so
-        // mtime-dependent predicates short-circuit cleanly per-file.
-        const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
-        let mtimes_unix_secs: Vec<Option<i64>> = files
-            .iter()
-            .map(|e| {
-                if e.mtime == 0 {
-                    None
-                } else {
-                    Some((e.mtime - UNIX_EPOCH_AS_FILETIME) / 10_000_000)
-                }
-            })
-            .collect();
-        // Counters: best-effort load. If install.json is missing
-        // or corrupt the counter-driven predicates (picky-eater /
-        // verify-veteran) silently return None — they just won't
-        // grant yet.
-        let install_state = install::load().ok().flatten();
-        let install_counters = install_state.as_ref().map(|s| &s.counters);
-        let pred_ctx = PredicateContext {
-            all_paths: &all_paths,
-            mtimes_unix_secs: Some(&mtimes_unix_secs),
-            install_counters,
-            perceptual_mode_active: false,
-        };
-        evaluate_all(&pred_ctx)
-    };
+    let easter_egg_hits: Vec<String> =
+        crate::leaderboard::predicates::compute_easter_egg_hits(&files);
 
     // ---------------- Stage 2: size grouping ----------------
     let _ = tx.send(EngineEvent::Status("Stage 2 — size grouping".into()));

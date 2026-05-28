@@ -1067,6 +1067,14 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     // by `pipeline::grouping::group_by_size(inventory)` further down.
     let history_total_files = inventory.len() as u64;
     let history_total_bytes_read: u64 = inventory.iter().map(|f| f.size).sum();
+    // #149 — compute client-claimed easter-egg hits HERE, while the
+    // inventory is still owned (group_by_size moves it below). The CLI
+    // payload previously hardcoded an empty vec, so no client-claimed
+    // achievement could grant via a CLI scan. Shared helper with the
+    // GUI live-scan so the two can't drift.
+    #[cfg(feature = "telemetry")]
+    let easter_egg_hits =
+        superdeduper::leaderboard::predicates::compute_easter_egg_hits(&inventory);
     // #25 T1.2 — clone the inventory ONLY in image mode so Tier-4
     // has the full file list to filter image-extensions out of.
     // Default mode (exact) skips the clone — no perf penalty for
@@ -1487,7 +1495,10 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
                     features_used_bitmap: features_bits,
                     corpus_kind,
                     cache_hit_ratio: None,
-                    easter_egg_hits: Vec::new(),
+                    // #149 — computed above before the inventory was
+                    // consumed (was hardcoded empty → CLI never granted
+                    // any client-claimed achievement).
+                    easter_egg_hits,
                     zero_byte_group_max: None,
                     max_hardlink_count_in_scan: None,
                     name_collision_count: None,
