@@ -2960,13 +2960,7 @@ impl SuperdeduperApp {
                     // is one stat call per file. fs::metadata fail
                     // ⇒ size 0; logged but doesn't abort the action.
                     let size = measure_action_size(d);
-                    let r = match action {
-                        DedupeAction::Recycle => crate::dedupe::action_recycle(d, Some(&keeper)),
-                        DedupeAction::Hardlink => crate::dedupe::action_hardlink(d, &keeper),
-                        DedupeAction::Remove => crate::dedupe::action_remove(d, Some(&keeper)),
-                        DedupeAction::Reflink => crate::dedupe::action_reflink(d, &keeper),
-                        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(d, Some(&keeper)),
-                    };
+                    let r = run_one_dedupe_action(action, d, &keeper);
                     match r {
                         Ok(()) => {
                             summary.ok_count += 1;
@@ -4109,6 +4103,28 @@ fn measure_action_size(path: &Path) -> u64 {
 /// without round-tripping through dedupe.rs internals. Kept
 /// separate to avoid pulling the dedupe::safe_rename_unguarded
 /// signature change into this PR.
+/// Single-file action dispatch used by the GUI action workers — the
+/// keeper-safety SEAM. Every GUI destructive action flows through here,
+/// mapping the action to its guarded `dedupe::action_*` with the group's
+/// keeper, so the keeper-identity gate fires with the right keeper context.
+/// Exposed so testdesign's egui_kittest keeper-safety cells can prove the
+/// click → dispatch → guard path end-to-end (a unit test on `action_*`
+/// alone wouldn't prove the GUI threads the keeper) — the GUI worker calls
+/// exactly this, so driving it exercises the real wiring.
+pub fn run_one_dedupe_action(
+    action: DedupeAction,
+    target: &Path,
+    keeper: &Path,
+) -> crate::Result<()> {
+    match action {
+        DedupeAction::Recycle => crate::dedupe::action_recycle(target, Some(keeper)),
+        DedupeAction::Remove => crate::dedupe::action_remove(target, Some(keeper)),
+        DedupeAction::Hardlink => crate::dedupe::action_hardlink(target, keeper),
+        DedupeAction::Reflink => crate::dedupe::action_reflink(target, keeper),
+        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(target, Some(keeper)),
+    }
+}
+
 fn safe_renamed_path(src: &Path) -> PathBuf {
     let name = src
         .file_name()
