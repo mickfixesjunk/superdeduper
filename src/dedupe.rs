@@ -976,10 +976,18 @@ pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 /// which `perform_action` also calls — that would override the CLI's
 /// `--allow-system-paths` flag).
 fn guard_system_path(path: &Path) -> Result<()> {
-    if is_system_path(path) {
+    // `is_system_path` is path-string-based (for_user_display + prefix-match):
+    // robust vs the `\\?\` verbatim prefix (F-CLI-4) but NOT vs junction / 8.3
+    // / symlink aliases to a system dir (e.g. C:\link -> C:\Windows, then
+    // C:\link\foo.dll wouldn't match the C:\Windows prefix). Resolve the REAL
+    // target via canonical_key and check that too — the same string-vs-identity
+    // hardening gate-2 applied to the keeper (quality forward-note on 372f42e).
+    // Keep the raw check for when canonicalize fails (target gone) but the raw
+    // path is already a system prefix.
+    if is_system_path(path) || is_system_path(&canonical_key(path)) {
         return Err(Error::other(format!(
-            "refused: {} is under a system-critical path; refusing to \
-             delete/replace a system file",
+            "refused: {} is under (or resolves to) a system-critical path; \
+             refusing to delete/replace a system file",
             path.display(),
         )));
     }
@@ -2093,6 +2101,38 @@ mod tests {
         assert!(
             guard_system_path(&normal).is_ok(),
             "a normal path must pass the action-layer system guard"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // Hardening (quality forward-note on 372f42e): an ALIAS to a system dir
+    // must also be refused. A symlink whose target is a system dir has a raw
+    // path that is NOT a system prefix, so only the canonical_key resolution
+    // catches it. Without the canonical check this passes (raw not a system
+    // prefix) -> the symlink-aliased system path would be actioned.
+    #[cfg(unix)]
+    #[test]
+    fn guard_system_path_refuses_symlink_alias_to_system_dir() {
+        let d = tmpdir();
+        // /usr/bin is under the "/usr/" system prefix and exists on any Linux
+        // box (canonicalize needs the target to exist to resolve). Symlink to
+        // it from a non-system tmpdir path: the raw string is NOT a system
+        // prefix, but the canonical resolution IS.
+        let target = std::path::Path::new("/usr/bin");
+        if !target.exists() {
+            return; // no system dir to alias here; skip
+        }
+        let link = d.join("syslink");
+        if std::os::unix::fs::symlink(target, &link).is_err() {
+            return; // environment can't symlink; skip
+        }
+        assert!(
+            !is_system_path(&link),
+            "precondition: the raw alias path is NOT a system prefix"
+        );
+        assert!(
+            guard_system_path(&link).is_err(),
+            "a symlink resolving to a system dir must be refused (canonical check)"
         );
         fs::remove_dir_all(&d).ok();
     }
