@@ -513,6 +513,22 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
         superdeduper::channel::server_url_for(superdeduper::channel::active_channel()).to_string()
     });
 
+    // #58 follow-up — `--print-captcha-url` short-circuit. Resolve
+    // the channel-aware captcha URL, print it, exit. No install
+    // mutation, no PoW, no browser, no loopback. Uses the existing
+    // install_id if one is on disk; falls back to a placeholder so
+    // testdesign's AT-captcha-* tests can pattern-match the channel
+    // routing without needing a registered install.
+    if args.print_captcha_url {
+        let frontend =
+            superdeduper::channel::frontend_url_for(superdeduper::channel::active_channel());
+        let install_id = install::load()?
+            .map(|s| s.install_id)
+            .unwrap_or_else(|| "<unregistered>".to_string());
+        println!("{frontend}/setup/{install_id}");
+        return Ok(());
+    }
+
     // --reset rotates the install_id. Refuse without explicit opt-in
     // confirmation: prints what's about to happen + requires the
     // env var (CI / scripted) or stdin "y". For simplicity now,
@@ -533,9 +549,12 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
         (None, _) => install::new_unregistered(server_url),
     };
 
+    // #58 — route the profile URL through the active channel's
+    // frontend so dev/local installs print the right host.
+    let frontend = superdeduper::channel::frontend_url_for(superdeduper::channel::active_channel());
     if state.registered {
         println!(
-            "Already registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}",
+            "Already registered. install_id = {}\nProfile: {frontend}/profile/{}",
             state.install_id, state.install_id
         );
         return Ok(());
@@ -545,7 +564,7 @@ fn run_register(args: superdeduper::cli::RegisterArgs) -> anyhow::Result<()> {
     match registration::register_cli(&mut state) {
         Ok(()) => {
             println!(
-                "Registered. install_id = {}\nProfile: https://superdeduper.io/profile/{}\nUse `superdeduper config show` to see current share preference.",
+                "Registered. install_id = {}\nProfile: {frontend}/profile/{}\nUse `superdeduper config show` to see current share preference.",
                 state.install_id, state.install_id
             );
             Ok(())

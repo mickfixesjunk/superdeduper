@@ -233,12 +233,31 @@ where
 
 /// Derive the web origin (`https://superdeduper.io`) from the api
 /// origin (`https://api.superdeduper.io`). The `/setup` page lives
-/// on the bare domain per web's deploy. Falls back to the input if
-/// no `api.` prefix is found — useful for staging / dev where the
-/// api server might be at `http://localhost:8080` and the same
-/// host serves /setup.
+/// on the bare domain per web's deploy.
+///
+/// #58 — uses the channel's frontend URL when the api_url matches
+/// a known channel's server URL, so dev's `dev-api.superdeduper.io`
+/// resolves to `dev.superdeduper.io` (not `dev-api.superdeduper.io`,
+/// which the old `api.` prefix strip produced). Falls back to the
+/// old string-rewriting heuristic for unrecognized URLs (staging
+/// instances, ad-hoc dev backends, etc.).
 fn web_origin_from_api(api_url: &str) -> String {
-    // Split into scheme://rest so we can rewrite only the host.
+    let had_trailing_slash = api_url.ends_with('/');
+    let trimmed = api_url.trim_end_matches('/');
+    for channel in crate::channel::Channel::all() {
+        if crate::channel::server_url_for(*channel).trim_end_matches('/') == trimmed {
+            let mut out = crate::channel::frontend_url_for(*channel)
+                .trim_end_matches('/')
+                .to_string();
+            if had_trailing_slash {
+                out.push('/');
+            }
+            return out;
+        }
+    }
+    // Fallback: legacy string-rewrite heuristic (strip `api.` prefix).
+    // Useful for staging / dev where the api server might be at
+    // `http://localhost:8080` and the same host serves /setup.
     if let Some((scheme, rest)) = api_url.split_once("://") {
         if let Some(stripped) = rest.strip_prefix("api.") {
             return format!("{scheme}://{stripped}");
@@ -310,8 +329,36 @@ mod tests {
         );
     }
 
+    /// #58 — dev channel's `dev-api.superdeduper.io` server URL maps
+    /// to `dev.superdeduper.io` frontend (not `dev-api.superdeduper.io`
+    /// which the old `api.` prefix-strip would have produced).
+    #[test]
+    fn web_origin_maps_dev_channel_to_dev_frontend() {
+        assert_eq!(
+            web_origin_from_api("https://dev-api.superdeduper.io"),
+            "https://dev.superdeduper.io"
+        );
+        assert_eq!(
+            web_origin_from_api("https://dev-api.superdeduper.io/"),
+            "https://dev.superdeduper.io/"
+        );
+    }
+
+    /// #58 — local channel's localhost:3000 API maps to localhost:5173
+    /// (Vite default) per `frontend_url_for(Local)`.
+    #[test]
+    fn web_origin_maps_local_channel_to_local_frontend() {
+        assert_eq!(
+            web_origin_from_api("http://localhost:3000"),
+            "http://localhost:5173"
+        );
+    }
+
     #[test]
     fn web_origin_passes_through_non_api_origins() {
+        // Unrecognized origins fall through to the prefix-strip
+        // heuristic. localhost:8080 (not a known channel server URL)
+        // has no `api.` prefix → passes through unchanged.
         assert_eq!(
             web_origin_from_api("http://localhost:8080"),
             "http://localhost:8080"

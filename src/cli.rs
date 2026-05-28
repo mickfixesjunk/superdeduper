@@ -724,6 +724,22 @@ pub struct RegisterArgs {
     /// Override the backend URL. Default `https://api.superdeduper.io`.
     #[arg(long, value_name = "URL")]
     pub server_url: Option<String>,
+
+    /// #58 follow-up — print the captcha-setup URL that registration
+    /// WOULD open in the browser, then exit 0. Doesn't bind the
+    /// loopback server, doesn't open a browser, doesn't run any PoW.
+    /// Useful for:
+    ///
+    /// * testdesign's AT-captcha-* per-channel acceptance tests
+    ///   (shell + grep stdout instead of plumbing browser-open
+    ///   interception)
+    /// * user-side debug ("why is this URL wrong for my channel?")
+    ///   without committing to the captcha flow
+    ///
+    /// Mirrors the existing `--integration-test-mode` /
+    /// `--receipt-file` "describe-what-you'd-do" pattern.
+    #[arg(long)]
+    pub print_captcha_url: bool,
 }
 
 /// G-track CLI subcommands for `superdeduper achievements`. Minimum-viable
