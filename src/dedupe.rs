@@ -886,7 +886,14 @@ fn canonical_set(paths: &[PathBuf]) -> BTreeMap<PathBuf, ()> {
 /// system-critical prefixes. Windows enumerates the well-known paths
 /// from the spec; other platforms use a sensible default for testing.
 pub fn is_system_path(path: &Path) -> bool {
-    let s = path.to_string_lossy().to_ascii_lowercase();
+    // F-CLI-4 — normalize the Windows verbatim prefix (`\\?\`) before
+    // matching. The engine walks with verbatim paths internally (Win32
+    // long-path support), so a raw `to_string_lossy()` is
+    // `\\?\C:\Windows\…`, which would NOT match the `c:\windows`
+    // prefixes below — silently bypassing the system-path guard for the
+    // exact destructive-action path users hit. `for_user_display` strips
+    // the prefix (and passes Linux/regular paths through unchanged).
+    let s = crate::path_display::for_user_display(path).to_ascii_lowercase();
     #[cfg(windows)]
     {
         for prefix in [
@@ -1303,6 +1310,28 @@ mod tests {
             is_system_path(&p),
             "/var/lib paths must be blocked from CLI dedupe by default"
         );
+    }
+
+    // F-CLI-4 regression: the engine walks with verbatim (`\\?\`) paths
+    // internally, so is_system_path must strip that prefix before
+    // matching — otherwise `\\?\C:\Windows\…` slips past the guard and
+    // a destructive action runs under a system-critical path without
+    // --allow-system-paths. Windows-only (the prefix list is cfg-gated).
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefixed_system_paths_are_blocked() {
+        for p in [
+            r"\\?\C:\Windows\System32\sdd-test.dat",
+            r"\\?\C:\Program Files\sdd-test\dup.dat",
+            r"\\?\c:\programdata\sdd-test\dup.dat",
+        ] {
+            assert!(
+                is_system_path(&PathBuf::from(p)),
+                "verbatim-prefixed system path must be blocked: {p}"
+            );
+        }
+        // Sanity: a verbatim non-system path is NOT blocked.
+        assert!(!is_system_path(&PathBuf::from(r"\\?\D:\Media\song.flac")));
     }
 
     #[test]
