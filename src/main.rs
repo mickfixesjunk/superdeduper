@@ -1675,6 +1675,13 @@ fn run_dedupe(args: DedupeArgs) -> anyhow::Result<()> {
         outcome.skipped_invalidated,
         outcome.failed,
     )?;
+    if outcome.skipped_decode_warning > 0 {
+        writeln!(
+            stderr,
+            "Excluded from permanent removal (decode warning): {} — re-run with --action recycle to remove these reversibly.",
+            outcome.skipped_decode_warning,
+        )?;
+    }
     writeln!(
         stderr,
         "Reclaimed (planned): {}",

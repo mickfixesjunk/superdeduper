@@ -349,6 +349,7 @@ mod summarize_tests {
             link_equivalent,
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
+            decode_warning_paths: Vec::new(),
         }
     }
 

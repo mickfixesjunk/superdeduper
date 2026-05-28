@@ -161,6 +161,14 @@ pub struct ActionReceipt {
     /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// #119 — present when the target file carried an audio decode
+    /// warning at scan time (corrupt-but-decodable). Orthogonal to
+    /// `outcome`: it is set both when such a file is excluded from a
+    /// destructive action and when it proceeds via a reversible one,
+    /// so the warning is always visible on the receipt regardless of
+    /// what happened. `None` for unflagged files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_warning: Option<String>,
 }
 
 impl ActionReceipt {
@@ -183,6 +191,7 @@ impl ActionReceipt {
             recycle_bin_entry: None,
             hardlink_count_delta: 0,
             error: None,
+            decode_warning: None,
         }
     }
 

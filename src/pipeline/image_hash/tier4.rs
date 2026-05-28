@@ -214,6 +214,8 @@ pub fn find_similar_groups(
             link_equivalent: false,
             unique_inodes: indices.len() as u64,
             similarity_kind: SimilarityKind::PerceptualImage,
+            // Image groups never carry audio decode warnings.
+            decode_warning_paths: Vec::new(),
         };
         crate::pipeline::assert_unique_paths(&g);
         groups.push(g);

@@ -250,6 +250,14 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
         clusters.entry(root).or_default().push(i);
     }
 
+    // #119 — owned set of paths that produced a decode warning, so
+    // each group can carry the subset of its members that are
+    // corrupt-but-fingerprintable. Owned (not borrowed from
+    // `decode_warnings`) so the move into `AudioTier4Result` below
+    // isn't blocked by an outstanding borrow.
+    let warned_paths: std::collections::HashSet<std::path::PathBuf> =
+        decode_warnings.iter().map(|w| w.path.clone()).collect();
+
     let mut groups = Vec::new();
     for (_root, indices) in clusters {
         if indices.len() < 2 {
@@ -281,12 +289,19 @@ pub fn find_similar_groups(inventory: &[FileEntry], threshold: f64) -> AudioTier
             .map(|&i| hashed[i].file.path.clone())
             .collect();
         files.sort();
+        // #119 — members of THIS group that hit a decode warning.
+        let decode_warning_paths: Vec<std::path::PathBuf> = files
+            .iter()
+            .filter(|p| warned_paths.contains(*p))
+            .cloned()
+            .collect();
         let g = DuplicateGroup {
             size: max_size,
             content_hash: format!("perceptual-audio-{canonical_fp_token:016x}"),
             files,
             link_equivalent: false,
             unique_inodes: indices.len() as u64,
+            decode_warning_paths,
             // GH #54 — was `PerceptualImage` in the v1 placeholder
             // (so the GUI marker still surfaced "review carefully");
             // testrunner's AT6 caught the inconsistency between
