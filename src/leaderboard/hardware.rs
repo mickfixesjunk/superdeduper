@@ -74,9 +74,6 @@ pub fn detect() -> HardwareFingerprint {
 /// Settings-modal previews + tests that want a hardware fingerprint
 /// without a scan-root context call [`detect`] directly; their
 /// `filesystem` field stays the platform default.
-///
-/// Future phases (separate P0 issues): disk_class proper detection
-/// via Windows WMI / Linux /sys/class/nvme; Windows Dev Drive flag.
 pub fn detect_with_root_hint(root_hint: Option<&std::path::Path>) -> HardwareFingerprint {
     let cpu_threads = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
