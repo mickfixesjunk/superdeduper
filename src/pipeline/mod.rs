@@ -117,6 +117,7 @@ mod assert_unique_paths_tests {
             unique_inodes: 0,
             similarity_kind: SimilarityKind::ByteIdentical,
             decode_warning_paths: Vec::new(),
+            file_sizes: Vec::new(),
         }
     }
 
@@ -210,4 +211,13 @@ pub struct DuplicateGroup {
     /// `#[serde(default)]` keeps older results JSON (no field) readable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decode_warning_paths: Vec<PathBuf>,
+    /// #147 — Per-member scan-time size in bytes, index-aligned with
+    /// `files`. `size` above is only the group representative (the
+    /// largest member for perceptual groups), so the changed-since-scan
+    /// guard must check each member against ITS own recorded size, not
+    /// the representative — otherwise size-varying perceptual members
+    /// are wrongly rejected as "changed." Empty when not recorded
+    /// (older JSON); consumers fall back to `size` in that case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_sizes: Vec<u64>,
 }

@@ -350,6 +350,7 @@ mod summarize_tests {
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
             decode_warning_paths: Vec::new(),
+            file_sizes: Vec::new(),
         }
     }
 

@@ -472,6 +472,10 @@ fn run_group(
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
             decode_warning_paths: Vec::new(),
+            // Byte-identical members all equal `size`; the per-file
+            // changed-since-scan guard falls back to `size` when this
+            // is empty, so no need to populate it here (#147).
+            file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
         return Ok(vec![g]);
@@ -541,6 +545,10 @@ fn run_group(
             unique_inodes: 1,
             similarity_kind: SimilarityKind::ByteIdentical,
             decode_warning_paths: Vec::new(),
+            // Byte-identical members all equal `size`; the per-file
+            // changed-since-scan guard falls back to `size` when this
+            // is empty, so no need to populate it here (#147).
+            file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
         out.push(g);
@@ -625,6 +633,10 @@ fn run_group(
             unique_inodes,
             similarity_kind: SimilarityKind::ByteIdentical,
             decode_warning_paths: Vec::new(),
+            // Byte-identical members all equal `size`; the per-file
+            // changed-since-scan guard falls back to `size` when this
+            // is empty, so no need to populate it here (#147).
+            file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
         out.push(g);
