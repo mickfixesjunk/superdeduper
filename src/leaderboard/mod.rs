@@ -30,6 +30,7 @@ pub mod hardware;
 pub mod hmac_signer;
 pub mod install;
 pub mod oauth;
+pub mod payload_meta;
 pub mod predicates;
 pub mod ranks_poll;
 pub mod registration;

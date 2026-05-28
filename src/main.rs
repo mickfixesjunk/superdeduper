@@ -1352,11 +1352,16 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
     output::write(writer.as_mut(), cfg.format, &duplicates, &skipped)?;
     writer.flush()?;
 
-    // #38 v1 — persist a scan_history record so CLI scans show up
-    // in the same History tab the GUI populates. Best-effort: a
-    // failure to write the JSON file doesn't fail the scan (the
-    // user already got the results above). Same shape as the
-    // gui::live::run() hook so both paths emit identical records.
+    // #38 v1 + #142 — persist a scan_history record so CLI scans
+    // show up in the same History tab the GUI populates AND so
+    // `submit-pending` can flush them to the leaderboard. Pre-#142
+    // the CLI write skipped the submission_payload (only GUI built
+    // one), which made every CLI-scanned row invisible to
+    // submit-pending. Best-effort throughout: a failure to write
+    // the JSON file doesn't fail the scan; a failure to build the
+    // payload (telemetry off, no install state) leaves the row
+    // without a payload but the row still writes so the History
+    // tab surfaces the scan.
     {
         let total_dups = duplicates.len() as u64;
         let reclaimable_bytes: u64 = duplicates
@@ -1365,24 +1370,135 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
             .map(|g| g.unique_inodes.saturating_sub(1) * g.size)
             .sum();
         let channel_slug = superdeduper::channel::active_channel().as_slug();
-        let roots: Vec<String> = cfg
+        let roots_strings: Vec<String> = cfg
             .roots
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let groups_by_similarity_kind =
             superdeduper::scan_history::similarity_kind_breakdown(&duplicates);
-        let record = superdeduper::scan_history::ScanRecord::new_finished(
-            superdeduper::scan_history::new_scan_id(),
+        let scan_id = superdeduper::scan_history::new_scan_id();
+        #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))]
+        let mut record = superdeduper::scan_history::ScanRecord::new_finished(
+            scan_id.clone(),
             started_at_unix,
             channel_slug,
-            roots,
+            roots_strings,
             history_total_files,
             history_total_bytes_read,
             total_dups,
             reclaimable_bytes,
             groups_by_similarity_kind,
         );
+
+        // #142 — build the submission payload + attach to the
+        // scan_history row so submit-pending picks it up. Mirrors
+        // gui::live::run()'s pattern; the CLI's pipeline doesn't
+        // instrument as many esoteric metrics as the GUI's worker
+        // (cache_hit_ratio, hardlink counts, easter-egg hits) so
+        // the optional run_shape fields stay None. The locked
+        // fields (wall_clock, bytes, files, hash_algorithm, scope,
+        // features bitmap, corpus_kind) + result_summary land
+        // correctly; web rank + lifetime + pathfinder grants fire
+        // from CLI submissions just like GUI submissions.
+        #[cfg(feature = "telemetry")]
+        if let Ok(Some(install_state)) = superdeduper::leaderboard::install::load() {
+            use superdeduper::leaderboard::hardware;
+            use superdeduper::leaderboard::payload_meta;
+            use superdeduper::leaderboard::submission::{
+                self, ResultSummary, RunShape, SubmissionInputs, FEATURE_BIT_ALLOW_RECALL_ON_READ,
+                FEATURE_BIT_ALLOW_SYSTEM_PATHS, FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB,
+                FEATURE_BIT_FOLLOW_LINKS, FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB,
+                FEATURE_BIT_REFERENCE_ROOTS,
+            };
+            let wall_clock_seconds = scan_started.elapsed().as_secs_f64();
+            let hash_algorithm = match cfg.hash_algo {
+                superdeduper::pipeline::hash::HashAlgo::Blake3 => "blake3",
+                superdeduper::pipeline::hash::HashAlgo::River5 => "river5-aes-ni",
+            }
+            .to_string();
+            let scope = payload_meta::classify_scope(&cfg.roots);
+            let corpus_kind = payload_meta::classify_corpus_kind(&cfg.roots);
+            let mut features_bits: u64 = 0;
+            if cfg.use_cache {
+                features_bits |= FEATURE_BIT_CACHE;
+            }
+            if cfg.use_format_aware {
+                features_bits |= FEATURE_BIT_FORMAT_AWARE;
+            }
+            if cfg.follow_links {
+                features_bits |= FEATURE_BIT_FOLLOW_LINKS;
+            }
+            if cfg.allow_system_paths {
+                features_bits |= FEATURE_BIT_ALLOW_SYSTEM_PATHS;
+            }
+            if cfg.allow_recall_on_read {
+                features_bits |= FEATURE_BIT_ALLOW_RECALL_ON_READ;
+            }
+            if !cfg.reference_roots.is_empty() {
+                features_bits |= FEATURE_BIT_REFERENCE_ROOTS;
+            }
+            if cfg.include.is_some() {
+                features_bits |= FEATURE_BIT_INCLUDE_GLOB;
+            }
+            if cfg.exclude.is_some() {
+                features_bits |= FEATURE_BIT_EXCLUDE_GLOB;
+            }
+            let share_count = payload_meta::count_distinct_share_roots(&cfg.roots);
+            let largest_group_bytes: u64 = duplicates
+                .iter()
+                .filter(|g| !g.link_equivalent)
+                .map(|g| g.size.saturating_mul(g.unique_inodes.saturating_sub(1)))
+                .max()
+                .unwrap_or(0);
+            let inputs = SubmissionInputs {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                run_uuid: uuid::Uuid::new_v4().to_string(),
+                scan_id: Some(scan_id.clone()),
+                hardware: hardware::detect_with_root_hint(
+                    cfg.roots.first().map(|p| p.as_path()),
+                ),
+                run_shape: RunShape {
+                    wall_clock_seconds,
+                    bytes_scanned: history_total_bytes_read,
+                    files_scanned: history_total_files,
+                    hash_algorithm,
+                    walker_variant: "hybrid".to_string(),
+                    scope,
+                    features_used_bitmap: features_bits,
+                    corpus_kind,
+                    cache_hit_ratio: None,
+                    easter_egg_hits: Vec::new(),
+                    zero_byte_group_max: None,
+                    max_hardlink_count_in_scan: None,
+                    name_collision_count: None,
+                    share_count_in_scope: if share_count > 0 {
+                        Some(share_count)
+                    } else {
+                        None
+                    },
+                    dry_run: None,
+                    groups_reviewed_count: None,
+                },
+                result_summary: ResultSummary {
+                    duplicate_groups: total_dups,
+                    duplicate_bytes_reclaimable: reclaimable_bytes
+                        .min(history_total_bytes_read),
+                    largest_single_group_bytes: largest_group_bytes
+                        .min(history_total_bytes_read),
+                    actions_taken_summary: std::collections::BTreeMap::new(),
+                    placeholder_skip_count: if skipped.is_empty() {
+                        None
+                    } else {
+                        Some(skipped.len() as u64)
+                    },
+                    placeholder_skip_bytes: None,
+                },
+            };
+            let payload = submission::build_payload(&inputs, &install_state.install_id);
+            record = record.with_submission_payload(payload, install_state.install_id);
+        }
+
         if let Err(e) = superdeduper::scan_history::record_completed(&record) {
             tracing::warn!(error = %e, "scan_history: record_completed failed (non-fatal)");
         }

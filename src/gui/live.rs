@@ -1814,12 +1814,15 @@ fn run(
             crate::pipeline::hash::HashAlgo::River5 => "river5-aes-ni",
         }
         .to_string();
-        // Scope heuristic from the root paths.
-        let scope = classify_scope(&roots);
-        // Corpus kind heuristic: "system" if any root looks like an
-        // OS-system tree (C:\Windows, /System, /usr, etc.), else
-        // "user-data".
-        let corpus_kind = classify_corpus_kind(&roots);
+        // Scope + corpus kind heuristics via the shared
+        // `payload_meta` module (#142 — moved out of gui::live so
+        // CLI's run_scan can compute identical values for its
+        // submission payload build).
+        let root_paths_only: Vec<std::path::PathBuf> =
+            roots.iter().map(|r| r.path.clone()).collect();
+        let scope = crate::leaderboard::payload_meta::classify_scope(&root_paths_only);
+        let corpus_kind =
+            crate::leaderboard::payload_meta::classify_corpus_kind(&root_paths_only);
         // Features bitmap built from the resolved settings.
         let mut features_bits: u64 = 0;
         if settings.use_cache {
@@ -1908,7 +1911,9 @@ fn run(
                 // actually read. Backend uses this for the latent
                 // `multi-share-maestro` grant.
                 share_count_in_scope: {
-                    let n = count_distinct_share_roots(&root_paths);
+                    let n = crate::leaderboard::payload_meta::count_distinct_share_roots(
+                        &root_paths,
+                    );
                     if n > 0 {
                         Some(n)
                     } else {
@@ -2449,108 +2454,6 @@ fn display_path(p: &std::path::Path) -> String {
     crate::path_display::for_user_display(p)
 }
 
-/// Map roots → `run_shape.scope` enum:
-/// * single drive-root (e.g. `C:\`) → `whole-volume`
-/// * single non-root path → `subdirectory`
-/// * multiple paths → `selection`
-#[cfg(feature = "telemetry")]
-fn classify_scope(roots: &[RootEntry]) -> String {
-    if roots.len() > 1 {
-        return "selection".to_string();
-    }
-    match roots.first() {
-        Some(r) if is_drive_root(&r.path) => "whole-volume".to_string(),
-        Some(_) => "subdirectory".to_string(),
-        None => "subdirectory".to_string(),
-    }
-}
-
-/// "system" if any root path looks like an OS-system tree;
-/// otherwise "user-data". Conservative heuristic — the backend just
-/// uses this for category bucketing.
-#[cfg(feature = "telemetry")]
-fn classify_corpus_kind(roots: &[RootEntry]) -> String {
-    for r in roots {
-        let s = r.path.to_string_lossy().to_ascii_lowercase();
-        if s.contains("\\windows\\")
-            || s.ends_with("\\windows")
-            || s.contains("/system/")
-            || s.starts_with("/system")
-            || s.contains("\\program files")
-            || s.starts_with("/usr/")
-            || s.starts_with("/bin/")
-            || s.starts_with("/sbin/")
-        {
-            return "system".to_string();
-        }
-    }
-    "user-data".to_string()
-}
-
-#[cfg(feature = "telemetry")]
-fn is_drive_root(p: &std::path::Path) -> bool {
-    let s = p.to_string_lossy();
-    // Windows: "C:\", "D:\", "\\?\C:\". Unix: "/".
-    s == "/"
-        || (s.len() == 3 && s.chars().nth(1) == Some(':') && s.ends_with('\\'))
-        || (s.len() == 7 && s.starts_with("\\\\?\\") && s.ends_with('\\'))
-}
-
-#[cfg(feature = "telemetry")]
-fn is_network_share_path(p: &std::path::Path) -> bool {
-    let s = p.to_string_lossy();
-    // Windows UNC `\\server\share\...` — leading `\\` but not the
-    // verbatim-device form `\\?\` or `\\.\`. Also catches the
-    // verbatim-UNC variant `\\?\UNC\server\share\...`.
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
-        let prefix3 = bytes.get(2).copied();
-        if prefix3 != Some(b'?') && prefix3 != Some(b'.') {
-            return true;
-        }
-        if s.starts_with("\\\\?\\UNC\\") {
-            return true;
-        }
-    }
-    // Cross-platform URL forms surfaced by user-typed paths.
-    s.starts_with("smb://") || s.starts_with("nfs://") || s.starts_with("cifs://")
-}
-
-#[cfg(feature = "telemetry")]
-fn count_distinct_share_roots(paths: &[std::path::PathBuf]) -> u64 {
-    use std::collections::HashSet;
-    let mut shares: HashSet<String> = HashSet::new();
-    for p in paths {
-        if !is_network_share_path(p) {
-            continue;
-        }
-        let s = p.to_string_lossy();
-        // For `\\server\share\rest` (or verbatim-UNC equivalent),
-        // group by `\\server\share` so multiple roots into the same
-        // share count once. For URL forms, group by scheme+authority.
-        let key = if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
-            // `server\share\rest` → `server\share`
-            let two: Vec<&str> = rest.splitn(3, '\\').take(2).collect();
-            format!("unc:{}", two.join("\\"))
-        } else if let Some(rest) = s.strip_prefix("\\\\") {
-            let two: Vec<&str> = rest.splitn(3, '\\').take(2).collect();
-            format!("unc:{}", two.join("\\"))
-        } else if let Some(rest) = s.strip_prefix("smb://") {
-            let auth = rest.split('/').next().unwrap_or("");
-            format!("smb:{auth}")
-        } else if let Some(rest) = s.strip_prefix("nfs://") {
-            let auth = rest.split('/').next().unwrap_or("");
-            format!("nfs:{auth}")
-        } else if let Some(rest) = s.strip_prefix("cifs://") {
-            let auth = rest.split('/').next().unwrap_or("");
-            format!("cifs:{auth}")
-        } else {
-            s.to_string()
-        };
-        shares.insert(key);
-    }
-    shares.len() as u64
-}
 
 fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<ScanConfig> {
     let include = if settings.include_glob.is_empty() {
@@ -2708,127 +2611,4 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // classify_scope / classify_corpus_kind / is_drive_root —
-    // the heuristics that produce run_shape.scope + corpus_kind on
-    // the leaderboard payload. Wrong outputs land in the backend
-    // and bucket users incorrectly; pin the obvious cases.
-    // ============================================================
-
-    #[cfg(feature = "telemetry")]
-    fn root(path: &str) -> RootEntry {
-        RootEntry {
-            path: std::path::PathBuf::from(path),
-            is_reference: false,
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn classify_scope_whole_volume_for_single_drive_root() {
-        assert_eq!(classify_scope(&[root(r"C:\")]), "whole-volume");
-        assert_eq!(classify_scope(&[root("/")]), "whole-volume");
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn classify_scope_subdirectory_for_single_non_root() {
-        assert_eq!(classify_scope(&[root(r"C:\Users\Mick")]), "subdirectory");
-        assert_eq!(
-            classify_scope(&[root("/home/neomatrix/Documents")]),
-            "subdirectory"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn classify_scope_selection_for_multiple_roots() {
-        assert_eq!(
-            classify_scope(&[root(r"C:\Users\A"), root(r"D:\Backup")]),
-            "selection"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn classify_corpus_kind_system_on_windows_system_paths() {
-        assert_eq!(
-            classify_corpus_kind(&[root(r"C:\Windows\System32")]),
-            "system"
-        );
-        assert_eq!(
-            classify_corpus_kind(&[root(r"C:\Program Files\Foo")]),
-            "system"
-        );
-        assert_eq!(classify_corpus_kind(&[root("/usr/local/bin")]), "system");
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn classify_corpus_kind_user_data_on_user_paths() {
-        assert_eq!(classify_corpus_kind(&[root(r"C:\Users\Mick")]), "user-data");
-        assert_eq!(
-            classify_corpus_kind(&[root("/home/neomatrix/Photos")]),
-            "user-data"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn is_drive_root_recognises_windows_and_unix_roots() {
-        assert!(is_drive_root(Path::new(r"C:\")));
-        assert!(is_drive_root(Path::new(r"D:\")));
-        assert!(is_drive_root(Path::new("/")));
-        assert!(!is_drive_root(Path::new(r"C:\Users")));
-        assert!(!is_drive_root(Path::new("/home")));
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn is_network_share_path_detects_unc_and_url_forms() {
-        // UNC.
-        assert!(is_network_share_path(Path::new(r"\\fileserver\public")));
-        assert!(is_network_share_path(Path::new(r"\\fileserver\public\sub")));
-        assert!(is_network_share_path(Path::new(
-            r"\\?\UNC\fileserver\public\sub"
-        )));
-        // URL forms.
-        assert!(is_network_share_path(Path::new("smb://nas.local/photos")));
-        assert!(is_network_share_path(Path::new("nfs://10.0.0.5/export")));
-        assert!(is_network_share_path(Path::new("cifs://host/share")));
-        // Verbatim-device forms must NOT count as shares.
-        assert!(!is_network_share_path(Path::new(r"\\?\C:\Users")));
-        assert!(!is_network_share_path(Path::new(r"\\.\PhysicalDrive0")));
-        // Plain local paths.
-        assert!(!is_network_share_path(Path::new(r"C:\Users\Mick")));
-        assert!(!is_network_share_path(Path::new("/home/mick")));
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn count_distinct_share_roots_dedups_by_share() {
-        let paths = vec![
-            std::path::PathBuf::from(r"\\fileserver\public\a"),
-            std::path::PathBuf::from(r"\\fileserver\public\b"),
-            std::path::PathBuf::from(r"\\fileserver\private"),
-            std::path::PathBuf::from(r"\\?\UNC\fileserver\private\sub"),
-            std::path::PathBuf::from("smb://nas.local/photos"),
-            std::path::PathBuf::from("smb://nas.local/videos"),
-            std::path::PathBuf::from(r"C:\Users\Mick"),
-        ];
-        // Distinct shares: \\fileserver\public, \\fileserver\private
-        // (UNC + verbatim-UNC collapse), smb://nas.local (one
-        // authority, two paths). Local C:\ doesn't count.
-        assert_eq!(count_distinct_share_roots(&paths), 3);
-    }
-
-    #[test]
-    #[cfg(feature = "telemetry")]
-    fn count_distinct_share_roots_zero_when_no_shares() {
-        let paths = vec![
-            std::path::PathBuf::from(r"C:\Users\Mick"),
-            std::path::PathBuf::from("/home/mick"),
-        ];
-        assert_eq!(count_distinct_share_roots(&paths), 0);
-    }
 }
