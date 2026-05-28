@@ -24,13 +24,16 @@
 # gh is unavailable).
 #
 # Usage: scripts/release-integrity-check.sh [release-ref]
-#   release-ref defaults to origin/release/v0.2.16
+#   release-ref defaults to HEAD — the local, about-to-be-tagged state.
+#   This is deliberate: a pre-cut gate must judge what you're ABOUT to
+#   tag (including local merges not yet pushed), not the stale remote.
+#   Pass origin/release/v0.2.16 explicitly to audit the pushed remote.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-RELEASE_REF="${1:-origin/release/v0.2.16}"
+RELEASE_REF="${1:-HEAD}"
 
 git fetch origin --quiet 2>/dev/null || true
 
