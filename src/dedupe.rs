@@ -309,7 +309,15 @@ fn process_group(
         }
         outcome.planned += 1;
 
-        if references.contains_key(path) {
+        // F-SAFE-2 (data-loss) — the "never modify a reference" guard must
+        // canonicalize the member, same as the two sibling reference checks
+        // (in-reference skip + pick_keeper). `references` is canonical-keyed,
+        // so a RAW contains_key here MISSED any reference member whose path
+        // representation differs from its canonical form (\\?\ verbatim,
+        // symlink root, 8.3, case-fold) — that reference copy would then fall
+        // through to validate_file + perform_action and be DELETED. Same
+        // canonical_key asymmetry class as the P0 and F-CLI-7.
+        if references.contains_key(&canonical_key(path)) {
             outcome.skipped_reference += 1;
             tracing::info!(
                 group = idx + 1,
@@ -1696,6 +1704,84 @@ mod tests {
         }
         let _ = inode_a;
         let _ = inode_b;
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // P0 (data-loss) regression — quality NIT: the replace_with_hardlink
+    // restore arm had ZERO automated coverage, so a future "simplify the
+    // Err arm" refactor could silently reintroduce the delete-on-failed-
+    // link data loss. This pins the property on Linux (platform-available,
+    // no cross-volume needed): a hardlink that FAILS must leave the
+    // original target intact. We force the failure by pointing at a keeper
+    // that doesn't exist (fs::hard_link -> ENOENT), exercising exactly the
+    // rename-aside -> link-fails -> restore path.
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_hardlink_restores_the_original() {
+        let d = tmpdir();
+        let target = d.join("victim.bin");
+        let missing_keeper = d.join("does-not-exist.bin");
+        write_file(&target, b"precious");
+        let res = replace_with_hardlink(&target, &missing_keeper);
+        assert!(res.is_err(), "linking to a missing keeper must fail");
+        assert!(
+            target.exists(),
+            "DATA-LOSS GUARD: a failed hardlink must restore the original target"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"precious",
+            "restored target must have its original content"
+        );
+        // The move-aside tmp must not be left behind on the restore path.
+        assert!(
+            !target.with_extension("superdeduper.tmp").exists(),
+            "restore must not leave the .tmp aside-copy"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // F-SAFE-2 (data-loss) regression — a reference member reached via a
+    // path that differs from its canonical form (here: a symlinked parent
+    // dir) must STILL be protected by the never-modify-reference guard.
+    // Pre-fix the guard used a RAW contains_key against the canonical-keyed
+    // reference set, so the alias missed the guard and the reference copy
+    // was deleted. Linux symlink makes raw != canonical without needing
+    // Windows verbatim/8.3.
+    #[cfg(unix)]
+    #[test]
+    fn reference_member_via_symlinked_path_is_not_deleted() {
+        let d = tmpdir();
+        let real = d.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let reference = real.join("master.bin");
+        let dupe = real.join("copy.bin");
+        write_file(&reference, b"same");
+        write_file(&dupe, b"same");
+        // Alias the reference through a symlinked dir so its path repr
+        // differs from canonical (canonicalize resolves the symlink).
+        let link = d.join("via_link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let reference_alias = link.join("master.bin");
+
+        // Group carries the ALIASED reference path; reference_paths marks
+        // it as a reference. Both members are references here (the dupe is
+        // also under the reference root), but the keeper-pick lands on one
+        // and the OTHER reference must not be deleted via the loop guard.
+        let mut r = results(vec![group(
+            4,
+            vec![reference_alias.clone(), dupe.clone()],
+        )]);
+        r.reference_paths = vec![reference_alias.clone(), dupe.clone()];
+        let path = write_results(&d, &r);
+        let args = make_args(path, false, DedupeAction::Remove);
+        let outcome = run(&args).unwrap();
+        assert!(
+            reference.exists() && dupe.exists(),
+            "DATA-LOSS GUARD: a reference member reached via a symlinked path \
+             must not be deleted (canonical-keyed guard must catch the alias)"
+        );
+        assert_eq!(outcome.executed, 0, "no reference copy should be removed");
         fs::remove_dir_all(&d).ok();
     }
 
