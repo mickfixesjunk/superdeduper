@@ -257,12 +257,15 @@ impl ExclusionPolicy {
         let path_str_buf;
         let match_target: &Path =
             if cfg!(windows) || path.to_str().map(|s| s.contains('\\')).unwrap_or(false) {
-                // Normalise backslashes once; reuse the buffer for
-                // both the path-match and the extension lookup.
-                let normalised = path
-                    .to_str()
-                    .map(|s| s.replace('\\', "/"))
-                    .unwrap_or_default();
+                // Strip the Windows verbatim prefix (`\\?\`) FIRST via the
+                // canonical helper, THEN normalise backslashes to forward
+                // slashes. The engine walks with verbatim paths internally,
+                // so a raw `\\?\C:\…` would normalise to `//?/C:/…` —
+                // drive-anchored exclusion globs (e.g. `C:/Windows/**`)
+                // wouldn't match it. for_user_display drops the prefix
+                // (and rewrites `\\?\UNC\` to the `\\server\share` form);
+                // see CONTRIBUTING S15.
+                let normalised = crate::path_display::for_user_display(path).replace('\\', "/");
                 path_str_buf = std::path::PathBuf::from(normalised);
                 &path_str_buf
             } else {
@@ -449,6 +452,28 @@ mod tests {
         assert_eq!(
             policy.evaluate(Path::new("system32/kernel32.dll")),
             Decision::Excluded(ExclusionReason::CustomExtension)
+        );
+    }
+
+    #[test]
+    fn verbatim_prefixed_path_matches_drive_anchored_pattern() {
+        // S15 / verbatim-prefix harden: the engine walks with `\\?\`
+        // paths internally. A drive-anchored exclusion glob must still
+        // match a verbatim-prefixed path — pre-harden it normalised to
+        // `//?/C:/Windows/...` and slipped past `C:/Windows/**`.
+        let config = ExclusionConfig {
+            enabled: true,
+            active_packs: vec![],
+            custom_extensions: vec![],
+            custom_patterns: vec!["C:/Windows/**".into()],
+        };
+        let policy = ExclusionPolicy::compile(&config, &empty_presets()).unwrap();
+        assert!(
+            matches!(
+                policy.evaluate(Path::new(r"\\?\C:\Windows\System32\kernel32.dll")),
+                Decision::Excluded(ExclusionReason::CustomPattern)
+            ),
+            "verbatim-prefixed path must match the drive-anchored exclusion glob"
         );
     }
 
