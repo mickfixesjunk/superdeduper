@@ -166,7 +166,28 @@ fi
 
 case "$GATE_RC" in
   0) echo "==> fast-gate GREEN — promoting to latest" ;;
-  2) echo "==> fast-gate could-not-run (exit 2) — harness/binary not available; promoting with WARNING" >&2 ;;
+  3)
+    # ABSENT: the test harness simply isn't staged on this box. Don't
+    # block shipping on missing test infra — promote, but say so loudly
+    # so a drop that went out ungated is visible in the log.
+    echo "==> fast-gate ABSENT (exit 3) — harness not staged here; promoting UNGATED (with warning)" >&2
+    ;;
+  2)
+    # BROKEN: the gate is present but could not run (SD_BIN misconfig or
+    # the wrapper reported can't-run). Distinct from absent — a broken
+    # gate must NOT silently ship ungated (quality NIT).
+    cat >&2 <<EOF
+==================================================================
+fast-gate BROKE (exit 2) — present but could not run.
+A misconfigured/broken gate must NOT ship ungated. The archive at
+${ARCHIVE_DIR} is kept; this drop is NOT promoted to ${LATEST_DIR}.
+Fix the harness wiring (SD_HARNESS_DIR / SD_BIN / the wrapper), or
+re-run with SD_SKIP_FAST_GATE=1 if you consciously accept shipping
+ungated.
+==================================================================
+EOF
+    exit "$GATE_RC"
+    ;;
   *)
     cat >&2 <<EOF
 ==================================================================
