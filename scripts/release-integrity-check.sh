@@ -10,15 +10,24 @@
 # silently skipped").
 #
 # Run this BEFORE cutting a release tag. Exit code:
-#   0 — no closed-issue branches have unmerged commits (clear to cut)
-#   1 — candidate stranded branches found (eyeball each before cutting)
+#   0 — every closed-issue branch's work is present in the release (no strands)
+#   1 — TRUE strands and/or auto-classify-inconclusive branches found (resolve)
+#   2 — bad release ref
 #
 # Why git cherry (not merge-base --is-ancestor): cherry compares by
 # patch-id, so squash/cherry-pick/re-implemented merges correctly count
 # as "present." is-ancestor over-reports every non-fast-forward merge.
-# Even so, cherry can't tell a re-implementation from a true strand, so
-# this is a HUMAN gate: it narrows ~60 branches to the handful worth a
-# 30-second artifact check, it does not auto-decide.
+#
+# Patch-id alone can't tell a re-implementation from a true strand, so this
+# gate ALSO runs dev-health's distinctive-identifier method (the one that
+# caught the #56/#126 + #134/#137 clusters loose-grep / patch-id missed): for
+# each closed-issue branch with unmerged commits, extract its added
+# definitions (fn/struct/enum/const) and `git grep` them in the release tree.
+# All present -> CLEARED (re-implementation); all absent -> STRANDED (block);
+# partial / no-marker -> needs-human-verify (block, conservatively). This
+# auto-clears the recurring false-positives and AUTO-BLOCKS a cut that's
+# missing closed-and-verified work, instead of relying on a human to eyeball
+# each candidate.
 #
 # Requires: git, gh (for issue-state lookup; degrades to "unknown" if
 # gh is unavailable).
@@ -65,11 +74,59 @@ issue_state() {
   echo "$state"
 }
 
-stranded=0
-reviewed=0
+# dev-health distinctive-identifier classifier. Given a closed-issue branch
+# with unmerged commits, decide whether its work is GENUINELY absent from the
+# release ref (true strand -> BLOCK) or present via a re-implementation that
+# git-cherry's patch-id couldn't match (safe -> CLEAR). This automates the
+# manual `git grep <artifact>` check that caught the #56/#126 + #134/#137
+# clusters loose-grep / patch-id alone missed.
+#
+# Method: extract DISTINCTIVE added markers (fn/struct/enum/const/static
+# DEFINITIONS) from the branch's unmerged commits, then `git grep` each in the
+# release ref's tree. Conservative: auto-CLEAR only when EVERY marker is
+# present (confident re-impl); STRANDED when none are present (confident
+# strand); AMBIGUOUS (partial, or no extractable markers e.g. comment-only)
+# stays a human-gate flag. Echoes: CLEARED | STRANDED | AMBIGUOUS, then a
+# detail line on stderr.
+classify_stranding() {
+  local branch="$1" ref="$2"
+  local commits markers total=0 absent=0 absent_list=""
+  commits="$(git cherry "$ref" "$branch" 2>/dev/null | awk '/^\+/{print $2}')"
+  [[ -z "$commits" ]] && { echo "AMBIGUOUS"; return; }
+  # Added definition identifiers across the unmerged commits' diffs.
+  markers="$(
+    for c in $commits; do git show --no-color "$c" 2>/dev/null; done \
+      | grep -E '^\+' \
+      | grep -oE '(fn|struct|enum|trait) [A-Za-z_][A-Za-z0-9_]+|(const|static) [A-Z_][A-Z0-9_]+' \
+      | awk '{print $2}' | sort -u
+  )"
+  [[ -z "$markers" ]] && { echo "AMBIGUOUS"; return; }
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    total=$((total + 1))
+    if ! git grep -qwI "$m" "$ref" -- '*.rs' 2>/dev/null; then
+      absent=$((absent + 1))
+      absent_list="${absent_list} $m"
+    fi
+  done <<< "$markers"
+  if [[ "$absent" -eq 0 ]]; then
+    echo "CLEARED"
+  elif [[ "$absent" -eq "$total" ]]; then
+    echo "STRANDED"
+  else
+    echo "AMBIGUOUS"
+    echo "    partial: ${absent}/${total} markers absent in ${ref}:${absent_list}" >&2
+  fi
+}
+
+stranded=0      # confident true-strands (definitions absent) -> BLOCK
+ambiguous=0     # partial / no-marker -> human gate -> BLOCK (conservative)
+cleared=0       # confident re-implementations -> safe
+reviewed=0      # non-closed-issue branches -> low signal
 
 echo "==> Release-integrity gate vs ${RELEASE_REF}"
-echo "    (closed-issue branches with unmerged commits = verify before cutting)"
+echo "    (closed-issue branches with unmerged commits, auto-classified by"
+echo "     distinctive-identifier presence — dev-health method)"
 echo
 
 for branch in $(git branch -r --list 'origin/fix/*' 'origin/feat/*' | sed 's/^[ *]*//'); do
@@ -85,29 +142,45 @@ for branch in $(git branch -r --list 'origin/fix/*' 'origin/feat/*' | sed 's/^[ 
   state="$(issue_state "$num")"
 
   if [[ "$state" == "CLOSED" ]]; then
-    stranded=$((stranded + 1))
-    echo "  [STRANDED?] $short — issue #$num CLOSED, $unmerged commit(s) not on release"
-    git cherry -v "$RELEASE_REF" "$branch" 2>/dev/null | grep '^+' | sed 's/^/             /'
+    verdict="$(classify_stranding "$branch" "$RELEASE_REF")"
+    case "$verdict" in
+      CLEARED)
+        cleared=$((cleared + 1))
+        echo "  [cleared]   $short — #$num CLOSED, $unmerged unmerged, but its added identifiers are PRESENT in ${RELEASE_REF} (re-implementation)"
+        ;;
+      STRANDED)
+        stranded=$((stranded + 1))
+        echo "  [STRANDED]  $short — #$num CLOSED, $unmerged unmerged, and its added identifiers are ABSENT from ${RELEASE_REF} (TRUE strand — merge before cutting)"
+        git cherry -v "$RELEASE_REF" "$branch" 2>/dev/null | grep '^+' | sed 's/^/                /'
+        ;;
+      *)
+        ambiguous=$((ambiguous + 1))
+        echo "  [verify]    $short — #$num CLOSED, $unmerged unmerged; auto-classify inconclusive (partial / no-marker) — human check required"
+        git cherry -v "$RELEASE_REF" "$branch" 2>/dev/null | grep '^+' | sed 's/^/                /'
+        ;;
+    esac
   else
     reviewed=$((reviewed + 1))
   fi
 done
 
 echo
-echo "==> $stranded closed-issue branch(es) with unmerged commits (verify each)"
-echo "    $reviewed other branch(es) with unmerged commits (open/experimental — lower signal)"
+echo "==> ${stranded} TRUE-strand · ${ambiguous} needs-verify · ${cleared} cleared(re-impl) closed-issue branch(es)"
+echo "    ${reviewed} other branch(es) with unmerged commits (open/experimental — lower signal)"
 
-if [[ "$stranded" -gt 0 ]]; then
+if [[ "$stranded" -gt 0 || "$ambiguous" -gt 0 ]]; then
   cat >&2 <<EOF
 
-For each [STRANDED?] branch above, confirm whether its work is genuinely
-absent from ${RELEASE_REF} (truly stranded — merge it before cutting) or
-present via a re-implementation git cherry couldn't match (safe to ignore).
-A quick \`git grep <artifact> ${RELEASE_REF}\` settles it.
+[STRANDED] branches are TRUE strands (added identifiers absent from
+${RELEASE_REF}) — merge them before tagging, or the release ships missing
+closed-and-verified work (the #56/#126 + #134/#137 class).
+[verify] branches are auto-classify-inconclusive (partial overlap, or a
+comment/doc-only change with no extractable identifier) — settle each with
+\`git grep <distinctive-snippet> ${RELEASE_REF}\` and merge-or-accept.
 
-Gate FAILED: resolve or consciously accept these before tagging a release.
+Gate FAILED: resolve [STRANDED] (and clear [verify]) before tagging a release.
 EOF
   exit 1
 fi
 
-echo "Gate PASSED: no closed-issue branches have unmerged commits."
+echo "Gate PASSED: every closed-issue branch's work is present in ${RELEASE_REF} (no true strands)."
