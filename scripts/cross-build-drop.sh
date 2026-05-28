@@ -93,9 +93,10 @@ echo "==> Windows GUI (gui + telemetry + audio; cross-compile via cargo-zigbuild
 cargo zigbuild --release --features "gui telemetry audio similar-images similar-audio" --bin superdeduper-gui \
   --target x86_64-pc-windows-gnu
 
-# Stage into the archive dir (never overwrite an existing per-sha
-# folder). Stage into the latest dir (always overwrite).
-mkdir -p "$ARCHIVE_DIR" "$LATEST_DIR"
+# Stage into the archive dir FIRST (never overwrite an existing
+# per-sha folder). The latest-dir promote is gated on the fast-subset
+# gate below, so it happens AFTER, conditionally.
+mkdir -p "$ARCHIVE_DIR"
 
 declare -a BINARIES=(
   "target/x86_64-unknown-linux-musl/release/superdeduper           superdeduper-linux-x86_64"
@@ -108,16 +109,14 @@ for entry in "${BINARIES[@]}"; do
   src="$(echo "$entry" | awk '{print $1}')"
   dst="$(echo "$entry" | awk '{print $2}')"
   cp -v "$src" "$ARCHIVE_DIR/$dst"
-  cp -v "$src" "$LATEST_DIR/$dst"
 done
 
-# SHA256SUMS — same content in both destinations.
+# SHA256SUMS — staged in the archive.
 (cd "$ARCHIVE_DIR" && sha256sum \
   superdeduper-linux-x86_64 \
   superdeduper-gui-linux-x86_64 \
   superdeduper-windows-x86_64.exe \
   superdeduper-gui-windows-x86_64.exe > SHA256SUMS)
-cp -v "$ARCHIVE_DIR/SHA256SUMS" "$LATEST_DIR/SHA256SUMS"
 
 # LATEST.txt sidecar — `cat /mnt/c/.../LATEST.txt` answers
 # "what version is this drop?" in one command. Single file
@@ -140,6 +139,55 @@ binaries:
   - superdeduper-windows-x86_64.exe
   - superdeduper-gui-windows-x86_64.exe
 EOF
+
+echo "==> archive staged: ${ARCHIVE_DIR}"
+ls -la "$ARCHIVE_DIR"
+
+# ---- Per-build fast-subset gate (testdesign/specs/fast-subset-gate.md) ----
+# POST-BUILD gate (distinct from the PRE-CUT release-integrity-check.sh):
+# run the ~7s pure-local Linux subset against the just-built binary; a
+# build that FAILS the gate is NOT promoted to the latest-path drop (the
+# archive stays for triage). The gate is a no-network correctness check,
+# so it's every-build-affordable. Set SD_SKIP_FAST_GATE=1 to bypass
+# (e.g. when the harness is mid-edit) — bypass is logged loudly.
+#
+# Engine ships the thin dispatcher (scripts/fast-gate.sh) + this hook;
+# the gate composition + row scripts live in testrunner's harness,
+# located via SD_HARNESS_DIR. The Windows EXE gate (scripts/fast-gate.ps1)
+# is sdd-testwin's to run on the Windows box — this WSL flow can only
+# meaningfully run the Linux leg against the Linux binary.
+GATE_RC=0
+if [[ "${SD_SKIP_FAST_GATE:-0}" == "1" ]]; then
+  echo "==> WARNING: fast-gate BYPASSED (SD_SKIP_FAST_GATE=1) — promoting unguarded" >&2
+else
+  echo "==> fast-gate: running Linux subset against the fresh binary"
+  SD_BIN="$ARCHIVE_DIR/superdeduper-linux-x86_64" bash "$REPO_ROOT/scripts/fast-gate.sh" || GATE_RC=$?
+fi
+
+case "$GATE_RC" in
+  0) echo "==> fast-gate GREEN — promoting to latest" ;;
+  2) echo "==> fast-gate could-not-run (exit 2) — harness/binary not available; promoting with WARNING" >&2 ;;
+  *)
+    cat >&2 <<EOF
+==================================================================
+fast-gate FAILED (exit ${GATE_RC}) — build FLAGGED.
+The archive at ${ARCHIVE_DIR} is kept for triage, but this drop is
+NOT promoted to the latest path (${LATEST_DIR}). Fix the failing row
+(printed above) and re-build, or re-run with SD_SKIP_FAST_GATE=1 to
+force the promote if you understand why the gate is red.
+==================================================================
+EOF
+    exit "$GATE_RC"
+    ;;
+esac
+
+# ---- Promote to the latest path (always overwrite) ----
+mkdir -p "$LATEST_DIR"
+for entry in "${BINARIES[@]}"; do
+  dst="$(echo "$entry" | awk '{print $2}')"
+  cp -v "$ARCHIVE_DIR/$dst" "$LATEST_DIR/$dst"
+done
+cp -v "$ARCHIVE_DIR/SHA256SUMS" "$LATEST_DIR/SHA256SUMS"
 cp -v "$ARCHIVE_DIR/LATEST.txt" "$LATEST_DIR/LATEST.txt"
 
 echo "==> drop complete"
