@@ -466,7 +466,13 @@ pub enum ImageHashAlgoArg {
     /// Average hash — cheap, prefilter-only.
     Ahash,
     /// Difference hash — robust on procedural / screenshot content;
-    /// pair with `--image-similarity-threshold 5`.
+    /// pair with `--image-similarity-threshold 5`. This is the default:
+    /// `#[default]` is kept index-aligned with the clap
+    /// `default_value_t` on `--image-hash-algorithm` so non-clap callers
+    /// (e.g. the GUI via `ImageHashAlgoArg::default()`) resolve the same
+    /// default as CLI parsing. #127 flipped the clap default to dhash but
+    /// left this on phash, diverging the two paths (F-CLI-1).
+    #[default]
     Dhash,
     /// Double-gradient hash (slug retained as "phash" for back-compat
     /// with existing scan JSON + cache rows). Despite the historical
@@ -476,7 +482,6 @@ pub enum ImageHashAlgoArg {
     /// usually competitive at a fraction of the cost. See
     /// `pipeline::image_hash::Algorithm::DoubleGradient` for the full
     /// story.
-    #[default]
     Phash,
 }
 
@@ -880,6 +885,18 @@ pub fn parse_size(s: &str) -> crate::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-CLI-1 guard: the `#[derive(Default)]` variant of
+    /// `ImageHashAlgoArg` must equal the clap `default_value_t` on
+    /// `--image-hash-algorithm` (see the `#[arg(... default_value_t =
+    /// ImageHashAlgoArg::Dhash)]` field). When they diverge, non-clap
+    /// callers (the GUI, which uses `ImageHashAlgoArg::default()`) get a
+    /// different default than CLI parsing — the F37-class bug #127 left
+    /// behind (clap flipped to dhash; the derived Default stayed phash).
+    #[test]
+    fn image_hash_algo_default_matches_clap_default() {
+        assert_eq!(ImageHashAlgoArg::default(), ImageHashAlgoArg::Dhash);
+    }
 
     #[test]
     fn parse_size_accepts_units() {
