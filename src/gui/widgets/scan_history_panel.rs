@@ -324,7 +324,7 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
 
         let delete_response = ui
             .add(
-                egui::Button::new(RichText::new("✕ Delete").color(theme::TEXT_LO))
+                egui::Button::new(RichText::new("× Delete").color(theme::TEXT_LO))
                     .min_size(egui::vec2(80.0, 22.0)),
             )
             .on_hover_text("Permanently remove this row from local history. No server delete.");
@@ -411,7 +411,7 @@ fn show_last_outcome_banner(ui: &mut Ui) {
         );
         if ui
             .add(
-                egui::Button::new(RichText::new("✕").color(theme::TEXT_LO))
+                egui::Button::new(RichText::new("×").color(theme::TEXT_LO))
                     .min_size(egui::vec2(20.0, 18.0)),
             )
             .on_hover_text("Dismiss this banner.")
