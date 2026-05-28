@@ -58,12 +58,16 @@ impl KeepScore {
 /// mtime-newness component just contributes 0.
 pub fn score_file(path: &Path, mtime: Option<SystemTime>) -> KeepScore {
     let mut s = KeepScore::default();
-    // Normalise to forward slashes so the string-contains checks
-    // below work identically on Windows runtime data and on Linux
-    // test paths typed with backslashes — std::path::Path doesn't
-    // parse Windows separators on non-Windows platforms but the
-    // substring checks don't care.
-    let path_str = path.to_string_lossy().replace('\\', "/");
+    // Strip the Windows `\\?\` verbatim prefix (S15) via the canonical
+    // helper, THEN normalise to forward slashes. The substring
+    // location checks below are prefix-immune, but the `/`-count depth
+    // signal (a few lines down) is NOT — a raw verbatim path would
+    // count `//?/` as bogus segments and inflate the depth score. The
+    // strip keeps depth comparable across verbatim, clean-Windows, and
+    // Linux test paths. std::path::Path doesn't parse Windows
+    // separators off-Windows, so the contains-checks operate on the
+    // string form.
+    let path_str = crate::path_display::for_user_display(path).replace('\\', "/");
     let lower = path_str.to_lowercase();
 
     // ---------- Location quality (negative signals) ----------

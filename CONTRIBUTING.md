@@ -125,6 +125,39 @@ claim.** Quality has caught this class on five of the last eight
 pre-push reviews; the cost of a one-minute self-scan beats the
 cost of every NIT cycle.
 
+### S15 — Normalize the Windows verbatim prefix before any path string-match
+
+> The engine walks with Windows verbatim paths internally
+> (`\\?\C:\…`, the long-path form that bypasses the Win32 `MAX_PATH`
+> limit). **ANCHORED** path matches — `starts_with`, drive-anchored
+> globs (`C:/Windows/**`), equality, or structural counts like
+> `path.matches('/').count()` (depth) — MUST normalize that prefix
+> first via `path_display::for_user_display`: a raw
+> `to_string_lossy()` is `\\?\C:\Windows\…`, which silently fails a
+> `c:\windows` prefix-match and adds bogus segments to a slash-count.
+> **Substring** `.contains()` matches are leading-prefix-IMMUNE
+> (`//?/c:/$recycle.bin/…` still contains `$recycle.bin`) — normalizing
+> is harmless but optional there. When unsure which style it is,
+> normalize.
+
+This class has bitten three times: #34 (asserter normalization), #118
+(dupes display), and — escalating to a **safety guard** — F-CLI-4,
+where `is_system_path` returned false on verbatim paths so
+`dedupe --action remove` ran under `C:\Windows` / `C:\Program Files`
+with NO `--allow-system-paths`. `for_user_display` is the single
+canonical stripper (handles the `\\?\` drive form + rewrites
+`\\?\UNC\` to `\\server\share`); route every path-comparison boundary
+through it.
+
+**Audited sites (2026-05-28):** `is_system_path` (fixed, F-CLI-4 —
+anchored prefix-match), `exclusions::evaluate` (hardened — drive-anchored
+globs), `keep.rs::score_file` (routed through `for_user_display` — its
+substring location penalties were immune, but the `/`-count depth signal
+was prefix-skewed), `payload_meta` drive-root / network-share (already
+verbatim-aware), cache keys (inode/USN-keyed, immune). New path-matching
+code: add it to this list + route ANCHORED matches through
+`for_user_display`.
+
 ## Where these came from
 
 The numbering (S11-S13) reflects the principal-engineer code review
@@ -138,6 +171,12 @@ GetSystemDirectoryW; E3 NIT 1 integer-arithmetic; E3 NIT 2 stale
 phash; #74 NIT path_display carve-out; #57 NIT SERIAL-mutex
 claim). Quality flagged the cadence; design routed the
 standing-principle slot.
+
+S15 was added 2026-05-28 after F-CLI-4 — the third `\\?\`
+verbatim-prefix bite (#34, #118, then F-CLI-4) and the first to hit
+a destructive-action safety guard. Design endorsed routing every
+path-comparison boundary through the existing `for_user_display`
+helper rather than a new abstraction (the systemic close to the class).
 
 ## Regenerating the wire schema
 
