@@ -138,3 +138,30 @@ GetSystemDirectoryW; E3 NIT 1 integer-arithmetic; E3 NIT 2 stale
 phash; #74 NIT path_display carve-out; #57 NIT SERIAL-mutex
 claim). Quality flagged the cadence; design routed the
 standing-principle slot.
+
+## Regenerating the wire schema
+
+`schema/submit.schema.json` is the canonical leaderboard wire
+contract. It is generated FROM the Rust structs (RunShape,
+ResultSummary, HardwareFingerprint) via schemars — never hand-edit
+it. The `submission_schema_matches_committed` test is a drift gate:
+it derives the schema fresh and string-compares against the
+committed file, failing the build if they diverge.
+
+To regenerate after a deliberate struct change:
+
+```
+SD_UPDATE_SCHEMA=1 cargo test --features telemetry submission_schema_matches_committed
+```
+
+Then review the diff and commit the regenerated file alongside the
+struct change, so the contract change is visible in one commit.
+
+**The gate also fires on schemars version bumps.** A `cargo update`
+that changes the schemars version (even a patch within 0.8) can
+alter the emitted formatting — key ordering, whitespace, `format`
+annotations — and fail the test even with no struct change. This is
+intentional: schemars' output IS the wire contract, so a toolchain
+bump that reshapes the emitted schema is a contract change that
+deserves a deliberate regen + diff review. If a routine dep update
+trips this test, run the regen command above and review what moved.
