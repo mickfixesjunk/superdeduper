@@ -221,11 +221,33 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
     // Status pill. v1 always reads "pending" because the resubmit
     // path is v2 work, but we render it as a proper pill anyway so
     // v2 just changes the data (no UI change needed).
-    let (status_text, status_color) = match record.submission_state {
-        SubmissionState::Pending => ("⏳ pending", theme::WARN),
-        SubmissionState::Submitted => ("✓ submitted", theme::COOL),
-        SubmissionState::Failed => ("⚠ failed", theme::HOT),
-        SubmissionState::Interrupted => ("🛑 interrupted", theme::HOT),
+    //
+    // #126 — surface the disablement reason inline when the row is
+    // Pending but the Resubmit button is gated. Without this, the
+    // user sees a greyed-out Resubmit + a bare "pending" label and
+    // has no way to tell whether the row is recoverable
+    // (rescan → fresh row), permanently stuck (cross-install,
+    // retry-cap), or just blocked behind another in-flight resubmit.
+    // The hover tooltip carried this info already but plain greyed-out
+    // looks ambiguous in the table view.
+    let pending_no_payload = matches!(record.submission_state, SubmissionState::Pending)
+        && record.submission_payload.is_none();
+    let (status_text, status_color, status_tooltip) = match record.submission_state {
+        SubmissionState::Pending if pending_no_payload => (
+            "⏳ pending · no payload".to_string(),
+            theme::WARN,
+            Some(
+                "This row was recorded before payload-capture (#41 v2 / v0.2.10) landed; \
+                 the engine can't reconstruct a submittable payload from it. The work \
+                 is still in the local history, just not resubmittable. \
+                 To get credit, rescan the same roots — the fresh row will be submittable."
+                    .to_string(),
+            ),
+        ),
+        SubmissionState::Pending => ("⏳ pending".to_string(), theme::WARN, None),
+        SubmissionState::Submitted => ("✓ submitted".to_string(), theme::COOL, None),
+        SubmissionState::Failed => ("⚠ failed".to_string(), theme::HOT, None),
+        SubmissionState::Interrupted => ("🛑 interrupted".to_string(), theme::HOT, None),
     };
     let status_label = ui.label(
         RichText::new(status_text)
@@ -233,10 +255,12 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
             .monospace()
             .small(),
     );
-    // Surface attempt history on hover for any row that's been
-    // retried — quiet for the first attempt so the tooltip stays
-    // signal-only.
-    if record.attempt_count >= 2 {
+    // Layered hover: #126 disablement-reason takes precedence; the
+    // existing retry-history tooltip comes second if the first
+    // doesn't apply but the row HAS been retried.
+    if let Some(tip) = status_tooltip {
+        status_label.on_hover_text(tip);
+    } else if record.attempt_count >= 2 {
         status_label.on_hover_text(format!(
             "Retried {}× (most recent: {})",
             record.attempt_count,
