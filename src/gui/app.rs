@@ -4143,8 +4143,8 @@ pub fn run_one_dedupe_action(
     match action {
         DedupeAction::Recycle => crate::dedupe::action_recycle(target, Some(keeper), references),
         DedupeAction::Remove => crate::dedupe::action_remove(target, Some(keeper), references),
-        DedupeAction::Hardlink => crate::dedupe::action_hardlink(target, keeper),
-        DedupeAction::Reflink => crate::dedupe::action_reflink(target, keeper),
+        DedupeAction::Hardlink => crate::dedupe::action_hardlink(target, keeper, references),
+        DedupeAction::Reflink => crate::dedupe::action_reflink(target, keeper, references),
         DedupeAction::SafeRename => {
             crate::dedupe::action_safe_rename(target, Some(keeper), references)
         }

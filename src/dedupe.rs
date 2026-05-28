@@ -1060,15 +1060,27 @@ pub fn action_recycle(path: &Path, keeper: Option<&Path>, references: &[PathBuf]
     Ok(())
 }
 
-pub fn action_hardlink(target: &Path, keeper: &Path) -> Result<()> {
+// hardlink/reflink ALSO take `references` + run guard_reference: replace-with-link
+// renames the target aside, links it to the keeper, and removes the original —
+// for a REFERENCE target that destroys the reference's independent copy and
+// repoints its path at the keeper, i.e. it MODIFIES the reference ("references
+// are never modified. Period." — module contract). Same rationale as
+// guard_system_path on these two (replace-with-link also touches the file) and
+// matches the CLI, whose process_group reference skip runs before EVERY action
+// incl. hardlink/reflink (quality finding on a11499a). NOT keeper-identity-
+// guarded — a positive keeper match under hardlink/reflink is the benign
+// already-linked no-op.
+pub fn action_hardlink(target: &Path, keeper: &Path, references: &[PathBuf]) -> Result<()> {
     guard_destructive(target, false)?;
     guard_system_path(target)?;
+    guard_reference(target, references)?;
     replace_with_hardlink(target, keeper)
 }
 
-pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
+pub fn action_reflink(target: &Path, keeper: &Path, references: &[PathBuf]) -> Result<()> {
     guard_destructive(target, false)?;
     guard_system_path(target)?;
+    guard_reference(target, references)?;
     replace_with_reflink(target, keeper)
 }
 
@@ -2258,6 +2270,36 @@ mod tests {
         fs::remove_dir_all(&d).ok();
     }
 
+    // quality finding on a11499a: hardlink/reflink ALSO modify a reference
+    // (replace-with-link destroys the reference's independent copy + repoints it
+    // at the keeper), so action_hardlink/action_reflink must guard_reference too
+    // — not just the 3 delete variants. Reachability: GUI keeper selection is
+    // user-driven, so a reference can be a hardlink/reflink target.
+    #[test]
+    fn action_hardlink_refuses_reference_target() {
+        let d = tmpdir();
+        let ref_root = d.join("library");
+        fs::create_dir_all(&ref_root).unwrap();
+        let reference_member = ref_root.join("master.bin");
+        write_file(&reference_member, b"master");
+        let keeper = d.join("keeper.bin");
+        write_file(&keeper, b"master");
+        assert!(
+            action_hardlink(&reference_member, &keeper, std::slice::from_ref(&ref_root)).is_err(),
+            "action_hardlink must refuse a reference target (replace-with-link modifies the reference)"
+        );
+        assert!(
+            action_reflink(&reference_member, &keeper, std::slice::from_ref(&ref_root)).is_err(),
+            "action_reflink must refuse a reference target"
+        );
+        // The reference's independent copy is intact (not renamed aside/relinked).
+        assert!(
+            reference_member.exists() && fs::read(&reference_member).unwrap() == b"master",
+            "reference master copy must be untouched after the refusals"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
     // F-CLI-4 regression: the engine walks with verbatim (`\\?\`) paths
     // internally, so is_system_path must strip that prefix before
     // matching — otherwise `\\?\C:\Windows\…` slips past the guard and
@@ -2459,7 +2501,7 @@ mod tests {
         write_file(&a, b"reflink-me");
         write_file(&b, b"reflink-me");
 
-        match action_reflink(&b, &a) {
+        match action_reflink(&b, &a, &[]) {
             // CoW-capable temp filesystem (Btrfs / XFS-reflink=1)
             // is allowed — the test should pass on those hosts too.
             Ok(()) => {
