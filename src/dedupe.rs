@@ -965,7 +965,10 @@ pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 /// the keeper-identity gate, so the GUI path (which doesn't go through the
 /// CLI planner) can't delete the keeper reached via an alias. Pass
 /// `Some(keeper)` from any dedup flow; `None` only when there is genuinely
-/// no keeper to protect.
+/// no keeper to protect. They also take `references` (the user's reference
+/// paths/roots) and run `guard_reference`, so the GUI can't delete a copy
+/// under a reference root reached via an alias. Pass `&[]` when there are no
+/// references to protect.
 /// v0.2.36 relocation gate — system-path. The CLI planner refuses
 /// system-critical paths in `process_group` (honouring the
 /// `--allow-system-paths` escape hatch); the GUI runs none of that, so this
@@ -994,17 +997,60 @@ fn guard_system_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn action_remove(path: &Path, keeper: Option<&Path>) -> Result<()> {
+/// v0.2.36 relocation gate — reference protection. The CLI planner skips
+/// every reference member in `process_group` (F-SAFE-2: `references.
+/// contains_key(&canonical_key(path))`, canonical-keyed). The GUI runs none
+/// of that: its bulk paths filter reference roots with a RAW
+/// `path.starts_with(root)` prefix match (caller-side, alias-vulnerable — a
+/// `\\?\` verbatim / 8.3 / junction / symlink / case alias under a reference
+/// root slips PAST `starts_with`, exactly the canonical_key asymmetry class as
+/// F-SAFE-2 / F-CLI-7 / the P0), and the per-group + single-row seam
+/// (`run_one_dedupe_action`) had NO reference protection at ALL. This gate
+/// moves the check DOWN to the action layer, canonical-keyed, so it protects
+/// every GUI path and defeats the whole alias class.
+///
+/// Refuses a destructive action when `target` IS, or resolves UNDER, any
+/// `reference` entry — canonicalizing BOTH sides first (the GUI's raw
+/// `starts_with` is the bug we're closing). `reference` may be exact file
+/// paths (CLI `reference_paths`) OR root directories (GUI reference roots) —
+/// the equals-or-canonical-ancestor test covers both. Empty `reference` ⇒
+/// caller asserts no references to protect ⇒ no gate. Lives on the `action_*`
+/// entry points only (mirrors `guard_system_path`); the CLI is already
+/// protected at the planner, so `perform_action` doesn't re-run it.
+fn guard_reference(target: &Path, reference: &[PathBuf]) -> Result<()> {
+    if reference.is_empty() {
+        return Ok(());
+    }
+    let canon_target = canonical_key(target);
+    for r in reference {
+        let canon_ref = canonical_key(r);
+        // Component-wise: PathBuf::starts_with won't false-match across a
+        // component boundary (e.g. /a/bc does not start_with /a/b).
+        if canon_target == canon_ref || canon_target.starts_with(&canon_ref) {
+            return Err(Error::other(format!(
+                "refused: {} is (or resolves under) the reference path {} — \
+                 references are never modified",
+                target.display(),
+                r.display(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn action_remove(path: &Path, keeper: Option<&Path>, references: &[PathBuf]) -> Result<()> {
     guard_destructive(path, false)?;
     guard_system_path(path)?;
+    guard_reference(path, references)?;
     guard_keeper_identity(DedupeAction::Remove, path, keeper)?;
     fs::remove_file(path)?;
     Ok(())
 }
 
-pub fn action_recycle(path: &Path, keeper: Option<&Path>) -> Result<()> {
+pub fn action_recycle(path: &Path, keeper: Option<&Path>, references: &[PathBuf]) -> Result<()> {
     guard_destructive(path, false)?;
     guard_system_path(path)?;
+    guard_reference(path, references)?;
     guard_keeper_identity(DedupeAction::Recycle, path, keeper)?;
     // Drop the TrashOutcome — the GUI's per-row recycle path doesn't
     // emit receipts (it's only the `dedupe` subcommand flow that
@@ -1029,9 +1075,14 @@ pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
 /// Safe-mode rename: append `.superdeduper` to the target. Idempotent —
 /// files already ending in the suffix are a no-op. Reversible via
 /// `unsuperdeduper_root`. Never deletes anything.
-pub fn action_safe_rename(target: &Path, keeper: Option<&Path>) -> Result<()> {
+pub fn action_safe_rename(
+    target: &Path,
+    keeper: Option<&Path>,
+    references: &[PathBuf],
+) -> Result<()> {
     guard_destructive(target, false)?;
     guard_system_path(target)?;
+    guard_reference(target, references)?;
     guard_keeper_identity(DedupeAction::SafeRename, target, keeper)?;
     safe_rename_unguarded(target)
 }
@@ -1465,7 +1516,7 @@ mod tests {
         let d = tmpdir();
         let f = d.join("doomed.bin");
         write_file(&f, b"bye");
-        action_remove(&f, None).unwrap();
+        action_remove(&f, None, &[]).unwrap();
         assert!(!f.exists());
         fs::remove_dir_all(&d).ok();
     }
@@ -1888,11 +1939,11 @@ mod tests {
         write_file(&keeper, b"same");
         std::fs::hard_link(&keeper, &alias).unwrap(); // same physical file
         assert!(
-            action_remove(&alias, Some(&keeper)).is_err(),
+            action_remove(&alias, Some(&keeper), &[]).is_err(),
             "action_remove must refuse a keeper-alias target"
         );
         assert!(
-            action_safe_rename(&alias, Some(&keeper)).is_err(),
+            action_safe_rename(&alias, Some(&keeper), &[]).is_err(),
             "action_safe_rename must refuse a keeper-alias target"
         );
         assert!(alias.exists() && keeper.exists(), "both must remain after refusal");
@@ -1900,7 +1951,7 @@ mod tests {
         let other = d.join("other.bin");
         write_file(&other, b"same");
         assert!(
-            action_remove(&other, Some(&keeper)).is_ok(),
+            action_remove(&other, Some(&keeper), &[]).is_ok(),
             "a distinct file must not be id-refused"
         );
         assert!(!other.exists(), "the distinct file was removed");
@@ -2137,6 +2188,76 @@ mod tests {
         fs::remove_dir_all(&d).ok();
     }
 
+    // v0.2.36 relocation #2 — guard_reference at the action layer.
+    #[test]
+    fn guard_reference_allows_when_no_references() {
+        let d = tmpdir();
+        let f = d.join("dupe.bin");
+        write_file(&f, b"x");
+        assert!(
+            guard_reference(&f, &[]).is_ok(),
+            "empty reference set ⇒ no gate"
+        );
+        let other = d.join("ref_root");
+        fs::create_dir_all(&other).unwrap();
+        assert!(
+            guard_reference(&f, std::slice::from_ref(&other)).is_ok(),
+            "a file NOT under any reference root must be allowed (no over-refusal)"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn guard_reference_refuses_member_under_reference_root() {
+        let d = tmpdir();
+        let ref_root = d.join("library");
+        fs::create_dir_all(&ref_root).unwrap();
+        let member = ref_root.join("keep_me.bin");
+        write_file(&member, b"x");
+        assert!(
+            guard_reference(&member, std::slice::from_ref(&ref_root)).is_err(),
+            "a file UNDER a reference root must be refused"
+        );
+        // And the reference path itself (exact-match, e.g. CLI reference_paths).
+        assert!(
+            guard_reference(&member, std::slice::from_ref(&member)).is_err(),
+            "the reference path itself must be refused (exact match)"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // The whole point of relocating to the action layer: the GUI's old
+    // caller-side `path.starts_with(reference_root)` filter is RAW-string and
+    // misses a member reached via a symlink alias whose path doesn't share the
+    // reference root's prefix. guard_reference canonicalizes BOTH sides, so the
+    // alias is caught. This is the F-SAFE-2 canonical_key asymmetry, on the GUI
+    // path. Negative-controlled by the allow test above.
+    #[cfg(unix)]
+    #[test]
+    fn guard_reference_refuses_symlink_alias_into_reference_root() {
+        let d = tmpdir();
+        let ref_root = d.join("library");
+        fs::create_dir_all(&ref_root).unwrap();
+        let member = ref_root.join("keep_me.bin");
+        write_file(&member, b"x");
+        // Alias the member from a path OUTSIDE the reference root — a raw
+        // starts_with(ref_root) would NOT match this alias.
+        let alias = d.join("sneaky_alias.bin");
+        if std::os::unix::fs::symlink(&member, &alias).is_err() {
+            return; // environment can't symlink; skip
+        }
+        assert!(
+            !alias.starts_with(&ref_root),
+            "precondition: the raw alias path does NOT share the reference root prefix"
+        );
+        assert!(
+            guard_reference(&alias, std::slice::from_ref(&ref_root)).is_err(),
+            "a symlink alias resolving UNDER a reference root must be refused \
+             (canonical check — the GUI's raw starts_with filter missed this)"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
     // F-CLI-4 regression: the engine walks with verbatim (`\\?\`) paths
     // internally, so is_system_path must strip that prefix before
     // matching — otherwise `\\?\C:\Windows\…` slips past the guard and
@@ -2295,7 +2416,7 @@ mod tests {
         std::env::set_var("HOME", &fake_home);
         std::env::remove_var("XDG_DATA_HOME");
 
-        action_recycle(&target, None).expect("action_recycle on Linux");
+        action_recycle(&target, None, &[]).expect("action_recycle on Linux");
 
         // Original gone.
         assert!(

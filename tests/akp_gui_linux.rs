@@ -75,7 +75,7 @@ fn assert_refused(action: DedupeAction, vector: &str) {
         other => panic!("unknown vector {other}"),
     };
 
-    let r = run_one_dedupe_action(action, &target, &keeper);
+    let r = run_one_dedupe_action(action, &target, &keeper, &[]);
     assert!(
         r.is_err(),
         "DATA-LOSS GUARD (GUI seam): {vector} / {action:?} — destructive action on a \
@@ -104,7 +104,7 @@ fn assert_distinct_actioned(action: DedupeAction) {
     fs::write(&other, b"same").unwrap();
     std::env::set_var("XDG_DATA_HOME", d.join("xdg"));
 
-    let r = run_one_dedupe_action(action, &other, &keeper);
+    let r = run_one_dedupe_action(action, &other, &keeper, &[]);
     assert!(
         r.is_ok(),
         "negative control: a distinct file must dedupe via the GUI dispatch ({action:?}), got {r:?}"
@@ -159,7 +159,7 @@ fn gui_seam_hardlink_action_on_alias_is_noop_ok() {
     let alias = d.join("alias.hl");
     fs::write(&keeper, b"keeper-bytes").unwrap();
     fs::hard_link(&keeper, &alias).unwrap();
-    let r = run_one_dedupe_action(DedupeAction::Hardlink, &alias, &keeper);
+    let r = run_one_dedupe_action(DedupeAction::Hardlink, &alias, &keeper, &[]);
     assert!(r.is_ok(), "hardlink action on an already-hardlinked alias should be Ok no-op, got {r:?}");
     assert!(keeper.exists() && alias.exists(), "both names survive the no-op");
     fs::remove_dir_all(&d).ok();

@@ -2590,7 +2590,7 @@ impl SuperdeduperApp {
                             current: Some(d.display().to_string()),
                         });
                         let size = measure_action_size(d);
-                        match crate::dedupe::action_safe_rename(d, Some(keeper)) {
+                        match crate::dedupe::action_safe_rename(d, Some(keeper), &reference_roots) {
                             Ok(()) => {
                                 action_summary.ok_count += 1;
                                 action_summary.ok_bytes += size;
@@ -2859,8 +2859,12 @@ impl SuperdeduperApp {
                         });
                         let size = measure_action_size(d);
                         let r = match action {
-                            DedupeAction::Recycle => crate::dedupe::action_recycle(d, Some(keeper)),
-                            DedupeAction::Remove => crate::dedupe::action_remove(d, Some(keeper)),
+                            DedupeAction::Recycle => {
+                                crate::dedupe::action_recycle(d, Some(keeper), &reference_roots)
+                            }
+                            DedupeAction::Remove => {
+                                crate::dedupe::action_remove(d, Some(keeper), &reference_roots)
+                            }
                             // Other variants aren't valid for bulk-
                             // destructive here; treat as a no-op +
                             // failure so the caller sees an
@@ -2918,6 +2922,19 @@ impl SuperdeduperApp {
         self.action_cancel.store(false, Ordering::Relaxed);
         let cancel = Arc::clone(&self.action_cancel);
         let tx = self.tx.clone();
+        // Reference protection (v0.2.36 relocation #2): thread the user's
+        // reference roots to the action layer so a per-group action can't
+        // delete a copy under a reference root reached via an alias. The
+        // per-group GroupAction dupes are NOT pre-filtered by reference root
+        // (only the bulk-all-visible paths filter), so this is the sole
+        // reference guard on this path.
+        let reference_roots: Vec<PathBuf> = self
+            .persisted
+            .roots
+            .iter()
+            .filter(|r| r.is_reference)
+            .map(|r| r.path.clone())
+            .collect();
         std::thread::Builder::new()
             .name("superdeduper-action".into())
             .spawn(move || {
@@ -2960,7 +2977,7 @@ impl SuperdeduperApp {
                     // is one stat call per file. fs::metadata fail
                     // ⇒ size 0; logged but doesn't abort the action.
                     let size = measure_action_size(d);
-                    let r = run_one_dedupe_action(action, d, &keeper);
+                    let r = run_one_dedupe_action(action, d, &keeper, &reference_roots);
                     match r {
                         Ok(()) => {
                             summary.ok_count += 1;
@@ -4111,17 +4128,26 @@ fn measure_action_size(path: &Path) -> u64 {
 /// click → dispatch → guard path end-to-end (a unit test on `action_*`
 /// alone wouldn't prove the GUI threads the keeper) — the GUI worker calls
 /// exactly this, so driving it exercises the real wiring.
+///
+/// `references` is the user's reference roots/paths; it's threaded to the
+/// destructive `action_*` so the action layer refuses to delete a copy that
+/// resolves under a reference root (v0.2.36 relocation #2 — the GUI's old
+/// caller-side `starts_with` filter missed aliased reference paths). Pass
+/// `&[]` when there are no references.
 pub fn run_one_dedupe_action(
     action: DedupeAction,
     target: &Path,
     keeper: &Path,
+    references: &[PathBuf],
 ) -> crate::Result<()> {
     match action {
-        DedupeAction::Recycle => crate::dedupe::action_recycle(target, Some(keeper)),
-        DedupeAction::Remove => crate::dedupe::action_remove(target, Some(keeper)),
+        DedupeAction::Recycle => crate::dedupe::action_recycle(target, Some(keeper), references),
+        DedupeAction::Remove => crate::dedupe::action_remove(target, Some(keeper), references),
         DedupeAction::Hardlink => crate::dedupe::action_hardlink(target, keeper),
         DedupeAction::Reflink => crate::dedupe::action_reflink(target, keeper),
-        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(target, Some(keeper)),
+        DedupeAction::SafeRename => {
+            crate::dedupe::action_safe_rename(target, Some(keeper), references)
+        }
     }
 }
 
@@ -4442,7 +4468,7 @@ mod keeper_safety_gui_tests {
         // (shared file-id) — the keeper reached via an alias.
         fs::hard_link(&keeper, &alias).unwrap();
         // The exact dispatch the GUI Go button flows through.
-        let r = run_one_dedupe_action(DedupeAction::Remove, &alias, &keeper);
+        let r = run_one_dedupe_action(DedupeAction::Remove, &alias, &keeper, &[]);
         assert!(
             r.is_err(),
             "GUI remove of a keeper-alias must be refused by the action-layer gate"
@@ -4455,7 +4481,7 @@ mod keeper_safety_gui_tests {
         let other = d.join("other.bin");
         fs::write(&other, b"same").unwrap();
         assert!(
-            run_one_dedupe_action(DedupeAction::Remove, &other, &keeper).is_ok(),
+            run_one_dedupe_action(DedupeAction::Remove, &other, &keeper, &[]).is_ok(),
             "a distinct file must dedupe normally via the GUI dispatch"
         );
         assert!(!other.exists(), "the distinct file was removed");

@@ -76,7 +76,7 @@ where
                 continue;
             }
         };
-        let r = run_one_dedupe_action(*action, &alias, &keeper);
+        let r = run_one_dedupe_action(*action, &alias, &keeper, &[]);
         assert!(
             r.is_err(),
             "[{variant} / {aname}] gate DID NOT refuse keeper-alias (target={}, keeper={})",
