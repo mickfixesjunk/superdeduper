@@ -99,7 +99,7 @@ pub fn detect_with_root_hint(root_hint: Option<&std::path::Path>) -> HardwareFin
         filesystem,
         cluster_size_kb: 4,
         volume_size_gb_bucket: "1024".to_string(),
-        is_dev_drive: detect_is_dev_drive(),
+        is_dev_drive: detect_is_dev_drive(root_hint),
     }
 }
 
@@ -116,21 +116,19 @@ pub fn detect_with_root_hint(root_hint: Option<&std::path::Path>) -> HardwareFin
 // `pathfinder-dev-drive` web-side achievement consumes.
 // ============================================================
 
-fn detect_is_dev_drive() -> bool {
-    platform_detect_is_dev_drive().unwrap_or(false)
+fn detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> bool {
+    platform_detect_is_dev_drive(root_hint).unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]
-fn platform_detect_is_dev_drive() -> Option<bool> {
-    // Probe the system volume (the drive Windows booted from).
-    // GetSystemDirectoryW returns its full path (e.g.
-    // "C:\\Windows\\System32"); we extract the drive letter and
-    // probe THAT volume's persistent flags, which handles the rare
-    // non-C system-drive case (multi-OS / custom installs /
-    // letter-remapped configs) honestly instead of hard-assuming
-    // C:. Most Dev Drives ARE the system volume per Windows 11
-    // 24H2 docs; a multi-volume walk is Phase 3.1 if Mick needs
-    // sidecar-volume detection later.
+fn platform_detect_is_dev_drive(root_hint: Option<&std::path::Path>) -> Option<bool> {
+    // F-CLI-5 — probe the volume being SCANNED, not the boot volume.
+    // A Dev Drive is typically a separate trusted ReFS sidecar volume
+    // (e.g. F:), not C:; the prior system-volume-only probe read
+    // DEV_VOLUME=0 because it asked C: (which genuinely isn't a Dev
+    // Drive). Derive the device path from the scanned root's drive
+    // letter; fall back to the system volume when there's no root hint
+    // (e.g. a hardware-only detect with no scan in flight).
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{
@@ -144,7 +142,9 @@ fn platform_detect_is_dev_drive() -> Option<bool> {
 
     // `\\?\<letter>:` device path (no trailing backslash; CreateFileW + FSCTL
     // need the volume device path, not a directory path).
-    let device_path = system_volume_device_path()?;
+    let device_path = root_hint
+        .and_then(volume_device_path_for)
+        .or_else(system_volume_device_path)?;
     let path: Vec<u16> = device_path
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -221,8 +221,25 @@ fn system_volume_device_path() -> Option<String> {
     Some(format!("\\\\?\\{}:", letter.to_ascii_uppercase()))
 }
 
+/// F-CLI-5 — derive the `\\?\<letter>:` volume device path for an
+/// arbitrary (scanned) path, so is_dev_drive probes the volume the
+/// user actually scanned rather than the boot volume. Normalizes the
+/// Windows verbatim prefix first (S15) so a `\\?\F:\…` root reads the
+/// real drive letter. Returns `None` for non-drive-letter roots (UNC
+/// shares etc.) — those aren't Dev Drives.
+#[cfg(target_os = "windows")]
+fn volume_device_path_for(path: &std::path::Path) -> Option<String> {
+    let s = crate::path_display::for_user_display(path);
+    let mut chars = s.chars();
+    let letter = chars.next()?;
+    if chars.next() != Some(':') || !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(format!("\\\\?\\{}:", letter.to_ascii_uppercase()))
+}
+
 #[cfg(not(target_os = "windows"))]
-fn platform_detect_is_dev_drive() -> Option<bool> {
+fn platform_detect_is_dev_drive(_root_hint: Option<&std::path::Path>) -> Option<bool> {
     // Dev Drive is a Windows-only feature; always false elsewhere.
     Some(false)
 }
@@ -1194,5 +1211,29 @@ mod tests {
             "Server"
         );
         assert_eq!(map_windows_edition_to_enum("WindowsRT".into()), "Other");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn volume_device_path_extracts_drive_from_scanned_root() {
+        use std::path::Path;
+        // F-CLI-5: derive \\?\<letter>: from the SCANNED root so
+        // is_dev_drive probes that volume, not the boot volume.
+        assert_eq!(
+            volume_device_path_for(Path::new(r"F:\Projects\foo")).as_deref(),
+            Some(r"\\?\F:")
+        );
+        // Verbatim-prefixed root reads the real drive letter (S15).
+        assert_eq!(
+            volume_device_path_for(Path::new(r"\\?\F:\Projects")).as_deref(),
+            Some(r"\\?\F:")
+        );
+        // Lowercase drive letter is normalised to upper.
+        assert_eq!(
+            volume_device_path_for(Path::new(r"d:\data")).as_deref(),
+            Some(r"\\?\D:")
+        );
+        // UNC / non-drive roots aren't Dev Drives → None.
+        assert!(volume_device_path_for(Path::new(r"\\server\share\x")).is_none());
     }
 }
