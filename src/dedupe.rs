@@ -410,15 +410,21 @@ fn emit_action_receipt(
         ActionReceipt::new(action_str, &source_str, &keeper_str, size)
     };
 
-    // GH #33 — populate the recycle_bin_entry block when the action
-    // was recycle-to-trash AND the platform backend surfaced metadata.
-    // Linux's XDG trash impl fills all four fields; Windows IFileOperation
-    // wiring is v2 territory (TrashOutcome::default() leaves them None).
-    if matches!(action, DedupeAction::Recycle)
-        && (trash_outcome.container.is_some()
-            || trash_outcome.info_file.is_some()
-            || trash_outcome.data_file.is_some())
-    {
+    // GH #33 — populate the recycle_bin_entry block on every
+    // successful recycle action, regardless of platform. Linux's
+    // XDG trash impl fills all four fields; Windows currently
+    // populates only `original_path` (container/$I/$R filename
+    // capture from IFileOperationProgressSink is v2 work). The empty-
+    // string fallback for unknown fields keeps the receipt shape
+    // stable across platforms so fixture assertions can target
+    // `recycle_bin_entry.original_path` uniformly.
+    //
+    // Pre-fix: the entry was gated on at least one of
+    // container/info/data being Some, which skipped Windows
+    // entirely (TrashOutcome::default()) — harness fixtures had to
+    // strip the field from their expected_receipt_fields rather
+    // than asserting on it. Per sdd-testwin full-#12 R3 finding.
+    if matches!(action, DedupeAction::Recycle) && error.is_none() {
         receipt.recycle_bin_entry = Some(RecycleBinEntry {
             container: trash_outcome
                 .container
