@@ -1199,6 +1199,35 @@ mod tests {
         fs::remove_dir_all(&d).ok();
     }
 
+    // #147 NIT — the per-file size source must STILL catch a perceptual
+    // member that changed on disk since the scan. Recorded file_sizes[i]
+    // = 50 but the file is 60 bytes now → the guard must fire (this pins
+    // "we didn't blanket-disable the changed-since-scan guard for
+    // perceptual groups"; a refactor that short-circuits validation for
+    // perceptual kinds would re-open the TOCTOU hole + fail here).
+    #[test]
+    fn perceptual_member_changed_since_scan_is_still_caught() {
+        let d = tmpdir();
+        let keeper = d.join("a_keeper.flac");
+        let dupe = d.join("b_dupe.flac");
+        write_file(&keeper, &vec![0u8; 100]);
+        // On-disk size (60) ≠ the recorded scan-time size (50) → changed.
+        write_file(&dupe, &vec![0u8; 60]);
+        let mut g = group(100, vec![keeper.clone(), dupe.clone()]);
+        g.similarity_kind = SimilarityKind::PerceptualAudio;
+        g.file_sizes = vec![100, 50];
+        let r = results(vec![g]);
+        let path = write_results(&d, &r);
+        let args = make_args(path, true, DedupeAction::Recycle);
+        let outcome = run(&args).unwrap();
+        assert_eq!(
+            outcome.skipped_invalidated, 1,
+            "a perceptual member modified since scan (recorded 50, on-disk 60) must be caught"
+        );
+        assert_eq!(outcome.executed, 0, "the changed member must not be actioned");
+        fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn remove_action_deletes_non_keeper() {
         let d = tmpdir();
