@@ -90,7 +90,7 @@ pub fn detect_with_root_hint(root_hint: Option<&std::path::Path>) -> HardwareFin
         .and_then(detect_filesystem)
         .unwrap_or_else(|| default_filesystem().to_string());
     HardwareFingerprint {
-        cpu_model_string: detect_cpu_model(),
+        cpu_model_string: normalize_cpu_brand(&detect_cpu_model()),
         cpu_cores,
         cpu_threads,
         cpu_isa_flags: detect_isa_flags(),
@@ -601,6 +601,42 @@ fn detect_filesystem_linux(path: &std::path::Path) -> Option<String> {
 // CPU model — best-effort across platforms.
 // ============================================================
 
+/// Strip the trailing " <N>-Core Processor" suffix from the raw
+/// OS-reported brand so the achievements catalog can match the
+/// brand alone (pathfinder-ryzen-9-9950x3d et al). Raw AMD reports
+/// on Windows + Linux include the core count; Intel and the
+/// "unknown" fallback don't, and pass through unchanged.
+///
+/// Strip rule: walks the string from the end, matching the literal
+/// "-Core Processor" suffix (case-sensitive — every observed brand
+/// uses it exactly), then walks back over the digit run before it.
+/// Anything that doesn't match the shape is left alone so the
+/// function is a no-op for future brand formats we haven't seen.
+fn normalize_cpu_brand(raw: &str) -> String {
+    let trimmed = raw.trim_end();
+    let Some(prefix) = trimmed.strip_suffix("-Core Processor") else {
+        return trimmed.to_string();
+    };
+    let digits_end = prefix.trim_end();
+    let mut cut = digits_end.len();
+    while cut > 0
+        && digits_end
+            .as_bytes()
+            .get(cut - 1)
+            .is_some_and(|b| b.is_ascii_digit())
+    {
+        cut -= 1;
+    }
+    if cut == digits_end.len() {
+        // "-Core Processor" without a preceding digit run; leave
+        // the input alone so a future engineer notices the
+        // surprise instead of having the function silently mangle
+        // it.
+        return trimmed.to_string();
+    }
+    digits_end[..cut].trim_end().to_string()
+}
+
 #[cfg(target_os = "linux")]
 fn detect_cpu_model() -> String {
     use std::io::BufRead;
@@ -1016,6 +1052,43 @@ mod tests {
                 "path {path:?} expected network={expect_network}, got fs={fs:?}",
             );
         }
+    }
+
+    #[test]
+    fn normalize_cpu_brand_strips_amd_core_count_suffix() {
+        // Pathfinder catalog drift #3 — Windows + Linux both
+        // emit the trailing "<N>-Core Processor" string for AMD
+        // brand reports; catalog rules match on the brand alone.
+        assert_eq!(
+            normalize_cpu_brand("AMD Ryzen 9 9950X3D 16-Core Processor"),
+            "AMD Ryzen 9 9950X3D",
+        );
+        assert_eq!(
+            normalize_cpu_brand("AMD Ryzen 5 7600X 6-Core Processor"),
+            "AMD Ryzen 5 7600X",
+        );
+        assert_eq!(
+            normalize_cpu_brand("AMD Ryzen 9 9950X3D 16-Core Processor   "),
+            "AMD Ryzen 9 9950X3D",
+        );
+    }
+
+    #[test]
+    fn normalize_cpu_brand_leaves_intel_brand_unchanged() {
+        let intel = "Intel(R) Core(TM) i9-14900K CPU @ 3.20GHz";
+        assert_eq!(normalize_cpu_brand(intel), intel);
+    }
+
+    #[test]
+    fn normalize_cpu_brand_leaves_unknown_unchanged() {
+        assert_eq!(normalize_cpu_brand("unknown"), "unknown");
+        assert_eq!(normalize_cpu_brand(""), "");
+    }
+
+    #[test]
+    fn normalize_cpu_brand_no_digits_before_suffix_is_noop() {
+        let weird = "Some Brand X-Core Processor";
+        assert_eq!(normalize_cpu_brand(weird), weird);
     }
 
     #[test]
