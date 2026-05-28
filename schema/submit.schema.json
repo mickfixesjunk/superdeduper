@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "definitions": {
+    "HardwareFingerprint": {
+      "properties": {
+        "cluster_size_kb": {
+          "description": "NTFS cluster size in KB. Defaults to 4 (the NTFS default for volumes ≤ 16 TB).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cpu_cores": {
+          "description": "Physical cores. Distinct from `cpu_threads` on hyperthreaded CPUs (cores < threads).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cpu_isa_flags": {
+          "description": "CPUID ISA flag names, lowercase + dash-or-digit-only per the backend pattern `^[a-z0-9-]{1,20}$`. Sorted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cpu_model_string": {
+          "description": "Vendor + model as reported by the OS, e.g. `\"AMD Ryzen 9 9950X3D 16-Core Processor\"`.",
+          "type": "string"
+        },
+        "cpu_threads": {
+          "description": "`std::thread::available_parallelism()` — total logical threads visible to the scheduler.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "disk_class": {
+          "description": "Enum: `\"NVMe-Gen5\" | \"NVMe-Gen4\" | \"NVMe-Gen3\" | \"SATA-SSD\" | \"HDD\" | \"network\" | \"mixed\"`. Defaults to \"mixed\" — proper detection is a future enhancement.",
+          "type": "string"
+        },
+        "filesystem": {
+          "description": "Enum: `\"NTFS\" | \"ReFS\" | \"exFAT\" | \"FAT32\" | \"network-SMB\" | \"other\"`. Defaults to \"NTFS\" on Windows, \"other\" elsewhere.",
+          "type": "string"
+        },
+        "is_dev_drive": {
+          "default": false,
+          "description": "this machine is a Windows Dev Drive (ReFS + developer- workload flag set, Windows 11 24H2+). Defaults to false on non-Windows and when no Dev Drive is detected. `#[serde(default)]` keeps old engine submissions readable (web sees them as false).",
+          "title": "130 Pathfinder Phase 3 — `true` when ANY local volume on",
+          "type": "boolean"
+        },
+        "os_edition": {
+          "description": "Enum: `\"Home\" | \"Pro\" | \"Enterprise\" | \"Education\" | \"Server\" | \"Other\"`. Parsed out of the full Windows edition string when possible; \"Other\" on macOS / Linux.",
+          "type": "string"
+        },
+        "os_version": {
+          "description": "OS-specific version label, e.g. `\"Windows 11 25H2\"`, `\"macOS 14.5\"`, `\"Ubuntu 22.04\"`. Free-form string.",
+          "type": "string"
+        },
+        "ram_total_gb_bucket": {
+          "description": "Snapped enum: `\"4\" | \"8\" | \"16\" | \"32\" | \"64\" | \"128\" | \"256\" | \"512\" | \"1024\"`. Round-down to the nearest enum value (so 30 GB → \"16\"). Defaults to \"16\" if detection fails (sensible mid-range guess).",
+          "type": "string"
+        },
+        "volume_size_gb_bucket": {
+          "description": "Snapped enum power-of-two from \"1\" to \"32768\" (GB). Defaults to \"1024\" (1 TB — common modern drive) when volume probe isn't wired.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cluster_size_kb",
+        "cpu_cores",
+        "cpu_isa_flags",
+        "cpu_model_string",
+        "cpu_threads",
+        "disk_class",
+        "filesystem",
+        "os_edition",
+        "os_version",
+        "ram_total_gb_bucket",
+        "volume_size_gb_bucket"
+      ],
+      "type": "object"
+    },
+    "ResultSummary": {
+      "description": "`result_summary` block per backend schema.",
+      "properties": {
+        "actions_taken_summary": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "description": "Per-action BYTES applied during dedupe, keyed by the locked schema strings web's `lifetime-audit.ts` expects:\n\n- `\"deleted_to_recycle_bytes\"`: sum of source-file sizes moved to the Recycle Bin via `delete-to-recycle`. - `\"deleted_permanently_bytes\"`: sum of sizes irrecoverably deleted via `delete-permanently`. - `\"hardlink_replaced_bytes\"`: sum of source sizes replaced by hardlinks pointing at the keeper. On-disk reclaim equals these bytes (the keeper's data is now shared).\n\nEmpty `{}` is valid + the natural state at scan-end (actions happen post-scan). When the user has run dedupe actions between scan + submit, this map carries the totals.\n\n**Key names are LOCKED** per design's `gamification-achievement-balance.md` action-bytes formula; web's auditor will reject submissions using different keys. Use [`ACTION_BYTES_KEY_*`] constants instead of hardcoding.",
+          "type": "object"
+        },
+        "duplicate_bytes_reclaimable": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duplicate_groups": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "largest_single_group_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "placeholder_skip_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "placeholder_skip_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "actions_taken_summary",
+        "duplicate_bytes_reclaimable",
+        "duplicate_groups",
+        "largest_single_group_bytes"
+      ],
+      "type": "object"
+    },
+    "RunShape": {
+      "description": "`run_shape` block per backend schema.",
+      "properties": {
+        "bytes_scanned": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cache_hit_ratio": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "corpus_kind": {
+          "description": "Enum: `\"user-data\" | \"system\" | \"canonical-bench\"`.",
+          "type": "string"
+        },
+        "dry_run": {
+          "description": "actions. GUI scans are always dry-run at scan-finish time (actions ship later via PATCH /actions). CLI `scan` subcommand is intrinsically dry-run; `dedupe` doesn't generate a fresh scan submission. Server's `aggregates-delta.ts` increments `lifetime_dry_run_count` by 1 when this is true, powering the `safety-first` achievement.",
+          "title": "89 — `true` when this scan submission carries no destructive",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "easter_egg_hits": {
+          "description": "G2 client-claimed achievement IDs. Backend grants these when the predicate is `unlock_kind: client-claimed`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "features_used_bitmap": {
+          "description": "Bitmap of which engine features were active during the scan. See [`FEATURE_BIT_*`] constants.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "files_scanned": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "groups_reviewed_count": {
+          "description": "in the GUI since the last scan finished. Server aggregates into `lifetime_groups_reviewed`. Plumbed wire-compatibly; initially `None` (submission ships at scan-finish *before* reviews happen). Future work: PATCH-update this field as the user opens groups, or defer initial submission until first review.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "title": "89 — count of duplicate-group cards the user opened/reviewed",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "hash_algorithm": {
+          "description": "Enum: `\"river5-aes-ni\" | \"river5-96\" | \"blake3\" | \"sha256\" | \"other\"`.",
+          "type": "string"
+        },
+        "max_hardlink_count_in_scan": {
+          "description": "Highest hardlink count observed on any inode during this scan. Backend uses this to grant \"hardlink archaeologist\".",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name_collision_count": {
+          "description": "Count of distinct (filename) values that appeared at least twice but with different content hashes — i.e. identical filenames at different paths whose CONTENT differs. Used by backend to grant \"name-collider\".",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scope": {
+          "description": "Enum: `\"whole-volume\" | \"subdirectory\" | \"selection\" | \"canonical-bench\"`.",
+          "type": "string"
+        },
+        "share_count_in_scope": {
+          "description": "Count of distinct network-share roots in this scan's scope (Windows UNC `\\\\server\\share`, `smb://...`, `nfs://...`). Backend uses this to grant the latent `multi-share-maestro` achievement. Counted at root-resolution time so the value reflects the user's *requested* scope, not whether files were actually read from those shares.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "walker_variant": {
+          "description": "Enum: `\"mft\" | \"walker\" | \"hybrid\"`.",
+          "type": "string"
+        },
+        "wall_clock_seconds": {
+          "format": "double",
+          "type": "number"
+        },
+        "zero_byte_group_max": {
+          "description": "G1.x server-side esoteric metrics. All optional / additive per the schema; older engines that don't compute these just omit the field. The backend uses them to grant catalog entries like \"zero-byte hoarder\", \"hardlink archaeologist\", \"name-collider\". Largest dup-group (by member count) whose content is zero bytes — i.e. the count of empty-file \"dups\" in the largest such group. Used by backend to grant \"zero-byte hoarder\" when this exceeds the threshold.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "bytes_scanned",
+        "corpus_kind",
+        "features_used_bitmap",
+        "files_scanned",
+        "hash_algorithm",
+        "scope",
+        "walker_variant",
+        "wall_clock_seconds"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Engine-owned canonical schema for the /api/v1/submit payload sub-objects. Derived from the Rust structs via schemars (#144). DO NOT hand-edit — regenerate via SD_UPDATE_SCHEMA=1 cargo test.",
+  "properties": {
+    "hardware": {
+      "$ref": "#/definitions/HardwareFingerprint"
+    },
+    "result_summary": {
+      "$ref": "#/definitions/ResultSummary"
+    },
+    "run_shape": {
+      "$ref": "#/definitions/RunShape"
+    }
+  },
+  "title": "superdeduper.submit.wire-structs"
+}

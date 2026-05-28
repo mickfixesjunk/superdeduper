@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
 pub struct HardwareFingerprint {
     /// Vendor + model as reported by the OS, e.g.
     /// `"AMD Ryzen 9 9950X3D 16-Core Processor"`.
