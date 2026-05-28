@@ -433,48 +433,88 @@ fn process_group(
         // Keeper-preservation gate 2 (Mick safety directive) — file-IDENTITY.
         // If this member resolves to the SAME physical file as the keeper, it
         // IS the keeper reached via an alias (\\?\ / 8.3 / junction / symlink
-        // / case). Runs BEFORE the dry-run branch so a preview also reflects
-        // the refusal, and subsumes the old inode-string already_hardlinked
-        // check (file-id is robust where the Windows inode placeholder was
-        // not). Refuse only on a POSITIVE id match (both resolve + equal) so a
-        // transiently-unopenable member isn't over-refused — a None member
-        // falls through to validate_file/guard like before. AKP negative
-        // controls: cross-volume distinct files have a different `volume` so
-        // they DON'T match here (correct dedup proceeds).
-        if let (Some(kid), Some(mid)) = (keeper_identity, file_identity(path)) {
-            if kid == mid {
-                let mut r = crate::action_receipt::ActionReceipt::new(
-                    crate::action_receipt::action_label(args.action),
-                    &path.display().to_string(),
-                    &keeper.display().to_string(),
-                    group.size,
+        // / case). Opening a handle to read the kernel file-id collapses every
+        // alias form to one comparison. Runs BEFORE the dry-run branch so a
+        // preview reflects the refusal, and subsumes the old inode-string
+        // already_hardlinked check.
+        let member_identity = file_identity(path);
+        let positive_keeper_match =
+            matches!((keeper_identity, member_identity), (Some(k), Some(m)) if k == m);
+        if positive_keeper_match {
+            let mut r = crate::action_receipt::ActionReceipt::new(
+                crate::action_receipt::action_label(args.action),
+                &path.display().to_string(),
+                &keeper.display().to_string(),
+                group.size,
+            );
+            if matches!(args.action, DedupeAction::Hardlink) {
+                // The dedup intent (loser shares the keeper's inode) is
+                // already satisfied — no-op, not a refusal. 0 bytes freed.
+                r.outcome = "already_hardlinked".to_string();
+                let _ = receipts.emit(&r);
+                outcome.executed += 1;
+            } else {
+                // Destructive action on the keeper-via-alias: fail-closed.
+                r.outcome = "refused_keeper_identity".to_string();
+                r.error = Some(
+                    "refused: member resolves by file-id to the keeper \
+                     (same physical file via an alias) — destructive action \
+                     would delete the keeper"
+                        .to_string(),
                 );
-                if matches!(args.action, DedupeAction::Hardlink) {
-                    // The dedup intent (loser shares the keeper's inode) is
-                    // already satisfied — no-op, not a refusal. 0 bytes freed.
-                    r.outcome = "already_hardlinked".to_string();
-                    let _ = receipts.emit(&r);
-                    outcome.executed += 1;
-                } else {
-                    // Destructive action on the keeper-via-alias: fail-closed.
-                    r.outcome = "refused_keeper_identity".to_string();
-                    r.error = Some(
-                        "refused: member resolves by file-id to the keeper \
-                         (same physical file via an alias) — destructive action \
-                         would delete the keeper"
-                            .to_string(),
-                    );
-                    outcome.skipped_keeper_identity += 1;
-                    tracing::warn!(
-                        group = idx + 1,
-                        path = %path.display(),
-                        keeper = %keeper.display(),
-                        "keeper-identity: member resolves to the keeper; destructive action refused"
-                    );
-                    let _ = receipts.emit(&r);
-                }
-                continue;
+                outcome.skipped_keeper_identity += 1;
+                tracing::warn!(
+                    group = idx + 1,
+                    path = %path.display(),
+                    keeper = %keeper.display(),
+                    "keeper-identity: member resolves to the keeper; destructive action refused"
+                );
+                let _ = receipts.emit(&r);
             }
+            continue;
+        }
+
+        // Quality Finding 1/2 — fail-CLOSED on identity-resolution
+        // UNCERTAINTY for IRREVERSIBLE actions. If we can't positively
+        // resolve BOTH the keeper's and this member's file-id (locked,
+        // sharing-violation, access-denied), we cannot PROVE the member
+        // isn't the keeper-via-alias — and for permanent `remove` there is no
+        // gate-4 that can PREVENT the loss (post-condition verify runs after
+        // the delete, only DETECTS it). The directive is default-trip =
+        // preserve, so refuse rather than delete on a guess. A None keeper
+        // would otherwise disable the gate for the WHOLE group (the most acute
+        // fail-open). Tolerance for transient unopenability is kept only for
+        // REVERSIBLE actions (recycle = trash, safe-rename = undoable) +
+        // hardlink/reflink (replace-with-link, guarded by the move-aside
+        // restore), where a wrong call is recoverable.
+        if matches!(args.action, DedupeAction::Remove)
+            && (keeper_identity.is_none() || member_identity.is_none())
+        {
+            outcome.skipped_keeper_identity += 1;
+            tracing::warn!(
+                group = idx + 1,
+                path = %path.display(),
+                keeper = %keeper.display(),
+                keeper_resolved = keeper_identity.is_some(),
+                member_resolved = member_identity.is_some(),
+                "keeper-identity: file-id unresolvable under permanent remove; refused (fail-closed)"
+            );
+            let mut r = crate::action_receipt::ActionReceipt::new(
+                crate::action_receipt::action_label(args.action),
+                &path.display().to_string(),
+                &keeper.display().to_string(),
+                group.size,
+            );
+            r.outcome = "refused_keeper_unresolvable".to_string();
+            r.error = Some(
+                "refused: could not resolve the file-id of the keeper and/or this \
+                 member, so it cannot be proven distinct from the keeper — \
+                 permanent remove is irreversible, so the group is preserved \
+                 (fail-closed). Retry when the file is not locked."
+                    .to_string(),
+            );
+            let _ = receipts.emit(&r);
+            continue;
         }
 
         if args.dry_run {
@@ -1706,6 +1746,71 @@ mod tests {
         assert_eq!(outcome.skipped_keeper_identity, 0, "distinct file must not be id-refused");
         assert_eq!(outcome.executed, 1, "the genuine dup is removed");
         assert!(keeper.exists() && !dupe.exists());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // Quality Finding 1 (HIGH) — fail-CLOSED when the KEEPER's identity is
+    // unresolvable under permanent `remove`. An unresolvable keeper would
+    // otherwise disable gate-2 for the whole group, letting an
+    // aliased-keeper member be deleted. We model an unresolvable keeper with
+    // a BROKEN symlink (fs::metadata follows it -> errors -> file_identity
+    // None). Under `remove`, a resolvable member must then be REFUSED
+    // (refused_keeper_unresolvable), not deleted. Negative-control verified:
+    // without the fail-closed branch the member is removed (gate disabled by
+    // the None keeper).
+    #[cfg(unix)]
+    #[test]
+    fn unresolvable_keeper_fails_closed_under_remove() {
+        let d = tmpdir();
+        // keeper = broken symlink -> file_identity(keeper) == None.
+        let keeper = d.join("a_keeper.bin");
+        std::os::unix::fs::symlink(d.join("missing-target"), &keeper).unwrap();
+        let member = d.join("b_member.bin");
+        write_file(&member, b"data");
+        // --strategy first => keeper_idx = 0 (the broken symlink).
+        let r = results(vec![group(4, vec![keeper.clone(), member.clone()])]);
+        let receipts = run_capturing_receipts(&d, &r, DedupeAction::Remove, false);
+        assert!(
+            receipts.contains("\"outcome\":\"refused_keeper_unresolvable\""),
+            "unresolvable keeper under remove must fail closed, got: {receipts}"
+        );
+        assert!(
+            member.exists(),
+            "DATA-LOSS GUARD: member must NOT be removed when the keeper's identity \
+             can't be resolved under permanent remove"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // Counterpart to Finding 2: the SAME unresolvable-keeper case under a
+    // REVERSIBLE action (recycle) does NOT over-refuse — the transient-lock
+    // tolerance is kept where a wrong call is recoverable. (Asserts the
+    // fail-closed branch is correctly scoped to irreversible remove only.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unresolvable_keeper_does_not_over_refuse_under_recycle() {
+        let d = tmpdir();
+        let keeper = d.join("a_keeper.bin");
+        std::os::unix::fs::symlink(d.join("missing-target"), &keeper).unwrap();
+        let member = d.join("b_member.bin");
+        write_file(&member, b"data");
+        let r = results(vec![group(4, vec![keeper.clone(), member.clone()])]);
+        let args = DedupeArgs {
+            results_file: write_results(&d, &r),
+            strategy: KeepStrategy::First,
+            action: DedupeAction::Recycle,
+            mode: crate::cli::ScanMode::Exact,
+            dry_run: false,
+            allow_system_paths: false,
+            allow_destructive_on_deduped: false,
+            integration_test_mode: false,
+            receipt_file: None,
+        };
+        let outcome = run(&args).unwrap();
+        assert_eq!(
+            outcome.skipped_keeper_identity, 0,
+            "recycle is reversible — must NOT fail-closed-refuse on unresolvable id"
+        );
         fs::remove_dir_all(&d).ok();
     }
 
