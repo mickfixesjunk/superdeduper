@@ -25,6 +25,19 @@ use accesskit::Role;
 use egui_kittest::kittest::Queryable;
 use superdeduper::gui::app::SuperdeduperApp;
 
+/// Tests in this file mutate PROCESS-GLOBAL env (XDG_DATA_HOME / HOME via
+/// set_var) to isolate each app instance. cargo runs tests in parallel threads,
+/// so without serialization they clobber each other's XDG/HOME mid-run (observed:
+/// recycle + reference flaked only when run together). This process-wide lock
+/// serializes them — each test holds it for its full duration. Poison-tolerant
+/// (a panicking test shouldn't wedge the rest).
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Build a scannable corpus in its OWN tempdir (NOT under the isolated XDG/HOME):
 /// 3 byte-identical 8 KiB files (a dup group — 8 KiB clears the 4 KiB GUI
 /// min_size floor) + 1 distinct file (cascade-safety negative control).
@@ -80,6 +93,7 @@ fn isolated_env(tag: &str) -> PathBuf {
 
 #[test]
 fn tier_a_app_instantiates_and_steps_frames_headless() {
+    let _env = env_lock();
     let root = isolated_env("boot");
     // build_eframe gives us a CreationContext (storage=None) and runs the app's
     // update() each harness.run() — egui layout on CPU, no wgpu adapter.
@@ -119,6 +133,7 @@ fn click_all(harness: &egui_kittest::Harness<'_, SuperdeduperApp>, substr: &str)
 /// headless GUI-E2E surface (Tier-A + §6 + E2E-10) is unblocked.
 #[test]
 fn tier_a_seed_root_then_real_scan_populates_table() {
+    let _env = env_lock();
     let home = isolated_env("scan");
     let (corpus, _files) = make_dup_corpus("scan");
     let corpus_for_closure = corpus.clone();
@@ -298,6 +313,7 @@ fn drive_bulk_action(
 /// confirm (DELETE). Effect: both losers GONE from disk; keeper + distinct kept.
 #[test]
 fn tier_a_g_remove_actions_losers_preserves_keeper() {
+    let _env = env_lock();
     let (mut harness, corpus, files, home) = boot_and_scan("remove");
     let [keeper, loser_a, loser_b, distinct] = files;
     drive_bulk_action(&mut harness, "Nuke dupes", "DELETE");
@@ -318,6 +334,7 @@ fn tier_a_g_remove_actions_losers_preserves_keeper() {
 /// Effect: losers GONE from the corpus (moved to XDG Trash); keeper + distinct kept.
 #[test]
 fn tier_a_g_recycle_actions_losers_preserves_keeper() {
+    let _env = env_lock();
     let (mut harness, corpus, files, home) = boot_and_scan("recycle");
     let [keeper, loser_a, loser_b, distinct] = files;
     drive_bulk_action(&mut harness, "Recycle dupes", "DELETE");
@@ -339,6 +356,7 @@ fn tier_a_g_recycle_actions_losers_preserves_keeper() {
 /// original loser paths are gone, the .superdeduper variants exist; keeper kept.
 #[test]
 fn tier_a_g_saferename_renames_losers_preserves_keeper() {
+    let _env = env_lock();
     let (mut harness, corpus, files, home) = boot_and_scan("saferename");
     let [keeper, loser_a, loser_b, distinct] = files;
     let renamed = |p: &PathBuf| {
@@ -396,6 +414,7 @@ fn drive_scan_to_table(harness: &mut egui_kittest::Harness<'static, Superdeduper
 /// gate isn't fail-closed-to-uselessness, the A5 negative-control discipline).
 #[test]
 fn tier_a_g_reference_protection_preserves_reference_file() {
+    let _env = env_lock();
     let home = isolated_env("refguard");
 
     // Two corpora: a SCAN root (2 plain dup copies) + a REFERENCE root (same
@@ -457,5 +476,67 @@ fn tier_a_g_reference_protection_preserves_reference_file() {
     );
 
     std::fs::remove_dir_all(&base).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// G-HARDLINK (§3 a/b/c) — per-ROW "🔗 Hardlink" affordance (NOT the bulk combo).
+/// Expand the group row (the "▸ <keeper>" selectable label), click Hardlink,
+/// confirm with "HARDLINK", and assert the dupes are replaced with hardlinks to
+/// the keeper: all member paths still exist (no path touched) + they collapse to
+/// a SINGLE shared inode (the real on-disk effect), content byte-identical.
+#[test]
+fn tier_a_g_hardlink_collapses_dupes_to_one_inode() {
+    let _env = env_lock();
+    use std::os::unix::fs::MetadataExt;
+    let (mut harness, corpus, files, home) = boot_and_scan("hardlink");
+    let [keeper, loser_a, loser_b, distinct] = files;
+
+    // pre: the three dup members are distinct inodes (the collision to collapse).
+    let ino = |p: &PathBuf| std::fs::metadata(p).map(|m| m.ino()).unwrap_or(0);
+    let pre: std::collections::HashSet<u64> = [ino(&keeper), ino(&loser_a), ino(&loser_b)].into_iter().collect();
+    assert_eq!(pre.len(), 3, "pre: the 3 dup members should start as distinct inodes, got {pre:?}");
+    let dup_sha = std::fs::read(&keeper).unwrap();
+
+    // a (present): expand the group row — the keeper-path column is a "▸ <path>"
+    // selectable label; clicking it toggles expansion, revealing the per-row 🔗 Hardlink.
+    assert!(click_all(&mut harness, "▸") > 0, "STEP=expand: collapsed group row (▸) not found");
+    for _ in 0..3 {
+        harness.step();
+    }
+    // b (triggers): click the per-row 🔗 Hardlink -> #85 modal (word HARDLINK).
+    assert!(click_all(&mut harness, "Hardlink") > 0, "STEP=click: per-row 🔗 Hardlink button not found after expand");
+    for _ in 0..3 {
+        harness.step();
+    }
+    // #85 confirm: focus + type HARDLINK + Confirm.
+    {
+        let mut found = false;
+        for ti in harness.query_all_by_role(Role::TextInput) {
+            ti.focus();
+            ti.type_text("HARDLINK");
+            found = true;
+        }
+        assert!(found, "STEP=confirm: confirm-modal TextEdit (Type HARDLINK) not found");
+    }
+    for _ in 0..3 {
+        harness.step();
+    }
+    assert!(click_all(&mut harness, "Confirm") > 0, "STEP=confirm: Confirm button not found");
+
+    // c (effect): the worker replaces the dupes with hardlinks to the keeper —
+    // all 3 member paths still exist + collapse to ONE shared inode, byte-identical.
+    let collapsed = run_until(&mut harness, || {
+        let s: std::collections::HashSet<u64> = [ino(&keeper), ino(&loser_a), ino(&loser_b)].into_iter().collect();
+        keeper.exists() && loser_a.exists() && loser_b.exists() && s.len() == 1 && !s.contains(&0)
+    });
+    assert!(
+        collapsed,
+        "STEP=effect: dupes not hardlinked to one inode (keeper={}, a={}, b={})",
+        ino(&keeper), ino(&loser_a), ino(&loser_b)
+    );
+    assert!(std::fs::read(&keeper).unwrap() == dup_sha, "STEP=effect: hardlinked content must be byte-identical");
+    assert!(distinct.exists(), "STEP=effect: distinct non-dup file must be untouched (cascade safety)");
+
+    std::fs::remove_dir_all(&corpus).ok();
     std::fs::remove_dir_all(&home).ok();
 }
