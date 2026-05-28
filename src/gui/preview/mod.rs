@@ -115,7 +115,7 @@ pub fn show(ui: &mut Ui, path: &Path, state: &mut PreviewState) -> Option<Previe
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .small_button(RichText::new("✕ Close").color(theme::TEXT_HI))
+                .small_button(RichText::new("× Close").color(theme::TEXT_HI))
                 .clicked()
             {
                 action = Some(PreviewAction::Close);

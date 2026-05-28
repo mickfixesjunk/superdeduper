@@ -262,7 +262,14 @@ fn render_modal_body(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(
-                    egui::Button::new(RichText::new("✕").color(theme::TEXT_HI))
+                    // #143 — `×` (U+00D7 MULTIPLICATION SIGN) is in
+                    // every Latin font egui bundles by default;
+                    // the previous `✕` (U+2715 HEAVY MULTIPLICATION
+                    // X, Dingbats block) was tofu-ing on Mick's
+                    // Windows install because the Dingbats block
+                    // isn't in Ubuntu-Light + isn't reliably in
+                    // NotoEmoji's bitmap-emoji subset either.
+                    egui::Button::new(RichText::new("×").color(theme::TEXT_HI))
                         .frame(false)
                         .min_size(egui::vec2(24.0, 24.0)),
                 )
