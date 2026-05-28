@@ -952,6 +952,39 @@ fn scan_console_writer(format: superdeduper::cli::OutputFormat, quiet: bool) -> 
     }
 }
 
+/// F-CLI-7 — group-member files that fall under a `--reference` root,
+/// resolved at scan time so the scan→dedupe-file two-step can honor
+/// `--strategy in-reference`. The under-root prefix-compare normalizes
+/// the Windows verbatim `\\?\` prefix on BOTH sides first (S15) so a
+/// verbatim scanned path matches a (possibly verbatim) reference root;
+/// `Path::starts_with` is component-wise so `C:\refs` doesn't falsely
+/// prefix `C:\refs-backup`. Returns the ORIGINAL file paths (as they
+/// appear in `groups[].files`); dedupe canonicalizes both these and the
+/// group members before matching, so the stored representation only has
+/// to round-trip, not match byte-for-byte.
+fn resolve_reference_paths(
+    reference_roots: &[std::path::PathBuf],
+    groups: &[pipeline::DuplicateGroup],
+) -> Vec<std::path::PathBuf> {
+    if reference_roots.is_empty() {
+        return Vec::new();
+    }
+    let norm_roots: Vec<std::path::PathBuf> = reference_roots
+        .iter()
+        .map(|r| std::path::PathBuf::from(superdeduper::path_display::for_user_display(r)))
+        .collect();
+    let mut refs = Vec::new();
+    for g in groups {
+        for f in &g.files {
+            let nf = std::path::PathBuf::from(superdeduper::path_display::for_user_display(f));
+            if norm_roots.iter().any(|root| nf.starts_with(root)) {
+                refs.push(f.clone());
+            }
+        }
+    }
+    refs
+}
+
 fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
     // #81 — `--list-exclusion-packs` short-circuits the scan and
     // prints every preset pack with its content so the user can
@@ -1131,7 +1164,7 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
             )),
             None => scan_console_writer(cfg.format, quiet),
         };
-        output::write(writer.as_mut(), cfg.format, &[], &skipped)?;
+        output::write(writer.as_mut(), cfg.format, &[], &skipped, &[])?;
         writer.flush()?;
         return Ok(());
     }
@@ -1385,13 +1418,17 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
     #[cfg(not(feature = "similar-audio"))]
     let _ = audio_similarity_threshold;
 
+    // F-CLI-7 — resolve which group-member files fall under a
+    // --reference root + persist them so `dedupe --strategy in-reference`
+    // works through the scan→dedupe-file two-step.
+    let reference_paths = resolve_reference_paths(&cfg.reference_roots, &duplicates);
     let mut writer: Box<dyn Write> = match &cfg.output {
         Some(p) => Box::new(BufWriter::new(
             std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
         )),
         None => scan_console_writer(cfg.format, quiet),
     };
-    output::write(writer.as_mut(), cfg.format, &duplicates, &skipped)?;
+    output::write(writer.as_mut(), cfg.format, &duplicates, &skipped, &reference_paths)?;
     writer.flush()?;
 
     // #38 v1 + #142 — persist a scan_history record so CLI scans
@@ -1686,7 +1723,7 @@ fn run_force_hash_mode(
         )),
         None => scan_console_writer(cfg.format, quiet),
     };
-    output::write(writer.as_mut(), cfg.format, &[], skipped)?;
+    output::write(writer.as_mut(), cfg.format, &[], skipped, &[])?;
     writer.flush()?;
     Ok(())
 }
@@ -1783,4 +1820,60 @@ fn init_logging(verbose: u8, quiet: bool) {
         .with_target(false)
         .with_writer(io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn group_of(files: &[&str]) -> pipeline::DuplicateGroup {
+        pipeline::DuplicateGroup {
+            files: files.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    // F-CLI-7 — production-side reference resolution decides which files
+    // get MARKED reference (→ kept vs deleted), so it's regression-locked
+    // here rather than resting on the comment's component-wise claim.
+    #[test]
+    fn resolve_reference_paths_includes_under_root_excludes_others() {
+        let roots = vec![PathBuf::from("/data/refs")];
+        let groups = vec![group_of(&["/data/refs/a.jpg", "/data/other/b.jpg"])];
+        let got = resolve_reference_paths(&roots, &groups);
+        assert_eq!(got, vec![PathBuf::from("/data/refs/a.jpg")]);
+    }
+
+    #[test]
+    fn resolve_reference_paths_sibling_prefix_is_not_under_root() {
+        // The load-bearing component-wise guarantee: `/data/refs` must NOT
+        // prefix `/data/refs-backup`. A string-prefix compare would wrongly
+        // mark the backup copy as reference and keep it.
+        let roots = vec![PathBuf::from("/data/refs")];
+        let groups = vec![group_of(&["/data/refs-backup/c.jpg"])];
+        assert!(resolve_reference_paths(&roots, &groups).is_empty());
+    }
+
+    #[test]
+    fn resolve_reference_paths_empty_roots_yields_empty() {
+        let groups = vec![group_of(&["/data/refs/a.jpg"])];
+        assert!(resolve_reference_paths(&[], &groups).is_empty());
+    }
+
+    // The S15 normalize: a verbatim-prefixed scanned path must still match
+    // a non-verbatim reference root. Only meaningful on Windows, where the
+    // backslash is a path separator (so `starts_with` is component-wise).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_reference_paths_verbatim_member_matches_plain_root() {
+        let roots = vec![PathBuf::from(r"C:\refs")];
+        let verbatim = r"\\?\C:\refs\a.jpg";
+        let groups = vec![group_of(&[verbatim])];
+        // Returns the ORIGINAL (verbatim) path, not the normalized form.
+        assert_eq!(
+            resolve_reference_paths(&roots, &groups),
+            vec![PathBuf::from(verbatim)]
+        );
+    }
 }

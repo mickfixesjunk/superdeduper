@@ -20,6 +20,12 @@ struct Report<'a> {
     /// runs. ReparseDedup files appear here AND in `groups` because
     /// they're observed AND hashable; downstream filters as needed.
     skipped: &'a [SkippedFile],
+    /// F-CLI-7 — group-member files under a `scan --reference` root,
+    /// resolved at scan time. Persisted so the scan→dedupe-file flow can
+    /// honor `--strategy in-reference`. Empty array when no reference
+    /// roots (present-but-empty keeps the schema shape stable, like
+    /// `skipped`).
+    reference_paths: &'a [std::path::PathBuf],
     summary: Summary,
 }
 
@@ -55,6 +61,7 @@ pub fn write(
     format: OutputFormat,
     groups: &[DuplicateGroup],
     skipped: &[SkippedFile],
+    reference_paths: &[std::path::PathBuf],
 ) -> Result<()> {
     let summary = summarize(groups, skipped);
     match format {
@@ -68,6 +75,7 @@ pub fn write(
                 schema: "superdeduper.scan.v2",
                 groups,
                 skipped,
+                reference_paths,
                 summary,
             };
             serde_json::to_writer_pretty(&mut *out, &report).map_err(io_err)?;
