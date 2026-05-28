@@ -51,7 +51,7 @@ detection via `st_ino` + `st_dev`).
    reads can be sorted by starting LCN; hardlinks and ReFS block clones
    are detected and short-circuited here.
 4. **Hash progressively** in four tiers (format-aware → 4 KiB head → head/mid/tail → full content via `river5` by default, `BLAKE3` opt-in) so most non-duplicates are eliminated without reading the full file.
-5. **Confirm and emit** results, with optional `--paranoid` byte-by-byte verification.
+5. **Emit** results — files sharing a full-content hash are reported as duplicate groups.
 
 Everything I/O-heavy goes through IOCP queues sorted by LCN with
 auto-tuned queue depth (HDD ≈ 32, SSD ≈ 256), and a SQLite cache keyed by
