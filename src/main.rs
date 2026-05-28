@@ -1142,7 +1142,7 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
     // files have unique sizes (videos, archives) and would otherwise
     // never enter Tier 3 under the standard dup-detection pipeline.
     if args.force_hash {
-        run_force_hash_mode(&cfg, &inventory, &skipped, scan_started)?;
+        run_force_hash_mode(&cfg, &inventory, &skipped, scan_started, quiet)?;
         return Ok(());
     }
 
@@ -1563,6 +1563,7 @@ fn run_force_hash_mode(
     inventory: &[inventory::FileEntry],
     skipped: &[superdeduper::pipeline::SkippedFile],
     scan_started: std::time::Instant,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     use rayon::prelude::*;
     use std::sync::atomic::AtomicU64;
@@ -1683,7 +1684,7 @@ fn run_force_hash_mode(
         Some(p) => Box::new(BufWriter::new(
             std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
         )),
-        None => Box::new(BufWriter::new(io::stdout().lock())),
+        None => scan_console_writer(cfg.format, quiet),
     };
     output::write(writer.as_mut(), cfg.format, &[], skipped)?;
     writer.flush()?;
