@@ -111,6 +111,49 @@ pub fn evaluate_all(ctx: &PredicateContext<'_>) -> Vec<String> {
     hits
 }
 
+/// #149 — build a [`PredicateContext`] from a freshly-walked inventory
+/// and run [`evaluate_all`], returning the client-claimed hit IDs to
+/// embed in `run_shape.easter_egg_hits`. Shared by the GUI live-scan
+/// AND the CLI scan so the two payload-build paths can't drift — the
+/// CLI path previously hardcoded an empty vec, so no client-claimed
+/// achievement could ever grant via a CLI scan (every predicate's hit
+/// was silently dropped before reaching the payload).
+///
+/// `perceptual_mode_active` is left false to match the GUI's existing
+/// behavior; wiring it to the actual scan mode (so `format-fanatic`
+/// can fire on perceptual scans) is a separate follow-up that changes
+/// both callers via this one signature.
+#[cfg(feature = "telemetry")]
+pub fn compute_easter_egg_hits(inventory: &[crate::inventory::FileEntry]) -> Vec<String> {
+    let all_paths: Vec<&std::path::Path> = inventory.iter().map(|e| e.path.as_path()).collect();
+    // FILETIME (100ns ticks since 1601-01-01) → Unix seconds. `mtime
+    // == 0` is the walker's "unknown" sentinel → None so mtime-driven
+    // predicates short-circuit cleanly per-file.
+    const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
+    let mtimes_unix_secs: Vec<Option<i64>> = inventory
+        .iter()
+        .map(|e| {
+            if e.mtime == 0 {
+                None
+            } else {
+                Some((e.mtime - UNIX_EPOCH_AS_FILETIME) / 10_000_000)
+            }
+        })
+        .collect();
+    // Counters: best-effort. Missing/corrupt install.json → the
+    // counter-driven predicates (picky-eater / verify-veteran) just
+    // don't grant yet.
+    let install_state = super::install::load().ok().flatten();
+    let install_counters = install_state.as_ref().map(|s| &s.counters);
+    let ctx = PredicateContext {
+        all_paths: &all_paths,
+        mtimes_unix_secs: Some(&mtimes_unix_secs),
+        install_counters,
+        perceptual_mode_active: false,
+    };
+    evaluate_all(&ctx)
+}
+
 // =====================================================================
 // Implemented predicates
 // =====================================================================
