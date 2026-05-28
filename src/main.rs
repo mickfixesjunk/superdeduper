@@ -129,6 +129,131 @@ fn run_scan_history(cmd: superdeduper::cli::ScanHistoryCommand) -> anyhow::Resul
             println!("scan-history: removed (or absent) {scan_id}");
             Ok(())
         }
+        #[cfg(feature = "telemetry")]
+        ScanHistoryCommand::Resubmit { scan_id, pending } => {
+            run_scan_history_resubmit(scan_id, pending)
+        }
+        ScanHistoryCommand::Prune { days } => {
+            // 0 = "forever — never prune" sentinel; the underlying
+            // helper returns 0 in that case without touching the
+            // filesystem. Print the no-op result so scripted callers
+            // see expected output regardless of input.
+            let retention_secs = (days as u64).saturating_mul(86_400);
+            let pruned = scan_history::prune_older_than(retention_secs)?;
+            if days == 0 {
+                println!("scan-history: prune is a no-op (days=0 means retain forever).");
+            } else {
+                println!("scan-history: pruned {pruned} record(s) older than {days} day(s).");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// #56 — Implementation for `scan-history resubmit`. Either replays
+/// one scan_id or drains every Pending row. Single-row path calls
+/// `submit_recorded_payload` against the row's recorded channel +
+/// stored install; multi-row path defers to `submit-pending` which
+/// already does the right thing.
+#[cfg(feature = "telemetry")]
+fn run_scan_history_resubmit(scan_id: Option<String>, pending: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use superdeduper::channel::{self, Channel};
+    use superdeduper::leaderboard::install;
+    use superdeduper::leaderboard::submission::{self, SubmitOutcome};
+    use superdeduper::scan_history::{self, SubmissionState};
+
+    match (scan_id, pending) {
+        (Some(_), true) => {
+            // clap's `conflicts_with` should already catch this; defensive.
+            anyhow::bail!("pass either <SCAN_ID> or --pending, not both")
+        }
+        (None, false) => {
+            anyhow::bail!("pass <SCAN_ID> or --pending to specify what to resubmit")
+        }
+        (None, true) => {
+            // Multi-row drain — delegate to `submit-pending`'s
+            // implementation (same channel partitioning + retry cap
+            // semantics, all already battle-tested). Empty channel
+            // filter, non-dry-run.
+            let args = superdeduper::cli::SubmitPendingArgs {
+                channel: None,
+                dry_run: false,
+            };
+            run_submit_pending(args)
+        }
+        (Some(id), false) => {
+            let record = scan_history::load(&id)?
+                .ok_or_else(|| anyhow::anyhow!("no scan-history row matches scan_id {id}"))?;
+            let payload = record
+                .submission_payload
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "row {id} has no captured submission payload (likely a v1/v2 row from before #41)"
+                ))?;
+            let built_with = record
+                .built_with_install_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("row {id} has no captured install_id"))?;
+            let chan: Channel = record
+                .channel
+                .parse()
+                .with_context(|| format!("parse channel slug `{}`", record.channel))?;
+            let server_url = channel::server_url_for(chan);
+            let install_state = install::load_for(chan)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no install state for channel `{}` — run `superdeduper register --channel {}` first",
+                    chan.as_slug(),
+                    chan.as_slug()
+                )
+            })?;
+            if !install_state.registered {
+                anyhow::bail!(
+                    "install for channel `{}` not registered — run `superdeduper register --channel {}` first",
+                    chan.as_slug(),
+                    chan.as_slug()
+                );
+            }
+            let outcome = submission::submit_recorded_payload(
+                &install_state,
+                payload,
+                built_with,
+                server_url,
+            );
+            match outcome {
+                SubmitOutcome::Accepted { submission_id, .. } => {
+                    scan_history::mark_submitted(&id, submission_id.clone())?;
+                    println!("✓ {id} accepted (submission_id={submission_id})");
+                    Ok(())
+                }
+                SubmitOutcome::DuplicateNoChange => {
+                    scan_history::update_submission_state(&id, SubmissionState::Submitted, true)?;
+                    println!("• {id} already-on-file (409) — marked submitted");
+                    Ok(())
+                }
+                SubmitOutcome::Rejected { status, reason } => {
+                    scan_history::update_submission_state(&id, SubmissionState::Failed, true)?;
+                    anyhow::bail!("✗ {id} rejected (status={status}, reason={reason})")
+                }
+                SubmitOutcome::Transient { reason } => {
+                    let prior_attempts = scan_history::load(&id)?
+                        .map(|r| r.attempt_count)
+                        .unwrap_or(0);
+                    let new_state = scan_history::transient_outcome_state(prior_attempts);
+                    scan_history::update_submission_state(&id, new_state, true)?;
+                    let suffix = match new_state {
+                        SubmissionState::Failed => " — retry cap reached, marked Failed",
+                        _ => " — will retry on next run",
+                    };
+                    anyhow::bail!("· {id} transient (reason={reason}){suffix}")
+                }
+                SubmitOutcome::FlaggedForReview { .. } => {
+                    scan_history::update_submission_state(&id, SubmissionState::Submitted, true)?;
+                    println!("• {id} queued for review — marked submitted");
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
