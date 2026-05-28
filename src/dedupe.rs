@@ -32,6 +32,16 @@ pub struct ResultsFile {
     pub groups: Vec<DuplicateGroup>,
     #[serde(default)]
     pub summary: Option<Summary>,
+    /// F-CLI-7 — group-member files that fell under a `scan --reference`
+    /// root, resolved + persisted at scan time so the separated
+    /// scan→dedupe-file flow can honor `--strategy in-reference` (and
+    /// never-modify-references) without a `dedupe --reference` flag.
+    /// Stored as they appear in `groups[].files`; the reference check
+    /// canonicalizes these and the group members alike before matching.
+    /// Empty when the scan had no reference roots. `#[serde(default)]`
+    /// keeps older results JSON readable.
+    #[serde(default)]
+    pub reference_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -191,7 +201,23 @@ pub fn run(args: &DedupeArgs) -> Result<Outcome> {
         });
     }
 
-    let references = canonical_set(&[]); // reference set is part of the scan; reserved.
+    // F-CLI-7 — reference set comes from the scan-persisted reference_paths
+    // (group-member files under a `scan --reference` root). Was always
+    // empty before, so `--strategy in-reference` + never-modify-reference
+    // couldn't work via the scan→dedupe-file two-step.
+    let references = canonical_set(&results.reference_paths);
+    // F-CLI-7 — `--strategy in-reference` against a results file whose
+    // scan had NO `--reference` roots can't anchor on anything; surface
+    // it as one clean config error up front rather than failing every
+    // group in the loop below.
+    if matches!(args.strategy, KeepStrategy::InReference) && references.is_empty() {
+        return Err(Error::ConfigInvalid {
+            field: "--strategy",
+            reason: "in-reference needs reference roots, but this results file's scan \
+                     had none — re-run `scan --reference <root>` to mark reference copies"
+                .into(),
+        });
+    }
     let mut outcome = Outcome::default();
     // Construct the action-receipt writer once per run. Disabled
     // sink when --integration-test-mode is off; emit calls become
@@ -228,6 +254,18 @@ fn process_group(
             tracing::warn!(path = %path.display(), "system path; group skipped");
             return Ok(());
         }
+    }
+
+    // F-CLI-7 — in-reference only acts on groups that contain a reference
+    // member; a group with none isn't a config error (run() already handled
+    // the no-refs-at-all case) — skip it cleanly rather than fail.
+    if matches!(args.strategy, KeepStrategy::InReference)
+        && !group
+            .files
+            .iter()
+            .any(|f| references.contains_key(&canonical_key(f)))
+    {
+        return Ok(());
     }
 
     let keeper_idx = pick_keeper(group, args.strategy, references)?;
@@ -499,7 +537,7 @@ fn pick_keeper(
 ) -> Result<usize> {
     // Reference paths always win, regardless of strategy.
     for (i, p) in group.files.iter().enumerate() {
-        if references.contains_key(p) {
+        if references.contains_key(&canonical_key(p)) {
             return Ok(i);
         }
     }
@@ -870,16 +908,21 @@ fn replace_with_reflink(_target: &Path, _keeper: &Path) -> Result<()> {
     ))
 }
 
-/// Convert a slice of user-supplied paths into a canonical lookup set.
-/// Canonicalisation tolerates non-existent paths by falling back to
-/// the input path; we still match by exact equality afterwards.
+/// Canonicalize one path for reference matching. Tolerates non-existent
+/// paths by falling back to the input. Both the reference-set keys
+/// (`canonical_set`) and every group member checked against them go
+/// through this, so matching is consistent — otherwise a scanned path
+/// whose representation differs from its canonical form (symlinked root,
+/// Windows `\\?\` verbatim prefix) would never match its own reference
+/// entry, and in-reference would silently skip the group instead of
+/// keeping the reference copy.
+fn canonical_key(p: &Path) -> PathBuf {
+    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Build a canonical lookup set from the scan-persisted reference paths.
 fn canonical_set(paths: &[PathBuf]) -> BTreeMap<PathBuf, ()> {
-    let mut out = BTreeMap::new();
-    for p in paths {
-        let c = fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-        out.insert(c, ());
-    }
-    out
+    paths.iter().map(|p| (canonical_key(p), ())).collect()
 }
 
 /// Return true if `path` falls under any of the platform's
@@ -978,6 +1021,7 @@ mod tests {
             schema: "superdeduper.scan.v1".into(),
             groups,
             summary: None,
+            reference_paths: Vec::new(),
         }
     }
 
@@ -1131,6 +1175,84 @@ mod tests {
             !receipts.contains("skipped_decode_warning"),
             "recycle must NOT be recorded as a skip, got: {receipts}"
         );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // F-CLI-7 — the scan→dedupe-file two-step must honour
+    // `--strategy in-reference`: the reference member persisted in the
+    // results file's `reference_paths` is kept, the non-reference dupe
+    // is removed.
+    fn in_reference_args(results_path: PathBuf) -> DedupeArgs {
+        DedupeArgs {
+            results_file: results_path,
+            strategy: KeepStrategy::InReference,
+            action: DedupeAction::Remove,
+            mode: crate::cli::ScanMode::Exact,
+            dry_run: false,
+            allow_system_paths: false,
+            allow_destructive_on_deduped: false,
+            integration_test_mode: false,
+            receipt_file: None,
+        }
+    }
+
+    #[test]
+    fn in_reference_keeps_the_reference_file_via_persisted_paths() {
+        let d = tmpdir();
+        let reference = d.join("master.bin");
+        let dupe = d.join("copy.bin");
+        write_file(&reference, b"same");
+        write_file(&dupe, b"same");
+        let mut r = results(vec![group(4, vec![dupe.clone(), reference.clone()])]);
+        r.reference_paths = vec![reference.clone()];
+        let path = write_results(&d, &r);
+        let outcome = run(&in_reference_args(path)).unwrap();
+        assert_eq!(outcome.executed, 1, "the non-reference dupe is removed");
+        assert!(reference.exists(), "reference copy must be kept");
+        assert!(!dupe.exists(), "non-reference dupe must be removed");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn in_reference_skips_groups_with_no_reference_member() {
+        // A scan with reference roots can still yield duplicate groups
+        // where none of the members live under a reference — those are
+        // skipped cleanly, not config-failed.
+        let d = tmpdir();
+        let reference = d.join("master.bin");
+        let a = d.join("a.bin");
+        let b = d.join("b.bin");
+        write_file(&reference, b"ref");
+        write_file(&a, b"same");
+        write_file(&b, b"same");
+        // Group has no reference member; reference_paths is non-empty so
+        // run()'s up-front "no refs at all" guard does not fire.
+        let mut r = results(vec![group(4, vec![a.clone(), b.clone()])]);
+        r.reference_paths = vec![reference.clone()];
+        let path = write_results(&d, &r);
+        let outcome = run(&in_reference_args(path)).unwrap();
+        assert_eq!(outcome.executed, 0, "no-reference group is skipped");
+        assert_eq!(outcome.failed, 0, "skipping must not count as a failure");
+        assert!(a.exists() && b.exists(), "both members untouched");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn in_reference_without_any_reference_paths_is_a_config_error() {
+        let d = tmpdir();
+        let a = d.join("a.bin");
+        let b = d.join("b.bin");
+        write_file(&a, b"same");
+        write_file(&b, b"same");
+        // No reference_paths at all → clean up-front config error.
+        let r = results(vec![group(4, vec![a.clone(), b.clone()])]);
+        let path = write_results(&d, &r);
+        let err = run(&in_reference_args(path)).unwrap_err();
+        assert!(
+            matches!(err, Error::ConfigInvalid { field: "--strategy", .. }),
+            "expected a --strategy config error, got: {err:?}"
+        );
+        assert!(a.exists() && b.exists(), "nothing removed on config error");
         fs::remove_dir_all(&d).ok();
     }
 
