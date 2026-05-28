@@ -61,6 +61,9 @@ pub struct Outcome {
     /// #119 — files excluded from permanent `remove` because they
     /// carried an audio decode warning at scan time (a-hybrid guard).
     pub skipped_decode_warning: u64,
+    /// §7.1 — files refused because they're cloud placeholders / reparse
+    /// points that block destructive action under the active policy.
+    pub skipped_placeholder: u64,
     pub failed: u64,
     pub bytes_reclaimed: u64,
 }
@@ -247,11 +250,27 @@ fn process_group(
         return Ok(());
     }
 
-    // System-path guard.
-    for path in &group.files {
-        if !args.allow_system_paths && is_system_path(path) {
+    // System-path guard (F-CLI-4). Refuse the whole group if any member
+    // is under a system-critical path. §7.1 — emit a per-file
+    // refused_system_path receipt for each refused member so the
+    // containment matrix can assert WHICH file was refused, not just read
+    // the coarse skipped_system counter (the empty-snapshot-delta cell
+    // would otherwise have no per-action signal).
+    if !args.allow_system_paths {
+        let sys: Vec<&PathBuf> = group.files.iter().filter(|p| is_system_path(p)).collect();
+        if !sys.is_empty() {
             outcome.skipped_system += 1;
-            tracing::warn!(path = %path.display(), "system path; group skipped");
+            for p in &sys {
+                tracing::warn!(path = %p.display(), "system path; group skipped");
+                let mut r = crate::action_receipt::ActionReceipt::new(
+                    crate::action_receipt::action_label(args.action),
+                    &p.display().to_string(),
+                    &p.display().to_string(),
+                    group.size,
+                );
+                r.outcome = "refused_system_path".to_string();
+                let _ = receipts.emit(&r);
+            }
             return Ok(());
         }
     }
@@ -273,6 +292,19 @@ fn process_group(
 
     for (i, path) in group.files.iter().enumerate() {
         if i == keeper_idx {
+            // §7.1 — the keeper is consciously preserved; emit an explicit
+            // left_alone receipt (one per keeper-per-group) so the
+            // containment matrix asserts conscious-preserve, not
+            // silent-miss. No data moves: delta 0, no inode change.
+            let size = group.file_sizes.get(i).copied().unwrap_or(group.size);
+            let mut r = crate::action_receipt::ActionReceipt::new(
+                crate::action_receipt::action_label(args.action),
+                &keeper.display().to_string(),
+                &keeper.display().to_string(),
+                size,
+            );
+            r.outcome = "left_alone".to_string();
+            let _ = receipts.emit(&r);
             continue;
         }
         outcome.planned += 1;
@@ -349,6 +381,36 @@ fn process_group(
             continue;
         }
 
+        // §7.1 — refuse destructive action on cloud-placeholder / reparse
+        // files with a DISTINCT outcome. Previously this was caught only
+        // inside perform_action's guard_destructive and collapsed into the
+        // generic `error` outcome (message-substring only) — fragile, since
+        // a regression that stopped refusing would still read as a generic
+        // failure. perform_action keeps the same guard as defense-in-depth.
+        // On non-Windows this is always NotPlaceholder, so it never fires.
+        let pstate = placeholder_state_for(path)?;
+        if pstate.blocks_destructive_action_under_policy(args.allow_destructive_on_deduped) {
+            outcome.skipped_placeholder += 1;
+            tracing::warn!(
+                group = idx + 1,
+                path = %path.display(),
+                state = ?pstate,
+                "placeholder/reparse; destructive action refused"
+            );
+            let mut r = crate::action_receipt::ActionReceipt::new(
+                crate::action_receipt::action_label(args.action),
+                &path.display().to_string(),
+                &keeper.display().to_string(),
+                group.size,
+            );
+            r.outcome = "refused_placeholder".to_string();
+            r.error = Some(format!(
+                "refused destructive action on placeholder/reparse file ({pstate:?})"
+            ));
+            let _ = receipts.emit(&r);
+            continue;
+        }
+
         if args.dry_run {
             tracing::info!(
                 group = idx + 1,
@@ -375,6 +437,36 @@ fn process_group(
         // nothing else).
         let pre = crate::action_receipt::read_inode_and_nlink(path);
 
+        // §7.1 — a hardlink action targeting a file that ALREADY shares
+        // the keeper's inode is a no-op: emit already_hardlinked instead
+        // of re-linking. Guarded against the Windows inode placeholder
+        // (read_inode returns 0x0..0 there until file_index is plumbed),
+        // so it can't false-positive every Windows file as already-linked.
+        if matches!(args.action, DedupeAction::Hardlink) {
+            if let (Some((src_ino, _)), Some((keep_ino, _))) =
+                (&pre, &crate::action_receipt::read_inode_and_nlink(keeper))
+            {
+                if src_ino == keep_ino && src_ino != "0x0000000000000000" {
+                    let mut r = crate::action_receipt::ActionReceipt::new(
+                        crate::action_receipt::action_label(args.action),
+                        &path.display().to_string(),
+                        &keeper.display().to_string(),
+                        group.size,
+                    );
+                    r.outcome = "already_hardlinked".to_string();
+                    r.inode_before = Some(src_ino.clone());
+                    r.inode_after = Some(src_ino.clone());
+                    let _ = receipts.emit(&r);
+                    // No-op success: the dedup intent (source shares the
+                    // keeper inode) is already satisfied. Count as executed
+                    // (matching the dry-run precedent) but reclaim no bytes
+                    // — nothing was freed.
+                    outcome.executed += 1;
+                    continue;
+                }
+            }
+        }
+
         match perform_action(args.action, path, keeper, args.allow_destructive_on_deduped) {
             Ok(trash_outcome) => {
                 outcome.executed += 1;
@@ -394,16 +486,29 @@ fn process_group(
                     group.size,
                     pre,
                     None,
+                    None,
                     trash_outcome,
                     decode_warning,
                 );
             }
             Err(e) => {
                 outcome.failed += 1;
+                // §7.1 — a cross-volume hardlink/reflink failure is a
+                // distinct REFUSAL outcome, not a generic error. The
+                // underlying op now propagates the OS error (Windows
+                // ERROR_NOT_SAME_DEVICE / Unix EXDEV) — see the P0 fix in
+                // winapi_wrappers::create_hard_link — and the original file
+                // is preserved by perform_action's restore path.
+                let cross_volume = matches!(
+                    args.action,
+                    DedupeAction::Hardlink | DedupeAction::Reflink
+                ) && is_cross_device(&e);
+                let outcome_override = cross_volume.then_some("refused_cross_volume");
                 tracing::error!(
                     group = idx + 1,
                     path = %path.display(),
                     error = %e,
+                    cross_volume,
                     "action failed"
                 );
                 let err_str = format!("{e}");
@@ -415,6 +520,7 @@ fn process_group(
                     group.size,
                     pre,
                     Some(err_str),
+                    outcome_override,
                     crate::platform::TrashOutcome::default(),
                     decode_warning,
                 );
@@ -438,6 +544,10 @@ fn emit_action_receipt(
     size: u64,
     pre: Option<(String, u64)>,
     error: Option<String>,
+    // §7.1 — when set, replaces the default ok/error outcome with a
+    // distinct named outcome (e.g. refused_cross_volume) while keeping any
+    // human detail in `error`. The outcome string is the matrix assertion.
+    outcome_override: Option<&str>,
     trash_outcome: crate::platform::TrashOutcome,
     decode_warning: Option<String>,
 ) {
@@ -454,6 +564,9 @@ fn emit_action_receipt(
     } else {
         ActionReceipt::new(action_str, &source_str, &keeper_str, size)
     };
+    if let Some(o) = outcome_override {
+        receipt.outcome = o.to_string();
+    }
 
     // GH #33 — populate the recycle_bin_entry block on every
     // successful recycle action, regardless of platform. Linux's
@@ -528,6 +641,20 @@ fn emit_action_receipt(
     receipt.decode_warning = decode_warning;
 
     let _ = receipts.emit(&receipt);
+}
+
+// §7.1 — OS error code for a cross-volume link/clone attempt, used to
+// classify a hardlink/reflink failure as refused_cross_volume rather
+// than a generic error. Windows: ERROR_NOT_SAME_DEVICE. Unix: EXDEV.
+#[cfg(windows)]
+const CROSS_DEVICE_ERRNO: i32 = 17;
+#[cfg(not(windows))]
+const CROSS_DEVICE_ERRNO: i32 = 18;
+
+/// True when `err` is the platform's cross-volume error (the underlying
+/// op now propagates it — see the create_hard_link P0 fix).
+fn is_cross_device(err: &Error) -> bool {
+    matches!(err, Error::Io(e) if e.raw_os_error() == Some(CROSS_DEVICE_ERRNO))
 }
 
 fn pick_keeper(
@@ -1291,6 +1418,92 @@ mod tests {
             receipts.contains("decode_warning"),
             "receipt must surface the decode_warning, got: {receipts}"
         );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // §7.1 — receipt-emission contract for the containment matrix.
+    // Helper: run with integration-test-mode + a receipt file and return
+    // the NDJSON lines.
+    fn run_capturing_receipts(d: &Path, r: &ResultsFile, action: DedupeAction, dry_run: bool) -> String {
+        let path = write_results(d, r);
+        let receipt_path = d.join("receipts.jsonl");
+        let args = DedupeArgs {
+            results_file: path,
+            strategy: KeepStrategy::First,
+            action,
+            mode: crate::cli::ScanMode::Exact,
+            dry_run,
+            allow_system_paths: false,
+            allow_destructive_on_deduped: false,
+            integration_test_mode: true,
+            receipt_file: Some(receipt_path.clone()),
+        };
+        run(&args).unwrap();
+        fs::read_to_string(&receipt_path).unwrap_or_default()
+    }
+
+    #[test]
+    fn keeper_emits_left_alone_receipt() {
+        let d = tmpdir();
+        let keeper = d.join("a_keeper.bin");
+        let dupe = d.join("b_dupe.bin");
+        write_file(&keeper, b"same");
+        write_file(&dupe, b"same");
+        let r = results(vec![group(4, vec![keeper.clone(), dupe.clone()])]);
+        // dry-run: the keeper's left_alone emit is before the dry-run
+        // branch, so it fires regardless + we avoid touching the backend.
+        let receipts = run_capturing_receipts(&d, &r, DedupeAction::Remove, true);
+        assert!(
+            receipts.contains("\"outcome\":\"left_alone\""),
+            "keeper must carry an explicit left_alone receipt, got: {receipts}"
+        );
+        assert!(
+            receipts.contains("a_keeper.bin"),
+            "left_alone receipt must name the keeper, got: {receipts}"
+        );
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn system_path_member_emits_refused_system_path() {
+        let d = tmpdir();
+        // is_system_path is a pure prefix check (no file access) and the
+        // guard returns before any member is stat'd, so a synthetic
+        // system path is sufficient. Pairs with a normal member so the
+        // group has >= 2 files.
+        #[cfg(windows)]
+        let sys = PathBuf::from("c:\\windows\\system32\\evil.dll");
+        #[cfg(not(windows))]
+        let sys = PathBuf::from("/var/lib/superdeduper-test/evil.bin");
+        let normal = d.join("ok.bin");
+        write_file(&normal, b"same");
+        let r = results(vec![group(4, vec![sys.clone(), normal.clone()])]);
+        let receipts = run_capturing_receipts(&d, &r, DedupeAction::Remove, false);
+        assert!(
+            receipts.contains("\"outcome\":\"refused_system_path\""),
+            "a system-path member must emit a refused_system_path receipt, got: {receipts}"
+        );
+        assert!(normal.exists(), "the whole group is refused; nothing removed");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // already_hardlinked needs real inodes; only meaningful on Unix (the
+    // Windows file_index is a placeholder until plumbed — see action_receipt).
+    #[cfg(unix)]
+    #[test]
+    fn already_hardlinked_member_is_a_noop_receipt() {
+        let d = tmpdir();
+        let keeper = d.join("a_keeper.bin");
+        let linked = d.join("b_linked.bin");
+        write_file(&keeper, b"same");
+        std::fs::hard_link(&keeper, &linked).unwrap(); // shares keeper's inode
+        let r = results(vec![group(4, vec![keeper.clone(), linked.clone()])]);
+        let receipts = run_capturing_receipts(&d, &r, DedupeAction::Hardlink, false);
+        assert!(
+            receipts.contains("\"outcome\":\"already_hardlinked\""),
+            "a member already sharing the keeper inode must emit already_hardlinked, got: {receipts}"
+        );
+        assert!(linked.exists(), "already-linked member is left in place (no-op)");
         fs::remove_dir_all(&d).ok();
     }
 
