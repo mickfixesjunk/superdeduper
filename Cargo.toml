@@ -232,6 +232,10 @@ tempfile = "3.10"
 # the #153 Tier-A GUI cells can drive the real SuperdeduperApp (eframe::App)
 # headless (click -> worker -> FS effect); dev-only, no release impact.
 egui_kittest = { version = "0.32", features = ["wgpu", "snapshot", "eframe"] }
+# Already a transitive dep (via egui/kittest); named directly so the #153 Tier-A
+# GUI driver can use accesskit::Role to target widgets (e.g. the destructive-
+# confirm modal's text field) in kittest queries. dev-only, no release impact.
+accesskit = "0.19"
 
 [profile.release]
 opt-level = 3
