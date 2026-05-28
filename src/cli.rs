@@ -704,6 +704,12 @@ pub enum KeepStrategy {
     LongestPath,
     InReference,
     First,
+    /// F-CLI-6 — GUI-only: the GUI duplicate-group table IS the
+    /// interactive keeper surface. `#[value(skip)]` keeps the variant
+    /// for the GUI while removing it from the CLI `--strategy` choices,
+    /// so the CLI no longer advertises (in `--help`) a strategy that
+    /// errors at runtime ("interactive is not yet implemented").
+    #[value(skip)]
     Interactive,
     /// Pick the keeper by scoring each file on multiple signals —
     /// path quality (Recycle Bin / temp / cache penalised, depth
