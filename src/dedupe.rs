@@ -833,6 +833,11 @@ fn perform_action(
     allow_destructive_on_deduped: bool,
 ) -> Result<crate::platform::TrashOutcome> {
     guard_destructive(path, allow_destructive_on_deduped)?;
+    // Keeper-identity chokepoint backstop. process_group's planner gate
+    // refuses + emits before reaching here on the normal CLI path, so this
+    // is defense-in-depth (independent gate per the directive) — and it
+    // guards any future caller that reaches perform_action directly.
+    guard_keeper_identity(action, path, Some(keeper))?;
     match action {
         DedupeAction::Remove => {
             fs::remove_file(path)?;
@@ -879,6 +884,52 @@ fn guard_destructive(path: &Path, allow_destructive_on_deduped: bool) -> Result<
     Ok(())
 }
 
+/// Keeper-preservation gate 2 at the ACTION LAYER — shared by the CLI
+/// chokepoint (`perform_action`) AND the GUI direct-action entry points
+/// (`action_*`). The GUI dedupe path runs NONE of the CLI planner's
+/// keeper-safety stack (no pick_keeper / reference / system-path / identity
+/// guards — it calls `action_*` directly), so without this it deletes a
+/// keeper reached via an alias. This is the one placement that protects
+/// BOTH clients.
+///
+/// Refuses a DELETE-the-loser action (remove / recycle / safe-rename) on a
+/// `target` that resolves by file-IDENTITY to `keeper` (the keeper via a
+/// `\\?\`/8.3/junction/symlink/case alias — `file_identity` collapses them
+/// all). For permanent `remove` (irreversible), also refuses when identity
+/// can't be positively resolved (fail-closed; recycle/safe-rename are
+/// recoverable so they tolerate transient unopenability). hardlink/reflink
+/// replace-with-link (don't delete data) and aren't gated here — a positive
+/// match there is the benign already-linked no-op. `keeper == None` ⇒ caller
+/// asserts no keeper to protect (non-dedup) ⇒ no gate.
+fn guard_keeper_identity(action: DedupeAction, target: &Path, keeper: Option<&Path>) -> Result<()> {
+    if !matches!(
+        action,
+        DedupeAction::Remove | DedupeAction::Recycle | DedupeAction::SafeRename
+    ) {
+        return Ok(());
+    }
+    let Some(keeper) = keeper else { return Ok(()) };
+    let kid = file_identity(keeper);
+    let mid = file_identity(target);
+    if matches!((kid, mid), (Some(k), Some(m)) if k == m) {
+        return Err(Error::other(format!(
+            "refused: {} resolves by file-id to the keeper {} (same physical \
+             file via an alias) — destructive action would delete the keeper",
+            target.display(),
+            keeper.display(),
+        )));
+    }
+    if matches!(action, DedupeAction::Remove) && (kid.is_none() || mid.is_none()) {
+        return Err(Error::other(format!(
+            "refused: could not resolve the file-id of the keeper and/or {} to \
+             prove it distinct from the keeper — permanent remove is \
+             irreversible, so it is preserved (fail-closed)",
+            target.display(),
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn placeholder_state_for(path: &Path) -> Result<crate::inventory::PlaceholderState> {
     use std::os::windows::fs::MetadataExt;
@@ -909,14 +960,22 @@ pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 /// if a caller forgets to filter (e.g. a future code path, or a
 /// future GUI flow), the action layer refuses to delete / replace /
 /// rename a cloud placeholder or reparse-tagged file.
-pub fn action_remove(path: &Path) -> Result<()> {
+///
+/// The delete-the-loser variants also take the group's `keeper` and run
+/// the keeper-identity gate, so the GUI path (which doesn't go through the
+/// CLI planner) can't delete the keeper reached via an alias. Pass
+/// `Some(keeper)` from any dedup flow; `None` only when there is genuinely
+/// no keeper to protect.
+pub fn action_remove(path: &Path, keeper: Option<&Path>) -> Result<()> {
     guard_destructive(path, false)?;
+    guard_keeper_identity(DedupeAction::Remove, path, keeper)?;
     fs::remove_file(path)?;
     Ok(())
 }
 
-pub fn action_recycle(path: &Path) -> Result<()> {
+pub fn action_recycle(path: &Path, keeper: Option<&Path>) -> Result<()> {
     guard_destructive(path, false)?;
+    guard_keeper_identity(DedupeAction::Recycle, path, keeper)?;
     // Drop the TrashOutcome — the GUI's per-row recycle path doesn't
     // emit receipts (it's only the `dedupe` subcommand flow that
     // surfaces them). Future: thread metadata into a per-action
@@ -938,8 +997,9 @@ pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
 /// Safe-mode rename: append `.superdeduper` to the target. Idempotent —
 /// files already ending in the suffix are a no-op. Reversible via
 /// `unsuperdeduper_root`. Never deletes anything.
-pub fn action_safe_rename(target: &Path) -> Result<()> {
+pub fn action_safe_rename(target: &Path, keeper: Option<&Path>) -> Result<()> {
     guard_destructive(target, false)?;
+    guard_keeper_identity(DedupeAction::SafeRename, target, keeper)?;
     safe_rename_unguarded(target)
 }
 
@@ -1372,7 +1432,7 @@ mod tests {
         let d = tmpdir();
         let f = d.join("doomed.bin");
         write_file(&f, b"bye");
-        action_remove(&f).unwrap();
+        action_remove(&f, None).unwrap();
         assert!(!f.exists());
         fs::remove_dir_all(&d).ok();
     }
@@ -1782,6 +1842,38 @@ mod tests {
         fs::remove_dir_all(&d).ok();
     }
 
+    // Action-layer keeper guard (the GUI-facing entry points — quality
+    // proved the GUI runs none of the planner stack). action_remove /
+    // action_safe_rename must REFUSE a target that resolves by file-id to
+    // the keeper, even though they're called directly (no process_group).
+    #[cfg(unix)]
+    #[test]
+    fn action_layer_guard_refuses_keeper_alias() {
+        let d = tmpdir();
+        let keeper = d.join("keeper.bin");
+        let alias = d.join("alias.bin");
+        write_file(&keeper, b"same");
+        std::fs::hard_link(&keeper, &alias).unwrap(); // same physical file
+        assert!(
+            action_remove(&alias, Some(&keeper)).is_err(),
+            "action_remove must refuse a keeper-alias target"
+        );
+        assert!(
+            action_safe_rename(&alias, Some(&keeper)).is_err(),
+            "action_safe_rename must refuse a keeper-alias target"
+        );
+        assert!(alias.exists() && keeper.exists(), "both must remain after refusal");
+        // A genuinely distinct file is NOT refused (no over-refusal).
+        let other = d.join("other.bin");
+        write_file(&other, b"same");
+        assert!(
+            action_remove(&other, Some(&keeper)).is_ok(),
+            "a distinct file must not be id-refused"
+        );
+        assert!(!other.exists(), "the distinct file was removed");
+        fs::remove_dir_all(&d).ok();
+    }
+
     // Counterpart to Finding 2: the SAME unresolvable-keeper case under a
     // REVERSIBLE action (recycle) does NOT over-refuse — the transient-lock
     // tolerance is kept where a wrong call is recoverable. (Asserts the
@@ -2112,7 +2204,7 @@ mod tests {
         std::env::set_var("HOME", &fake_home);
         std::env::remove_var("XDG_DATA_HOME");
 
-        action_recycle(&target).expect("action_recycle on Linux");
+        action_recycle(&target, None).expect("action_recycle on Linux");
 
         // Original gone.
         assert!(

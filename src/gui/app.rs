@@ -2576,7 +2576,7 @@ impl SuperdeduperApp {
                 let mut skipped = 0u64;
                 let mut renamed_paths: Vec<PathBuf> = Vec::new();
                 let mut processed = 0u64;
-                'outer: for (_keeper, dupes) in &groups {
+                'outer: for (keeper, dupes) in &groups {
                     for d in dupes {
                         if cancel.load(Ordering::Relaxed) {
                             action_summary.user_stopped = true;
@@ -2590,7 +2590,7 @@ impl SuperdeduperApp {
                             current: Some(d.display().to_string()),
                         });
                         let size = measure_action_size(d);
-                        match crate::dedupe::action_safe_rename(d) {
+                        match crate::dedupe::action_safe_rename(d, Some(keeper)) {
                             Ok(()) => {
                                 action_summary.ok_count += 1;
                                 action_summary.ok_bytes += size;
@@ -2794,7 +2794,7 @@ impl SuperdeduperApp {
             .map(|r| r.path.clone())
             .collect();
         let hide_unreclaimable = self.groups_state.hide_unreclaimable;
-        let groups: Vec<Vec<PathBuf>> = self
+        let groups: Vec<(PathBuf, Vec<PathBuf>)> = self
             .state
             .duplicates
             .iter()
@@ -2819,11 +2819,14 @@ impl SuperdeduperApp {
                 if dupes.is_empty() {
                     None
                 } else {
-                    Some(dupes)
+                    // Carry the keeper (files[0]) alongside its dupes so the
+                    // action-layer keeper-identity gate can refuse a dupe that
+                    // resolves (via an alias) to the keeper.
+                    Some((g.files[0].clone(), dupes))
                 }
             })
             .collect();
-        let total: u64 = groups.iter().map(|d| d.len() as u64).sum();
+        let total: u64 = groups.iter().map(|(_, dupes)| dupes.len() as u64).sum();
         let action_label = format!(
             "{label_emoji} · {total} file(s) across {} group(s)",
             groups.len()
@@ -2844,7 +2847,7 @@ impl SuperdeduperApp {
                     user_stopped: false,
                 };
                 let mut processed = 0u64;
-                'outer: for dupes in &groups {
+                'outer: for (keeper, dupes) in &groups {
                     for d in dupes {
                         if cancel.load(Ordering::Relaxed) {
                             summary.user_stopped = true;
@@ -2856,8 +2859,8 @@ impl SuperdeduperApp {
                         });
                         let size = measure_action_size(d);
                         let r = match action {
-                            DedupeAction::Recycle => crate::dedupe::action_recycle(d),
-                            DedupeAction::Remove => crate::dedupe::action_remove(d),
+                            DedupeAction::Recycle => crate::dedupe::action_recycle(d, Some(keeper)),
+                            DedupeAction::Remove => crate::dedupe::action_remove(d, Some(keeper)),
                             // Other variants aren't valid for bulk-
                             // destructive here; treat as a no-op +
                             // failure so the caller sees an
@@ -2958,11 +2961,11 @@ impl SuperdeduperApp {
                     // ⇒ size 0; logged but doesn't abort the action.
                     let size = measure_action_size(d);
                     let r = match action {
-                        DedupeAction::Recycle => crate::dedupe::action_recycle(d),
+                        DedupeAction::Recycle => crate::dedupe::action_recycle(d, Some(&keeper)),
                         DedupeAction::Hardlink => crate::dedupe::action_hardlink(d, &keeper),
-                        DedupeAction::Remove => crate::dedupe::action_remove(d),
+                        DedupeAction::Remove => crate::dedupe::action_remove(d, Some(&keeper)),
                         DedupeAction::Reflink => crate::dedupe::action_reflink(d, &keeper),
-                        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(d),
+                        DedupeAction::SafeRename => crate::dedupe::action_safe_rename(d, Some(&keeper)),
                     };
                     match r {
                         Ok(()) => {
