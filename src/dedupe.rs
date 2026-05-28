@@ -1764,23 +1764,32 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let reference_alias = link.join("master.bin");
 
-        // Group carries the ALIASED reference path; reference_paths marks
-        // it as a reference. Both members are references here (the dupe is
-        // also under the reference root), but the keeper-pick lands on one
-        // and the OTHER reference must not be deleted via the loop guard.
+        // Ordering is load-bearing (quality catch: the obvious ordering is
+        // fake-green). pick_keeper's reference-wins loop returns the FIRST
+        // reference member as keeper, and the keeper is excluded from the
+        // delete loop BY INDEX — so it never reaches the line-280 guard.
+        // To actually exercise the canonical-key fix, the aliased reference
+        // (raw != canonical) must be the NON-keeper: put the canonical-path
+        // member (`dupe`, raw == canonical) FIRST so it takes the keeper
+        // slot, and the symlink-aliased reference SECOND so it flows through
+        // line 280. RAW lookup there MISSES the alias -> deletes it (test
+        // fails on the bug); CANONICAL lookup matches -> protected.
+        // Negative-control confirmed: reverting line 280 to the raw lookup
+        // makes this test FAIL (the aliased reference gets deleted).
         let mut r = results(vec![group(
             4,
-            vec![reference_alias.clone(), dupe.clone()],
+            vec![dupe.clone(), reference_alias.clone()],
         )]);
-        r.reference_paths = vec![reference_alias.clone(), dupe.clone()];
+        r.reference_paths = vec![dupe.clone(), reference_alias.clone()];
         let path = write_results(&d, &r);
         let args = make_args(path, false, DedupeAction::Remove);
         let outcome = run(&args).unwrap();
         assert!(
-            reference.exists() && dupe.exists(),
-            "DATA-LOSS GUARD: a reference member reached via a symlinked path \
-             must not be deleted (canonical-keyed guard must catch the alias)"
+            reference.exists(),
+            "DATA-LOSS GUARD: the aliased reference (non-keeper, raw != canonical) \
+             must survive the line-280 guard via canonical_key"
         );
+        assert!(dupe.exists(), "the keeper must also survive");
         assert_eq!(outcome.executed, 0, "no reference copy should be removed");
         fs::remove_dir_all(&d).ok();
     }
