@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("--channel / SUPERDEDUPER_CHANNEL / config.toml: {e}"))?;
     superdeduper::channel::set_active_channel(active);
 
-    let result = dispatch(cli.command);
+    let result = dispatch(cli.command, cli.quiet);
 
     // Per dev-channel-spec.md §5.5: every CLI command on non-prod
     // prints a footer line so the user is reminded which environment
@@ -43,9 +43,9 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-fn dispatch(command: Command) -> anyhow::Result<()> {
+fn dispatch(command: Command, quiet: bool) -> anyhow::Result<()> {
     match command {
-        Command::Scan(args) => run_scan(args),
+        Command::Scan(args) => run_scan(args, quiet),
         Command::Dedupe(args) => run_dedupe(args),
         Command::Cache(cmd) => run_cache(cmd),
         Command::DriveInfo => run_drive_info(),
@@ -937,7 +937,22 @@ fn run_drive_info() -> anyhow::Result<()> {
     }
 }
 
-fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
+/// F-CLI-2 — stdout writer for scan output, honoring `--quiet`. Under
+/// quiet, human-readable console output (Text / Report) is "non-error
+/// status" and is silenced to a sink. Machine formats (JSON / CSV — the
+/// requested deliverable, e.g. `-q --format json | jq`) still emit;
+/// explicit `--output FILE` is handled by the caller and never routed
+/// here. Shared by both scan output paths so the gating can't drift.
+fn scan_console_writer(format: superdeduper::cli::OutputFormat, quiet: bool) -> Box<dyn Write> {
+    use superdeduper::cli::OutputFormat;
+    if quiet && matches!(format, OutputFormat::Text | OutputFormat::Report) {
+        Box::new(io::sink())
+    } else {
+        Box::new(BufWriter::new(io::stdout().lock()))
+    }
+}
+
+fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
     // #81 — `--list-exclusion-packs` short-circuits the scan and
     // prints every preset pack with its content so the user can
     // see exactly what each pack covers before deciding whether to
@@ -1114,7 +1129,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
             Some(p) => Box::new(BufWriter::new(
                 std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
             )),
-            None => Box::new(BufWriter::new(io::stdout().lock())),
+            None => scan_console_writer(cfg.format, quiet),
         };
         output::write(writer.as_mut(), cfg.format, &[], &skipped)?;
         writer.flush()?;
@@ -1374,7 +1389,7 @@ fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
         Some(p) => Box::new(BufWriter::new(
             std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
         )),
-        None => Box::new(BufWriter::new(io::stdout().lock())),
+        None => scan_console_writer(cfg.format, quiet),
     };
     output::write(writer.as_mut(), cfg.format, &duplicates, &skipped)?;
     writer.flush()?;
