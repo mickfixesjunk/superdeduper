@@ -54,6 +54,7 @@ pub struct SubmissionInputs {
 
 /// `run_shape` block per backend schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
 pub struct RunShape {
     pub wall_clock_seconds: f64,
     pub bytes_scanned: u64,
@@ -129,6 +130,7 @@ pub struct RunShape {
 
 /// `result_summary` block per backend schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
 pub struct ResultSummary {
     pub duplicate_groups: u64,
     pub duplicate_bytes_reclaimable: u64,
@@ -224,6 +226,55 @@ pub struct RankEntry {
     pub bracket: String,
     pub rank: u64,
     pub bucket_size: u64,
+}
+
+/// #144 — Derive the canonical JSON Schema for the submission wire
+/// structs (`RunShape`, `ResultSummary`, `HardwareFingerprint`) +
+/// render it as pretty JSON. ENGINE OWNS this schema: it's derived
+/// from the Rust structs via `schemars`, committed to
+/// `schema/submit.schema.json`, and a CI test
+/// (`submission_schema_matches_committed`) fails if a struct field
+/// changes without regenerating the committed file. That failure
+/// is the #96 root-cause forcing function — a field rename can no
+/// longer silently drift into a runtime 400 (is_dev_drive incident)
+/// or a silently-disabled achievement (catalog drifts).
+///
+/// Web validates against the committed/published artifact (its
+/// half of #96 — design routed the consumption mechanism to web).
+///
+/// To regenerate after an intentional struct change:
+/// `SD_UPDATE_SCHEMA=1 cargo test --features telemetry
+/// submission_schema_matches_committed` writes the new file; review
+/// the diff + commit it alongside the struct change.
+#[cfg(feature = "telemetry")]
+pub fn wire_schema_json() -> String {
+    let settings = schemars::gen::SchemaSettings::draft2019_09();
+    let generator = schemars::gen::SchemaGenerator::new(settings);
+    // Build a combined object describing all three top-level wire
+    // blocks under stable keys. The combined doc is what web
+    // validates a submission's hardware / run_shape / result_summary
+    // sub-objects against.
+    let mut gen = generator;
+    let run_shape = gen.subschema_for::<RunShape>();
+    let result_summary = gen.subschema_for::<ResultSummary>();
+    let hardware = gen.subschema_for::<super::hardware::HardwareFingerprint>();
+    let root = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2019-09/schema",
+        "title": "superdeduper.submit.wire-structs",
+        "description": "Engine-owned canonical schema for the /api/v1/submit \
+                        payload sub-objects. Derived from the Rust structs via \
+                        schemars (#144). DO NOT hand-edit — regenerate via \
+                        SD_UPDATE_SCHEMA=1 cargo test.",
+        "definitions": gen.definitions(),
+        "properties": {
+            "hardware": hardware,
+            "run_shape": run_shape,
+            "result_summary": result_summary,
+        },
+    });
+    let mut s = serde_json::to_string_pretty(&root).expect("schema serializes");
+    s.push('\n');
+    s
 }
 
 /// Build the canonical JSON request body. Pure function so tests can
@@ -1233,6 +1284,43 @@ mod tests {
         assert_eq!(
             ACTION_BYTES_KEY_HARDLINK_REPLACED,
             "hardlink_replaced_bytes"
+        );
+    }
+
+    /// #144 — the committed schema/submit.schema.json must match
+    /// the schema derived from the current struct definitions. A
+    /// field rename / add / type change without regenerating the
+    /// committed file fails here — the #96 root-cause CI gate.
+    ///
+    /// Regenerate after an intentional struct change:
+    /// `SD_UPDATE_SCHEMA=1 cargo test --features telemetry
+    /// submission_schema_matches_committed`
+    #[test]
+    fn submission_schema_matches_committed() {
+        let derived = wire_schema_json();
+        let committed_path = concat!(env!("CARGO_MANIFEST_DIR"), "/schema/submit.schema.json");
+        if std::env::var("SD_UPDATE_SCHEMA").is_ok() {
+            std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/schema"))
+                .expect("create schema dir");
+            std::fs::write(committed_path, &derived).expect("write schema");
+            eprintln!("SD_UPDATE_SCHEMA: wrote {committed_path}");
+            return;
+        }
+        let committed = std::fs::read_to_string(committed_path).unwrap_or_else(|e| {
+            panic!(
+                "schema/submit.schema.json missing or unreadable ({e}). \
+                 Regenerate with SD_UPDATE_SCHEMA=1 cargo test --features \
+                 telemetry submission_schema_matches_committed"
+            )
+        });
+        assert_eq!(
+            derived, committed,
+            "the submission wire structs (RunShape / ResultSummary / \
+             HardwareFingerprint) changed but schema/submit.schema.json \
+             was not regenerated. This is the #96 drift gate — a field \
+             change must bump the canonical schema in lockstep. \
+             Regenerate: SD_UPDATE_SCHEMA=1 cargo test --features telemetry \
+             submission_schema_matches_committed, review the diff, commit it.",
         );
     }
 

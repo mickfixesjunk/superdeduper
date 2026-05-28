@@ -90,6 +90,14 @@ uuid = { version = "1.10", optional = true, features = ["v4"] }
 # (gamification §5) to count distinct scripts in a path. Tiny crate,
 # data-table only, no other deps.
 unicode-script = { version = "0.5", optional = true }
+# #144 — JSON Schema derivation for the submission wire structs
+# (RunShape / ResultSummary / HardwareFingerprint). The committed
+# schema/submit.schema.json is DERIVED from these structs; a CI
+# test fails if a struct field changes without regenerating the
+# committed schema (the #96 root-cause forcing function). Engine
+# owns the canonical schema; web validates against it. Telemetry-
+# gated — non-leaderboard builds don't pull schemars.
+schemars = { version = "0.8", optional = true }
 
 # T1.2 perceptual image similarity (#25). `image` decodes JPEG / PNG /
 # WebP / GIF / BMP / TIFF / ICO; `image_hasher` provides the dHash /
@@ -152,7 +160,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars"]
 # T1.2 perceptual image similarity (#25). Pulls `image` for decode
 # + `image_hasher` for the dHash/aHash/pHash family. Off by default
 # while the feature lands incrementally — first slice is just the
