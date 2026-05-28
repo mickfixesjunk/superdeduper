@@ -1284,9 +1284,10 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
             "stage 2-4 skipped: --placeholders-only set"
         );
         let mut writer: Box<dyn Write> = match &cfg.output {
-            Some(p) => Box::new(BufWriter::new(
-                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-            )),
+            // #137 — file branch via the shared output::open_writer; None keeps
+            // the quiet-aware scan_console_writer.
+            Some(p) => output::open_writer(Some(p))
+                .with_context(|| format!("creating {}", p.display()))?,
             None => scan_console_writer(cfg.format, quiet),
         };
         output::write(writer.as_mut(), cfg.format, &[], &skipped, &[])?;
@@ -1548,9 +1549,10 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
     // works through the scan→dedupe-file two-step.
     let reference_paths = resolve_reference_paths(&cfg.reference_roots, &duplicates);
     let mut writer: Box<dyn Write> = match &cfg.output {
-        Some(p) => Box::new(BufWriter::new(
-            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-        )),
+        // #137 — file branch via the shared output::open_writer; None keeps
+        // the quiet-aware scan_console_writer.
+        Some(p) => output::open_writer(Some(p))
+            .with_context(|| format!("creating {}", p.display()))?,
         None => scan_console_writer(cfg.format, quiet),
     };
     output::write(writer.as_mut(), cfg.format, &duplicates, &skipped, &reference_paths)?;
@@ -1843,9 +1845,10 @@ fn run_force_hash_mode(
 
     // Write empty groups[] JSON for compatibility.
     let mut writer: Box<dyn Write> = match &cfg.output {
-        Some(p) => Box::new(BufWriter::new(
-            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-        )),
+        // #137 — file branch via the shared output::open_writer; None keeps
+        // the quiet-aware scan_console_writer.
+        Some(p) => output::open_writer(Some(p))
+            .with_context(|| format!("creating {}", p.display()))?,
         None => scan_console_writer(cfg.format, quiet),
     };
     output::write(writer.as_mut(), cfg.format, &[], skipped, &[])?;

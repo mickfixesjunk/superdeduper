@@ -13,8 +13,15 @@
 //!    byte-by-byte verification stub was removed in #131; real
 //!    byte-by-byte verification is a v0.3.x feature scope.)
 //!
-//! The [`winapi_wrappers`] module hides every `unsafe` FFI call behind a safe
-//! Rust API. No `unsafe` code is permitted elsewhere in the crate.
+//! The [`winapi_wrappers`] module hides every Windows `unsafe` FFI call
+//! behind a safe Rust API. Other `unsafe` blocks exist where the
+//! cross-platform syscall surface requires them — e.g. CPUID intrinsics
+//! in `leaderboard::hardware`, `libc::statfs` on Linux, the
+//! `GetFileInformationByHandleEx` file-id resolution in `dedupe`'s
+//! keeper-identity gate — each kept minimal + commented at the call
+//! site. #134: the prior claim of "no unsafe elsewhere in the crate" was
+//! aspirational and false by grep; the policy is "unsafe is justified at
+//! the call site," not "absent."
 
 pub mod action_receipt;
 pub mod cache;

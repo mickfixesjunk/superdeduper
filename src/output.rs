@@ -1,6 +1,6 @@
 //! Output formatting for scan results.
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use serde::Serialize;
@@ -8,6 +8,22 @@ use serde::Serialize;
 use crate::cli::OutputFormat;
 use crate::pipeline::{DuplicateGroup, SkippedFile};
 use crate::Result;
+
+/// #137 — shared "stdout-or-file" output-writer factory. The CLI emit
+/// paths (run_diagnose's plain dispatch + run_scan's file branch) all
+/// hand-rolled the same `Box::new(BufWriter::new(File::create(p)))` /
+/// `stdout().lock()` stanza; this is the single source. `Some(path)`
+/// returns a buffered file writer; `None` a buffered stdout writer.
+/// Returns the raw `io::Result` so non-anyhow callers can use it; anyhow
+/// callers add a "creating <path>" context at the call site. (run_scan
+/// keeps its own quiet-aware `scan_console_writer` for the None branch and
+/// uses this only for the Some/file branch.)
+pub fn open_writer(output: Option<&Path>) -> std::io::Result<Box<dyn Write>> {
+    match output {
+        Some(p) => Ok(Box::new(BufWriter::new(std::fs::File::create(p)?))),
+        None => Ok(Box::new(BufWriter::new(std::io::stdout().lock()))),
+    }
+}
 
 #[derive(Serialize)]
 struct Report<'a> {
