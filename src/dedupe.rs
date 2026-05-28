@@ -966,8 +966,29 @@ pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 /// CLI planner) can't delete the keeper reached via an alias. Pass
 /// `Some(keeper)` from any dedup flow; `None` only when there is genuinely
 /// no keeper to protect.
+/// v0.2.36 relocation gate — system-path. The CLI planner refuses
+/// system-critical paths in `process_group` (honouring the
+/// `--allow-system-paths` escape hatch); the GUI runs none of that, so this
+/// action-layer guard closes the GUI gap. The GUI has NO allow-system-paths
+/// escape, so it refuses UNCONDITIONALLY here — a GUI dedup must never
+/// delete/replace a file under `C:\Windows`, `C:\Program Files`, etc. Lives
+/// on the `action_*` entry points only (NOT in the shared `guard_destructive`,
+/// which `perform_action` also calls — that would override the CLI's
+/// `--allow-system-paths` flag).
+fn guard_system_path(path: &Path) -> Result<()> {
+    if is_system_path(path) {
+        return Err(Error::other(format!(
+            "refused: {} is under a system-critical path; refusing to \
+             delete/replace a system file",
+            path.display(),
+        )));
+    }
+    Ok(())
+}
+
 pub fn action_remove(path: &Path, keeper: Option<&Path>) -> Result<()> {
     guard_destructive(path, false)?;
+    guard_system_path(path)?;
     guard_keeper_identity(DedupeAction::Remove, path, keeper)?;
     fs::remove_file(path)?;
     Ok(())
@@ -975,6 +996,7 @@ pub fn action_remove(path: &Path, keeper: Option<&Path>) -> Result<()> {
 
 pub fn action_recycle(path: &Path, keeper: Option<&Path>) -> Result<()> {
     guard_destructive(path, false)?;
+    guard_system_path(path)?;
     guard_keeper_identity(DedupeAction::Recycle, path, keeper)?;
     // Drop the TrashOutcome — the GUI's per-row recycle path doesn't
     // emit receipts (it's only the `dedupe` subcommand flow that
@@ -986,11 +1008,13 @@ pub fn action_recycle(path: &Path, keeper: Option<&Path>) -> Result<()> {
 
 pub fn action_hardlink(target: &Path, keeper: &Path) -> Result<()> {
     guard_destructive(target, false)?;
+    guard_system_path(target)?;
     replace_with_hardlink(target, keeper)
 }
 
 pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
     guard_destructive(target, false)?;
+    guard_system_path(target)?;
     replace_with_reflink(target, keeper)
 }
 
@@ -999,6 +1023,7 @@ pub fn action_reflink(target: &Path, keeper: &Path) -> Result<()> {
 /// `unsuperdeduper_root`. Never deletes anything.
 pub fn action_safe_rename(target: &Path, keeper: Option<&Path>) -> Result<()> {
     guard_destructive(target, false)?;
+    guard_system_path(target)?;
     guard_keeper_identity(DedupeAction::SafeRename, target, keeper)?;
     safe_rename_unguarded(target)
 }
@@ -2044,6 +2069,32 @@ mod tests {
             is_system_path(&p),
             "/var/lib paths must be blocked from CLI dedupe by default"
         );
+    }
+
+    // v0.2.36 relocation — the GUI action layer (action_*) now runs an
+    // UNCONDITIONAL system-path refusal (no --allow-system-paths escape on the
+    // GUI). Directly exercise the guard: a system-prefixed path is refused, a
+    // normal path passes. (The action_* wiring is verified by inspection +
+    // testdesign's adversarial GUI system-path cell on a real system file;
+    // a unit test can't plant a real C:\Windows file, and guard_destructive's
+    // metadata check would mask a non-existent one.)
+    #[test]
+    fn guard_system_path_refuses_system_prefix_allows_normal() {
+        let d = tmpdir();
+        #[cfg(windows)]
+        let sys = PathBuf::from("C:\\Windows\\System32\\evil.dll");
+        #[cfg(not(windows))]
+        let sys = PathBuf::from("/etc/shadow");
+        assert!(
+            guard_system_path(&sys).is_err(),
+            "a system-critical path must be refused at the action layer"
+        );
+        let normal = d.join("ok.bin");
+        assert!(
+            guard_system_path(&normal).is_ok(),
+            "a normal path must pass the action-layer system guard"
+        );
+        fs::remove_dir_all(&d).ok();
     }
 
     // F-CLI-4 regression: the engine walks with verbatim (`\\?\`) paths
