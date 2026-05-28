@@ -179,6 +179,11 @@ fn run_scan_history_resubmit(scan_id: Option<String>, pending: bool) -> anyhow::
             let args = superdeduper::cli::SubmitPendingArgs {
                 channel: None,
                 dry_run: false,
+                // #109 F25: this internal resubmit-drain keeps the
+                // human-readable text stream (it's not feeding a JSON
+                // consumer); --format json is for the `submit-pending`
+                // CLI surface, not this delegated path.
+                format: superdeduper::cli::OutputFormat::Text,
             };
             run_submit_pending(args)
         }
