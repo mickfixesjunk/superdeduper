@@ -191,17 +191,47 @@ fn parse_response(resp: ureq::Response) -> PrivacyOutcome {
             return PrivacyOutcome::Transient(format!("200 OK but body parse failed: {e}"));
         }
     };
+    parse_flags_body(&body)
+}
+
+/// Pure flag-extraction from a decoded response body. Split out from
+/// `parse_response` so the no-silent-clobber guard is unit-testable without a
+/// live `ureq::Response`.
+fn parse_flags_body(body: &serde_json::Value) -> PrivacyOutcome {
     // Accept either the bare PrivacyFlags shape (PATCH response)
     // or a wrapped {privacy_applied: PrivacyFlags} (GET /profile/me
     // response). Older transitional servers may still emit `privacy`
-    // as an alias — try it as a fallback before degrading to all-off
-    // defaults so a partial rollout doesn't surface as Transient.
+    // as an alias.
     let flags_value = body
         .get("privacy_applied")
         .or_else(|| body.get("privacy"))
-        .unwrap_or(&body)
-        .clone();
-    match serde_json::from_value::<PrivacyFlags>(flags_value) {
+        .unwrap_or(body);
+    // CRITICAL: every PrivacyFlags field is `#[serde(default)]`, so
+    // `from_value` succeeds as ALL-OFF on ANY object — even one with zero
+    // recognised keys (wrong wrapper, renamed fields, an error envelope).
+    // That silent degrade was the "toggle doesn't stick" bug: a successful
+    // PATCH whose response shape we didn't recognise parsed to all-off and
+    // clobbered the optimistic toggle. Require at least one known key before
+    // trusting the parse; otherwise surface the raw shape as Transient so the
+    // caller keeps its current state instead of reverting to all-off.
+    const KNOWN_KEYS: [&str; 6] = [
+        "show_display_name",
+        "show_provider",
+        "show_avatar",
+        "show_install_breakdown",
+        "show_hardware_history",
+        "show_recent_runs",
+    ];
+    let has_known_key = flags_value
+        .as_object()
+        .map(|m| KNOWN_KEYS.iter().any(|k| m.contains_key(*k)))
+        .unwrap_or(false);
+    if !has_known_key {
+        return PrivacyOutcome::Transient(format!(
+            "privacy response had no recognised flag keys (not clobbering current state); raw body: {body}"
+        ));
+    }
+    match serde_json::from_value::<PrivacyFlags>(flags_value.clone()) {
         Ok(flags) => PrivacyOutcome::Ok(flags),
         Err(e) => PrivacyOutcome::Transient(format!("flags parse failed: {e}")),
     }
@@ -233,6 +263,41 @@ mod tests {
         let s = serde_json::to_string(&f).unwrap();
         let back: PrivacyFlags = serde_json::from_str(&s).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn parse_unrecognised_shape_does_not_clobber_to_all_off() {
+        // An object with NO known flag keys (e.g. an error envelope or a
+        // renamed/wrapped shape) must NOT silently parse to all-off — that
+        // was the "toggle doesn't stick" clobber. Expect Transient so the
+        // caller keeps its current (optimistic) state.
+        let body = serde_json::json!({"error": "nope", "account_id": "abc"});
+        match parse_flags_body(&body) {
+            PrivacyOutcome::Transient(_) => {}
+            other => panic!("expected Transient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_wrapped_and_bare_shapes() {
+        // Wrapped (GET /profile/me): {privacy_applied: {...}}
+        let wrapped = serde_json::json!({"privacy_applied": {"show_avatar": true}});
+        assert_eq!(
+            parse_flags_body(&wrapped),
+            PrivacyOutcome::Ok(PrivacyFlags {
+                show_avatar: true,
+                ..Default::default()
+            })
+        );
+        // Bare (PATCH response): {show_display_name: true, ...}
+        let bare = serde_json::json!({"show_display_name": true});
+        assert_eq!(
+            parse_flags_body(&bare),
+            PrivacyOutcome::Ok(PrivacyFlags {
+                show_display_name: true,
+                ..Default::default()
+            })
+        );
     }
 
     #[test]
