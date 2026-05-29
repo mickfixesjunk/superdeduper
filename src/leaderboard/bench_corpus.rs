@@ -111,15 +111,22 @@ pub fn quick_tier() -> TierSpec {
     }
 }
 
-/// `corpus-v1-full` — opt-in (~18.8 GB, ~30.5% reclaimable). Byte volume is
-/// PROVISIONAL per B.3 (reparametrizes when the benchmarker knee lands — only
-/// the constants here change, never the layout logic).
+/// `corpus-v2-full` — the COMPETITIVE Hall-of-Fame tier (design call [A],
+/// 2026-05-29): ~1.5M tiny 4KiB files / ~6.14 GB / ~30% reclaimable, a SINGLE
+/// size class. File COUNT (not byte volume) is the point — ~1.5M file-opens
+/// make the dedup SYSCALL-BOUND, which (a) bounds the forge (in-memory recovery
+/// can't fake 1.5M open() syscalls) and (b) is self-cold even on high-RAM rigs
+/// (the 22k/6.29GB build fit in RAM -> read-bound -> not self-cold; that was a
+/// deviation). O_DIRECT cold-enforce still applies (defense-in-depth). Single
+/// size class => size-group prunes nothing => candidate-bytes == full 6.14 GB.
+/// `corpus_version` here is the generator's internal label; web sets the SERVED
+/// id. Constants are tunable; the layout logic never changes.
 pub fn full_tier() -> TierSpec {
     TierSpec {
-        corpus_version: "corpus-v1-full",
-        small: SizeClassSpec { file_size: SMALL_SIZE, file_count: 1_000_000, size2_clusters: 295_000, big_clusters: 250, big_size: 21 },
-        medium: SizeClassSpec { file_size: MEDIUM_SIZE, file_count: 12_000, size2_clusters: 3_500, big_clusters: 5, big_size: 21 },
-        large: SizeClassSpec { file_size: LARGE_SIZE, file_count: 12, size2_clusters: 2, big_clusters: 1, big_size: 3 },
+        corpus_version: "corpus-v2-full",
+        small: SizeClassSpec { file_size: SMALL_SIZE, file_count: 1_500_000, size2_clusters: 442_500, big_clusters: 375, big_size: 21 },
+        medium: SizeClassSpec { file_size: MEDIUM_SIZE, file_count: 0, size2_clusters: 0, big_clusters: 0, big_size: 0 },
+        large: SizeClassSpec { file_size: LARGE_SIZE, file_count: 0, size2_clusters: 0, big_clusters: 0, big_size: 0 },
     }
 }
 
@@ -695,14 +702,17 @@ mod tests {
 
     #[test]
     fn full_tier_matches_published_aggregates() {
+        // corpus-v2-full (design [A]): single 4KiB class, ~1.5M tiny files.
         let plan = plan_corpus(&full_tier());
-        assert_eq!(plan.file_count, 1_012_012, "full file_count");
-        assert_eq!(plan.leaf_count, 1_015_072, "full leaf_count");
-        assert_eq!(plan.total_bytes, 19_900_137_472, "full total_bytes (~18.8 GiB)");
+        assert_eq!(plan.file_count, 1_500_000, "full file_count");
+        // 4KiB < 1MiB => exactly 1 leaf per file.
+        assert_eq!(plan.leaf_count, 1_500_000, "full leaf_count");
+        assert_eq!(plan.total_bytes, 6_144_000_000, "full total_bytes (~6.14 GB)");
         let dups: u64 = plan.dupsets.iter().map(|s| s.len() as u64 - 1).sum();
-        assert_eq!(dups, 300_000 + 3_600 + 4, "full duplicate-file count");
+        // size2: 442_500 clusters * 1 dup; big: 375 clusters * (21-1) dups.
+        assert_eq!(dups, 442_500 + 375 * 20, "full duplicate-file count");
         let frac = full_tier().reclaimable_fraction();
-        assert!((0.304..0.306).contains(&frac), "full reclaimable ~30.5%, got {frac}");
+        assert!((0.299..0.301).contains(&frac), "full reclaimable ~30%, got {frac}");
     }
 
     #[test]
