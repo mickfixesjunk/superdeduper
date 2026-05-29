@@ -104,11 +104,16 @@ pub fn fetch(state: &InstallState, server_url: &str) -> PrivacyOutcome {
     let canonical_marker = serde_json::json!({"install_id": state.install_id});
     let body = super::hmac_signer::canonical_body(&canonical_marker);
     let signature = super::hmac_signer::sign(&install_key, &body);
+    // SEND the signed body (don't just sign it): the server verifies the HMAC
+    // against the request body, so an empty body (.call()) -> 400 empty_body
+    // (Mick's v0.2.37 Profile-Visibility bug). Match the working submit/update
+    // path: send_bytes the canonical body. send_bytes still issues a GET here.
     let response = ureq::get(&url)
         .set("X-Sd-Install-Id", &state.install_id)
         .set("X-Sd-Signature", &signature)
+        .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(10))
-        .call();
+        .send_bytes(&body);
     match response {
         Ok(resp) => parse_response(resp),
         Err(ureq::Error::Status(401, resp)) => {
