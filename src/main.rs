@@ -549,183 +549,31 @@ fn parse_bench_seed(seed: Option<String>) -> anyhow::Result<[u8; 32]> {
     Ok(a)
 }
 
-/// T-BENCH-ME `--bench-me`: the live client loop. POST /bench/start → download
-/// the corpus tar → run the real full-content dedupe (reads every byte: the
-/// ranked wall + the I/O signature) → answer the server's possession challenge
-/// → submit (scope=canonical-bench). The server verifies result + challenge
-/// directly against its private seed/groundtruth.
+/// T-BENCH-ME `--bench-me`: thin CLI wrapper over the shared
+/// `leaderboard::bench_run::run` orchestration (the GUI button calls the same
+/// fn -> parity by construction). Loads the install, runs the loop with stderr
+/// progress, prints the outcome.
 #[cfg(feature = "telemetry")]
 fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
-    use superdeduper::leaderboard::{bench_client, hardware, install, submission};
-
+    use superdeduper::leaderboard::{bench_run, install};
     let channel = superdeduper::channel::active_channel();
     let state = install::load_for(channel)
         .context("loading install state")?
-        .ok_or_else(|| anyhow::anyhow!("not registered on {channel:?} — run `superdeduper register` first"))?;
-    anyhow::ensure!(state.registered, "install not registered; run `superdeduper register`");
-    let base = state.server_url.trim_end_matches('/').to_string();
-
-    // 1. POST /bench/start
-    eprintln!("bench: POST {base}/api/v1/bench/start ({}, {})", args.corpus_version, args.tier);
-    let start: serde_json::Value = ureq::post(&format!("{base}/api/v1/bench/start"))
-        .send_json(serde_json::json!({
-            "install_id": state.install_id,
-            "corpus_version": args.corpus_version,
-            "tier": args.tier,
-        }))
-        .context("POST /bench/start failed")?
-        .into_json()
-        .context("parsing /bench/start response")?;
-    let getstr = |k: &str| -> anyhow::Result<String> {
-        start.get(k).and_then(|v| v.as_str()).map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("/bench/start response missing string field '{k}'"))
-    };
-    let bench_run_id = getstr("bench_run_id")?;
-    let download_url = getstr("download_url")?;
-    let protocol_version = getstr("protocol_version")?;
-    let corpus_version = getstr("corpus_version")?;
-    let tier = getstr("tier")?;
-    let challenges: Vec<bench_client::ChallengePosition> =
-        serde_json::from_value(start.get("challenges").cloned().unwrap_or_default())
-            .context("parsing challenges[]")?;
-    eprintln!("bench: run_id={bench_run_id} challenges={} download={download_url}", challenges.len());
-
-    // 2. download + untar the corpus (to a REAL disk if --workdir given; the
-    // default temp dir may be RAM-backed, which inflates throughput past the
-    // physical disk cap and trips the server's sanity gate).
-    let workroot = args.workdir.clone().unwrap_or_else(std::env::temp_dir);
-    let workdir = workroot.join(format!("sd-bench-me-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&workdir);
-    let corpus_dir = workdir.join("corpus");
-    std::fs::create_dir_all(&corpus_dir)?;
-    eprintln!("bench: downloading + extracting corpus → {}", corpus_dir.display());
-    let resp = ureq::get(&download_url).call().context("GET download_url failed")?;
-    tar::Archive::new(resp.into_reader())
-        .unpack(&corpus_dir)
-        .context("extracting corpus tar")?;
-
-    // Optional cold-cache flush (dev/bench affordance; Linux + root only) so
-    // the dedupe read is disk-bound rather than served from page cache —
-    // mirrors benchmarker's cache-flush staging. Env-gated, best-effort.
-    #[cfg(target_os = "linux")]
-    if std::env::var("SD_BENCH_DROP_CACHES").is_ok() {
-        let _ = std::process::Command::new("sync").status();
-        match std::fs::write("/proc/sys/vm/drop_caches", "3\n") {
-            Ok(()) => eprintln!("bench: dropped page caches (cold read)"),
-            Err(e) => eprintln!("bench: WARN could not drop caches ({e}); read may be cache-warm"),
-        }
-    }
-
-    // 3. real full-content dedupe (reads EVERY byte: ranked wall + I/O signal)
-    let t = std::time::Instant::now();
-    let (dupsets, bytes_scanned, files_scanned) = full_content_dedup(&corpus_dir)?;
-    let dedupe_wall = t.elapsed().as_secs_f64();
+        .ok_or_else(|| anyhow::anyhow!("not registered on {channel:?} -- run `superdeduper register` first"))?;
+    let outcome = bench_run::run(
+        &state,
+        &args.corpus_version,
+        &args.tier,
+        args.workdir.as_deref(),
+        args.keep,
+        |msg| eprintln!("bench: {msg}"),
+    )?;
     eprintln!(
-        "bench: dedupe {dedupe_wall:.2}s — {files_scanned} files, {bytes_scanned} bytes read, {} dup groups",
-        dupsets.len()
+        "bench: result_digest={} ({} dup groups, {} bytes, {:.2}s)",
+        outcome.result_digest, outcome.dup_groups, outcome.bytes_scanned, outcome.dedupe_secs
     );
-
-    // 4. answer the possession challenge (hash the downloaded bytes at the offsets)
-    let (answers, _challenge_bytes) = bench_client::answer_challenge_from_dir(&corpus_dir, &challenges)
-        .context("answering challenge from disk")?;
-
-    // 5. assemble the canonical-bench submission
-    eprintln!(
-        "bench: result_digest={} ({} dup groups)",
-        bench_client::result_digest(&dupsets),
-        dupsets.len()
-    );
-    let bench = bench_client::to_canonical_bench(
-        &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
-    );
-    let largest = dupsets.iter().map(|g| g.len() as u64).max().unwrap_or(0);
-    let inputs = submission::SubmissionInputs {
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        run_uuid: uuid::Uuid::new_v4().to_string(),
-        scan_id: None,
-        bench: Some(bench),
-        // detect from the corpus dir so disk_class reflects the actual disk the
-        // bench read from (drives the server's per-disk-class throughput cap).
-        hardware: hardware::detect_with_root_hint(Some(&corpus_dir)),
-        run_shape: submission::RunShape {
-            wall_clock_seconds: dedupe_wall,
-            bytes_scanned,
-            files_scanned,
-            hash_algorithm: "blake3".to_string(),
-            walker_variant: "walker".to_string(),
-            scope: "canonical-bench".to_string(),
-            features_used_bitmap: 0,
-            corpus_kind: "canonical-bench".to_string(),
-            cache_hit_ratio: None,
-            easter_egg_hits: Vec::new(),
-            zero_byte_group_max: None,
-            max_hardlink_count_in_scan: None,
-            name_collision_count: None,
-            share_count_in_scope: None,
-            dry_run: None,
-            groups_reviewed_count: None,
-        },
-        result_summary: submission::ResultSummary {
-            duplicate_groups: dupsets.len() as u64,
-            duplicate_bytes_reclaimable: 0,
-            largest_single_group_bytes: largest,
-            actions_taken_summary: std::collections::BTreeMap::new(),
-            placeholder_skip_count: None,
-            placeholder_skip_bytes: None,
-            client_found_dupsets: Some(dupsets),
-        },
-    };
-
-    // 6. submit (HMAC-signed POST to the channel's /submit)
-    eprintln!("bench: submitting to {base} …");
-    let outcome = submission::submit(&state, &inputs);
-    println!("bench-me result: {outcome:?}");
-
-    // 7. cleanup
-    if args.keep {
-        eprintln!("bench: kept corpus at {}", corpus_dir.display());
-    } else {
-        let _ = std::fs::remove_dir_all(&workdir);
-    }
+    println!("bench-me result: {:?}", outcome.submit);
     Ok(())
-}
-
-/// Full-content exact-dedupe over the extracted corpus: read EVERY file fully
-/// (so `bytes_scanned` == the corpus total — the server's I/O cross-check),
-/// BLAKE3-group byte-identical files, return canonical dup sets (path_index
-/// lists sorted within + across), total bytes, and file count.
-#[cfg(feature = "telemetry")]
-fn full_content_dedup(dir: &std::path::Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
-    use std::collections::HashMap;
-    let mut by_hash: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
-    let mut bytes = 0u64;
-    let mut count = 0u64;
-    for entry in std::fs::read_dir(dir).context("reading corpus dir")? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        let pi = match superdeduper::leaderboard::bench_corpus::parse_corpus_path_index(&name) {
-            Some(p) => p,
-            None => continue,
-        };
-        let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        bytes += data.len() as u64;
-        count += 1;
-        by_hash.entry(*blake3::hash(&data).as_bytes()).or_default().push(pi);
-    }
-    let mut dupsets: Vec<Vec<u64>> = by_hash
-        .into_values()
-        .filter(|v| v.len() >= 2)
-        .map(|mut v| {
-            v.sort_unstable();
-            v
-        })
-        .collect();
-    dupsets.sort();
-    Ok((dupsets, bytes, count))
 }
 
 /// G-track: `superdeduper achievements` — list / refetch the install's

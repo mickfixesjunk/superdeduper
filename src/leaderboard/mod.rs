@@ -55,3 +55,7 @@ pub mod bench_corpus; // G4
 /// server-issued offsets + commits to its dedupe result via `result_digest`.
 /// No generation / seed / Merkle tree — this is what survives the generator strip.
 pub mod bench_client; // G4
+/// G4 / T-BENCH-ME shared `--bench-me` orchestration (download -> dedup ->
+/// challenge -> submit), called by BOTH the CLI and the GUI button so they
+/// can't drift. Telemetry-gated.
+pub mod bench_run; // G4
