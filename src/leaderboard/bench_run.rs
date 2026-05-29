@@ -57,7 +57,10 @@ pub fn run(
     fresh: bool,
     submit: bool,
     cancel: &std::sync::atomic::AtomicBool,
-    mut progress: impl FnMut(&str),
+    // `Send`: the live-progress poller runs on a scoped thread that owns
+    // `progress` for the duration of the dedup. Both callers (CLI -> stderr,
+    // GUI -> status channel) are Send.
+    mut progress: impl FnMut(&str) + Send,
 ) -> anyhow::Result<BenchOutcome> {
     use std::sync::atomic::Ordering;
     let check_cancel = || -> anyhow::Result<()> {
@@ -134,7 +137,32 @@ pub fn run(
     check_cancel()?;
     progress("deduping (size-grouped, cold-enforced reads)");
     let t = std::time::Instant::now();
-    let (dupsets, bytes_scanned, files_scanned, cold_enforced) = full_content_dedup(&corpus_dir)?;
+    // Live progress while the parallel reads run: workers bump `files_done`;
+    // a scoped poller thread owns `progress` and reports done/total every
+    // ~400ms. Only the poller touches `progress` inside the scope (the dedup
+    // body never does), so the &mut borrow is exclusive. `cancel` is honoured
+    // per file inside the dedup, so the user is never trapped on a long run.
+    let files_done = std::sync::atomic::AtomicU64::new(0);
+    let total_candidates = std::sync::atomic::AtomicU64::new(0);
+    let dedup_finished = std::sync::atomic::AtomicBool::new(false);
+    let dedup_result = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !dedup_finished.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let total = total_candidates.load(Ordering::Relaxed);
+                if total > 0 && !dedup_finished.load(Ordering::Relaxed) {
+                    let done = files_done.load(Ordering::Relaxed);
+                    progress(&format!(
+                        "deduping {done}/{total} candidates (cold-enforced reads)"
+                    ));
+                }
+            }
+        });
+        let r = full_content_dedup(&corpus_dir, cancel, &files_done, &total_candidates);
+        dedup_finished.store(true, Ordering::Relaxed);
+        r
+    });
+    let (dupsets, bytes_scanned, files_scanned, cold_enforced) = dedup_result?;
     let dedupe_secs = t.elapsed().as_secs_f64();
     progress(&format!(
         "deduped {dedupe_secs:.2}s: {files_scanned} files enumerated, {} dup groups, cold-enforced={cold_enforced}",
@@ -421,7 +449,12 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
 /// throughput numerator (must equal the server's per-corpus_version bytes
 /// constant per the quality forge-fix); `files_enumerated` is the total
 /// corpus file count seen (the scan scope), not just candidates.
-fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64, bool)> {
+fn full_content_dedup(
+    dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    files_done: &std::sync::atomic::AtomicU64,
+    total_out: &std::sync::atomic::AtomicU64,
+) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64, bool)> {
     // Pass 1: enumerate + stat (size only, no content reads). Group
     // path_indices by file size.
     let mut by_size: HashMap<u64, Vec<(u64, std::path::PathBuf)>> = HashMap::new();
@@ -451,25 +484,73 @@ fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64, bo
     // CACHE-BYPASSING (cold-enforce, #106 pt2); `cold_enforced` tracks
     // whether EVERY candidate read actually went cold (false if any fell
     // back to a buffered read on an unsupported platform/fs).
+    // Flatten the candidates (size-groups of >=2) into one worklist so the
+    // reads can be issued concurrently. A single serial loop here is
+    // pathological on the full tier (1M tiny files): single-thread O_DIRECT is
+    // latency-bound on per-file open/read/close (~4k files/s), NOT device-
+    // bound — which manufactured benchmarker's r3-FULL 250s cold / 125x spread
+    // AND undersold us vs czkawka. The production hasher (pipeline/hash.rs)
+    // reads on a bounded rayon io_pool; the bench must mirror that for fidelity.
+    use rayon::prelude::*;
+    let candidates: Vec<(u64, std::path::PathBuf)> = by_size
+        .into_iter()
+        .filter(|(_size, group)| group.len() >= 2)
+        .flat_map(|(_size, group)| group.into_iter())
+        .collect();
+    let any_candidate = !candidates.is_empty();
+    total_out.store(candidates.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+    // Dedicated, bounded pool sized to available parallelism — concurrent
+    // O_DIRECT issue lets the device absorb the IOPS instead of serializing.
+    // Each worker reads cold-bypassing + blake3-hashes; only the 49-byte
+    // (hash,pi,len,cold) tuple survives the closure, so peak memory stays at
+    // ~io_threads files, not the whole candidate set.
+    let io_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+    let io_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(io_threads)
+        .thread_name(|i| format!("superdeduper-bench-io-{i}"))
+        .build()
+        .map_err(|e| anyhow::anyhow!("bench io pool build: {e}"))?;
+    let hashed: Vec<([u8; 32], u64, u64, bool)> = io_pool.install(|| {
+        candidates
+            .into_par_iter()
+            .map(|(pi, path)| {
+                // Cancel mid-run so a long full-tier dedup isn't an
+                // uninterruptible trap (checked per file — a Relaxed load is
+                // free next to the read). rayon stops scheduling on first Err;
+                // run() downcasts Cancelled to a clean abort, no partial submit.
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(anyhow::Error::new(Cancelled));
+                }
+                let (data, cold) = read_uncached(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                files_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, anyhow::Error>((
+                    *blake3::hash(&data).as_bytes(),
+                    pi,
+                    data.len() as u64,
+                    cold,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })?;
+
+    // Serial fold (cheap; the cost was the reads). cold_enforced is the AND
+    // across every worker — one buffered fallback taints the whole run, which
+    // is load-bearing: the 125x cold/warm spread means a silent warm read on
+    // the full tier would be an enormous score advantage (testdesign's
+    // leverage point). result_digest is unaffected by read order: dupsets are
+    // sorted below and blake3 is content-addressed.
     let mut by_hash: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
     let mut candidate_bytes = 0u64;
     let mut cold_enforced = true;
-    let mut any_candidate = false;
-    for (_size, group) in by_size {
-        if group.len() < 2 {
-            continue;
-        }
-        for (pi, path) in group {
-            let (data, cold) =
-                read_uncached(&path).with_context(|| format!("reading {}", path.display()))?;
-            cold_enforced &= cold;
-            any_candidate = true;
-            candidate_bytes += data.len() as u64;
-            by_hash
-                .entry(*blake3::hash(&data).as_bytes())
-                .or_default()
-                .push(pi);
-        }
+    for (hash, pi, len, cold) in hashed {
+        cold_enforced &= cold;
+        candidate_bytes += len;
+        by_hash.entry(hash).or_default().push(pi);
     }
     // A corpus with no size-collisions read nothing -> not meaningfully cold.
     let cold_enforced = cold_enforced && any_candidate;
@@ -554,7 +635,15 @@ mod tests {
         // read (the size-group skip) and contributes 0 candidate bytes.
         write_file(&dir, 5, &[0xDD; 50]);
 
-        let (dupsets, candidate_bytes, files_enumerated, _cold) = full_content_dedup(&dir).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let done = std::sync::atomic::AtomicU64::new(0);
+        let total = std::sync::atomic::AtomicU64::new(0);
+        let (dupsets, candidate_bytes, files_enumerated, _cold) =
+            full_content_dedup(&dir, &cancel, &done, &total).unwrap();
+        // The progress counter saw every candidate (4 same-size files); the
+        // unique-size file was never read.
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 4);
 
         // Correctness-neutral: the dup set is exactly {1,2} — identical to
         // what a full-content hash of every file would produce.
@@ -564,6 +653,28 @@ mod tests {
         assert_eq!(candidate_bytes, 400);
         // All five files are enumerated (the scan scope), candidates or not.
         assert_eq!(files_enumerated, 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dedup_aborts_when_cancel_preset() {
+        let dir = std::env::temp_dir().join(format!("sd-bench-canceltest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, 1, &[0xAA; 100]);
+        write_file(&dir, 2, &[0xAA; 100]);
+
+        // Cancel already set -> the first candidate read short-circuits to a
+        // Cancelled error rather than completing the dedup.
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let done = std::sync::atomic::AtomicU64::new(0);
+        let total = std::sync::atomic::AtomicU64::new(0);
+        let err = full_content_dedup(&dir, &cancel, &done, &total)
+            .expect_err("preset cancel must abort the dedup");
+        assert!(
+            err.downcast_ref::<Cancelled>().is_some(),
+            "expected Cancelled, got: {err:#}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
