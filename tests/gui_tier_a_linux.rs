@@ -232,6 +232,7 @@ fn boot_and_scan(
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(ok, "boot_and_scan[{tag}]: groups table did not populate after scan");
+    dismiss_scan_complete_if_present(&mut harness); // telemetry: clear the overlay so the table is reachable
     (harness, corpus, files, home)
 }
 
@@ -249,6 +250,24 @@ fn run_until(
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+/// Under --features telemetry, a scan-complete modal (Ready) OVERLAYS the table
+/// after a scan finishes — clicking the bulk combo/Go is then blocked. "Skip
+/// this time" dismisses it (-> Hidden), revealing the table. No-op under
+/// --features gui (the modal is cfg'd out). Cells that need the TABLE call this
+/// after the table populates; G-SUBMIT does NOT (it drives the modal's Submit).
+fn dismiss_scan_complete_if_present(harness: &mut egui_kittest::Harness<'static, SuperdeduperApp>) {
+    for _ in 0..20 {
+        if click_all(harness, "Skip this time") > 0 {
+            for _ in 0..3 {
+                harness.step();
+            }
+            return;
+        }
+        harness.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// §3 a/b/c action driver, shared by the destructive bulk cells. On a populated
@@ -403,6 +422,7 @@ fn drive_scan_to_table(harness: &mut egui_kittest::Harness<'static, Superdeduper
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(ok, "STEP=scan: groups table did not populate");
+    dismiss_scan_complete_if_present(harness); // telemetry: clear the overlay so the table is reachable
 }
 
 /// G-REFERENCE-PROTECTION (§4 GUI ref-protection / [[adversarial-keeper...]] §7.4
@@ -536,6 +556,136 @@ fn tier_a_g_hardlink_collapses_dupes_to_one_inode() {
     );
     assert!(std::fs::read(&keeper).unwrap() == dup_sha, "STEP=effect: hardlinked content must be byte-identical");
     assert!(distinct.exists(), "STEP=effect: distinct non-dup file must be untouched (cascade safety)");
+
+    std::fs::remove_dir_all(&corpus).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// G-SUBMIT (§3 a/b/c) — PURE-HEADLESS (testdesign (b)): assert the GUI-unique
+/// layer only — the scan-complete modal's Submit control is present (a), and
+/// clicking it DISPATCHES the submit worker + transitions OUT of Ready into the
+/// pre-POST "Submitting…" state (b/c). The actual POST -> submission_id / ranks /
+/// Submitted-pill is the SHARED backend wire-contract, covered by the CLI
+/// submit-pending rows + E2E-1 vs the dev server — NOT re-tested here (no network
+/// in Tier-A; keeps it offline-deterministic).
+#[test]
+#[cfg(feature = "telemetry")] // scan-complete modal + leaderboard submit are telemetry-gated
+fn tier_a_g_submit_dispatches_from_scan_complete_modal() {
+    let _env = env_lock();
+    let home = isolated_env("submit");
+    let (corpus, _files) = make_dup_corpus("submit");
+    let corpus_c = corpus.clone();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1400.0_f32, 900.0])
+        .build_eframe(move |cc| {
+            let mut app = SuperdeduperApp::new(cc);
+            app.add_root(corpus_c.clone(), false);
+            app
+        });
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(&harness, "Continue");
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(&harness, "Start scan");
+    // Scan-complete modal (Ready) shows "Submit to leaderboard" once the scan
+    // finishes (reclaimable stats present — our corpus has a real dup group).
+    let mut submit_present = false;
+    for _ in 0..400 {
+        harness.step();
+        click_all(&harness, "scan →"); // advance the preflight proceed
+        if harness.query_all_by_label_contains("Submit to leaderboard").next().is_some() {
+            submit_present = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // a (present)
+    assert!(
+        submit_present,
+        "STEP=present: scan-complete modal 'Submit to leaderboard' control not found after scan"
+    );
+
+    // b (triggers): click Submit -> dispatch submit_recorded_payload + leave Ready.
+    assert!(click_all(&harness, "Submit to leaderboard") > 0, "STEP=click: Submit control not clickable");
+    // c (pre-POST state): the modal transitions to the "Submitting…" state, OR at
+    // minimum leaves Ready (the Submit-to-leaderboard button is gone) — either
+    // proves the dispatch fired. We do NOT assert Submitted (needs the network POST).
+    let dispatched = {
+        let mut ok = false;
+        for _ in 0..200 {
+            harness.step();
+            let submitting = harness.query_all_by_label_contains("Submitting").next().is_some();
+            let left_ready = harness.query_all_by_label_contains("Submit to leaderboard").next().is_none();
+            if submitting || left_ready {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ok
+    };
+    assert!(
+        dispatched,
+        "STEP=dispatch: clicking Submit did not transition out of Ready into Submitting (dispatch not observed)"
+    );
+
+    std::fs::remove_dir_all(&corpus).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// §6 scan (c)-ENHANCEMENT — the scan-complete modal renders the real headline
+/// stats (group-count + reclaimable). Telemetry-gated (the modal is telemetry-
+/// only). Real-state: our corpus is exactly 1 dup group of 3×8 KiB identical
+/// files -> duplicate_groups == 1, reclaimable == (3-1)*8192 = 16 KiB. Asserts
+/// the modal shows the "Reclaimable" + "Duplicate groups" stat labels AND the
+/// correct reclaimable value (a feature break -> wrong/zero stat would fail).
+#[test]
+#[cfg(feature = "telemetry")] // scan-complete modal is telemetry-gated
+fn tier_a_scan_complete_modal_shows_real_stats() {
+    let _env = env_lock();
+    let home = isolated_env("scanstats");
+    let (corpus, _files) = make_dup_corpus("scanstats");
+    let corpus_c = corpus.clone();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1400.0_f32, 900.0])
+        .build_eframe(move |cc| {
+            let mut app = SuperdeduperApp::new(cc);
+            app.add_root(corpus_c.clone(), false);
+            app
+        });
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(&harness, "Continue");
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(&harness, "Start scan");
+    // wait for the scan-complete modal (its "Reclaimable" stat label appears).
+    let mut modal = false;
+    for _ in 0..400 {
+        harness.step();
+        click_all(&harness, "scan →");
+        if harness.query_all_by_label_contains("Reclaimable").next().is_some()
+            && harness.query_all_by_label_contains("Duplicate groups").next().is_some()
+        {
+            modal = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(modal, "STEP=modal: scan-complete modal stat panel (Reclaimable + Duplicate groups) not shown");
+
+    // Real-state: the reclaimable value reflects the actual dedup (16 KiB for our
+    // 1 group of 3×8 KiB). humansize uses humansize::BINARY.
+    let want = humansize::format_size(16384u64, humansize::BINARY);
+    assert!(
+        harness.query_all_by_label_contains(&want).next().is_some(),
+        "STEP=stats: scan-complete modal should show reclaimable {want:?} (1 group, 2 losers × 8 KiB)"
+    );
 
     std::fs::remove_dir_all(&corpus).ok();
     std::fs::remove_dir_all(&home).ok();
