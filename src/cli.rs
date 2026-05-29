@@ -168,9 +168,11 @@ pub struct BenchMeArgs {
     /// Tier label sent to /bench/start.
     #[arg(long, value_name = "TIER", default_value = "quick")]
     pub tier: String,
-    /// Keep the downloaded corpus working dir instead of deleting it after.
+    /// Force a fresh corpus download, ignoring (and replacing) the cached copy.
+    /// By default the corpus is CACHED per corpus_version and reused across
+    /// runs (no re-download of the 100MB+ corpus every time).
     #[arg(long, default_value_t = false)]
-    pub keep: bool,
+    pub fresh: bool,
     /// Working directory for the downloaded corpus. Defaults to the system temp
     /// dir; override to a REAL disk if temp is RAM-backed (e.g. tmpfs `/tmp`),
     /// so the dedupe read is disk-bound + disk-class is detected correctly.

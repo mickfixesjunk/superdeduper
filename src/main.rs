@@ -565,7 +565,7 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
         &args.corpus_version,
         &args.tier,
         args.workdir.as_deref(),
-        args.keep,
+        args.fresh,
         |msg| eprintln!("bench: {msg}"),
     )?;
     eprintln!(

@@ -35,7 +35,7 @@ pub fn run(
     corpus_version: &str,
     tier: &str,
     workroot: Option<&Path>,
-    keep: bool,
+    fresh: bool,
     mut progress: impl FnMut(&str),
 ) -> anyhow::Result<BenchOutcome> {
     anyhow::ensure!(state.registered, "install not registered; run `superdeduper register`");
@@ -65,17 +65,30 @@ pub fn run(
         serde_json::from_value(start.get("challenges").cloned().unwrap_or_default())
             .context("parsing challenges[]")?;
 
-    // 2. download + untar the corpus
+    // 2. download + untar the corpus -- CACHED per corpus_version so repeat
+    // runs reuse the bytes instead of re-pulling 100MB+ every time. The corpus
+    // is deterministic for a given corpus_version, so reuse is safe (the server
+    // still issues fresh challenges each run; a stale/wrong cache would fail the
+    // possession check). `fresh` forces a re-download.
     let workroot = workroot.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
-    let workdir = workroot.join(format!("sd-bench-me-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&workdir);
-    let corpus_dir = workdir.join("corpus");
-    std::fs::create_dir_all(&corpus_dir)?;
-    progress(&format!("downloading + extracting corpus ({} challenges)", challenges.len()));
-    let resp = ureq::get(&download_url).call().context("GET download_url failed")?;
-    tar::Archive::new(resp.into_reader())
-        .unpack(&corpus_dir)
-        .context("extracting corpus tar")?;
+    let slug: String = corpus_version
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let corpus_dir = workroot.join(format!("sd-bench-corpus-{slug}"));
+    let complete = corpus_dir.join(".sd-bench-complete");
+    if fresh || !complete.exists() {
+        let _ = std::fs::remove_dir_all(&corpus_dir);
+        std::fs::create_dir_all(&corpus_dir)?;
+        progress(&format!("downloading + extracting corpus ({} challenges)", challenges.len()));
+        let resp = ureq::get(&download_url).call().context("GET download_url failed")?;
+        tar::Archive::new(resp.into_reader())
+            .unpack(&corpus_dir)
+            .context("extracting corpus tar")?;
+        std::fs::write(&complete, corpus_version.as_bytes()).context("writing cache sentinel")?;
+    } else {
+        progress(&format!("reusing cached corpus at {} ({} challenges)", corpus_dir.display(), challenges.len()));
+    }
 
     // 3. real full-content dedupe (reads EVERY byte: ranked wall + I/O signal)
     progress("deduping (full-content)");
@@ -131,9 +144,8 @@ pub fn run(
     progress("submitting");
     let submit = submission::submit(state, &inputs);
 
-    if !keep {
-        let _ = std::fs::remove_dir_all(&workdir);
-    }
+    // corpus_dir is the persistent cache -- intentionally NOT removed, so the
+    // next run reuses it (pass `fresh` to force a re-download).
     Ok(BenchOutcome {
         bench_run_id,
         corpus_version,
