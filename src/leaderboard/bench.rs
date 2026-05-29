@@ -235,11 +235,13 @@ fn push_lp(out: &mut Vec<u8>, b: &[u8]) {
 
 /// The bench-challenge binding context (BC) — version-binds a submission to a
 /// specific corpus build + run so a proof for one corpus/run cannot be replayed
-/// against another. Encoding (work-proof spec; byte-exactness pending
-/// research's BC golden vector cross-lock): the six leading fields are each
-/// `u32le`-length-prefixed in order, then `u64le(leaf_count)`, then
-/// `u32le(chunk_size)`. `manifest_hash = BLAKE3(served manifest)` where the
-/// served manifest carries NO root and NO groundtruth.
+/// against another. Encoding (work-proof spec, research-disambiguated +
+/// web-confirmed against the BC golden):
+/// `len-prefixed(protocol_version, corpus_version)` ‖ `manifest_hash` as
+/// **RAW 32B (NOT length-prefixed)** ‖ `len-prefixed(install_id, bench_run_id,
+/// tier)` ‖ `u64le(leaf_count)` ‖ `u32le(chunk_size)`. `manifest_hash =
+/// BLAKE3(served manifest)` where the served manifest carries NO root and NO
+/// groundtruth. BC golden challenge positions = `[1, 5, 0]`.
 pub struct BenchContext<'a> {
     pub protocol_version: &'a str,
     pub corpus_version: &'a str,
@@ -257,7 +259,9 @@ impl BenchContext<'_> {
         let mut out = Vec::new();
         push_lp(&mut out, self.protocol_version.as_bytes());
         push_lp(&mut out, self.corpus_version.as_bytes());
-        push_lp(&mut out, &self.manifest_hash);
+        // manifest_hash is RAW 32B — NOT length-prefixed (research disambig,
+        // web-confirmed vs the BC golden; a u32le(32) prefix here diverges).
+        out.extend_from_slice(&self.manifest_hash);
         push_lp(&mut out, self.install_id.as_bytes());
         push_lp(&mut out, self.bench_run_id.as_bytes());
         push_lp(&mut out, self.tier.as_bytes());
@@ -549,10 +553,13 @@ mod tests {
     fn bc_encoding_is_length_prefixed_and_field_sensitive() {
         let bc = sample_bc();
         let enc = bc.encode();
-        // structural: 6 length-prefixed fields + u64 leaf_count + u32 chunk_size.
-        // lengths: 9 + 15 + 32 + 11 + 7 + 5 = 79 bytes of field data; 6*4 prefix
-        // bytes = 24; + 8 (leaf_count) + 4 (chunk_size) = 79+24+12 = 115.
-        assert_eq!(enc.len(), 79 + 24 + 12);
+        // structural: 5 length-prefixed string fields + RAW 32B manifest_hash
+        // + u64 leaf_count + u32 chunk_size. field data 9+15+32+11+7+5 = 79;
+        // prefixes = 5*4 = 20 (manifest_hash has NO prefix); + 8 + 4 = 111.
+        assert_eq!(enc.len(), 79 + 20 + 12);
+        // manifest_hash (raw 32B) sits right after the 2nd field with no prefix:
+        // offset = 4+9 + 4+15 = 32; the next 32 bytes are the hash verbatim.
+        assert_eq!(&enc[32..64], &[0xABu8; 32], "manifest_hash is raw, unprefixed");
         // first field's u32le length prefix == len("tcorpus-1") == 9.
         assert_eq!(u32::from_le_bytes(enc[0..4].try_into().unwrap()), 9);
         // every field independently changes the encoding (no field collision).

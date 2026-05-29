@@ -498,6 +498,34 @@ pub fn build_bench_proof(
     }
 }
 
+/// Parse a corpus file path or name `f{path_index:010}.bin` → `path_index`.
+/// Accepts a full path (uses the final component) or a bare name; returns
+/// `None` for anything that isn't a corpus file.
+pub fn parse_corpus_path_index(path: &str) -> Option<u64> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.strip_prefix('f')?.strip_suffix(".bin")?.parse::<u64>().ok()
+}
+
+/// Convert the dedupe's found duplicate groups (each a list of corpus file
+/// paths) into the canonical `client_found_dupsets` for the submission:
+/// `path_index` lists, sorted within each group and groups sorted, so web can
+/// exact-compare against its server-regenerated groundtruth (client ==
+/// groundtruth, zero false-positives). Groups with fewer than 2 parseable
+/// corpus members are dropped (a duplicate set needs ≥2 files).
+pub fn client_found_dupsets(groups: &[Vec<String>]) -> Vec<Vec<u64>> {
+    let mut out: Vec<Vec<u64>> = groups
+        .iter()
+        .filter_map(|g| {
+            let mut idxs: Vec<u64> = g.iter().filter_map(|p| parse_corpus_path_index(p)).collect();
+            idxs.sort_unstable();
+            idxs.dedup();
+            (idxs.len() >= 2).then_some(idxs)
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 fn hex_lower(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in bytes {
@@ -667,6 +695,45 @@ mod tests {
         assert!((dedup_efficiency(ceiling / 2, ceiling) - 0.5).abs() < 0.02);
         assert_eq!(dedup_efficiency(ceiling * 2, ceiling), 1.0, "over-claim capped at 1.0");
         assert_eq!(dedup_efficiency(100, 0), 0.0, "no-dup corpus -> 0.0");
+    }
+
+    #[test]
+    fn parse_corpus_path_index_handles_paths_and_rejects_noise() {
+        assert_eq!(parse_corpus_path_index("f0000000012.bin"), Some(12));
+        assert_eq!(parse_corpus_path_index("/tmp/corpus/f0000000007.bin"), Some(7));
+        assert_eq!(parse_corpus_path_index(r"C:\corpus\f0000000123.bin"), Some(123));
+        assert_eq!(parse_corpus_path_index("f0000000000.bin"), Some(0));
+        assert_eq!(parse_corpus_path_index("notes.txt"), None);
+        assert_eq!(parse_corpus_path_index("f00.png"), None);
+        assert_eq!(parse_corpus_path_index("fXYZ.bin"), None);
+    }
+
+    #[test]
+    fn client_found_dupsets_perfect_dedupe_equals_groundtruth() {
+        // A perfect dedupe finds exactly the groundtruth clusters; rendered as
+        // corpus paths then parsed back, client_found_dupsets must equal the
+        // groundtruth (canonically sorted) — web's client==groundtruth gate.
+        let plan = plan_corpus(&tiny_tier());
+        let groups: Vec<Vec<String>> = plan
+            .dupsets
+            .iter()
+            .map(|set| set.iter().map(|&pi| format!("/corpus/f{pi:010}.bin")).collect())
+            .collect();
+        let mut expected = plan.dupsets.clone();
+        for g in &mut expected {
+            g.sort_unstable();
+        }
+        expected.sort_unstable();
+        assert_eq!(client_found_dupsets(&groups), expected, "perfect dedupe == groundtruth");
+
+        // a group with a non-corpus file still parses its corpus members;
+        // a singleton / unparseable group is dropped.
+        let noisy = vec![
+            vec!["/c/f0000000001.bin".into(), "/c/f0000000006.bin".into(), "/c/readme.txt".into()],
+            vec!["/c/f0000000003.bin".into()], // singleton -> dropped
+            vec!["/c/notes.md".into(), "/c/other.md".into()], // no corpus files -> dropped
+        ];
+        assert_eq!(client_found_dupsets(&noisy), vec![vec![1u64, 6]]);
     }
 
     #[test]
