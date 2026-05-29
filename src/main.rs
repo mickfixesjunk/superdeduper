@@ -630,6 +630,11 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
         .context("answering challenge from disk")?;
 
     // 5. assemble the canonical-bench submission
+    eprintln!(
+        "bench: result_digest={} ({} dup groups)",
+        bench_client::result_digest(&dupsets),
+        dupsets.len()
+    );
     let bench = bench_client::to_canonical_bench(
         &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
     );
