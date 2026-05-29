@@ -102,6 +102,14 @@ fn akp_gui_verbatim_prefix() {
     assert_variant("AKP-2-verbatim", |_dir, keeper| fs::canonicalize(keeper).ok());
 }
 
+// AKP-3 8.3: the 8.3 short name IS a valid keeper-alias (resolves + SAME file-id as the
+// long name — verified on-box). On c28af25 it refused via the NAMED refused_keeper_identity
+// guard; on 5d4226b it refuses via "I/O error os123 (invalid filename)" — canonicalization
+// errors on the 8.3 form BEFORE the file-id check. Keeper-SAFE either way, but the named
+// guard isn't REACHED for 8.3 on 5d4226b (engine finding: 8.3 canonicalization). This cell
+// is INVARIANT-KEYED — assert_variant asserts (is_err + keeper survives), NOT the mechanism —
+// so it passes on the keeper-safety invariant regardless of os123-vs-named-guard. The named
+// guard IS proven on the other 3 vectors (\\?\ / junction / case) for remove/recycle/safe-rename.
 #[test]
 fn akp_gui_short_name_8dot3() {
     assert_variant("AKP-3-8.3", |_dir, keeper| short_name(keeper));
