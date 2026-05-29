@@ -274,6 +274,13 @@ pub enum DebugCommand {
         /// lands this dev seed lets the rig be timed against a real corpus.)
         #[arg(long, value_name = "HEX")]
         seed: Option<String>,
+        /// Also compute + print the Merkle root (base64) after writing, with
+        /// its wall time. Hashes every leaf (the proof-of-work step) — lets a
+        /// determinism check confirm same-seed → same root, and times the
+        /// proof-hash pass. The root is not-served-not-secret. Off by default
+        /// (a plain corpus write doesn't need it).
+        #[arg(long)]
+        emit_root: bool,
     },
 }
 

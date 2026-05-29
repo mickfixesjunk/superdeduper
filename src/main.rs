@@ -425,7 +425,9 @@ fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
             Ok(())
         }
         #[cfg(feature = "telemetry")]
-        DebugCommand::MakeBenchCorpus { tier, out, seed } => run_make_bench_corpus(tier, out, seed),
+        DebugCommand::MakeBenchCorpus { tier, out, seed, emit_root } => {
+            run_make_bench_corpus(tier, out, seed, emit_root)
+        }
     }
 }
 
@@ -437,6 +439,7 @@ fn run_make_bench_corpus(
     tier: superdeduper::cli::BenchTier,
     out: std::path::PathBuf,
     seed: Option<String>,
+    emit_root: bool,
 ) -> anyhow::Result<()> {
     use superdeduper::cli::BenchTier;
     use superdeduper::leaderboard::{bench, bench_corpus as bc};
@@ -469,6 +472,20 @@ fn run_make_bench_corpus(
         t.elapsed().as_secs_f64(),
         manifest_path.display(),
     );
+
+    if emit_root {
+        // Hash every leaf (the proof-of-work pass) → the Merkle root. Lets a
+        // determinism check confirm same-seed → same root + times the pass.
+        let tr = std::time::Instant::now();
+        let leaves = bc::compute_leaves(&k_content, &plan);
+        let root = bench::merkle_root(&leaves).expect("non-empty corpus");
+        eprintln!(
+            "merkle_root (base64) = {} (leaf-hash pass: {:.1}s over {} leaves)",
+            bench::root_base64(&root),
+            tr.elapsed().as_secs_f64(),
+            leaves.len(),
+        );
+    }
     Ok(())
 }
 
