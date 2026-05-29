@@ -559,6 +559,18 @@ fn parse_bench_seed(seed: Option<String>) -> anyhow::Result<[u8; 32]> {
 fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     use superdeduper::leaderboard::{bench_run, install};
     let channel = superdeduper::channel::active_channel();
+    // PROD-DARK (launch hold, Mick option-2): the public prod bench backend
+    // isn't live yet. Refuse on the prod channel with a clear message rather
+    // than firing a doomed request at a missing /bench endpoint. Works on
+    // dev/local (set SUPERDEDUPER_CHANNEL=dev). Lifts when the prod
+    // leaderboard launches.
+    if !channel.is_non_prod() {
+        anyhow::bail!(
+            "bench-me is not yet available on the production leaderboard \
+             (launch hold). It runs on the dev/local channels: set \
+             SUPERDEDUPER_CHANNEL=dev to try it."
+        );
+    }
     let state = install::load_for(channel)
         .context("loading install state")?
         .ok_or_else(|| anyhow::anyhow!("not registered on {channel:?} -- run `superdeduper register` first"))?;

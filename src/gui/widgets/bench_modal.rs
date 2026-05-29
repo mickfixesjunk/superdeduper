@@ -150,6 +150,16 @@ fn run_worker(
     // install_unknown -> register, don't dead-end).
     set_status("preparing (checking registration)…");
     let channel = crate::channel::active_channel();
+    // PROD-DARK belt-and-suspenders (the header button is already hidden on
+    // prod): refuse if somehow reached on the prod channel — the prod bench
+    // backend isn't live yet (launch hold).
+    if !channel.is_non_prod() {
+        return finish(
+            "Benchmark isn't available on the production leaderboard yet (launch hold).".into(),
+            true,
+            false,
+        );
+    }
     let state = match install::load_for(channel) {
         Ok(Some(s)) if s.registered => s,
         Ok(Some(mut s)) => match registration::register_cli(&mut s) {

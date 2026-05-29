@@ -73,8 +73,14 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool
         // consent/explainer modal (default opt-out — nothing downloads,
         // runs, or submits until the user clicks an action inside it).
         // Telemetry-gated; only present in builds that can submit.
+        //
+        // PROD-DARK (launch hold, Mick option-2): the public prod
+        // leaderboard backend isn't live yet, so the button is HIDDEN on
+        // the prod channel — it would only hit a missing /bench backend and
+        // error. Shown on dev/local (where the bench backend exists). Same
+        // binary; runtime channel gate.
         #[cfg(feature = "telemetry")]
-        {
+        if crate::channel::active_channel().is_non_prod() {
             ui.add_space(8.0);
             let bench_btn = egui::Button::new(RichText::new("🏁  Benchmark").color(theme::TEXT_HI))
                 .fill(theme::PANEL_DEEP)
