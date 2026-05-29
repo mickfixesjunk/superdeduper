@@ -240,6 +240,39 @@ pub fn plan_corpus(spec: &TierSpec) -> CorpusPlan {
     }
 }
 
+impl CorpusPlan {
+    /// The groundtruth reclaimable CEILING in bytes — the Dedup Efficiency
+    /// denominator. Derived independently from `dupsets` (each cluster of `k`
+    /// identical files can shed `k-1` redundant copies), NOT from the tier
+    /// spec — so it cross-checks that the emitted dupsets encode exactly the
+    /// reclaimable layout. All files in a cluster share a class size.
+    ///
+    /// `files` is in contiguous global path-index order (`files[i].path_index
+    /// == i`), so a cluster's size is an O(1) index — not a linear scan (that
+    /// would be O(dupsets × files), quadratic on the full tier).
+    pub fn reclaimable_ceiling_bytes(&self) -> u64 {
+        self.dupsets
+            .iter()
+            .map(|set| {
+                let size = self.files.get(set[0] as usize).map(|f| f.size).unwrap_or(0);
+                debug_assert_eq!(self.files[set[0] as usize].path_index, set[0], "files indexed by path_index");
+                (set.len() as u64 - 1) * size
+            })
+            .sum()
+    }
+}
+
+/// Dedup Efficiency = measured reclaim / groundtruth ceiling, clamped to
+/// `[0, 1]` for display (a tool can never reclaim MORE than the ceiling; a
+/// value above 1 indicates a measurement bug, so we cap rather than mislead).
+/// `ceiling == 0` (a corpus with no dups) yields 0.0.
+pub fn dedup_efficiency(measured_reclaim_bytes: u64, ceiling_bytes: u64) -> f64 {
+    if ceiling_bytes == 0 {
+        return 0.0;
+    }
+    (measured_reclaim_bytes as f64 / ceiling_bytes as f64).clamp(0.0, 1.0)
+}
+
 /// Compute every Merkle leaf over the planned corpus, in global path order
 /// (content generated on the fly via the O(1) keystream — no disk). Heavy for
 /// production tiers; this is the canonical input to the root + manifest.
@@ -561,6 +594,32 @@ mod tests {
         let b8 = std::fs::read(dir.join(file_at(&plan, 8).path())).unwrap();
         assert_eq!(b2, b8, "exact-dup files are byte-identical on disk");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reclaimable_ceiling_cross_checks_spec_and_drives_efficiency() {
+        // The dupset-derived ceiling must equal the spec-derived dup_bytes —
+        // proving the emitted groundtruth encodes exactly the reclaimable layout.
+        for spec in [quick_tier(), full_tier()] {
+            let plan = plan_corpus(&spec);
+            let spec_dup_bytes: u64 = [spec.small, spec.medium, spec.large].iter().map(|c| c.dup_bytes()).sum();
+            assert_eq!(
+                plan.reclaimable_ceiling_bytes(),
+                spec_dup_bytes,
+                "{}: dupset-derived ceiling must equal spec dup_bytes",
+                spec.corpus_version
+            );
+        }
+        let plan = plan_corpus(&tiny_tier());
+        let ceiling = plan.reclaimable_ceiling_bytes();
+        // tiny: small dups 4 files (2 size-2 + 2 big-dups) @64 + medium 1 dup @128.
+        assert_eq!(ceiling, 4 * 64 + 1 * 128);
+        // Dedup Efficiency: a perfect tool reclaims the whole ceiling -> 1.0;
+        // half -> 0.5; over-claim is capped; zero ceiling -> 0.0.
+        assert_eq!(dedup_efficiency(ceiling, ceiling), 1.0);
+        assert!((dedup_efficiency(ceiling / 2, ceiling) - 0.5).abs() < 0.02);
+        assert_eq!(dedup_efficiency(ceiling * 2, ceiling), 1.0, "over-claim capped at 1.0");
+        assert_eq!(dedup_efficiency(100, 0), 0.0, "no-dup corpus -> 0.0");
     }
 
     #[test]
