@@ -1804,6 +1804,12 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
                 .map(|g| g.size.saturating_mul(g.unique_inodes.saturating_sub(1)))
                 .max()
                 .unwrap_or(0);
+            // #162 — CLI/GUI run_shape parity: compute the 3 esoteric metrics
+            // via the SHARED source-of-truth (payload_meta::run_shape_esoterics)
+            // so the CLI matches the GUI emitter exactly. Were hardcoded None ->
+            // zero-byte-reunion / hardlink-farm / name-twins never granted on CLI.
+            let (zero_byte_group_max, max_hardlink_count_in_scan, name_collision_count) =
+                payload_meta::run_shape_esoterics(&duplicates);
             let inputs = SubmissionInputs {
                 client_version: env!("CARGO_PKG_VERSION").to_string(),
                 run_uuid: uuid::Uuid::new_v4().to_string(),
@@ -1825,9 +1831,11 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
                     // consumed (was hardcoded empty → CLI never granted
                     // any client-claimed achievement).
                     easter_egg_hits,
-                    zero_byte_group_max: None,
-                    max_hardlink_count_in_scan: None,
-                    name_collision_count: None,
+                    // #162 — from the shared run_shape_esoterics (above); the
+                    // helper already applies the >0 ? Some : None convention.
+                    zero_byte_group_max,
+                    max_hardlink_count_in_scan,
+                    name_collision_count,
                     share_count_in_scope: if share_count > 0 {
                         Some(share_count)
                     } else {

@@ -115,6 +115,52 @@ pub fn count_distinct_share_roots(paths: &[PathBuf]) -> u64 {
     shares.len() as u64
 }
 
+/// #162 — the 3 esoteric run_shape dup-group metrics, computed from a SINGLE
+/// shared source so the CLI (`main.rs`) and the GUI emitter agree and can't
+/// drift. Previously the GUI computed these inline (gui/live.rs) while the CLI
+/// hardcoded `None`, so zero-byte-reunion / hardlink-farm / name-twins were
+/// unearnable on CLI. Returns `(zero_byte_group_max, max_hardlink_count_in_scan,
+/// name_collision_count)` with the GUI's `>0 ? Some : None` convention:
+/// - `zero_byte_group_max`: largest 0-byte dup group by member count.
+/// - `max_hardlink_count_in_scan`: largest `link_equivalent` group by member
+///   count (a confirmed lower bound on that inode's nlink).
+/// - `name_collision_count`: basenames resolving to ≥2 distinct content hashes.
+pub fn run_shape_esoterics(
+    groups: &[crate::pipeline::DuplicateGroup],
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    use std::collections::{HashMap, HashSet};
+    let mut zero_byte_group_max: u64 = 0;
+    let mut max_hardlink_count_in_scan: u64 = 0;
+    let mut basename_to_hashes: HashMap<String, HashSet<String>> = HashMap::new();
+    for g in groups {
+        let members = g.files.len() as u64;
+        if g.size == 0 && members > zero_byte_group_max {
+            zero_byte_group_max = members;
+        }
+        if g.link_equivalent && members > max_hardlink_count_in_scan {
+            max_hardlink_count_in_scan = members;
+        }
+        for path in &g.files {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                basename_to_hashes
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(g.content_hash.clone());
+            }
+        }
+    }
+    let name_collision_count = basename_to_hashes
+        .values()
+        .filter(|hs| hs.len() >= 2)
+        .count() as u64;
+    let opt = |n: u64| if n > 0 { Some(n) } else { None };
+    (
+        opt(zero_byte_group_max),
+        opt(max_hardlink_count_in_scan),
+        opt(name_collision_count),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +215,39 @@ mod tests {
         ];
         // 3 distinct share roots: server\share1, server\share2, smb:other
         assert_eq!(count_distinct_share_roots(&paths), 3);
+    }
+
+    // #162 — the shared run_shape esoterics computation (CLI + GUI source of
+    // truth). Locks the 3 metrics + the >0 ? Some : None convention so the CLI
+    // can't silently drop them again (it used to hardcode None).
+    #[test]
+    fn run_shape_esoterics_computes_the_three_metrics() {
+        use crate::pipeline::DuplicateGroup;
+        let g = |size: u64, hash: &str, link: bool, files: &[&str]| DuplicateGroup {
+            size,
+            content_hash: hash.to_string(),
+            files: files.iter().map(PathBuf::from).collect(),
+            link_equivalent: link,
+            ..Default::default()
+        };
+        let groups = vec![
+            // largest 0-byte group has 3 members -> zero_byte_group_max = 3.
+            g(0, "z", false, &["/a/e1", "/a/e2", "/a/e3"]),
+            // largest link_equivalent group has 4 members -> max_hardlink = 4.
+            g(100, "hl", true, &["/b/h1", "/b/h2", "/b/h3", "/b/h4"]),
+            // "twin.txt" appears in two groups with DIFFERENT hashes -> 1 collision.
+            g(10, "ha", false, &["/x/twin.txt", "/x/uniq_a"]),
+            g(20, "hb", false, &["/y/twin.txt", "/y/uniq_b"]),
+        ];
+        assert_eq!(
+            run_shape_esoterics(&groups),
+            (Some(3), Some(4), Some(1)),
+            "zero_byte_group_max / max_hardlink_count_in_scan / name_collision_count"
+        );
+
+        // No 0-byte / no link-equiv / no name-twin -> all None (the convention).
+        let plain = vec![g(50, "x", false, &["/p/only.bin", "/p/only2.bin"])];
+        assert_eq!(run_shape_esoterics(&plain), (None, None, None));
+        assert_eq!(run_shape_esoterics(&[]), (None, None, None));
     }
 }
