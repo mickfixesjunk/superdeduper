@@ -139,11 +139,17 @@ pub fn fetch(state: &InstallState) -> BadgeSummaryOutcome {
         "{}/api/v1/account/badge-summary",
         state.server_url.trim_end_matches('/')
     );
+    // Send the signed body: the HMAC is computed over `body`, so the
+    // server needs it to verify. `.call()` (empty body) yields a 400
+    // empty_body / signature mismatch — same bug class as the
+    // account_privacy::fetch Profile-Visibility 400. send_bytes keeps
+    // this a GET while attaching the canonical body.
     let response = ureq::get(&url)
         .set("X-Sd-Install-Id", &state.install_id)
         .set("X-Sd-Signature", &signature)
+        .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(10))
-        .call();
+        .send_bytes(&body);
     match response {
         Ok(resp) => match resp.into_json::<Vec<AccountBadgeEntry>>() {
             Ok(entries) => BadgeSummaryOutcome::Ok(entries),
