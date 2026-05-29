@@ -261,7 +261,14 @@ fn process_group(
     // the coarse skipped_system counter (the empty-snapshot-delta cell
     // would otherwise have no per-action signal).
     if !args.allow_system_paths {
-        let sys: Vec<&PathBuf> = group.files.iter().filter(|p| is_system_path(p)).collect();
+        // canonical-consistent with the GUI guard (resolves_to_system_path):
+        // both check the raw path AND its canonical resolution, so an alias to
+        // a system dir is refused on BOTH surfaces (v0.2.36 finding #1 fix).
+        let sys: Vec<&PathBuf> = group
+            .files
+            .iter()
+            .filter(|p| resolves_to_system_path(p))
+            .collect();
         if !sys.is_empty() {
             outcome.skipped_system += 1;
             for p in &sys {
@@ -979,15 +986,7 @@ pub const SAFE_RENAME_SUFFIX: &str = ".superdeduper";
 /// which `perform_action` also calls — that would override the CLI's
 /// `--allow-system-paths` flag).
 fn guard_system_path(path: &Path) -> Result<()> {
-    // `is_system_path` is path-string-based (for_user_display + prefix-match):
-    // robust vs the `\\?\` verbatim prefix (F-CLI-4) but NOT vs junction / 8.3
-    // / symlink aliases to a system dir (e.g. C:\link -> C:\Windows, then
-    // C:\link\foo.dll wouldn't match the C:\Windows prefix). Resolve the REAL
-    // target via canonical_key and check that too — the same string-vs-identity
-    // hardening gate-2 applied to the keeper (quality forward-note on 372f42e).
-    // Keep the raw check for when canonicalize fails (target gone) but the raw
-    // path is already a system prefix.
-    if is_system_path(path) || is_system_path(&canonical_key(path)) {
+    if resolves_to_system_path(path) {
         return Err(Error::other(format!(
             "refused: {} is under (or resolves to) a system-critical path; \
              refusing to delete/replace a system file",
@@ -995,6 +994,24 @@ fn guard_system_path(path: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether `path` IS, or canonically RESOLVES to, an OS-critical path. Shared
+/// by the GUI action layer (`guard_system_path`) AND the CLI planner
+/// (`process_group`'s system-path skip) so the two AGREE on what's refused —
+/// v0.2.36 finding #1: the prior asymmetry (GUI canonical-checked, CLI
+/// raw-only) let the GUI over-refuse while the CLI under-refused the same path.
+///
+/// `is_system_path` is path-string-based (for_user_display + prefix-match):
+/// robust vs the `\\?\` verbatim prefix (F-CLI-4) but NOT vs junction / 8.3 /
+/// symlink aliases to a system dir (e.g. `C:\link -> C:\Windows`, then
+/// `C:\link\foo.dll` wouldn't match the `C:\Windows` prefix). Resolving the REAL
+/// target via `canonical_key` and checking that too defeats the alias class —
+/// the same string-vs-identity hardening as keeper gate-2. The raw check stays
+/// as the fallback for when canonicalize fails (target gone) but the raw path is
+/// already a system prefix.
+fn resolves_to_system_path(path: &Path) -> bool {
+    is_system_path(path) || is_system_path(&canonical_key(path))
 }
 
 /// v0.2.36 relocation gate — reference protection. The CLI planner skips
@@ -1386,6 +1403,14 @@ pub fn is_system_path(path: &Path) -> bool {
     let s = crate::path_display::for_user_display(path).to_ascii_lowercase();
     #[cfg(windows)]
     {
+        // OS-CRITICAL only: deleting/replacing under these breaks the OS or
+        // installed software. The hard-refuse guard is for "this breaks the
+        // OS," NOT "this is your app data." v0.2.36 finding #1 (Mick ruling,
+        // option b): the prior %USERPROFILE%\AppData-wide clause was dropped —
+        // AppData\Local\Temp + caches are PRIME dedup targets, so hard-refusing
+        // all of AppData hobbled the tool. Fine-grained "maybe don't dedup app
+        // configs" stays the exclusions PRESET's job (overridable), not this
+        // hard guard.
         for prefix in [
             "c:\\windows",
             "c:\\program files",
@@ -1393,13 +1418,6 @@ pub fn is_system_path(path: &Path) -> bool {
             "c:\\programdata",
         ] {
             if s.starts_with(prefix) {
-                return true;
-            }
-        }
-        // %USERPROFILE%\AppData
-        if let Ok(home) = std::env::var("USERPROFILE") {
-            let appdata = format!("{}\\appdata", home.to_ascii_lowercase());
-            if s.starts_with(&appdata) {
                 return true;
             }
         }
