@@ -198,12 +198,17 @@ fn parse_response(resp: ureq::Response) -> PrivacyOutcome {
 /// `parse_response` so the no-silent-clobber guard is unit-testable without a
 /// live `ureq::Response`.
 fn parse_flags_body(body: &serde_json::Value) -> PrivacyOutcome {
-    // Accept either the bare PrivacyFlags shape (PATCH response)
-    // or a wrapped {privacy_applied: PrivacyFlags} (GET /profile/me
-    // response). Older transitional servers may still emit `privacy`
-    // as an alias.
+    // Unwrap the flags object from whichever envelope the server uses:
+    //   {flags: {show_*}}            — what prod actually emits (confirmed
+    //                                  2026-05-29 via Mick's self-diag status
+    //                                  line; this was the missing key behind
+    //                                  "toggle doesn't stick")
+    //   {privacy_applied: {show_*}}  — the originally-documented GET wrapper
+    //   {privacy: {show_*}}          — transitional alias
+    //   {show_*}                     — a bare PrivacyFlags object
     let flags_value = body
-        .get("privacy_applied")
+        .get("flags")
+        .or_else(|| body.get("privacy_applied"))
         .or_else(|| body.get("privacy"))
         .unwrap_or(body);
     // CRITICAL: every PrivacyFlags field is `#[serde(default)]`, so
@@ -280,7 +285,16 @@ mod tests {
 
     #[test]
     fn parse_accepts_wrapped_and_bare_shapes() {
-        // Wrapped (GET /profile/me): {privacy_applied: {...}}
+        // Prod shape (confirmed 2026-05-29): {flags: {...}}
+        let prod = serde_json::json!({"flags": {"show_recent_runs": true}});
+        assert_eq!(
+            parse_flags_body(&prod),
+            PrivacyOutcome::Ok(PrivacyFlags {
+                show_recent_runs: true,
+                ..Default::default()
+            })
+        );
+        // Documented wrapper (GET /profile/me): {privacy_applied: {...}}
         let wrapped = serde_json::json!({"privacy_applied": {"show_avatar": true}});
         assert_eq!(
             parse_flags_body(&wrapped),
