@@ -18,28 +18,26 @@ fn b64(h: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(h)
 }
 
-/// A server-issued challenge position (delivered in full by `POST /bench/start`
-/// — the client CANNOT derive these, since the BC needs the private seed).
-/// Read `byte_length` bytes at `byte_offset` from `f{path_index:010}.bin` and
-/// hash them; echo `leaf_index` back. Offsets are PER-FILE (the client has the
-/// files on disk).
+/// A server-issued challenge descriptor (delivered by `POST /bench/start` in
+/// its `challenges` array — the client CANNOT derive these, the BC needs the
+/// private seed). Read `byte_length` bytes at `byte_offset` from
+/// `f{path_index:010}.bin` and hash them. PER-FILE (the client has the files).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChallengePosition {
-    pub leaf_index: u64,
     pub path_index: u64,
     pub byte_offset: u64,
     pub byte_length: u64,
 }
 
-/// One challenge answer (web's wire): just `leaf_index` + the leaf hash. The
-/// server already holds the descriptor (path/offset/len) it issued, so the
-/// client need only return which leaf + its hash. `leaf_hash` uses the
-/// ALREADY-LOCKED leaf preimage (tag `0x00`) — web reproduces it from the
-/// regenerated corpus and direct-compares; no tree, no new hash golden.
+/// One challenge answer (web's DEPLOYED wire): the descriptor echoed back + the
+/// tag-0x02 `challenge_hash` of the bytes there (std-base64). The server
+/// regenerates the same range from the private seed and direct-compares.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChallengeAnswer {
-    pub leaf_index: u64,
-    pub leaf_hash: String,
+    pub path_index: u64,
+    pub byte_offset: u64,
+    pub byte_length: u64,
+    pub challenge_hash: String,
 }
 
 /// The challenge hash over a chunk (FROZEN, research golden): `BLAKE3(0x02 ‖
@@ -77,8 +75,10 @@ pub fn answer_challenge_from_dir(
         f.read_exact(&mut buf)?;
         bytes_read += p.byte_length;
         answers.push(ChallengeAnswer {
-            leaf_index: p.leaf_index,
-            leaf_hash: b64(&challenge_hash(&name, p.byte_offset, p.byte_length, &buf)),
+            path_index: p.path_index,
+            byte_offset: p.byte_offset,
+            byte_length: p.byte_length,
+            challenge_hash: b64(&challenge_hash(&name, p.byte_offset, p.byte_length, &buf)),
         });
     }
     Ok((answers, bytes_read))
@@ -146,11 +146,10 @@ pub fn to_canonical_bench(
         corpus_version: corpus_version.to_string(),
         tier: tier.to_string(),
         bench_run_id: bench_run_id.to_string(),
-        challenge_response: answers
-            .iter()
-            .map(|a| serde_json::to_value(a).expect("ChallengeAnswer serializes"))
-            .collect(),
-        result_digest: result_digest(found_dupsets),
+        bench_proof: serde_json::json!({
+            "answers": answers,
+            "result_digest": result_digest(found_dupsets),
+        }),
     }
 }
 
@@ -177,18 +176,18 @@ mod tests {
         std::fs::write(dir.join("f0000000001.bin"), b"the-quick-brown-fox").unwrap();
 
         let positions = vec![
-            ChallengePosition { leaf_index: 0, path_index: 0, byte_offset: 4, byte_length: 6 }, // "456789"
-            ChallengePosition { leaf_index: 5, path_index: 1, byte_offset: 0, byte_length: 9 }, // "the-quick"
+            ChallengePosition { path_index: 0, byte_offset: 4, byte_length: 6 }, // "456789"
+            ChallengePosition { path_index: 1, byte_offset: 0, byte_length: 9 }, // "the-quick"
         ];
         let (answers, bytes_read) = answer_challenge_from_dir(&dir, &positions).unwrap();
         assert_eq!(bytes_read, 15, "6 + 9 bytes read from disk");
         assert_eq!(answers.len(), 2);
         // hash matches an independent compute over the SAME (path, off, len, bytes).
-        assert_eq!(answers[0].leaf_hash, b64(&challenge_hash("f0000000000.bin", 4, 6, b"456789")));
-        assert_eq!(answers[1].leaf_hash, b64(&challenge_hash("f0000000001.bin", 0, 9, b"the-quick")));
-        // leaf_index echoed back per web's wire.
-        assert_eq!(answers[0].leaf_index, 0);
-        assert_eq!(answers[1].leaf_index, 5);
+        assert_eq!(answers[0].challenge_hash, b64(&challenge_hash("f0000000000.bin", 4, 6, b"456789")));
+        assert_eq!(answers[1].challenge_hash, b64(&challenge_hash("f0000000001.bin", 0, 9, b"the-quick")));
+        // descriptor echoed back per web's deployed wire.
+        assert_eq!(answers[0].path_index, 0);
+        assert_eq!((answers[1].byte_offset, answers[1].byte_length), (0, 9));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -237,16 +236,16 @@ mod tests {
     #[test]
     fn to_canonical_bench_assembles_submission_block() {
         let answers = vec![
-            ChallengeAnswer { leaf_index: 0, leaf_hash: "AAAA".into() },
-            ChallengeAnswer { leaf_index: 9, leaf_hash: "BBBB".into() },
+            ChallengeAnswer { path_index: 0, byte_offset: 0, byte_length: 8, challenge_hash: "AAAA".into() },
+            ChallengeAnswer { path_index: 9, byte_offset: 64, byte_length: 4, challenge_hash: "BBBB".into() },
         ];
         let dupsets = vec![vec![1u64, 4, 6]];
         let cb = to_canonical_bench("tbench-1", "corpus-v1-quick", "quick", "run-Z", &answers, &dupsets);
         assert_eq!(cb.bench_run_id, "run-Z");
         assert_eq!(cb.protocol_version, "tbench-1");
-        assert_eq!(cb.challenge_response.len(), 2);
-        assert_eq!(cb.challenge_response[1].get("leaf_index").and_then(|v| v.as_u64()), Some(9));
-        assert_eq!(cb.result_digest, result_digest(&dupsets));
+        assert_eq!(cb.bench_proof.pointer("/answers").and_then(|a| a.as_array()).map(Vec::len), Some(2));
+        assert_eq!(cb.bench_proof.pointer("/answers/1/path_index").and_then(|v| v.as_u64()), Some(9));
+        assert_eq!(cb.bench_proof.pointer("/result_digest").and_then(|v| v.as_str()), Some(result_digest(&dupsets).as_str()));
         // round-trips into a submission payload as the canonical-bench block.
         let inputs = super::super::submission::SubmissionInputs {
             client_version: "t".into(),
@@ -284,11 +283,9 @@ mod tests {
         };
         let p = super::super::submission::build_payload(&inputs, "id");
         assert_eq!(p.get("bench_run_id").and_then(|v| v.as_str()), Some("run-Z"));
-        assert_eq!(p.pointer("/challenge_response/1/leaf_index").and_then(|v| v.as_u64()), Some(9));
-        assert!(p.get("result_digest").is_some());
+        assert_eq!(p.pointer("/bench_proof/answers/1/path_index").and_then(|v| v.as_u64()), Some(9));
+        assert!(p.pointer("/bench_proof/result_digest").is_some());
         assert!(p.pointer("/result_summary/client_found_dupsets").is_some());
-        // ordinary (non-bench) submission omits the bench keys.
-        assert!(p.get("bench_proof").is_none(), "Merkle bench_proof retired");
     }
 
     /// Emits the challenge-response + result_digest GOLDEN VECTOR for web to

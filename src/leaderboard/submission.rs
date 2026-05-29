@@ -67,12 +67,11 @@ pub struct CanonicalBench {
     pub corpus_version: String,
     pub tier: String,
     pub bench_run_id: String,
-    /// Answers to the server-issued challenge positions: `[{leaf_index,
-    /// leaf_hash}]` (BLAKE3 tag-0x02 of the downloaded chunk). NO merkle_root,
-    /// NO audit_path — the server regenerates + direct-compares.
-    pub challenge_response: Vec<serde_json::Value>,
-    /// Canonical commitment to the dedupe result (`bench_client::result_digest`).
-    pub result_digest: String,
+    /// web's DEPLOYED envelope: `{ answers: [{path_index, byte_offset,
+    /// byte_length, challenge_hash}], result_digest }`. NO merkle_root, NO
+    /// audit_path — the server regenerates each range from the private seed
+    /// (tag 0x02) + direct-compares, and checks result_digest == digest(groundtruth).
+    pub bench_proof: serde_json::Value,
 }
 
 /// `run_shape` block per backend schema.
@@ -336,8 +335,7 @@ pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json:
         obj.insert("corpus_version".into(), bench.corpus_version.clone().into());
         obj.insert("tier".into(), bench.tier.clone().into());
         obj.insert("bench_run_id".into(), bench.bench_run_id.clone().into());
-        obj.insert("challenge_response".into(), bench.challenge_response.clone().into());
-        obj.insert("result_digest".into(), bench.result_digest.clone().into());
+        obj.insert("bench_proof".into(), bench.bench_proof.clone());
     }
     body
 }
@@ -1107,20 +1105,22 @@ mod tests {
             corpus_version: "corpus-v1-quick".into(),
             tier: "quick".into(),
             bench_run_id: "run-xyz".into(),
-            challenge_response: vec![serde_json::json!({ "leaf_index": 5, "leaf_hash": "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=" })],
-            result_digest: "SpVnFZopIQwCJbqb+CpmCtaKAAi9vWQ44gwu1TactwQ=".into(),
+            bench_proof: serde_json::json!({
+                "answers": [{ "path_index": 7, "byte_offset": 0, "byte_length": 16, "challenge_hash": "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=" }],
+                "result_digest": "2Ak/YbCbLu9E+xhuiv024PJd3OnS5ZTNzPJtDzh6aG0=",
+            }),
         });
         let p = build_payload(&inputs, "id");
         assert_eq!(p.get("protocol_version").and_then(|v| v.as_str()), Some("tbench-1"));
         assert_eq!(p.get("corpus_version").and_then(|v| v.as_str()), Some("corpus-v1-quick"));
         assert_eq!(p.get("tier").and_then(|v| v.as_str()), Some("quick"));
         assert_eq!(p.get("bench_run_id").and_then(|v| v.as_str()), Some("run-xyz"));
-        assert_eq!(p.get("result_digest").and_then(|v| v.as_str()), Some("SpVnFZopIQwCJbqb+CpmCtaKAAi9vWQ44gwu1TactwQ="));
-        assert_eq!(p.pointer("/challenge_response/0/leaf_index").and_then(|v| v.as_u64()), Some(5));
+        assert_eq!(p.pointer("/bench_proof/result_digest").and_then(|v| v.as_str()), Some("2Ak/YbCbLu9E+xhuiv024PJd3OnS5ZTNzPJtDzh6aG0="));
+        assert_eq!(p.pointer("/bench_proof/answers/0/path_index").and_then(|v| v.as_u64()), Some(7));
         assert!(p.pointer("/result_summary/client_found_dupsets").is_some());
         // ordinary (non-bench) submissions must NOT carry any of these keys.
         let plain = build_payload(&sample_inputs(), "id");
-        for k in ["protocol_version", "corpus_version", "tier", "bench_run_id", "challenge_response", "result_digest"] {
+        for k in ["protocol_version", "corpus_version", "tier", "bench_run_id", "bench_proof"] {
             assert!(plain.get(k).is_none(), "non-bench payload must omit '{k}'");
         }
     }
