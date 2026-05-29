@@ -690,3 +690,59 @@ fn tier_a_scan_complete_modal_shows_real_stats() {
     std::fs::remove_dir_all(&corpus).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Action (c) FEEDBACK — the post-action scan-history record's
+/// actually_reclaimed_bytes is patched to the EXACT actioned-loser bytes (the
+/// #79 local patch via record_local_action_for_latest_scan, app.rs:1934 — fires
+/// independent of any submission_id; the server PATCH is separate). Telemetry-
+/// gated (scan-history submission surface). Real-state on the PERSISTED record
+/// (source of truth, not a UI label): G-REMOVE of 2 losers × 8 KiB -> 16384
+/// EXACTLY, EXCLUDING the keeper (would be 24576 if keeper-inflated -> bug).
+#[test]
+#[cfg(feature = "telemetry")]
+fn tier_a_action_patches_scan_history_actually_reclaimed_bytes() {
+    let _env = env_lock();
+    let (mut harness, corpus, files, home) = boot_and_scan("reclaimpatch");
+    let [_keeper, loser_a, loser_b, _distinct] = files;
+    drive_bulk_action(&mut harness, "Nuke dupes", "DELETE");
+    // ensure the action actually ran (losers gone) before checking the patch.
+    let _ = run_until(&mut harness, || !loser_a.exists() && !loser_b.exists());
+
+    // Poll the persisted scan-history record for the EXACT reclaim (16 KiB).
+    // Tolerant of JSON whitespace: strip spaces and match the field:value.
+    let want = "\"actually_reclaimed_bytes\":16384";
+    let inflated = "\"actually_reclaimed_bytes\":24576"; // keeper-included = a bug
+    let scan_history_dir = home.join("data").join("superdeduper").join("scan-history");
+    let read_field = || -> (bool, bool) {
+        let mut exact = false;
+        let mut bad = false;
+        if let Ok(rd) = std::fs::read_dir(&scan_history_dir) {
+            for e in rd.flatten() {
+                if let Ok(body) = std::fs::read_to_string(e.path()) {
+                    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+                    if compact.contains(want) {
+                        exact = true;
+                    }
+                    if compact.contains(inflated) {
+                        bad = true;
+                    }
+                }
+            }
+        }
+        (exact, bad)
+    };
+    let patched = run_until(&mut harness, || read_field().0);
+    let (exact, keeper_inflated) = read_field();
+    assert!(
+        !keeper_inflated,
+        "STEP=feedback: actually_reclaimed_bytes == 24576 — keeper's 8 KiB was INCLUDED (should EXCLUDE keeper; real bug)"
+    );
+    assert!(
+        patched && exact,
+        "STEP=feedback: post-action scan_history.actually_reclaimed_bytes != 16384 (exact actioned-loser bytes, keeper excluded) in {:?}",
+        scan_history_dir
+    );
+
+    std::fs::remove_dir_all(&corpus).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
