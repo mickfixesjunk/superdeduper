@@ -302,12 +302,12 @@ mod tests {
             ("f0000000007.bin", 1048576, 4, b"edge"),
             ("f0000000042.bin", 100, 16, b"sixteen-bytes!!!"),
         ];
-        eprintln!("challenge_hash = BLAKE3(0x00||u32le(path_len)||path||u64le(off)||u64le(len)||bytes), std-base64:");
+        eprintln!("challenge_hash = BLAKE3(0x02||u32le(path_len)||path||u64le(off)||u64le(len)||bytes), std-base64:");
         for (path, off, len, bytes) in samples {
             eprintln!("  path={path} off={off} len={len} bytes={:?} -> {}", std::str::from_utf8(bytes).unwrap(), b64(&challenge_hash(path, off, len, bytes)));
         }
         let dupsets = vec![vec![0u64, 84000], vec![1, 84001], vec![2, 84002, 84003]];
-        eprintln!("result_digest preimage = 0x05||u64le(group_count)||(u64le(len)||u64le(pi)*)*; canonical dupsets {dupsets:?}");
+        eprintln!("result_digest preimage = u32le(17)||\"tcorpus-result-v1\"||u64le(cluster_count)||(u64le(len)||u64le(pi)*)*; canonical dupsets {dupsets:?}");
         eprintln!("  result_digest -> {}", result_digest(&dupsets));
         // determinism self-check.
         assert_eq!(result_digest(&dupsets), result_digest(&dupsets));
