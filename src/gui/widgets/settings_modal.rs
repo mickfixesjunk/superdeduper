@@ -146,6 +146,125 @@ fn render_done_dialog(ctx: &egui::Context) {
     }
 }
 
+/// Process-wide flag for the "Reset install" confirmation modal
+/// (client-spec §10.2: Reset is a destructive, identity-rotating
+/// action and MUST go through a confirmation modal, not fire on a
+/// single click). The Privacy-tab button sets this; the outer
+/// `show()` renders the confirm dialog and only on [Reset install]
+/// does the rotate actually run.
+#[cfg(feature = "telemetry")]
+static RESET_CONFIRM: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
+
+#[cfg(feature = "telemetry")]
+fn request_reset_confirm() {
+    *RESET_CONFIRM.lock() = true;
+}
+
+/// Run the destructive install reset on a background thread: back up
+/// the current install file, rotate to a fresh unregistered identity,
+/// then surface a Done dialog. Reset itself never hits the network —
+/// the separate Register button pushes the new identity. Extracted so
+/// both the (now gated) confirm modal and tests share one path.
+#[cfg(feature = "telemetry")]
+fn perform_install_reset(active: crate::channel::Channel) {
+    use crate::leaderboard::install;
+    std::thread::spawn(move || {
+        eprintln!("leaderboard: install reset confirmed — backing up + rotating install_id");
+        match install::back_up_for(active) {
+            Ok(Some(path)) => {
+                eprintln!("leaderboard: prior install backed up to {}", path.display())
+            }
+            Ok(None) => eprintln!("leaderboard: no prior install to back up"),
+            Err(e) => eprintln!("leaderboard: backup failed: {e}"),
+        }
+        // resolve_server_url so a reset under a mock/override re-creates
+        // the install pointed at the same endpoint (consistent with G1).
+        let server_url = crate::channel::resolve_server_url(active);
+        let fresh = install::new_unregistered(server_url);
+        match install::save_for(active, &fresh) {
+            Ok(()) => {
+                eprintln!(
+                    "leaderboard: reset complete. new install_id={}. \
+                     Click Register to push it to the leaderboard server.",
+                    fresh.install_id
+                );
+                show_done_dialog(format!(
+                    "Install reset. A backup of your previous identity was saved.\n\n\
+                     New install_id: {}\n\n\
+                     Click Register to push this identity to the leaderboard \
+                     (rank + achievements start fresh).",
+                    fresh.install_id
+                ));
+            }
+            Err(e) => {
+                eprintln!("leaderboard: reset failed: {e:?}");
+                show_done_dialog(format!("Install reset FAILED: {e}"));
+            }
+        }
+    });
+}
+
+/// Render the Reset-install confirmation modal when armed. [Reset
+/// install] runs the rotate; [Cancel] disarms. No-op when not armed.
+#[cfg(feature = "telemetry")]
+fn render_reset_confirm(ctx: &egui::Context) {
+    if !*RESET_CONFIRM.lock() {
+        return;
+    }
+    let mut decision: Option<bool> = None; // Some(true)=reset, Some(false)=cancel
+    egui::Window::new(RichText::new("Reset install?").color(theme::WARN).heading())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(440.0)
+        .show(ctx, |ui| {
+            ui.label(RichText::new(
+                "This rotates your install_id + install_key to a brand-new \
+                 identity. The leaderboard treats it as a fresh user: your \
+                 rank and achievements start from zero.",
+            ).color(theme::TEXT_HI));
+            ui.add_space(6.0);
+            ui.label(RichText::new(
+                "Your current identity is backed up to a .bak file first, so \
+                 the rotation is recoverable. Reset does not contact the \
+                 server — click Register afterward to push the new identity.",
+            ).color(theme::TEXT_LO).small());
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Reset install").color(theme::PANEL_DEEP).strong(),
+                        )
+                        .fill(theme::WARN)
+                        .min_size(egui::vec2(140.0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Cancel").color(theme::TEXT_HI))
+                            .min_size(egui::vec2(100.0, 28.0)),
+                    )
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    match decision {
+        Some(true) => {
+            *RESET_CONFIRM.lock() = false;
+            perform_install_reset(crate::channel::active_channel());
+        }
+        Some(false) => *RESET_CONFIRM.lock() = false,
+        None => {}
+    }
+}
+
 #[cfg(feature = "telemetry")]
 fn show_sample_preview(json: String) {
     *SAMPLE_PREVIEW.lock() = Some(json);
@@ -202,6 +321,12 @@ pub fn show(
     // main settings layer so the OK click doesn't affect the
     // settings-modal state machine.
     render_done_dialog(ctx);
+
+    // Reset-install confirmation modal (§10.2): destructive identity
+    // rotation is gated behind an explicit confirm, rendered above the
+    // settings layer like the other secondary modals.
+    #[cfg(feature = "telemetry")]
+    render_reset_confirm(ctx);
 
     if !*open {
         return false;
@@ -1886,36 +2011,12 @@ fn render_privacy_section(ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            // Reset is destructive but Mick's 2026-05-25T01:20Z
-            // preference is "back up the file, then rotate" — the
-            // .bak gives a recovery path if the rotation was
-            // accidental. Reset itself doesn't hit web; the
-            // separate Register button below pushes the new
-            // identity to the leaderboard server.
-            let active = crate::channel::active_channel();
-            std::thread::spawn(move || {
-                eprintln!(
-                    "leaderboard: install reset requested — backing up + rotating install_id"
-                );
-                match install::back_up_for(active) {
-                    Ok(Some(path)) => {
-                        eprintln!("leaderboard: prior install backed up to {}", path.display())
-                    }
-                    Ok(None) => eprintln!("leaderboard: no prior install to back up"),
-                    Err(e) => eprintln!("leaderboard: backup failed: {e}"),
-                }
-                let server_url = crate::channel::server_url_for(active).to_string();
-                let fresh = install::new_unregistered(server_url);
-                if let Err(e) = install::save_for(active, &fresh) {
-                    eprintln!("leaderboard: reset failed: {e:?}");
-                } else {
-                    eprintln!(
-                        "leaderboard: reset complete. new install_id={}. \
-                         Click Register to push it to the leaderboard server.",
-                        fresh.install_id
-                    );
-                }
-            });
+            // §10.2: gate the destructive identity rotation behind an
+            // explicit confirmation modal (rendered by the outer
+            // show()), rather than firing on this single click. The
+            // backup-then-rotate itself happens in perform_install_reset
+            // once the user confirms.
+            request_reset_confirm();
         }
         ui.add_space(4.0);
         // GUI Register — runs the same proof-of-work + POST
