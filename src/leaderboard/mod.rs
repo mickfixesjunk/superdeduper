@@ -39,5 +39,9 @@ pub mod vanity_slug;
 
 // G2-G4 modules slot in here as the phases land:
 // pub mod achievements;  // G2
-// pub mod corpus;        // G4
-// pub mod merkle;        // G4
+/// G4 / T-BENCH-ME canonical-bench primitives: deterministic ChaCha20 corpus
+/// content (O(1) random access) + the FROZEN byte-exact Merkle proof
+/// (per-1MiB-chunk leaves, RFC-6962 promote-last, base64-padded root) +
+/// single-round challenge derivation. (corpus generator + --bench-me flow
+/// build on these.) Telemetry-gated (the file is #![cfg(feature="telemetry")]).
+pub mod bench; // G4

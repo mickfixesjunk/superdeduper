@@ -1,0 +1,245 @@
+//! T-BENCH-ME canonical-bench primitives — the FROZEN byte-exact cores
+//! (design 2026-05-29, research-locked). MUST match web's #160 verifier
+//! byte-for-byte; the primitives here are covered by self-checking tests
+//! (determinism, random-access==sequential, tree-structure / odd-node) and
+//! will be cross-checked against research's golden vectors before any dev
+//! binary submits to a ranked board.
+//!
+//! FROZEN spec:
+//! - corpus content: RFC-8439 ChaCha20 keystream, O(1) random access.
+//!   `content(c) = ChaCha20(K_content, nonce = u96le(c))`; the chunk at byte
+//!   `offset` is the keystream seeked to `offset` (block = offset/64).
+//! - subkeys: `K_content = BLAKE3(seed‖0x01)`, `K_control = BLAKE3(seed‖0x02)`.
+//! - Merkle leaf = `BLAKE3(0x00 ‖ u32le(path_len) ‖ path_utf8_nfc ‖
+//!   u64le(offset) ‖ u64le(len) ‖ chunk[≤1MiB])`.
+//! - Merkle node = `BLAKE3(0x01 ‖ left ‖ right)` (32B children, no len prefix).
+//! - tree: RFC-6962, PROMOTE-LAST odd handling (NEVER duplicate a lone node —
+//!   CVE-2012-2459 guard); split at the largest power of two < n; 1-leaf root
+//!   = the leaf hash itself.
+//! - root wire form = std-base64 (RFC4648, WITH padding).
+//! - all in-hash integers = little-endian, fixed width.
+#![cfg(feature = "telemetry")]
+
+use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::ChaCha20;
+
+/// 1 MiB Merkle-leaf chunk size (FROZEN). The final chunk of a content may be
+/// shorter; its leaf `len` reflects the actual bytes.
+pub const CHUNK_SIZE: u64 = 1 << 20;
+
+const TAG_LEAF: u8 = 0x00;
+const TAG_NODE: u8 = 0x01;
+
+/// Derive the corpus subkeys from the 32-byte seed (FROZEN):
+/// `K_content = BLAKE3(seed‖0x01)`, `K_control = BLAKE3(seed‖0x02)`.
+pub fn corpus_keys(seed: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let derive = |tag: u8| {
+        let mut h = blake3::Hasher::new();
+        h.update(seed);
+        h.update(&[tag]);
+        *h.finalize().as_bytes()
+    };
+    (derive(0x01), derive(0x02))
+}
+
+/// 12-byte (u96 little-endian) ChaCha20 nonce for `content_id`. content_id is
+/// a u64 in corpus-v1: the low 8 bytes are `content_id.to_le_bytes()`, the
+/// high 4 bytes are zero (u96le of a u64). NOTE: confirm the content_id width
+/// + nonce packing against research's golden vector before shipping — this is
+/// exactly the byte-exact detail a vector pins.
+fn content_nonce(content_id: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..8].copy_from_slice(&content_id.to_le_bytes());
+    n
+}
+
+/// Fill `buf` with `content(content_id)` keystream bytes starting at byte
+/// `offset`. O(1) random access (StreamCipherSeek → block offset/64) — the
+/// property web relies on to verify a sampled leaf without the full corpus.
+pub fn content_bytes_at(k_content: &[u8; 32], content_id: u64, offset: u64, buf: &mut [u8]) {
+    let key = chacha20::Key::from(*k_content);
+    let nonce = chacha20::Nonce::from(content_nonce(content_id));
+    let mut cipher = ChaCha20::new(&key, &nonce);
+    cipher.seek(offset);
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    cipher.apply_keystream(buf);
+}
+
+/// Merkle leaf hash (FROZEN). `path` must be the canonical relative path in
+/// UTF-8 NFC with '/' separators. corpus-v1 paths (`f{index:010}.bin`) are
+/// ASCII, so NFC is identity; a non-ASCII path would require an NFC step
+/// (not added — corpus paths are ASCII by spec).
+pub fn leaf_hash(path: &str, offset: u64, len: u64, chunk: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&[TAG_LEAF]);
+    h.update(&(path.len() as u32).to_le_bytes());
+    h.update(path.as_bytes());
+    h.update(&offset.to_le_bytes());
+    h.update(&len.to_le_bytes());
+    h.update(chunk);
+    *h.finalize().as_bytes()
+}
+
+/// Merkle node hash (FROZEN): `BLAKE3(0x01 ‖ left ‖ right)`.
+pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&[TAG_NODE]);
+    h.update(left);
+    h.update(right);
+    *h.finalize().as_bytes()
+}
+
+/// RFC-6962 Merkle root over `leaves` with PROMOTE-LAST odd handling.
+/// `[]` → None; `[h]` → `h` (1-leaf root is the leaf itself, no node wrap);
+/// else split at the largest power of two strictly less than `n`. Never
+/// duplicates a lone node (CVE-2012-2459 guard).
+pub fn merkle_root(leaves: &[[u8; 32]]) -> Option<[u8; 32]> {
+    match leaves.len() {
+        0 => None,
+        1 => Some(leaves[0]),
+        n => {
+            let mut k = 1usize;
+            while k << 1 < n {
+                k <<= 1;
+            }
+            let left = merkle_root(&leaves[..k]).expect("non-empty left split");
+            let right = merkle_root(&leaves[k..]).expect("non-empty right split");
+            Some(node_hash(&left, &right))
+        }
+    }
+}
+
+/// std-base64 (RFC4648, WITH padding) of the 32-byte Merkle root — the FROZEN
+/// wire form (44 chars; NOT base64url).
+pub fn root_base64(root: &[u8; 32]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(root)
+}
+
+/// Single-round challenge positions (FROZEN): for k = 0,1,2,…
+/// `h_k = BLAKE3(ascii(bench_challenge_id) ‖ u32le(k))`; `pos =
+/// u64le(h_k[0..8]) mod leaf_count`; collect distinct positions until `n`
+/// (32 for v1) or until every leaf is covered.
+pub fn challenge_positions(bench_challenge_id: &str, leaf_count: u64, n: usize) -> Vec<u64> {
+    let target = n.min(leaf_count as usize);
+    let mut out = Vec::with_capacity(target);
+    let mut seen = std::collections::HashSet::with_capacity(target);
+    let mut k: u32 = 0;
+    while out.len() < target {
+        let mut h = blake3::Hasher::new();
+        h.update(bench_challenge_id.as_bytes());
+        h.update(&k.to_le_bytes());
+        let d = h.finalize();
+        let pos = u64::from_le_bytes(d.as_bytes()[0..8].try_into().unwrap()) % leaf_count;
+        if seen.insert(pos) {
+            out.push(pos);
+        }
+        k = k.wrapping_add(1);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_keys_deterministic_and_distinct() {
+        let seed = [7u8; 32];
+        let (kc1, kk1) = corpus_keys(&seed);
+        let (kc2, kk2) = corpus_keys(&seed);
+        assert_eq!(kc1, kc2, "K_content deterministic");
+        assert_eq!(kk1, kk2, "K_control deterministic");
+        assert_ne!(kc1, kk1, "K_content != K_control (different tag)");
+        assert_ne!(corpus_keys(&[8u8; 32]).0, kc1, "different seed -> different key");
+    }
+
+    #[test]
+    fn content_is_deterministic() {
+        let (kc, _) = corpus_keys(&[1u8; 32]);
+        let mut a = [0u8; 4096];
+        let mut b = [0u8; 4096];
+        content_bytes_at(&kc, 42, 0, &mut a);
+        content_bytes_at(&kc, 42, 0, &mut b);
+        assert_eq!(a, b, "same (key, content_id, offset) -> same bytes");
+        let mut other = [0u8; 4096];
+        content_bytes_at(&kc, 43, 0, &mut other);
+        assert_ne!(a, other, "different content_id -> different bytes");
+    }
+
+    #[test]
+    fn random_access_equals_sequential() {
+        // The load-bearing property web depends on: a chunk read at an
+        // arbitrary offset == the same window of the full sequential stream.
+        let (kc, _) = corpus_keys(&[9u8; 32]);
+        let mut full = [0u8; 8192];
+        content_bytes_at(&kc, 5, 0, &mut full);
+        // read a window straddling ChaCha block boundaries (block = 64B).
+        for &(off, len) in &[(0usize, 100usize), (64, 64), (100, 300), (4096, 1000), (8000, 192)] {
+            let mut window = vec![0u8; len];
+            content_bytes_at(&kc, 5, off as u64, &mut window);
+            assert_eq!(
+                &window[..],
+                &full[off..off + len],
+                "random-access chunk at offset {off} must equal the sequential window"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_hash_field_sensitive() {
+        let base = leaf_hash("f0000000001.bin", 0, 16, b"hello-chunk-data");
+        // every field independently changes the hash (no field collision).
+        assert_ne!(base, leaf_hash("f0000000002.bin", 0, 16, b"hello-chunk-data"));
+        assert_ne!(base, leaf_hash("f0000000001.bin", 1048576, 16, b"hello-chunk-data"));
+        assert_ne!(base, leaf_hash("f0000000001.bin", 0, 17, b"hello-chunk-data"));
+        assert_ne!(base, leaf_hash("f0000000001.bin", 0, 16, b"HELLO-chunk-data"));
+        // stable across calls.
+        assert_eq!(base, leaf_hash("f0000000001.bin", 0, 16, b"hello-chunk-data"));
+        // domain separation: a leaf is never equal to a node of the same bytes.
+        assert_ne!(leaf_hash("", 0, 0, b""), node_hash(&[0u8; 32], &[0u8; 32]));
+    }
+
+    #[test]
+    fn merkle_promote_last_structure() {
+        let l: Vec<[u8; 32]> = (0u8..5).map(|i| [i; 32]).collect();
+        assert_eq!(merkle_root(&[]), None, "empty -> None");
+        assert_eq!(merkle_root(&l[..1]), Some(l[0]), "1-leaf root = the leaf, no node wrap");
+        // 2 leaves -> node(l0,l1).
+        assert_eq!(merkle_root(&l[..2]), Some(node_hash(&l[0], &l[1])));
+        // 3 leaves: split at largest pow2<3 = 2 -> node(node(l0,l1), l2);
+        // the lone l2 is PROMOTED, never duplicated.
+        let expect3 = node_hash(&node_hash(&l[0], &l[1]), &l[2]);
+        assert_eq!(merkle_root(&l[..3]), Some(expect3));
+        // 5 leaves: split at 4 -> node( root([0..4]), l4 ).
+        let left4 = node_hash(&node_hash(&l[0], &l[1]), &node_hash(&l[2], &l[3]));
+        assert_eq!(merkle_root(&l[..5]), Some(node_hash(&left4, &l[4])));
+        // promote-last guard: a 3-leaf root must NOT equal the duplicate-last form.
+        let dup_last = node_hash(&node_hash(&l[0], &l[1]), &node_hash(&l[2], &l[2]));
+        assert_ne!(merkle_root(&l[..3]).unwrap(), dup_last, "must not duplicate the lone node");
+    }
+
+    #[test]
+    fn root_base64_is_padded_standard_44_chars() {
+        let s = root_base64(&[0xABu8; 32]);
+        assert_eq!(s.len(), 44, "32B -> 44 chars std-base64 with padding");
+        assert!(s.ends_with('='), "std-base64 padding present");
+        assert!(!s.contains('-') && !s.contains('_'), "std alphabet, not base64url");
+    }
+
+    #[test]
+    fn challenge_positions_distinct_deterministic_in_range() {
+        let a = challenge_positions("bench-chal-xyz", 1000, 32);
+        let b = challenge_positions("bench-chal-xyz", 1000, 32);
+        assert_eq!(a, b, "deterministic for the same challenge_id");
+        assert_eq!(a.len(), 32, "32 positions for a large corpus");
+        assert!(a.iter().all(|&p| p < 1000), "all positions in range");
+        let set: std::collections::HashSet<_> = a.iter().collect();
+        assert_eq!(set.len(), a.len(), "positions are distinct");
+        assert_ne!(a, challenge_positions("different-chal", 1000, 32), "different challenge -> different positions");
+        // tiny corpus: can't exceed leaf_count distinct positions.
+        assert_eq!(challenge_positions("c", 5, 32).len(), 5);
+    }
+}

@@ -86,6 +86,11 @@ rodio = { version = "0.19", optional = true, default-features = false }
 ureq = { version = "2.10", optional = true, default-features = false, features = ["json", "tls"] }
 hmac = { version = "0.12", optional = true }
 uuid = { version = "1.10", optional = true, features = ["v4"] }
+# T-BENCH-ME canonical-bench (telemetry): deterministic corpus generator
+# (RFC-8439 ChaCha20 keystream w/ StreamCipherSeek for O(1) random-access
+# chunk regen) + the base64-padded (RFC4648) Merkle root wire encoding.
+chacha20 = { version = "0.9", optional = true }
+base64 = { version = "0.22", optional = true }
 # Unicode script detection — used by the `polyglot-paths` predicate
 # (gamification §5) to count distinct scripts in a path. Tiny crate,
 # data-table only, no other deps.
@@ -160,7 +165,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64"]
 # T1.2 perceptual image similarity (#25). Pulls `image` for decode
 # + `image_hasher` for the dHash/aHash/pHash family. Off by default
 # while the feature lands incrementally — first slice is just the
