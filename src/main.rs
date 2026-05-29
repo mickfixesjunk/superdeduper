@@ -586,9 +586,20 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
         |msg| eprintln!("bench: {msg}"),
     )?;
     eprintln!(
-        "bench: result_digest={} ({} dup groups, {} bytes, {:.2}s)",
-        outcome.result_digest, outcome.dup_groups, outcome.bytes_scanned, outcome.dedupe_secs
+        "bench: result_digest={} ({} dup groups, {} candidate bytes, {:.2}s, cold-enforced={})",
+        outcome.result_digest,
+        outcome.dup_groups,
+        outcome.bytes_scanned,
+        outcome.dedupe_secs,
+        outcome.cold_enforced
     );
+    if !outcome.cold_enforced {
+        eprintln!(
+            "bench: WARNING cold-enforce did NOT apply (this platform/filesystem \
+             couldn't bypass the OS cache) — the throughput is a WARM number, not a \
+             ranked cold measurement."
+        );
+    }
     match &outcome.submit {
         Some(o) => println!("bench-me result: {o:?}"),
         None => println!("bench-me: ran locally, not submitted"),

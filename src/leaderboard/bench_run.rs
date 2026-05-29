@@ -23,6 +23,10 @@ pub struct BenchOutcome {
     pub files_scanned: u64,
     pub dedupe_secs: f64,
     pub result_digest: String,
+    /// True when EVERY timed candidate read bypassed the OS cache (cold-enforce,
+    /// #106 pt2). False if any read fell back to buffered (unsupported
+    /// platform/fs) — the throughput then isn't a trustworthy cold number.
+    pub cold_enforced: bool,
     /// The server outcome when submitted; `None` for a run-locally-only run.
     pub submit: Option<submission::SubmitOutcome>,
     /// The assembled submission inputs, retained so a run-locally result can be
@@ -128,11 +132,14 @@ pub fn run(
     // timed window covers enumerate + size-group + hash-candidates;
     // bytes_scanned = candidate bytes hashed (the throughput numerator).
     check_cancel()?;
-    progress("deduping (size-grouped)");
+    progress("deduping (size-grouped, cold-enforced reads)");
     let t = std::time::Instant::now();
-    let (dupsets, bytes_scanned, files_scanned) = full_content_dedup(&corpus_dir)?;
+    let (dupsets, bytes_scanned, files_scanned, cold_enforced) = full_content_dedup(&corpus_dir)?;
     let dedupe_secs = t.elapsed().as_secs_f64();
-    progress(&format!("deduped {dedupe_secs:.2}s: {files_scanned} files enumerated, {} dup groups", dupsets.len()));
+    progress(&format!(
+        "deduped {dedupe_secs:.2}s: {files_scanned} files enumerated, {} dup groups, cold-enforced={cold_enforced}",
+        dupsets.len()
+    ));
 
     // 4. answer the possession challenge
     let (answers, _read) = bench_client::answer_challenge_from_dir(&corpus_dir, &challenges)
@@ -198,6 +205,7 @@ pub fn run(
         files_scanned,
         dedupe_secs,
         result_digest,
+        cold_enforced,
         submit: submit_outcome,
         inputs,
     })
@@ -223,6 +231,144 @@ impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
     }
 }
 
+/// Read a file fully, BYPASSING the OS page cache, so the bench's timed
+/// dedup reflects cold-from-disk throughput (cold-enforce, #106 pt2 — the
+/// client half of the anti-forge closure: in-memory recovery can't fake the
+/// real read). Returns `(bytes, was_cold)`; `was_cold == false` means this
+/// platform/filesystem couldn't bypass the cache and we fell back to a
+/// normal buffered read (still byte-correct, just not cold-enforced).
+///
+/// * Linux: `O_DIRECT` + sector-aligned chunked reads (falls back when the fs
+///   rejects O_DIRECT, e.g. tmpfs/overlay, or the file isn't sector-aligned).
+/// * Windows: `FILE_FLAG_NO_BUFFERING` (same aligned scheme as `diagnose`).
+/// * macOS: `F_NOCACHE` (no alignment constraint).
+/// * other: buffered fallback (`was_cold == false`).
+#[cfg(target_os = "linux")]
+fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    const ALIGN: usize = 4096;
+    const CHUNK: usize = 1 << 20;
+    let size = std::fs::metadata(path)?.len() as usize;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    // SAFETY: cpath is a valid NUL-terminated C string for the duration.
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+    // O_DIRECT unsupported on this fs, or file not sector-aligned -> buffered.
+    if fd < 0 || size % ALIGN != 0 {
+        if fd >= 0 {
+            // SAFETY: fd is a valid open descriptor we are closing exactly once.
+            unsafe { libc::close(fd) };
+        }
+        return Ok((std::fs::read(path)?, false));
+    }
+    // SAFETY: fd is a freshly-opened, owned descriptor; File takes ownership.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // Sector-aligned CHUNK buffer (Vec is only word-aligned; slice into the
+    // aligned region). O_DIRECT requires buffer + count sector-aligned.
+    let mut storage = vec![0u8; CHUNK + ALIGN];
+    let pad = (ALIGN - (storage.as_ptr() as usize % ALIGN)) % ALIGN;
+    let mut out = Vec::with_capacity(size);
+    loop {
+        let n = file.read(&mut storage[pad..pad + CHUNK])?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&storage[pad..pad + n]);
+    }
+    Ok((out, true))
+}
+
+#[cfg(target_os = "macos")]
+fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let mut file = std::fs::File::open(path)?;
+    // F_NOCACHE: bypass the unified buffer cache for this descriptor's reads.
+    // No alignment constraint (unlike O_DIRECT). Best-effort: if it fails we
+    // still read, just not cold.
+    // SAFETY: valid open fd; F_NOCACHE is a documented fcntl with arg 1.
+    let cold = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == 0;
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok((out, cold))
+}
+
+#[cfg(windows)]
+fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+    const SECTOR: usize = 4096;
+    const CHUNK: usize = 1 << 20;
+    let size = std::fs::metadata(path)?.len() as usize;
+    // NO_BUFFERING needs the file sector-aligned; corpus files are. Else buffered.
+    if size % SECTOR != 0 {
+        return Ok((std::fs::read(path)?, false));
+    }
+    let mut storage = vec![0u8; CHUNK + SECTOR];
+    let pad = (SECTOR - (storage.as_ptr() as usize % SECTOR)) % SECTOR;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: wide is NUL-terminated + outlives the call; flags are valid for sync ReadFile.
+    let handle = unsafe {
+        match CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
+            HANDLE::default(),
+        ) {
+            Ok(h) => h,
+            Err(_) => return Ok((std::fs::read(path)?, false)), // can't open uncached -> buffered
+        }
+    };
+    struct Closer(HANDLE);
+    impl Drop for Closer {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let _guard = Closer(handle);
+    let mut out = Vec::with_capacity(size);
+    loop {
+        let mut read_bytes: u32 = 0;
+        // SAFETY: buf is sector-aligned, len is a sector multiple, handle open.
+        unsafe {
+            if ReadFile(
+                handle,
+                Some(&mut storage[pad..pad + CHUNK]),
+                Some(&mut read_bytes as *mut u32),
+                None,
+            )
+            .is_err()
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        if read_bytes == 0 {
+            break;
+        }
+        out.extend_from_slice(&storage[pad..pad + read_bytes as usize]);
+    }
+    Ok((out, true))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+    // No portable cache-bypass on this platform -> buffered (not cold).
+    Ok((std::fs::read(path)?, false))
+}
+
 /// Size-grouped exact-dedupe — the work a REAL dedup actually does. A
 /// byte-identical pair necessarily shares a size, so size is a sound
 /// prefilter: we only need to HASH files that share a size with >=1 other
@@ -238,7 +384,7 @@ impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
 /// throughput numerator (must equal the server's per-corpus_version bytes
 /// constant per the quality forge-fix); `files_enumerated` is the total
 /// corpus file count seen (the scan scope), not just candidates.
-fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
+fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64, bool)> {
     // Pass 1: enumerate + stat (size only, no content reads). Group
     // path_indices by file size.
     let mut by_size: HashMap<u64, Vec<(u64, std::path::PathBuf)>> = HashMap::new();
@@ -264,16 +410,23 @@ fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
 
     // Pass 2: hash ONLY candidates — files in a size-group of >=2. A
     // unique-size file cannot be part of any duplicate group, so skipping
-    // it changes neither the dup sets nor the result_digest.
+    // it changes neither the dup sets nor the result_digest. Reads are
+    // CACHE-BYPASSING (cold-enforce, #106 pt2); `cold_enforced` tracks
+    // whether EVERY candidate read actually went cold (false if any fell
+    // back to a buffered read on an unsupported platform/fs).
     let mut by_hash: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
     let mut candidate_bytes = 0u64;
+    let mut cold_enforced = true;
+    let mut any_candidate = false;
     for (_size, group) in by_size {
         if group.len() < 2 {
             continue;
         }
         for (pi, path) in group {
-            let data =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let (data, cold) =
+                read_uncached(&path).with_context(|| format!("reading {}", path.display()))?;
+            cold_enforced &= cold;
+            any_candidate = true;
             candidate_bytes += data.len() as u64;
             by_hash
                 .entry(*blake3::hash(&data).as_bytes())
@@ -281,6 +434,8 @@ fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
                 .push(pi);
         }
     }
+    // A corpus with no size-collisions read nothing -> not meaningfully cold.
+    let cold_enforced = cold_enforced && any_candidate;
     let mut dupsets: Vec<Vec<u64>> = by_hash
         .into_values()
         .filter(|v| v.len() >= 2)
@@ -290,7 +445,7 @@ fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
         })
         .collect();
     dupsets.sort();
-    Ok((dupsets, candidate_bytes, files_enumerated))
+    Ok((dupsets, candidate_bytes, files_enumerated, cold_enforced))
 }
 
 #[cfg(test)]
@@ -301,6 +456,24 @@ mod tests {
     fn write_file(dir: &Path, idx: u64, content: &[u8]) {
         let p = dir.join(format!("f{idx:06}.bin"));
         std::fs::File::create(&p).unwrap().write_all(content).unwrap();
+    }
+
+    #[test]
+    fn read_uncached_returns_correct_bytes() {
+        // Byte-correctness of the cache-bypass read across whatever path the
+        // platform/fs takes (O_DIRECT / NO_BUFFERING / F_NOCACHE / fallback).
+        // Write under ./target (ext4 on the dev box) so the Linux O_DIRECT
+        // path actually engages, not just the tmpfs fallback.
+        let dir = std::path::Path::new("target").join(format!("sd-uncached-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("f0000000001.bin");
+        // 40 KiB, a clean 4KiB multiple so O_DIRECT/NO_BUFFERING can read it.
+        let content: Vec<u8> = (0..40960u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &content).unwrap();
+        let (got, cold) = read_uncached(&p).unwrap();
+        assert_eq!(got, content, "uncached read must return byte-identical content");
+        eprintln!("read_uncached cold-enforced on this fs = {cold}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -318,7 +491,7 @@ mod tests {
         // read (the size-group skip) and contributes 0 candidate bytes.
         write_file(&dir, 5, &[0xDD; 50]);
 
-        let (dupsets, candidate_bytes, files_enumerated) = full_content_dedup(&dir).unwrap();
+        let (dupsets, candidate_bytes, files_enumerated, _cold) = full_content_dedup(&dir).unwrap();
 
         // Correctness-neutral: the dup set is exactly {1,2} — identical to
         // what a full-content hash of every file would produce.
