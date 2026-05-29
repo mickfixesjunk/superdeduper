@@ -91,6 +91,16 @@ pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// The RFC-6962 split point for `n` leaves: the largest power of two strictly
+/// less than `n` (`n >= 2`). The left subtree takes `[..k]`, the right `[k..]`.
+fn split_point(n: usize) -> usize {
+    let mut k = 1usize;
+    while k << 1 < n {
+        k <<= 1;
+    }
+    k
+}
+
 /// RFC-6962 Merkle root over `leaves` with PROMOTE-LAST odd handling.
 /// `[]` → None; `[h]` → `h` (1-leaf root is the leaf itself, no node wrap);
 /// else split at the largest power of two strictly less than `n`. Never
@@ -100,15 +110,54 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> Option<[u8; 32]> {
         0 => None,
         1 => Some(leaves[0]),
         n => {
-            let mut k = 1usize;
-            while k << 1 < n {
-                k <<= 1;
-            }
+            let k = split_point(n);
             let left = merkle_root(&leaves[..k]).expect("non-empty left split");
             let right = merkle_root(&leaves[k..]).expect("non-empty right split");
             Some(node_hash(&left, &right))
         }
     }
+}
+
+/// RFC-6962 audit (inclusion) path for the leaf at index `m` among `leaves`,
+/// deepest sibling FIRST. Pairs with [`root_from_path`]: a verifier holding
+/// only the sampled leaf + this path can reconstruct the root without the rest
+/// of the corpus — the property the bench challenge relies on. Same
+/// promote-last split as [`merkle_root`]; byte-exact with research's reference.
+pub fn audit_path(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let n = leaves.len();
+    if n <= 1 {
+        return vec![];
+    }
+    let k = split_point(n);
+    if m < k {
+        let mut p = audit_path(m, &leaves[..k]);
+        p.push(merkle_root(&leaves[k..]).expect("non-empty right split"));
+        p
+    } else {
+        let mut p = audit_path(m - k, &leaves[k..]);
+        p.push(merkle_root(&leaves[..k]).expect("non-empty left split"));
+        p
+    }
+}
+
+/// Reconstruct the Merkle root from a sampled `leaf`, its [`audit_path`], its
+/// leaf index `m`, and the total `leaf_count` `n`. The verifier's half of the
+/// inclusion proof: equals [`merkle_root`] iff the leaf is genuinely at `m`.
+pub fn root_from_path(leaf: [u8; 32], path: &[[u8; 32]], m: usize, n: usize) -> [u8; 32] {
+    let rev: Vec<[u8; 32]> = path.iter().rev().copied().collect();
+    fn rec(m: usize, n: usize, leaf: [u8; 32], rev: &[[u8; 32]], i: usize) -> [u8; 32] {
+        if n == 1 {
+            return leaf;
+        }
+        let k = split_point(n);
+        let sib = rev[i];
+        if m < k {
+            node_hash(&rec(m, k, leaf, rev, i + 1), &sib)
+        } else {
+            node_hash(&sib, &rec(m - k, n - k, leaf, rev, i + 1))
+        }
+    }
+    rec(m, n, leaf, &rev, 0)
 }
 
 /// Split one corpus file into its 1MiB-chunk Merkle leaves, in offset order
@@ -377,6 +426,51 @@ mod tests {
             "z6vzmw41RQT0EdEUE+zDHXlPBddgpSmx9OUopWvTl2w=",
             "merkle_root must match research golden vector byte-for-byte"
         );
+    }
+
+    #[test]
+    fn audit_path_reconstructs_root_for_every_position() {
+        // Rebuild the research golden 9-leaf tree; every leaf's audit path must
+        // reconstruct the golden root byte-for-byte (the web challenge's exact
+        // verification path). Locks the inclusion-proof half cross-impl.
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (kc, _) = corpus_keys(&seed);
+        let files: [(u64, u64); 8] = [
+            (0, 16), (100, 512), (2, 256), (3, 512),
+            (100, 512), (5, 1000), (100, 512), (7, 1_048_640),
+        ];
+        let mut leaves = Vec::new();
+        for (i, (cid, size)) in files.iter().enumerate() {
+            leaves.extend(file_leaves(&kc, &format!("f{i:010}.bin"), *cid, *size));
+        }
+        assert_eq!(leaves.len(), 9);
+        let root = merkle_root(&leaves).unwrap();
+        assert_eq!(root_base64(&root), "z6vzmw41RQT0EdEUE+zDHXlPBddgpSmx9OUopWvTl2w=");
+        for m in 0..leaves.len() {
+            let path = audit_path(m, &leaves);
+            let recon = root_from_path(leaves[m], &path, m, leaves.len());
+            assert_eq!(recon, root, "audit path for leaf {m} must reconstruct the golden root");
+        }
+        // a wrong leaf must NOT reconstruct the root (proof is sound).
+        let bad = root_from_path([0xFFu8; 32], &audit_path(3, &leaves), 3, leaves.len());
+        assert_ne!(bad, root, "a forged leaf must not reconstruct the root");
+    }
+
+    #[test]
+    fn audit_path_matches_reciprocal_vector_structure() {
+        // 3-leaf promote-last tree: leaf 1's path = [l0, l2] (deepest sibling
+        // first) — exactly the sample_proof emitted to web in the reciprocal
+        // vector (print_reciprocal_vector_for_web).
+        let l: Vec<[u8; 32]> = (0u8..3).map(|i| [i; 32]).collect();
+        assert_eq!(audit_path(1, &l), vec![l[0], l[2]]);
+        assert_eq!(audit_path(0, &l), vec![l[1], l[2]]);
+        assert_eq!(audit_path(2, &l), vec![node_hash(&l[0], &l[1])]);
+        for m in 0..3 {
+            assert_eq!(root_from_path(l[m], &audit_path(m, &l), m, 3), merkle_root(&l).unwrap());
+        }
     }
 
     #[test]

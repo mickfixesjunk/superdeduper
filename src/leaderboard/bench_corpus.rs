@@ -20,7 +20,7 @@
 //! bound into the leaf preimage (see [`super::bench::leaf_hash`]).
 #![cfg(feature = "telemetry")]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
 
@@ -317,6 +317,107 @@ pub fn write_corpus(dir: &Path, k_content: &[u8; 32], plan: &CorpusPlan) -> std:
     Ok(written)
 }
 
+/// The corpus location of one global Merkle leaf — which file it belongs to
+/// and the byte window inside it. Parallels [`compute_leaves`] order exactly;
+/// a verifier maps a challenged leaf index to its (file, offset, len) through
+/// this (pure, no content generation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeafLoc {
+    pub global_leaf: u64,
+    pub path_index: u64,
+    pub content_id: u64,
+    pub byte_offset: u64,
+    pub byte_length: u64,
+}
+
+/// Flat leaf→location map in global leaf order (matches [`compute_leaves`]).
+pub fn leaf_locations(plan: &CorpusPlan) -> Vec<LeafLoc> {
+    let mut locs = Vec::with_capacity(plan.leaf_count as usize);
+    let mut g = 0u64;
+    for fp in &plan.files {
+        let mut off = 0u64;
+        while off < fp.size {
+            let len = (fp.size - off).min(CHUNK_SIZE);
+            locs.push(LeafLoc { global_leaf: g, path_index: fp.path_index, content_id: fp.content_id, byte_offset: off, byte_length: len });
+            g += 1;
+            off += len;
+        }
+    }
+    locs
+}
+
+/// One sampled leaf in a [`BenchProof`]: enough for a verifier to (a)
+/// regenerate the chunk from the seed + plan and recompute the leaf hash, and
+/// (b) reconstruct the Merkle root via the audit path. All hashes std-base64.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SampleProof {
+    /// `m` — the challenged global leaf index.
+    pub leaf_index: u64,
+    pub path_index: u64,
+    pub byte_offset: u64,
+    pub byte_length: u64,
+    pub leaf_hash: String,
+    /// RFC-6962 audit path, deepest sibling first.
+    pub audit_path: Vec<String>,
+}
+
+/// The bench proof a `--bench-me` run submits: the committed root plus the
+/// challenged sample set. The proof hash is BLAKE3 throughout (cryptographic);
+/// river5 is NEVER used here (river5 stays the internal dedupe content hash).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BenchProof {
+    pub bench_challenge_id: String,
+    pub corpus_version: String,
+    pub leaf_count: u64,
+    pub merkle_root: String,
+    pub samples: Vec<SampleProof>,
+}
+
+/// Build the bench proof for a challenge: materialize the leaves, derive the
+/// challenged positions, and emit each sample with its audit path. SELF-VERIFY:
+/// every sample's audit path is checked to reconstruct the committed root
+/// before it is emitted (a proof that fails its own verifier is never sent).
+pub fn build_bench_proof(
+    spec: &TierSpec,
+    plan: &CorpusPlan,
+    k_content: &[u8; 32],
+    bench_challenge_id: &str,
+    sample_n: usize,
+) -> BenchProof {
+    let leaves = compute_leaves(k_content, plan);
+    assert_eq!(leaves.len() as u64, plan.leaf_count, "self-verify: leaf count");
+    let locs = leaf_locations(plan);
+    let root = bench::merkle_root(&leaves).expect("non-empty corpus");
+    let positions = bench::challenge_positions(bench_challenge_id, plan.leaf_count, sample_n);
+
+    let mut samples = Vec::with_capacity(positions.len());
+    for pos in positions {
+        let m = pos as usize;
+        let path = bench::audit_path(m, &leaves);
+        assert_eq!(
+            bench::root_from_path(leaves[m], &path, m, leaves.len()),
+            root,
+            "self-verify: sample {m} must reconstruct the committed root"
+        );
+        let loc = &locs[m];
+        samples.push(SampleProof {
+            leaf_index: pos,
+            path_index: loc.path_index,
+            byte_offset: loc.byte_offset,
+            byte_length: loc.byte_length,
+            leaf_hash: bench::root_base64(&leaves[m]),
+            audit_path: path.iter().map(bench::root_base64).collect(),
+        });
+    }
+    BenchProof {
+        bench_challenge_id: bench_challenge_id.to_string(),
+        corpus_version: spec.corpus_version.to_string(),
+        leaf_count: plan.leaf_count,
+        merkle_root: bench::root_base64(&root),
+        samples,
+    }
+}
+
 fn hex_lower(bytes: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in bytes {
@@ -460,6 +561,66 @@ mod tests {
         let b8 = std::fs::read(dir.join(file_at(&plan, 8).path())).unwrap();
         assert_eq!(b2, b8, "exact-dup files are byte-identical on disk");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaf_locations_parallel_compute_leaves() {
+        let plan = plan_corpus(&tiny_tier());
+        let locs = leaf_locations(&plan);
+        assert_eq!(locs.len() as u64, plan.leaf_count);
+        // global leaf indices are contiguous from 0.
+        for (i, loc) in locs.iter().enumerate() {
+            assert_eq!(loc.global_leaf, i as u64);
+        }
+        // each loc's content_id matches its file's plan entry.
+        for loc in &locs {
+            assert_eq!(loc.content_id, file_at(&plan, loc.path_index).content_id);
+        }
+    }
+
+    #[test]
+    fn bench_proof_is_independently_web_verifiable() {
+        // The load-bearing interop test: a verifier holding ONLY the seed, the
+        // (deterministic) plan, and the proof — never the engine's in-memory
+        // leaves — regenerates each sampled chunk, recomputes the leaf, and
+        // reconstructs the root. This is exactly what web's #160 verifier does.
+        use base64::Engine;
+        let seed = [0x77u8; 32];
+        let (kc, _) = bench::corpus_keys(&seed);
+        let spec = tiny_tier();
+        let plan = plan_corpus(&spec);
+        let proof = build_bench_proof(&spec, &plan, &kc, "bench-chal-tiny", 32);
+
+        // sample_n (32) capped at leaf_count (13); positions distinct & in range.
+        assert_eq!(proof.samples.len(), 13);
+        assert_eq!(proof.leaf_count, 13);
+        let mut seen = std::collections::HashSet::new();
+        for sm in &proof.samples {
+            assert!(sm.leaf_index < 13 && seen.insert(sm.leaf_index), "distinct in-range positions");
+        }
+
+        let dec = |s: &str| -> [u8; 32] {
+            let v = base64::engine::general_purpose::STANDARD.decode(s).unwrap();
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&v);
+            a
+        };
+        for sm in &proof.samples {
+            // map path_index -> content_id via the deterministic plan (web rebuilds it).
+            let fp = file_at(&plan, sm.path_index);
+            let mut chunk = vec![0u8; sm.byte_length as usize];
+            bench::content_bytes_at(&kc, fp.content_id, sm.byte_offset, &mut chunk);
+            let leaf = bench::leaf_hash(&fp.path(), sm.byte_offset, sm.byte_length, &chunk);
+            assert_eq!(bench::root_base64(&leaf), sm.leaf_hash, "regenerated leaf must match the proof");
+            let path: Vec<[u8; 32]> = sm.audit_path.iter().map(|s| dec(s)).collect();
+            let recon = bench::root_from_path(leaf, &path, sm.leaf_index as usize, proof.leaf_count as usize);
+            assert_eq!(bench::root_base64(&recon), proof.merkle_root, "reconstructed root must match the proof");
+        }
+
+        // proof round-trips through JSON (the wire form web ingests).
+        let json = serde_json::to_string(&proof).unwrap();
+        let back: BenchProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, proof);
     }
 
     // -- test helpers --
