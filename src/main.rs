@@ -425,8 +425,8 @@ fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
             Ok(())
         }
         #[cfg(feature = "telemetry")]
-        DebugCommand::MakeBenchCorpus { tier, out, seed, emit_root } => {
-            run_make_bench_corpus(tier, out, seed, emit_root)
+        DebugCommand::MakeBenchCorpus { tier, out, seed, emit_root, private_manifest } => {
+            run_make_bench_corpus(tier, out, seed, emit_root, private_manifest)
         }
     }
 }
@@ -440,6 +440,7 @@ fn run_make_bench_corpus(
     out: std::path::PathBuf,
     seed: Option<String>,
     emit_root: bool,
+    private_manifest: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use superdeduper::cli::BenchTier;
     use superdeduper::leaderboard::{bench, bench_corpus as bc};
@@ -485,6 +486,40 @@ fn run_make_bench_corpus(
             tr.elapsed().as_secs_f64(),
             leaves.len(),
         );
+    }
+
+    if let Some(path) = private_manifest {
+        // FULL private manifest (server-side verification data): root +
+        // groundtruth_dupsets + manifest_hash(M) + M-fields. NEVER served.
+        let full = bc::build_manifest(&spec, &seed, &plan, &k_content);
+        let m_hash = bc::manifest_hash(&bc::manifest_m(
+            "tbench-1",
+            spec.corpus_version,
+            &seed,
+            bench::CHUNK_SIZE as u32,
+            match tier {
+                BenchTier::Quick => "quick",
+                BenchTier::Full => "full",
+            },
+            plan.file_count,
+            plan.leaf_count,
+            plan.size_class_counts,
+        ));
+        let m_hash_hex: String = m_hash.iter().map(|b| format!("{b:02x}")).collect();
+        let doc = serde_json::json!({
+            "manifest_hash": m_hash_hex,
+            "merkle_root": full.merkle_root,
+            "leaf_count": full.leaf_count,
+            "file_count": full.file_count,
+            "total_bytes": full.total_bytes,
+            "size_class_counts": full.size_class_counts,
+            "groundtruth_dupsets": full.groundtruth_dupsets,
+            "corpus_seed": full.corpus_seed,
+            "chunk_size": full.chunk_size,
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&doc)?)
+            .with_context(|| format!("writing private manifest {}", path.display()))?;
+        eprintln!("private manifest (root + groundtruth) -> {}", path.display());
     }
     Ok(())
 }

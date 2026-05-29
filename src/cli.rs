@@ -283,6 +283,12 @@ pub enum DebugCommand {
         /// (a plain corpus write doesn't need it).
         #[arg(long)]
         emit_root: bool,
+        /// Write the FULL PRIVATE manifest (merkle_root + groundtruth_dupsets +
+        /// manifest_hash + M-fields) to this path — the server-side verification
+        /// data web keeps private (never served to clients). Requires hashing
+        /// every leaf. Use this when generating the canonical corpus server-side.
+        #[arg(long, value_name = "FILE")]
+        private_manifest: Option<PathBuf>,
     },
 }
 
