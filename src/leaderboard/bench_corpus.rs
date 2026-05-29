@@ -361,13 +361,53 @@ pub fn served_manifest(spec: &TierSpec, seed: &[u8; 32], plan: &CorpusPlan) -> S
     }
 }
 
-/// `manifest_hash = BLAKE3(served manifest bytes)` — the 32-byte digest fed
-/// into the BC. The client hashes exactly the bytes the server sent; this
-/// helper is the offline/golden path over the canonical-JSON serialization.
-/// (The authoritative served bytes are the server's; byte-exactness is pinned
-/// by research's BC golden vector.)
-pub fn manifest_hash(served_bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(served_bytes).as_bytes()
+/// Domain tag for the canonical binary manifest encoding M (research-pinned).
+pub const MANIFEST_DOMAIN_V1: &[u8] = b"tcorpus-manifest-v1";
+
+/// Build the canonical binary manifest encoding **M** — the `manifest_hash`
+/// preimage. M is a FIXED binary layout (NOT the served JSON: hashing M
+/// sidesteps all JSON-canonicalization drift, so client + server compute an
+/// identical `manifest_hash` regardless of JSON formatting). The manifest is
+/// still SERVED as JSON; the client reconstructs M from the JSON fields.
+/// Layout (research, design-relayed 2026-05-29): `lp(domain) ‖ lp(protocol) ‖
+/// lp(corpus_version) ‖ seed[32 raw] ‖ u32le(chunk_size) ‖ lp(tier) ‖
+/// u64le(file_count) ‖ u64le(leaf_count) ‖ u64le(small) ‖ u64le(medium) ‖
+/// u64le(large)`. NO root, NO groundtruth (server-private). `lp` =
+/// `u32le(len) ‖ utf8`.
+pub fn manifest_m(
+    protocol_version: &str,
+    corpus_version: &str,
+    seed: &[u8; 32],
+    chunk_size: u32,
+    tier: &str,
+    file_count: u64,
+    leaf_count: u64,
+    counts: SizeClassCounts,
+) -> Vec<u8> {
+    fn lp(out: &mut Vec<u8>, b: &[u8]) {
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    let mut m = Vec::new();
+    lp(&mut m, MANIFEST_DOMAIN_V1);
+    lp(&mut m, protocol_version.as_bytes());
+    lp(&mut m, corpus_version.as_bytes());
+    m.extend_from_slice(seed); // 32 raw bytes, no length prefix
+    m.extend_from_slice(&chunk_size.to_le_bytes());
+    lp(&mut m, tier.as_bytes());
+    m.extend_from_slice(&file_count.to_le_bytes());
+    m.extend_from_slice(&leaf_count.to_le_bytes());
+    m.extend_from_slice(&counts.small.to_le_bytes());
+    m.extend_from_slice(&counts.medium.to_le_bytes());
+    m.extend_from_slice(&counts.large.to_le_bytes());
+    m
+}
+
+/// `manifest_hash = BLAKE3(M)` — the 32-byte digest fed (as raw bytes) into the
+/// BC. Pass the bytes from [`manifest_m`]; both client and server hash the same
+/// M, so positions match without any JSON-canon agreement.
+pub fn manifest_hash(m: &[u8]) -> [u8; 32] {
+    *blake3::hash(m).as_bytes()
 }
 
 /// Materialize the corpus to `dir` as `f{path_index:010}.bin` files (flat
@@ -737,6 +777,32 @@ mod tests {
     }
 
     #[test]
+    fn manifest_m_matches_research_golden_anchor() {
+        // research's M golden anchor (design-relayed): corpus-v1-quick fields
+        // with EXAMPLE seed 0x20..0x3f -> BLAKE3(M) == the published hash.
+        // Reproducing it byte-for-byte locks my M serializer against web's.
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = 0x20 + i as u8;
+        }
+        let m = manifest_m(
+            "tbench-1",
+            "corpus-v1-quick",
+            &seed,
+            1_048_576,
+            "quick",
+            121_701,
+            121_956,
+            SizeClassCounts { small: 120_000, medium: 1_700, large: 1 },
+        );
+        assert_eq!(
+            hex_lower(&manifest_hash(&m)),
+            "c4138dbebc1d9180b8d684d175c3d201acf9102133015afdeef8f668754c0246",
+            "manifest_hash = BLAKE3(M) must match research's golden anchor"
+        );
+    }
+
+    #[test]
     fn served_manifest_excludes_root_and_groundtruth() {
         let seed = [0x33u8; 32];
         let spec = tiny_tier();
@@ -787,8 +853,11 @@ mod tests {
         let (kc, _) = bench::corpus_keys(&seed);
         let spec = tiny_tier();
         let plan = plan_corpus(&spec);
-        // BC binds the proof to this corpus build + run.
-        let mhash = manifest_hash(&serde_json::to_vec(&served_manifest(&spec, &seed, &plan)).unwrap());
+        // BC binds the proof to this corpus build + run (manifest_hash = BLAKE3(M)).
+        let mhash = manifest_hash(&manifest_m(
+            "tbench-1", spec.corpus_version, &seed, CHUNK_SIZE as u32, "tiny",
+            plan.file_count, plan.leaf_count, plan.size_class_counts,
+        ));
         let bc = bench::BenchContext {
             protocol_version: "tcorpus-1",
             corpus_version: spec.corpus_version,

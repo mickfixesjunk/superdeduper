@@ -580,6 +580,43 @@ mod tests {
     }
 
     #[test]
+    fn bc_matches_research_golden_vector() {
+        // research's BC golden (relayed via design + web, ref impl /tmp): the
+        // fixture BC must encode to this exact hex and yield positions [1,5,0].
+        // manifest_hash stand-in = BLAKE3("corpus-golden-v1").
+        let mh = *blake3::hash(b"corpus-golden-v1").as_bytes();
+        let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+        assert_eq!(
+            hex(&mh),
+            "c8ba451e061181ed70616d6a81e07950addd28fa568ad91064f3bcb6c00d7b2d",
+            "manifest_hash stand-in matches web's stated value"
+        );
+        let bc = BenchContext {
+            protocol_version: "tbench-1",
+            corpus_version: "corpus-golden-v1",
+            manifest_hash: mh,
+            install_id: "11111111-1111-4111-8111-111111111111",
+            bench_run_id: "22222222-2222-4222-8222-222222222222",
+            tier: "quick",
+            leaf_count: 9,
+            chunk_size: 1_048_576,
+        };
+        let enc = bc.encode();
+        // The byte-exact BC matches research's reference impl (/tmp/tcorpus-
+        // goldenvec build_bc, byte-identical: chunk_size = u32le(1048576) =
+        // 00 00 10 00). NOTE: web's channel-pasted hex had a transcription typo
+        // in the final 4 bytes (166B "…00100000" vs the correct 165B
+        // "…00001000"); the ref impl + this both yield positions [1,5,0].
+        assert_eq!(
+            hex(&enc),
+            "080000007462656e63682d3110000000636f727075732d676f6c64656e2d7631c8ba451e061181ed70616d6a81e07950addd28fa568ad91064f3bcb6c00d7b2d2400000031313131313131312d313131312d343131312d383131312d3131313131313131313131312400000032323232323232322d323232322d343232322d383232322d32323232323232323232323205000000717569636b090000000000000000001000",
+            "BC encoding must match research's reference impl byte-for-byte"
+        );
+        assert_eq!(enc.len(), 165);
+        assert_eq!(challenge_positions_from_bc(&enc, 9, 3), vec![1, 5, 0], "golden positions");
+    }
+
+    #[test]
     fn challenge_positions_from_bc_bind_to_the_context() {
         let bc = sample_bc();
         let enc = bc.encode();
