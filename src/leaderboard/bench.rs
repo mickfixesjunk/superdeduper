@@ -311,6 +311,71 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
+    /// Split a file into 1MiB-chunk leaves (path-lex/offset order). Shared by
+    /// the golden-vector test + (later) the generator's leaf emission.
+    fn file_leaves(kc: &[u8; 32], path: &str, content_id: u64, size: u64) -> Vec<[u8; 32]> {
+        let mut leaves = Vec::new();
+        let mut off = 0u64;
+        while off < size {
+            let len = (size - off).min(CHUNK_SIZE);
+            let mut chunk = vec![0u8; len as usize];
+            content_bytes_at(kc, content_id, off, &mut chunk);
+            leaves.push(leaf_hash(path, off, len, &chunk));
+            off += len;
+        }
+        leaves
+    }
+
+    // RESEARCH GOLDEN-VECTOR cross-check (/tmp/tcorpus-goldenvec, design
+    // 2026-05-29). Reproduces research's reference impl byte-for-byte:
+    // seed=000102…1f, K_content, the 8-file/9-leaf fixture (f7 spans 2 chunks),
+    // and the merkle_root. Triple-locks the engine cores (self + web #160 +
+    // research golden). The >1MiB f7 also exercises seek-based random-access
+    // at a real chunk boundary (offset 1MiB) matching the sequential stream.
+    #[test]
+    fn matches_research_golden_vector() {
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (kc, _) = corpus_keys(&seed);
+        assert_eq!(
+            hex32(&kc),
+            "358c10779b09eea6a01af531bdc0ea2b6e465f575b7856b8df608cb6e3fc86c0",
+            "K_content = BLAKE3(seed||0x01) must match research golden"
+        );
+        // golden 8-file fixture: (content_id, size). content_id 100 repeats
+        // (f1/f4/f6) -> dupset; f7 is 1MiB+64 -> 2 leaves.
+        let files: [(u64, u64); 8] = [
+            (0, 16),
+            (100, 512),
+            (2, 256),
+            (3, 512),
+            (100, 512),
+            (5, 1000),
+            (100, 512),
+            (7, 1_048_640),
+        ];
+        let mut leaves = Vec::new();
+        for (i, (cid, size)) in files.iter().enumerate() {
+            let path = format!("f{i:010}.bin");
+            leaves.extend(file_leaves(&kc, &path, *cid, *size));
+        }
+        assert_eq!(leaves.len(), 9, "8 files, f7 spans 2 chunks -> 9 leaves");
+        // a few golden leaf hashes (incl f7's two chunks -> exercises seek).
+        use base64::Engine;
+        let b64 = |h: &[u8; 32]| base64::engine::general_purpose::STANDARD.encode(h);
+        assert_eq!(b64(&leaves[0]), "ggmH46W4Dp9u3N5AXG0iERpd/GHfMeUo4bocn2iLt34=", "f0 leaf");
+        assert_eq!(b64(&leaves[7]), "pxqy/xV+P02qOGxqWVeFSLx+mDBR5alN9eFLMZsqvcg=", "f7 chunk0 leaf");
+        assert_eq!(b64(&leaves[8]), "qm4pHNZuL06BZV6C4OQgV4JS1REYIRfuS+0x7pfTqAE=", "f7 chunk1 leaf (offset 1MiB, seek)");
+        // THE golden root, byte-for-byte.
+        assert_eq!(
+            root_base64(&merkle_root(&leaves).unwrap()),
+            "z6vzmw41RQT0EdEUE+zDHXlPBddgpSmx9OUopWvTl2w=",
+            "merkle_root must match research golden vector byte-for-byte"
+        );
+    }
+
     #[test]
     fn challenge_positions_distinct_deterministic_in_range() {
         let a = challenge_positions("bench-chal-xyz", 1000, 32);
