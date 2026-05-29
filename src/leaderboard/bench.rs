@@ -229,6 +229,88 @@ mod tests {
         assert!(!s.contains('-') && !s.contains('_'), "std alphabet, not base64url");
     }
 
+    // CROSS-IMPL byte-match against web's #160 verifier reference vector
+    // (web msg 2026-05-29). web's leaf = BLAKE3(0x00 || preimage) over raw
+    // ascii preimages; this locks the TREE half (node_hash + merkle_root +
+    // promote-last) byte-for-byte with web. (Our real-corpus leaf wraps a
+    // STRUCTURED preimage — see leaf_hash — but the node/tree fold is identical.)
+    #[test]
+    fn merkle_matches_web_cross_impl_vector() {
+        let web_leaf = |s: &str| {
+            let mut h = blake3::Hasher::new();
+            h.update(&[TAG_LEAF]);
+            h.update(s.as_bytes());
+            *h.finalize().as_bytes()
+        };
+        let leaves: Vec<[u8; 32]> = (0..5).map(|i| web_leaf(&format!("leaf-{i}"))).collect();
+        // per-leaf hashes agree with web.
+        assert_eq!(root_base64(&leaves[0]), "E+22yZg+AO9liNscI7PB0yA4Jr6oJT9J29d2Nvo1Yaw=");
+        assert_eq!(root_base64(&leaves[1]), "i3iIxRiNVZRjoKxJgYfHK6bUj3t7vWjU8QtIKZAt2pU=");
+        assert_eq!(root_base64(&leaves[4]), "6qFHPJwbwGVOwTLH06FNqw0zXybw62KFcUQNGe/Ncd4=");
+        // the 5-leaf root matches web byte-for-byte -> tree/node half LOCKED.
+        let root = merkle_root(&leaves).expect("5 leaves");
+        assert_eq!(
+            root_base64(&root),
+            "5Tvt8Ma0OZJK521yNAjsfovZgJxS+3yEUrsmrKHgDbc=",
+            "merkle_root must match web's #160 reference vector byte-for-byte"
+        );
+        // web's intermediate node(l0,l1) appears in the path_index=3 proof.
+        assert_eq!(
+            root_base64(&node_hash(&leaves[0], &leaves[1])),
+            "RGnpwcmaZ0F6Vn5+PLJSrAOBqSuGo7IvzymH2etAFmk="
+        );
+    }
+
+    // Emits a reciprocal cross-impl vector for web (#160): a tiny real corpus
+    // (ChaCha20 content -> STRUCTURED leaf -> promote-last root) web can verify
+    // on dev. Run: cargo test --features telemetry -- --nocapture
+    //   print_reciprocal_vector_for_web
+    // Asserts internal determinism; the printed values go to web-superdeduper.
+    #[test]
+    fn print_reciprocal_vector_for_web() {
+        use base64::Engine;
+        let b64 = |h: &[u8; 32]| base64::engine::general_purpose::STANDARD.encode(h);
+        let seed = [0x42u8; 32];
+        let (kc, _kk) = corpus_keys(&seed);
+        // 3 files, 1 chunk each (size <= 1MiB). f2 shares content_id 0 with f0
+        // => exact-dup ground truth. path-lex order == index.
+        let files = [
+            ("f0000000000.bin", 0u64, 100u64),
+            ("f0000000001.bin", 1u64, 100u64),
+            ("f0000000002.bin", 0u64, 100u64),
+        ];
+        let mut leaves = Vec::new();
+        eprintln!("--- RECIPROCAL VECTOR (engine -> web #160) ---");
+        eprintln!("seed_hex: {}", hex32(&seed));
+        eprintln!("kdf: K_content=BLAKE3(seed||0x01); content(c)=ChaCha20(K_content,nonce=u96le(c)), nonce=c.to_le_bytes()(8)||[0;4]");
+        eprintln!("leaf=BLAKE3(0x00||u32le(path_len)||path_utf8||u64le(off)||u64le(len)||chunk); node=BLAKE3(0x01||L||R); RFC-6962 promote-last");
+        for (path, cid, size) in files {
+            let mut chunk = vec![0u8; size as usize];
+            content_bytes_at(&kc, cid, 0, &mut chunk);
+            let lh = leaf_hash(path, 0, size, &chunk);
+            eprintln!("file path={path} content_id={cid} off=0 len={size} chunk_b64_first16={} leaf={}",
+                base64::engine::general_purpose::STANDARD.encode(&chunk[..16.min(chunk.len())]), b64(&lh));
+            leaves.push(lh);
+        }
+        let root = merkle_root(&leaves).unwrap();
+        eprintln!("merkle_root: {}", b64(&root));
+        // sample proof for path_index=1 (leaf_count=3, promote-last):
+        // tree = node(node(l0,l1), l2); leaf1 sibling=l0, then sibling=l2.
+        eprintln!("sample_proof path_index=1 leaf_count=3 merkle_path=[{}, {}]", b64(&leaves[0]), b64(&leaves[2]));
+        // determinism self-check.
+        let (kc2, _) = corpus_keys(&seed);
+        let mut c2 = vec![0u8; 100];
+        content_bytes_at(&kc2, 0, 0, &mut c2);
+        let mut c1 = vec![0u8; 100];
+        content_bytes_at(&kc, 0, 0, &mut c1);
+        assert_eq!(c1, c2, "reciprocal vector content is deterministic");
+        assert_eq!(merkle_root(&leaves).unwrap(), root, "root reproducible");
+    }
+
+    fn hex32(b: &[u8; 32]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
     #[test]
     fn challenge_positions_distinct_deterministic_in_range() {
         let a = challenge_positions("bench-chal-xyz", 1000, 32);
