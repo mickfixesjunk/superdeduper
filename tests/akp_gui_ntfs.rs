@@ -23,16 +23,11 @@ const CONTENT: &[u8] = b"keeper-payload-do-not-destroy";
 
 fn fresh_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    // Base dir for keeper/reference corpora. Defaults to %TEMP% (portable).
-    // CAVEAT (finding #1, v0.2.36): the GUI action-layer system-path guard currently
-    // OVER-CLASSIFIES %TEMP% (C:\Users\<u>\AppData\Local\Temp) as system-critical, which
-    // MASKS the keeper-identity / reference guards (they refuse via system-path instead).
-    // The test still passes (refused + survives), but to ISOLATE which guard fires, point
-    // SDD_AKP_BASE at a non-system dir (e.g. C:\sdd-tests). Once finding #1 is resolved,
-    // %TEMP% isolates cleanly and the override is unnecessary.
-    let mut d = std::env::var_os("SDD_AKP_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    // %TEMP% (= C:\Users\<u>\AppData\Local\Temp). Post finding-#1 (v0.2.36 @ 5d4226b),
+    // is_system_path no longer classifies AppData/%TEMP% as system-critical, so %TEMP%
+    // isolates the keeper-identity / reference guards cleanly. (The pre-narrow 0b53e1b
+    // wrongly system-refused %TEMP% and masked those guards — fixed; no override needed.)
+    let mut d = std::env::temp_dir();
     d.push(format!("sdd-akpgui-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&d).unwrap();
     d
@@ -205,6 +200,35 @@ fn akp_gui_system_path_junction_alias() {
     let keeper = stage.join("keeper.bin");
     assert_protected_refused("SYS-junction-alias", &target, &keeper, &[], ACTIONS);
     let _ = fs::remove_dir_all(&sysdir);
+}
+
+// ── ALLOW-APPDATA (v0.2.36 re-cut; finding-#1 (b) narrowing) ──
+// Anti-over-refusal: a dup under %AppData% / %TEMP% must be ACTIONED (Ok, removed),
+// NOT refused as system. Proves is_system_path was narrowed to OS-critical only.
+// (On the PRE-narrow 0b53e1b this FAILS — %TEMP%/AppData was wrongly system-refused;
+// it flips GREEN on the re-cut. The refuse-System32 cells above stay GREEN throughout.)
+fn allow_actioned(label: &str, base: PathBuf) {
+    let dir = base.join(format!("sdd-akpgui-allow-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::SeqCst)));
+    fs::create_dir_all(&dir).unwrap();
+    let keeper = dir.join("keeper.bin");
+    let target = dir.join("loser.bin"); // DISTINCT file (own inode), byte-identical dup
+    payload(&keeper, CONTENT);
+    payload(&target, CONTENT);
+    let r = run_one_dedupe_action(DedupeAction::Remove, &target, &keeper, &[]);
+    assert!(r.is_ok(), "[{label}] dup under user-data must be ACTIONED, not system-refused (narrowing landed?), got: {:?}", r.err().map(|e| e.to_string()));
+    assert!(!target.exists(), "[{label}] target should be removed");
+    assert!(intact(&keeper, CONTENT), "[{label}] keeper must survive");
+    let _ = fs::remove_dir_all(&dir);
+    eprintln!("[{label}] GREEN: user-data dup ACTIONED (removed), keeper survives — narrowing confirmed");
+}
+#[test]
+fn akp_gui_allow_appdata_roaming() {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    allow_actioned("ALLOW-%AppData%", base);
+}
+#[test]
+fn akp_gui_allow_temp() {
+    allow_actioned("ALLOW-%TEMP%", std::env::temp_dir());
 }
 
 // ── CLASS 2: REFERENCE guard — target under a reference root refused on ALL 5 actions ──
