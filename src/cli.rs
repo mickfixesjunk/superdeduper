@@ -109,6 +109,15 @@ pub enum Command {
     #[cfg(feature = "telemetry")]
     SubmitPending(SubmitPendingArgs),
 
+    /// T-BENCH-ME: run the canonical-bench loop against the leaderboard —
+    /// POST /bench/start, download the corpus, run the real dedupe over it,
+    /// answer the server's possession challenge (hashing the downloaded
+    /// bytes), and submit (scope=canonical-bench). The ranked metric is the
+    /// dedupe-only wall; the server verifies the result + challenge directly.
+    /// Telemetry-gated.
+    #[cfg(feature = "telemetry")]
+    BenchMe(BenchMeArgs),
+
     /// #38 v1 — inspect or maintain the local scan history. Tester
     /// surface; cross-validates the persistence layer without
     /// requiring filesystem spelunking.
@@ -147,6 +156,26 @@ pub struct SubmitPendingArgs {
     /// as `scan`, `dedupe`, `diagnose`, `scan-history list`.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
+}
+
+/// T-BENCH-ME `--bench-me` arguments.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Args)]
+pub struct BenchMeArgs {
+    /// Corpus version to request (default the quick tier).
+    #[arg(long, value_name = "VERSION", default_value = "corpus-v1-quick")]
+    pub corpus_version: String,
+    /// Tier label sent to /bench/start.
+    #[arg(long, value_name = "TIER", default_value = "quick")]
+    pub tier: String,
+    /// Keep the downloaded corpus working dir instead of deleting it after.
+    #[arg(long, default_value_t = false)]
+    pub keep: bool,
+    /// Working directory for the downloaded corpus. Defaults to the system temp
+    /// dir; override to a REAL disk if temp is RAM-backed (e.g. tmpfs `/tmp`),
+    /// so the dedupe read is disk-bound + disk-class is detected correctly.
+    #[arg(long, value_name = "DIR")]
+    pub workdir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]

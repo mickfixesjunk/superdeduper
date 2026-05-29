@@ -91,6 +91,9 @@ uuid = { version = "1.10", optional = true, features = ["v4"] }
 # chunk regen) + the base64-padded (RFC4648) Merkle root wire encoding.
 chacha20 = { version = "0.9", optional = true }
 base64 = { version = "0.22", optional = true }
+# tar: unpack the downloaded canonical-bench corpus (single uncompressed tar of
+# f{path_index:010}.bin) in `--bench-me`. Pure-Rust, portable to the cross-build.
+tar = { version = "0.4", optional = true }
 # Unicode script detection — used by the `polyglot-paths` predicate
 # (gamification §5) to count distinct scripts in a path. Tiny crate,
 # data-table only, no other deps.
@@ -165,7 +168,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64", "dep:tar"]
 # T1.2 perceptual image similarity (#25). Pulls `image` for decode
 # + `image_hasher` for the dHash/aHash/pHash family. Off by default
 # while the feature lands incrementally — first slice is just the

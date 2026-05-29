@@ -121,7 +121,8 @@ pub fn result_digest(dupsets: &[Vec<u64>]) -> String {
 }
 
 /// Lowercase hex of a 32-byte digest (for cross-checking against research's
-/// hex goldens, which print hex; the wire form is [`b64`]).
+/// hex goldens, which print hex; the wire form is [`b64`]). Test-only.
+#[cfg(test)]
 fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
