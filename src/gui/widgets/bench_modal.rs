@@ -31,12 +31,41 @@ pub struct Shared {
     pub submitted: bool,
 }
 
+/// A user-selectable benchmark tier. The 100MB `corpus-v1-smoke` tier is
+/// intentionally NOT listed here (design 2026-05-29: smoke is test-only,
+/// reachable only via the CLI `--corpus-version corpus-v1-smoke`). The
+/// GUI exposes only the RANKED tiers that land on the Hall of Fame.
+#[derive(Clone, Copy)]
+pub struct BenchTierChoice {
+    /// corpus_version sent to /bench/start.
+    pub corpus_version: &'static str,
+    /// tier string sent to /bench/start.
+    pub tier: &'static str,
+    /// Short selector label.
+    pub label: &'static str,
+    /// Human download-size hint for the consent copy.
+    pub approx_size: &'static str,
+}
+
+/// User-exposed ranked tiers, in selector order. Default is index 0.
+/// Per design's reconciled corpus ids (2026-05-29): corpus-v1-quick is
+/// the 2.5GB RANKED corpus (NOT the old 100MB). Add further ranked tiers
+/// here as web hosts them; smoke stays CLI-only.
+pub const USER_TIERS: &[BenchTierChoice] = &[BenchTierChoice {
+    corpus_version: "corpus-v1-quick",
+    tier: "quick",
+    label: "Quick (ranked, ~2.5 GB)",
+    approx_size: "~2.5 GB",
+}];
+
 /// GUI-side bench state, held in the app. `None` modal => button not clicked.
 pub struct BenchUiState {
     pub open: bool,
     pub phase: Phase,
     /// Modal toggle: re-download the corpus fresh (maps to bench_run `fresh`).
     pub fresh: bool,
+    /// Selected ranked tier (index into `USER_TIERS`). Defaults to 0 (Quick).
+    pub tier_idx: usize,
     /// Show the "What gets shared?" full-JSON preview inline.
     pub show_share_preview: bool,
     pub shared: Arc<Mutex<Shared>>,
@@ -49,6 +78,7 @@ impl Default for BenchUiState {
             open: false,
             phase: Phase::Consent,
             fresh: false,
+            tier_idx: 0,
             show_share_preview: false,
             shared: Arc::new(Mutex::new(Shared::default())),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -62,9 +92,15 @@ impl BenchUiState {
         self.open = true;
         self.phase = Phase::Consent;
         self.fresh = false;
+        self.tier_idx = 0;
         self.show_share_preview = false;
         self.cancel.store(false, Ordering::Relaxed);
         *self.shared.lock().unwrap() = Shared::default();
+    }
+
+    /// The currently-selected tier (clamped to a valid entry).
+    fn tier(&self) -> BenchTierChoice {
+        USER_TIERS[self.tier_idx.min(USER_TIERS.len() - 1)]
     }
 
     /// Spawn the bench worker. `submit` = Run&submit (true) vs Run-locally (false).
@@ -79,15 +115,22 @@ impl BenchUiState {
         let shared = Arc::clone(&self.shared);
         let cancel = Arc::clone(&self.cancel);
         let fresh = self.fresh;
+        let tier = self.tier();
         std::thread::spawn(move || {
-            run_worker(&shared, &cancel, fresh, submit);
+            run_worker(&shared, &cancel, fresh, submit, tier);
         });
     }
 }
 
 /// Worker body: load/auto-register install, run the shared bench loop, write
 /// progress + the final human result into `shared`.
-fn run_worker(shared: &Arc<Mutex<Shared>>, cancel: &AtomicBool, fresh: bool, submit: bool) {
+fn run_worker(
+    shared: &Arc<Mutex<Shared>>,
+    cancel: &AtomicBool,
+    fresh: bool,
+    submit: bool,
+    tier: BenchTierChoice,
+) {
     use crate::leaderboard::{bench_run, install, registration, submission};
 
     let set_status = |msg: &str| {
@@ -127,8 +170,8 @@ fn run_worker(shared: &Arc<Mutex<Shared>>, cancel: &AtomicBool, fresh: bool, sub
 
     let outcome = bench_run::run(
         &state,
-        "corpus-v1-quick",
-        "quick",
+        tier.corpus_version,
+        tier.tier,
         None,
         fresh,
         submit,
@@ -142,11 +185,16 @@ fn run_worker(shared: &Arc<Mutex<Shared>>, cancel: &AtomicBool, fresh: bool, sub
         }
         Err(e) => finish(format!("Benchmark failed: {e}"), true, false),
         Ok(o) => {
+            // Human size: GB for >=1 GiB (the ranked corpora), else MB.
+            let bytes = o.bytes_scanned as f64;
+            let size = if bytes >= 1_073_741_824.0 {
+                format!("{:.2} GB", bytes / 1_073_741_824.0)
+            } else {
+                format!("{:.0} MB", bytes / 1_048_576.0)
+            };
             let perf = format!(
-                "Deduped the {:.0} MB test corpus in {:.2}s ({} groups).",
-                o.bytes_scanned as f64 / 1_048_576.0,
-                o.dedupe_secs,
-                o.dup_groups
+                "Deduped the {size} test corpus in {:.2}s ({} groups).",
+                o.dedupe_secs, o.dup_groups
             );
             match o.submit {
                 None => finish(
@@ -155,14 +203,16 @@ fn run_worker(shared: &Arc<Mutex<Shared>>, cancel: &AtomicBool, fresh: bool, sub
                     false,
                 ),
                 Some(submission::SubmitOutcome::Accepted { ranks, achievements_unlocked, .. }) => {
-                    // Honest result: <1GB dev/small is verify-only (NOT a fake
-                    // rank); a real ranked tier returns ranks[].
+                    // Honest result: the GUI only runs RANKED tiers
+                    // (corpus-v1-quick = 2.5GB ranked). A returned rank is
+                    // shown verbatim; an empty ranks[] means submitted-OK
+                    // but the rank isn't computed yet (don't fabricate one).
                     let mut msg = if let Some(top) = ranks.first() {
                         format!("Verified! You ranked on the Dedupe Hall of Fame.\n{top:?}")
                     } else {
                         format!(
-                            "Verified! Your machine deduped the test corpus correctly.\n\
-                             (Warm-up tier — the ranked Hall of Fame uses the full corpus.)"
+                            "Verified + submitted to the Dedupe Hall of Fame.\n\
+                             Your rank will appear on your profile shortly."
                         )
                     };
                     if !achievements_unlocked.is_empty() {
@@ -215,8 +265,11 @@ pub fn show(state: &mut BenchUiState, ctx: &egui::Context) -> BenchModalAction {
 }
 
 fn consent_view(state: &mut BenchUiState, ui: &mut egui::Ui, action: &mut BenchModalAction) {
+    let size = state.tier().approx_size;
     ui.label(egui::RichText::new("What happens").strong());
-    ui.label("1. Downloads a standard synthetic test corpus (~100 MB; cached after the first run).");
+    ui.label(format!(
+        "1. Downloads a standard synthetic ranked corpus ({size}; cached after the first run)."
+    ));
     ui.label("2. Runs SuperDeDuper's real dedup on it and times it.");
     ui.label("3. Submits your result to the public Dedupe Hall of Fame.");
     ui.add_space(6.0);
@@ -238,8 +291,26 @@ fn consent_view(state: &mut BenchUiState, ui: &mut egui::Ui, action: &mut BenchM
         }
     }
     ui.add_space(6.0);
+    // Tier selector (design 2026-05-29): the GUI exposes only RANKED tiers;
+    // the 100MB smoke corpus is CLI-only. Default is USER_TIERS[0] (Quick).
+    if USER_TIERS.len() > 1 {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Benchmark").strong());
+            egui::ComboBox::from_id_salt("sd_bench_tier")
+                .selected_text(USER_TIERS[state.tier_idx.min(USER_TIERS.len() - 1)].label)
+                .show_ui(ui, |ui| {
+                    for (i, t) in USER_TIERS.iter().enumerate() {
+                        ui.selectable_value(&mut state.tier_idx, i, t.label);
+                    }
+                });
+        });
+        ui.add_space(6.0);
+    }
     ui.label(egui::RichText::new("Workload").strong());
-    ui.label("Downloads ~100 MB (once; cached after) and runs a few-second CPU + disk workload. Run it when your machine is otherwise idle for an accurate result.");
+    ui.label(format!(
+        "Downloads {size} (once; cached after) and runs a CPU + disk workload. Run it when your \
+         machine is otherwise idle for an accurate, comparable result."
+    ));
     ui.checkbox(&mut state.fresh, "Re-download a fresh corpus (ignore cache)");
     ui.add_space(8.0);
     ui.horizontal(|ui| {
