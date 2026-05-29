@@ -225,12 +225,22 @@ pub fn load_for(channel: Channel) -> io::Result<Option<InstallState>> {
         }
         Err(e) => return Err(e),
     };
-    let state: InstallState = serde_json::from_slice(&bytes).map_err(|e| {
+    let mut state: InstallState = serde_json::from_slice(&bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("install.json parse: {e}"),
         )
     })?;
+    // SUPERDEDUPER_SERVER_URL override (channel::SERVER_URL_ENV_VAR):
+    // redirect a loaded install's endpoint at the env-named backend.
+    // Unset in production -> no effect. Lets a test point an already-
+    // registered install at a local mock (T-BENCH-ME spec §9 G1).
+    if let Ok(raw) = std::env::var(channel::SERVER_URL_ENV_VAR) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            state.server_url = trimmed.to_string();
+        }
+    }
     if state.schema_version > CURRENT_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

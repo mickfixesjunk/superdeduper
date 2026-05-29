@@ -107,9 +107,18 @@ pub fn run(
         std::fs::create_dir_all(&corpus_dir)?;
         progress(&format!("downloading + extracting corpus ({} challenges)", challenges.len()));
         let resp = ureq::get(&download_url).call().context("GET download_url failed")?;
-        tar::Archive::new(resp.into_reader())
-            .unpack(&corpus_dir)
-            .context("extracting corpus tar")?;
+        // Wrap the download stream so Cancel aborts mid-pull (the 100MB
+        // download is the long pole; checking only at stage boundaries
+        // would leave Cancel unresponsive for the whole download). The
+        // reader returns an io error the instant `cancel` is set;
+        // afterwards we re-check and surface it as a clean `Cancelled`
+        // rather than a corrupt-tar error (spec §9 G2).
+        let reader = CancelReader { inner: resp.into_reader(), cancel };
+        if let Err(e) = tar::Archive::new(reader).unpack(&corpus_dir) {
+            check_cancel()?; // cancel mid-download -> clean Cancelled, not a tar error
+            let _ = std::fs::remove_dir_all(&corpus_dir); // don't leave a half-extracted cache
+            return Err(anyhow::Error::new(e).context("extracting corpus tar"));
+        }
         std::fs::write(&complete, corpus_version.as_bytes()).context("writing cache sentinel")?;
     } else {
         progress(&format!("reusing cached corpus at {} ({} challenges)", corpus_dir.display(), challenges.len()));
@@ -190,6 +199,26 @@ pub fn run(
         submit: submit_outcome,
         inputs,
     })
+}
+
+/// A `Read` adapter that aborts the instant a cancel flag is set, so a
+/// long download can be interrupted mid-stream (not just at stage
+/// boundaries). On cancel it returns an `Interrupted` io error; the
+/// caller re-checks the flag and reports a clean `Cancelled`.
+struct CancelReader<'a, R> {
+    inner: R,
+    cancel: &'a std::sync::atomic::AtomicBool,
+}
+impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "benchmark cancelled during download",
+            ));
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// Full-content exact-dedupe: read EVERY file fully (bytes_scanned == corpus

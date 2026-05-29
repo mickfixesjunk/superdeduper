@@ -112,7 +112,10 @@ fn run_worker(shared: &Arc<Mutex<Shared>>, cancel: &AtomicBool, fresh: bool, sub
             Err(e) => return finish(format!("Couldn't register this install: {e:?}"), true, false),
         },
         Ok(None) => {
-            let url = crate::channel::server_url_for(channel).to_string();
+            // resolve_server_url honors SUPERDEDUPER_SERVER_URL so a fresh
+            // (never-registered) install registers against the mock too
+            // (T-BENCH-ME spec §9 G1).
+            let url = crate::channel::resolve_server_url(channel);
             let mut s = install::new_unregistered(url);
             match registration::register_cli(&mut s) {
                 Ok(()) => s,

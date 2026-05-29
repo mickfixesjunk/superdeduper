@@ -39,6 +39,30 @@ use serde::{Deserialize, Serialize};
 /// dev / local override without mutating the user's config file.
 pub const ENV_VAR: &str = "SUPERDEDUPER_CHANNEL";
 
+/// Environment variable that overrides the API backend URL outright,
+/// independent of channel. Same class as `SUPERDEDUPER_CHANNEL` but
+/// for the endpoint itself: lets a test point the client at a local
+/// mock server on an arbitrary port (the fixed `Channel::Local`
+/// localhost:3000 isn't enough when the mock binds elsewhere). Unset
+/// in production. T-BENCH-ME spec §9 G1 (non-vacuous swarm GUI E2E:
+/// the mock captures POST /submit + GET /corpus request counts).
+pub const SERVER_URL_ENV_VAR: &str = "SUPERDEDUPER_SERVER_URL";
+
+/// Resolve the API backend URL for `channel`, honoring the
+/// `SUPERDEDUPER_SERVER_URL` override if set (trimmed; empty is
+/// ignored). This is the single chokepoint so every surface —
+/// registration, bench, submit — targets the same (possibly mocked)
+/// endpoint without per-call-site drift.
+pub fn resolve_server_url(channel: Channel) -> String {
+    if let Some(raw) = env::var(SERVER_URL_ENV_VAR).ok() {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    server_url_for(channel).to_string()
+}
+
 /// The three channels supported in v1. `staging` deferred per
 /// dev-channel-spec.md §2.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -416,6 +440,21 @@ mod tests {
             "https://dev-api.superdeduper.io"
         );
         assert_eq!(server_url_for(Channel::Local), "http://localhost:3000");
+    }
+
+    #[test]
+    fn resolve_server_url_falls_back_to_channel_default_when_unset() {
+        // The override branch (SUPERDEDUPER_SERVER_URL set) can't be
+        // tested safely here without sequencing threads (process-global
+        // env). The default branch is the production path and must
+        // equal server_url_for. (Guard: assume the var is unset in the
+        // test env; if a harness sets it, skip rather than false-fail.)
+        if std::env::var(SERVER_URL_ENV_VAR).is_ok() {
+            return;
+        }
+        for &c in Channel::all() {
+            assert_eq!(resolve_server_url(c), server_url_for(c));
+        }
     }
 
     #[test]
