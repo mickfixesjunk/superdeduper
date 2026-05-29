@@ -194,8 +194,11 @@ fn run_worker(
             } else {
                 format!("{:.0} MB", bytes / 1_048_576.0)
             };
+            // bytes_scanned is the CANDIDATE bytes hashed (size-grouped),
+            // not the whole corpus -> word it as "hashed X of candidates"
+            // rather than implying X is the corpus size.
             let perf = format!(
-                "Deduped the {size} test corpus in {:.2}s ({} groups).",
+                "Deduped the test corpus in {:.2}s — hashed {size} of duplicate candidates, {} groups.",
                 o.dedupe_secs, o.dup_groups
             );
             match o.submit {

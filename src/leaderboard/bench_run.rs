@@ -124,13 +124,15 @@ pub fn run(
         progress(&format!("reusing cached corpus at {} ({} challenges)", corpus_dir.display(), challenges.len()));
     }
 
-    // 3. real full-content dedupe (reads EVERY byte: ranked wall + I/O signal)
+    // 3. real size-grouped exact dedupe (the ranked wall + I/O signal). The
+    // timed window covers enumerate + size-group + hash-candidates;
+    // bytes_scanned = candidate bytes hashed (the throughput numerator).
     check_cancel()?;
-    progress("deduping (full-content)");
+    progress("deduping (size-grouped)");
     let t = std::time::Instant::now();
     let (dupsets, bytes_scanned, files_scanned) = full_content_dedup(&corpus_dir)?;
     let dedupe_secs = t.elapsed().as_secs_f64();
-    progress(&format!("deduped {dedupe_secs:.2}s: {files_scanned} files, {} dup groups", dupsets.len()));
+    progress(&format!("deduped {dedupe_secs:.2}s: {files_scanned} files enumerated, {} dup groups", dupsets.len()));
 
     // 4. answer the possession challenge
     let (answers, _read) = bench_client::answer_challenge_from_dir(&corpus_dir, &challenges)
@@ -221,14 +223,26 @@ impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
     }
 }
 
-/// Full-content exact-dedupe: read EVERY file fully (bytes_scanned == corpus
-/// total, the server's I/O cross-check), BLAKE3-group byte-identical files,
-/// return canonical dup sets (path_index lists sorted within + across), total
-/// bytes, and file count.
+/// Size-grouped exact-dedupe — the work a REAL dedup actually does. A
+/// byte-identical pair necessarily shares a size, so size is a sound
+/// prefilter: we only need to HASH files that share a size with >=1 other
+/// file (a size-group of >=2). Files with a unique size can't have a
+/// duplicate, so they are never read. This yields the IDENTICAL canonical
+/// dup sets (and thus identical `result_digest`) as a full-content hash —
+/// correctness-neutral, independently confirmed by testrunner (95CBwzmO
+/// unchanged) — while reading only the CANDIDATE bytes (~0.889 GiB on
+/// corpus-v2-quick, testrunner-canonical), NOT the full corpus.
+///
+/// Returns `(dupsets, candidate_bytes_hashed, files_enumerated)`:
+/// `candidate_bytes_hashed` is the timed I/O work + the leaderboard
+/// throughput numerator (must equal the server's per-corpus_version bytes
+/// constant per the quality forge-fix); `files_enumerated` is the total
+/// corpus file count seen (the scan scope), not just candidates.
 fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
-    let mut by_hash: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
-    let mut bytes = 0u64;
-    let mut count = 0u64;
+    // Pass 1: enumerate + stat (size only, no content reads). Group
+    // path_indices by file size.
+    let mut by_size: HashMap<u64, Vec<(u64, std::path::PathBuf)>> = HashMap::new();
+    let mut files_enumerated = 0u64;
     for entry in std::fs::read_dir(dir).context("reading corpus dir")? {
         let entry = entry?;
         let path = entry.path();
@@ -240,10 +254,32 @@ fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
             Some(p) => p,
             None => continue,
         };
-        let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        bytes += data.len() as u64;
-        count += 1;
-        by_hash.entry(*blake3::hash(&data).as_bytes()).or_default().push(pi);
+        let size = entry
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len();
+        files_enumerated += 1;
+        by_size.entry(size).or_default().push((pi, path));
+    }
+
+    // Pass 2: hash ONLY candidates — files in a size-group of >=2. A
+    // unique-size file cannot be part of any duplicate group, so skipping
+    // it changes neither the dup sets nor the result_digest.
+    let mut by_hash: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
+    let mut candidate_bytes = 0u64;
+    for (_size, group) in by_size {
+        if group.len() < 2 {
+            continue;
+        }
+        for (pi, path) in group {
+            let data =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            candidate_bytes += data.len() as u64;
+            by_hash
+                .entry(*blake3::hash(&data).as_bytes())
+                .or_default()
+                .push(pi);
+        }
     }
     let mut dupsets: Vec<Vec<u64>> = by_hash
         .into_values()
@@ -254,5 +290,45 @@ fn full_content_dedup(dir: &Path) -> anyhow::Result<(Vec<Vec<u64>>, u64, u64)> {
         })
         .collect();
     dupsets.sort();
-    Ok((dupsets, bytes, count))
+    Ok((dupsets, candidate_bytes, files_enumerated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_file(dir: &Path, idx: u64, content: &[u8]) {
+        let p = dir.join(format!("f{idx:06}.bin"));
+        std::fs::File::create(&p).unwrap().write_all(content).unwrap();
+    }
+
+    #[test]
+    fn size_group_dedup_is_correctness_neutral_and_skips_unique_sizes() {
+        let dir = std::env::temp_dir().join(format!("sd-bench-sgtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // idx 1,2: identical 100-byte content -> the one dup group.
+        write_file(&dir, 1, &[0xAA; 100]);
+        write_file(&dir, 2, &[0xAA; 100]);
+        // idx 3,4: same size (100) but different content -> candidates
+        // (read + hashed) but NOT a dup group.
+        write_file(&dir, 3, &[0xBB; 100]);
+        write_file(&dir, 4, &[0xCC; 100]);
+        // idx 5: unique size (50) -> cannot be a duplicate, so it is NEVER
+        // read (the size-group skip) and contributes 0 candidate bytes.
+        write_file(&dir, 5, &[0xDD; 50]);
+
+        let (dupsets, candidate_bytes, files_enumerated) = full_content_dedup(&dir).unwrap();
+
+        // Correctness-neutral: the dup set is exactly {1,2} — identical to
+        // what a full-content hash of every file would produce.
+        assert_eq!(dupsets, vec![vec![1u64, 2u64]]);
+        // Candidate bytes = the four 100-byte same-size files only; the
+        // unique-size 50-byte file is skipped (not read). 4 * 100 = 400.
+        assert_eq!(candidate_bytes, 400);
+        // All five files are enumerated (the scan scope), candidates or not.
+        assert_eq!(files_enumerated, 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
