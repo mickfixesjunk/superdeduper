@@ -424,6 +424,69 @@ fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        #[cfg(feature = "telemetry")]
+        DebugCommand::MakeBenchCorpus { tier, out, seed } => run_make_bench_corpus(tier, out, seed),
+    }
+}
+
+/// T-BENCH-ME: materialize a canonical-bench corpus tier to `out`
+/// (`f{index:010}.bin` + `manifest.json`). Reuses the verified
+/// `bench_corpus` generator; the served manifest omits root + groundtruth.
+#[cfg(feature = "telemetry")]
+fn run_make_bench_corpus(
+    tier: superdeduper::cli::BenchTier,
+    out: std::path::PathBuf,
+    seed: Option<String>,
+) -> anyhow::Result<()> {
+    use superdeduper::cli::BenchTier;
+    use superdeduper::leaderboard::{bench, bench_corpus as bc};
+
+    let spec = match tier {
+        BenchTier::Quick => bc::quick_tier(),
+        BenchTier::Full => bc::full_tier(),
+    };
+    let seed = parse_bench_seed(seed)?;
+    let (k_content, _) = bench::corpus_keys(&seed);
+    let plan = bc::plan_corpus(&spec);
+    let manifest = bc::served_manifest(&spec, &seed, &plan);
+
+    eprintln!(
+        "generating {} ({} files, {} leaves, {} bytes) -> {}",
+        spec.corpus_version,
+        plan.file_count,
+        plan.leaf_count,
+        plan.total_bytes,
+        out.display(),
+    );
+    let t = std::time::Instant::now();
+    let written = bc::write_corpus(&out, &k_content, &plan)
+        .with_context(|| format!("writing corpus to {}", out.display()))?;
+    let manifest_path = out.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    eprintln!(
+        "done: {written} bytes in {:.1}s; served manifest -> {} (NO root, NO groundtruth)",
+        t.elapsed().as_secs_f64(),
+        manifest_path.display(),
+    );
+    Ok(())
+}
+
+/// Parse the optional `--seed` (64 hex chars → 32 bytes); default = the
+/// deterministic dev seed `BLAKE3("superdeduper-bench-dev-v1")`.
+#[cfg(feature = "telemetry")]
+fn parse_bench_seed(seed: Option<String>) -> anyhow::Result<[u8; 32]> {
+    match seed {
+        Some(h) => {
+            anyhow::ensure!(h.len() == 64, "--seed must be exactly 64 hex chars (32 bytes)");
+            let mut a = [0u8; 32];
+            for (i, byte) in a.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16)
+                    .map_err(|_| anyhow::anyhow!("--seed must be valid hex"))?;
+            }
+            Ok(a)
+        }
+        None => Ok(*blake3::hash(b"superdeduper-bench-dev-v1").as_bytes()),
     }
 }
 

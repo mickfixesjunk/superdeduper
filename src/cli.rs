@@ -255,11 +255,39 @@ pub enum DebugCommand {
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
+
+    /// T-BENCH-ME: materialize a canonical-bench corpus tier to disk
+    /// (`f{index:010}.bin` files + `manifest.json`) so the reference rig
+    /// and the `--bench-me` dev E2E can run a dedupe over the exact
+    /// deterministic corpus. The served manifest carries NO root and NO
+    /// groundtruth (work-proof invariant). Telemetry-gated.
+    #[cfg(feature = "telemetry")]
+    MakeBenchCorpus {
+        /// Tier: `quick` (~2.5 GB) or `full` (~19 GB).
+        #[arg(long, value_enum, default_value_t = BenchTier::Quick)]
+        tier: BenchTier,
+        /// Output directory (created if absent).
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// 32-byte corpus seed as 64 hex chars. Defaults to the dev seed.
+        /// (The PUBLISHED corpus-v1 seed is pinned by research; until that
+        /// lands this dev seed lets the rig be timed against a real corpus.)
+        #[arg(long, value_name = "HEX")]
+        seed: Option<String>,
+    },
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
 pub enum SnapshotFormat {
     Json,
+}
+
+/// T-BENCH-ME corpus tier selector.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Copy, Clone, ValueEnum)]
+pub enum BenchTier {
+    Quick,
+    Full,
 }
 
 #[derive(Debug, Args)]
