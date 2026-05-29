@@ -45,3 +45,8 @@ pub mod vanity_slug;
 /// single-round challenge derivation. (corpus generator + --bench-me flow
 /// build on these.) Telemetry-gated (the file is #![cfg(feature="telemetry")]).
 pub mod bench; // G4
+/// G4 / T-BENCH-ME corpus generator: the deterministic corpus-v1 layout
+/// (B.3/B.4 production contract) on top of `bench`'s frozen primitives — pure
+/// plan (file descriptors + groundtruth_dupsets + aggregates) plus
+/// materialization (leaves / on-disk corpus / signed-shape manifest).
+pub mod bench_corpus; // G4

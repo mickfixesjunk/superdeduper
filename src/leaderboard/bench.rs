@@ -111,6 +111,24 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> Option<[u8; 32]> {
     }
 }
 
+/// Split one corpus file into its 1MiB-chunk Merkle leaves, in offset order
+/// (path-lex/offset order). The final chunk may be shorter; its leaf `len`
+/// reflects the actual bytes. Content is generated on the fly via the O(1)
+/// random-access keystream — no disk read. Shared by the golden-vector test
+/// and the corpus generator (`super::bench_corpus`). `size == 0` → no leaves.
+pub fn file_leaves(k_content: &[u8; 32], path: &str, content_id: u64, size: u64) -> Vec<[u8; 32]> {
+    let mut leaves = Vec::new();
+    let mut off = 0u64;
+    while off < size {
+        let len = (size - off).min(CHUNK_SIZE);
+        let mut chunk = vec![0u8; len as usize];
+        content_bytes_at(k_content, content_id, off, &mut chunk);
+        leaves.push(leaf_hash(path, off, len, &chunk));
+        off += len;
+    }
+    leaves
+}
+
 /// std-base64 (RFC4648, WITH padding) of the 32-byte Merkle root — the FROZEN
 /// wire form (44 chars; NOT base64url).
 pub fn root_base64(root: &[u8; 32]) -> String {
@@ -309,21 +327,6 @@ mod tests {
 
     fn hex32(b: &[u8; 32]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
-    }
-
-    /// Split a file into 1MiB-chunk leaves (path-lex/offset order). Shared by
-    /// the golden-vector test + (later) the generator's leaf emission.
-    fn file_leaves(kc: &[u8; 32], path: &str, content_id: u64, size: u64) -> Vec<[u8; 32]> {
-        let mut leaves = Vec::new();
-        let mut off = 0u64;
-        while off < size {
-            let len = (size - off).min(CHUNK_SIZE);
-            let mut chunk = vec![0u8; len as usize];
-            content_bytes_at(kc, content_id, off, &mut chunk);
-            leaves.push(leaf_hash(path, off, len, &chunk));
-            off += len;
-        }
-        leaves
     }
 
     // RESEARCH GOLDEN-VECTOR cross-check (/tmp/tcorpus-goldenvec, design
