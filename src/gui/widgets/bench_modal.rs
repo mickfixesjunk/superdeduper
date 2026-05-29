@@ -374,9 +374,12 @@ fn done_view(state: &mut BenchUiState, ui: &mut egui::Ui) {
     });
 }
 
-/// The existing full-schema submission preview JSON (gamification §10.1) — the
-/// same surface Settings -> Privacy uses; here it's shown inline for "What
-/// gets shared?". Returns None if telemetry isn't available.
+/// The full-schema submission preview JSON for the BENCH context. Renders
+/// the canonical-bench shape (corpus_kind=canonical-bench, synthetic ~2.4GB
+/// numbers, + the bench fields), NOT the generic scan sample — the scan
+/// sample shows corpus_kind=user-data + bytes_scanned=320GB which would
+/// misrepresent the synthetic bench and contradict this modal's "no
+/// personal files" callout (design preview-context fix).
 fn sample_share_json() -> Option<String> {
-    Some(crate::gui::widgets::settings_modal::build_sample_payload_json())
+    Some(crate::gui::widgets::settings_modal::build_bench_sample_payload_json())
 }

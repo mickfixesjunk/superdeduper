@@ -2548,6 +2548,68 @@ pub fn build_sample_payload_json() -> String {
     serde_json::to_string_pretty(&payload).unwrap_or_else(|e| format!("(render failed: {e})"))
 }
 
+/// Build a synthetic CANONICAL-BENCH sample payload (pretty JSON) for the
+/// bench "What exactly gets shared?" preview. The generic scan sample
+/// (build_sample_payload_json) misrepresents the bench — it shows
+/// corpus_kind="user-data" + bytes_scanned=320GB, contradicting the
+/// bench's own "no personal files / synthetic" callout. This renders the
+/// REAL bench shape: synthetic run_shape (corpus_kind=canonical-bench, the
+/// ~2.4GB synthetic numbers) plus the bench fields (build_payload lifts
+/// bench_proof/bench_run_id/corpus_version/protocol_version/tier
+/// top-level). Numbers are representative of the corpus-v2-quick tier.
+#[cfg(feature = "telemetry")]
+pub fn build_bench_sample_payload_json() -> String {
+    use crate::leaderboard::{hardware, submission};
+    let inputs = submission::SubmissionInputs {
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        run_uuid: "00000000-0000-0000-0000-000000000000".into(),
+        scan_id: None,
+        hardware: hardware::detect(),
+        run_shape: submission::RunShape {
+            wall_clock_seconds: 1.05,
+            bytes_scanned: 2_410_000_000,
+            files_scanned: 8_600,
+            hash_algorithm: "blake3".into(),
+            walker_variant: "walker".into(),
+            scope: "canonical-bench".into(),
+            features_used_bitmap: 0,
+            corpus_kind: "canonical-bench".into(),
+            cache_hit_ratio: None,
+            easter_egg_hits: Vec::new(),
+            zero_byte_group_max: None,
+            max_hardlink_count_in_scan: None,
+            name_collision_count: None,
+            share_count_in_scope: None,
+            dry_run: None,
+            groups_reviewed_count: None,
+        },
+        result_summary: submission::ResultSummary {
+            duplicate_groups: 80,
+            duplicate_bytes_reclaimable: 0,
+            largest_single_group_bytes: 8_388_608,
+            actions_taken_summary: std::collections::BTreeMap::new(),
+            placeholder_skip_count: None,
+            placeholder_skip_bytes: None,
+            client_found_dupsets: None,
+        },
+        bench: Some(submission::CanonicalBench {
+            protocol_version: "tcorpus-1".into(),
+            corpus_version: "corpus-v2-quick".into(),
+            tier: "quick".into(),
+            bench_run_id: "00000000-0000-0000-0000-000000000000".into(),
+            bench_proof: serde_json::json!({
+                "answers": [
+                    { "path_index": 12, "byte_offset": 53248, "byte_length": 4096,
+                      "challenge_hash": "<blake3-of-corpus-bytes-at-this-range>" }
+                ],
+                "result_digest": "<blake3-of-your-dedupe-result>"
+            }),
+        }),
+    };
+    let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|e| format!("(render failed: {e})"))
+}
+
 #[cfg(feature = "telemetry")]
 fn render_submit_section(ui: &mut egui::Ui) {
     use crate::leaderboard::{install, submission};
