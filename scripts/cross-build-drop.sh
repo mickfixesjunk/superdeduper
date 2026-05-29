@@ -202,6 +202,23 @@ EOF
     ;;
 esac
 
+# ---- Archive-only hold for externally-gated promotes ----
+# Some cuts gate the LATEST promote on MORE than the fast-gate — e.g. a
+# data-safety guard relocation whose promote waits on adversarial GUI cells
+# + on-hardware verification (the v0.2.36 keeper/reference/system-path
+# relocation). For those, build + archive + run the fast-gate as a pre-check
+# here, but HOLD the LATEST promote until the external gate clears. Promote
+# later by re-running with SD_ARCHIVE_ONLY unset (the archive-by-sha is
+# already staged) or by copying the archive to LATEST manually.
+if [[ "${SD_ARCHIVE_ONLY:-0}" == "1" ]]; then
+  echo "==> SD_ARCHIVE_ONLY=1 — fast-gate ran as a pre-check; LATEST promote HELD."
+  echo "    The drop is archived but NOT promoted; an external gate (adversarial"
+  echo "    cells / on-hardware verify) owns the promote decision."
+  echo "archive: ${ARCHIVE_DIR}"
+  ls -la "$ARCHIVE_DIR"
+  exit 0
+fi
+
 # ---- Promote to the latest path (always overwrite) ----
 mkdir -p "$LATEST_DIR"
 for entry in "${BINARIES[@]}"; do
