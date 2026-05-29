@@ -2604,6 +2604,7 @@ pub fn build_bench_sample_payload_json() -> String {
                 ],
                 "result_digest": "<blake3-of-your-dedupe-result>"
             }),
+            cold_enforced: true,
         }),
     };
     let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");

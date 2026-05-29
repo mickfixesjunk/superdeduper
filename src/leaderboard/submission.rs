@@ -72,6 +72,11 @@ pub struct CanonicalBench {
     /// audit_path — the server regenerates each range from the private seed
     /// (tag 0x02) + direct-compares, and checks result_digest == digest(groundtruth).
     pub bench_proof: serde_json::Value,
+    /// #106 — whether EVERY timed candidate read bypassed the OS cache. The
+    /// server's per-run gate routes cold_enforced=false runs to the casual
+    /// (warm) board, excluded from the competitive cold HoF. Emitted TOP-LEVEL
+    /// on the submit body (web's field path); omit/null = legacy/casual.
+    pub cold_enforced: bool,
 }
 
 /// `run_shape` block per backend schema.
@@ -336,6 +341,10 @@ pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json:
         obj.insert("tier".into(), bench.tier.clone().into());
         obj.insert("bench_run_id".into(), bench.bench_run_id.clone().into());
         obj.insert("bench_proof".into(), bench.bench_proof.clone());
+        // #106 — cold-enforce flag, sibling of the bench-version fields (web's
+        // field path). false (warm/unverifiable, incl. WSL fail-closed) -> the
+        // server routes the run to the casual board, not competitive cold.
+        obj.insert("cold_enforced".into(), bench.cold_enforced.into());
     }
     body
 }
@@ -1109,9 +1118,12 @@ mod tests {
                 "answers": [{ "path_index": 7, "byte_offset": 0, "byte_length": 16, "challenge_hash": "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=" }],
                 "result_digest": "2Ak/YbCbLu9E+xhuiv024PJd3OnS5ZTNzPJtDzh6aG0=",
             }),
+            cold_enforced: true,
         });
         let p = build_payload(&inputs, "id");
         assert_eq!(p.get("protocol_version").and_then(|v| v.as_str()), Some("tbench-1"));
+        // #106 — cold_enforced lifts to the top level alongside the bench fields.
+        assert_eq!(p.get("cold_enforced").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(p.get("corpus_version").and_then(|v| v.as_str()), Some("corpus-v1-quick"));
         assert_eq!(p.get("tier").and_then(|v| v.as_str()), Some("quick"));
         assert_eq!(p.get("bench_run_id").and_then(|v| v.as_str()), Some("run-xyz"));

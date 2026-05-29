@@ -177,6 +177,7 @@ pub fn run(
     // 5. assemble + 6. submit
     let bench = bench_client::to_canonical_bench(
         &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
+        cold_enforced,
     );
     let largest = dupsets.iter().map(|g| g.len() as u64).max().unwrap_or(0);
     let inputs = submission::SubmissionInputs {

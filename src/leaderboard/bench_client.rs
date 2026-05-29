@@ -141,6 +141,7 @@ pub fn to_canonical_bench(
     bench_run_id: &str,
     answers: &[ChallengeAnswer],
     found_dupsets: &[Vec<u64>],
+    cold_enforced: bool,
 ) -> super::submission::CanonicalBench {
     super::submission::CanonicalBench {
         protocol_version: protocol_version.to_string(),
@@ -151,6 +152,7 @@ pub fn to_canonical_bench(
             "answers": answers,
             "result_digest": result_digest(found_dupsets),
         }),
+        cold_enforced,
     }
 }
 
@@ -241,9 +243,10 @@ mod tests {
             ChallengeAnswer { path_index: 9, byte_offset: 64, byte_length: 4, challenge_hash: "BBBB".into() },
         ];
         let dupsets = vec![vec![1u64, 4, 6]];
-        let cb = to_canonical_bench("tbench-1", "corpus-v1-quick", "quick", "run-Z", &answers, &dupsets);
+        let cb = to_canonical_bench("tbench-1", "corpus-v1-quick", "quick", "run-Z", &answers, &dupsets, true);
         assert_eq!(cb.bench_run_id, "run-Z");
         assert_eq!(cb.protocol_version, "tbench-1");
+        assert!(cb.cold_enforced, "cold_enforced threads through");
         assert_eq!(cb.bench_proof.pointer("/answers").and_then(|a| a.as_array()).map(Vec::len), Some(2));
         assert_eq!(cb.bench_proof.pointer("/answers/1/path_index").and_then(|v| v.as_u64()), Some(9));
         assert_eq!(cb.bench_proof.pointer("/result_digest").and_then(|v| v.as_str()), Some(result_digest(&dupsets).as_str()));
