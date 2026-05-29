@@ -18,28 +18,28 @@ fn b64(h: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(h)
 }
 
-/// A server-issued challenge position (delivered by `POST /bench/start`): read
-/// `length` bytes starting at `byte_offset` from `f{path_index:010}.bin` and
-/// hash them. Offsets are PER-FILE (path_index + byte offset within that file),
-/// not a global corpus offset — the client has the files on disk.
+/// A server-issued challenge position (delivered in full by `POST /bench/start`
+/// — the client CANNOT derive these, since the BC needs the private seed).
+/// Read `byte_length` bytes at `byte_offset` from `f{path_index:010}.bin` and
+/// hash them; echo `leaf_index` back. Offsets are PER-FILE (the client has the
+/// files on disk).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChallengePosition {
+    pub leaf_index: u64,
     pub path_index: u64,
     pub byte_offset: u64,
-    pub length: u64,
+    pub byte_length: u64,
 }
 
-/// One challenge answer: the position echoed back + the BLAKE3 hash of the
-/// bytes there (std-base64). `hash` uses the ALREADY-LOCKED leaf preimage
-/// (tag `0x00`) — the exact form web's verifier reproduces from the
-/// regenerated corpus, so no new hash golden is needed; only `result_digest`
-/// is new.
+/// One challenge answer (web's wire): just `leaf_index` + the leaf hash. The
+/// server already holds the descriptor (path/offset/len) it issued, so the
+/// client need only return which leaf + its hash. `leaf_hash` uses the
+/// ALREADY-LOCKED leaf preimage (tag `0x00`) — web reproduces it from the
+/// regenerated corpus and direct-compares; no tree, no new hash golden.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChallengeAnswer {
-    pub path_index: u64,
-    pub byte_offset: u64,
-    pub length: u64,
-    pub hash: String,
+    pub leaf_index: u64,
+    pub leaf_hash: String,
 }
 
 /// The challenge hash over a chunk: `BLAKE3(0x00 ‖ u32le(path_len) ‖ path_utf8
@@ -72,14 +72,12 @@ pub fn answer_challenge_from_dir(
         let name = format!("f{:010}.bin", p.path_index);
         let mut f = std::fs::File::open(dir.join(&name))?;
         f.seek(SeekFrom::Start(p.byte_offset))?;
-        let mut buf = vec![0u8; p.length as usize];
+        let mut buf = vec![0u8; p.byte_length as usize];
         f.read_exact(&mut buf)?;
-        bytes_read += p.length;
+        bytes_read += p.byte_length;
         answers.push(ChallengeAnswer {
-            path_index: p.path_index,
-            byte_offset: p.byte_offset,
-            length: p.length,
-            hash: b64(&challenge_hash(&name, p.byte_offset, p.length, &buf)),
+            leaf_index: p.leaf_index,
+            leaf_hash: b64(&challenge_hash(&name, p.byte_offset, p.byte_length, &buf)),
         });
     }
     Ok((answers, bytes_read))
@@ -127,18 +125,18 @@ mod tests {
         std::fs::write(dir.join("f0000000001.bin"), b"the-quick-brown-fox").unwrap();
 
         let positions = vec![
-            ChallengePosition { path_index: 0, byte_offset: 4, length: 6 }, // "456789"
-            ChallengePosition { path_index: 1, byte_offset: 0, length: 9 }, // "the-quick"
+            ChallengePosition { leaf_index: 0, path_index: 0, byte_offset: 4, byte_length: 6 }, // "456789"
+            ChallengePosition { leaf_index: 5, path_index: 1, byte_offset: 0, byte_length: 9 }, // "the-quick"
         ];
         let (answers, bytes_read) = answer_challenge_from_dir(&dir, &positions).unwrap();
         assert_eq!(bytes_read, 15, "6 + 9 bytes read from disk");
         assert_eq!(answers.len(), 2);
         // hash matches an independent compute over the SAME (path, off, len, bytes).
-        assert_eq!(answers[0].hash, b64(&challenge_hash("f0000000000.bin", 4, 6, b"456789")));
-        assert_eq!(answers[1].hash, b64(&challenge_hash("f0000000001.bin", 0, 9, b"the-quick")));
-        // echoed position is intact.
-        assert_eq!(answers[0].path_index, 0);
-        assert_eq!(answers[1].byte_offset, 0);
+        assert_eq!(answers[0].leaf_hash, b64(&challenge_hash("f0000000000.bin", 4, 6, b"456789")));
+        assert_eq!(answers[1].leaf_hash, b64(&challenge_hash("f0000000001.bin", 0, 9, b"the-quick")));
+        // leaf_index echoed back per web's wire.
+        assert_eq!(answers[0].leaf_index, 0);
+        assert_eq!(answers[1].leaf_index, 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
