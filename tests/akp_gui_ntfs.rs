@@ -23,7 +23,16 @@ const CONTENT: &[u8] = b"keeper-payload-do-not-destroy";
 
 fn fresh_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let mut d = std::env::temp_dir(); // C:\...\Temp = real NTFS
+    // Base dir for keeper/reference corpora. Defaults to %TEMP% (portable).
+    // CAVEAT (finding #1, v0.2.36): the GUI action-layer system-path guard currently
+    // OVER-CLASSIFIES %TEMP% (C:\Users\<u>\AppData\Local\Temp) as system-critical, which
+    // MASKS the keeper-identity / reference guards (they refuse via system-path instead).
+    // The test still passes (refused + survives), but to ISOLATE which guard fires, point
+    // SDD_AKP_BASE at a non-system dir (e.g. C:\sdd-tests). Once finding #1 is resolved,
+    // %TEMP% isolates cleanly and the override is unnecessary.
+    let mut d = std::env::var_os("SDD_AKP_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     d.push(format!("sdd-akpgui-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&d).unwrap();
     d
@@ -88,7 +97,7 @@ where
             "[{variant} / {aname}] KEEPER DESTROYED via alias (target={})",
             alias.display()
         );
-        eprintln!("[{variant} / {aname}] GREEN: refused + keeper survives");
+        eprintln!("[{variant} / {aname}] GREEN: refused ({}) + keeper survives", r.err().map(|e| e.to_string()).unwrap_or_default());
     }
 }
 
@@ -123,4 +132,119 @@ fn akp_gui_junction() {
 fn akp_gui_case_variant() {
     // case-insensitive collision: flip the filename case in the same dir.
     assert_variant("AKP-6-case", |dir, _keeper| Some(dir.join("KEEPER.BIN")));
+}
+
+// ───────────────────────── v0.2.36 action-layer relocations ─────────────────────────
+// System-path guard + reference guard, driven through the SAME GUI dispatch seam.
+// These are the real-NTFS / real-system-path legs the headless Linux harness can't reach.
+
+const ALL5: &[(DedupeAction, &str)] = &[
+    (DedupeAction::Remove, "Remove"),
+    (DedupeAction::Recycle, "Recycle"),
+    (DedupeAction::SafeRename, "SafeRename"),
+    (DedupeAction::Hardlink, "Hardlink"),
+    (DedupeAction::Reflink, "Reflink"),
+];
+
+fn payload(p: &Path, bytes: &[u8]) {
+    if let Some(d) = p.parent() { let _ = fs::create_dir_all(d); }
+    fs::write(p, bytes).unwrap();
+}
+fn intact(p: &Path, bytes: &[u8]) -> bool {
+    p.exists() && fs::read(p).map(|b| b == bytes).unwrap_or(false)
+}
+
+/// Drive each action through the GUI seam targeting `target` (the PROTECTED file)
+/// with `keeper` the other group member + `references`. Assert: Err (refused),
+/// target SURVIVES (the data-loss gate), keeper survives.
+fn assert_protected_refused(label: &str, target: &Path, keeper: &Path, references: &[PathBuf], actions: &[(DedupeAction, &str)]) {
+    for (action, aname) in actions {
+        // re-seed both files fresh each action (some actions mutate on success)
+        payload(target, b"PROTECTED-do-not-touch");
+        payload(keeper, CONTENT);
+        let r = run_one_dedupe_action(*action, target, keeper, references);
+        assert!(r.is_err(), "[{label} / {aname}] gate DID NOT refuse protected target {} (err expected)", target.display());
+        assert!(intact(target, b"PROTECTED-do-not-touch"), "[{label} / {aname}] PROTECTED TARGET DESTROYED: {}", target.display());
+        assert!(intact(keeper, CONTENT), "[{label} / {aname}] keeper damaged: {}", keeper.display());
+        eprintln!("[{label} / {aname}] GREEN: refused ({}) + target+keeper survive", r.err().map(|e| e.to_string()).unwrap_or_default());
+    }
+}
+
+// ── CLASS 1: SYSTEM-PATH guard (the Linux-can't-test authoritative leg) ──
+// A target under a system-critical path must be refused on the GUI action path.
+#[test]
+fn akp_gui_system_path_windows() {
+    let dir = PathBuf::from(r"C:\Windows\sdd-akpgui-sys");
+    let _ = fs::create_dir_all(&dir);
+    let target = dir.join("target.bin");
+    let keeper = fresh_dir("sys-keeper").join("keeper.bin"); // keeper OUTSIDE the system path
+    assert_protected_refused("SYS-C:\\Windows", &target, &keeper, &[], ACTIONS);
+    let _ = fs::remove_dir_all(&dir);
+}
+#[test]
+fn akp_gui_system_path_progfiles() {
+    let dir = PathBuf::from(r"C:\Program Files\sdd-akpgui-sys");
+    let _ = fs::create_dir_all(&dir);
+    let target = dir.join("target.bin");
+    let keeper = fresh_dir("sys-keeper2").join("keeper.bin");
+    assert_protected_refused("SYS-C:\\Program Files", &target, &keeper, &[], ACTIONS);
+    let _ = fs::remove_dir_all(&dir);
+}
+#[test]
+fn akp_gui_system_path_junction_alias() {
+    // junction-alias TO a system path: target reached via a non-system junction that
+    // points into C:\Windows must STILL be refused (canonicalize, not raw starts_with).
+    let sysdir = PathBuf::from(r"C:\Windows\sdd-akpgui-sysj");
+    let _ = fs::create_dir_all(&sysdir);
+    payload(&sysdir.join("target.bin"), b"PROTECTED-do-not-touch");
+    let stage = fresh_dir("sysj");
+    let link = stage.join("jx");
+    let ok = Command::new("cmd").args(["/c","mklink","/J",&link.display().to_string(),&sysdir.display().to_string()]).status().map(|s| s.success()).unwrap_or(false);
+    if !ok { eprintln!("[SYS-junction] SKIP (mklink /J failed)"); let _ = fs::remove_dir_all(&sysdir); return; }
+    let target = link.join("target.bin"); // alias path: non-system string, system-classified real path
+    let keeper = stage.join("keeper.bin");
+    assert_protected_refused("SYS-junction-alias", &target, &keeper, &[], ACTIONS);
+    let _ = fs::remove_dir_all(&sysdir);
+}
+
+// ── CLASS 2: REFERENCE guard — target under a reference root refused on ALL 5 actions ──
+// ── A5 NEGATIVE CONTROL: the gate must NOT refuse-everything ──
+// A distinct, unprotected dedup loser (not a keeper-alias, not under a reference,
+// not under a system path) MUST be actioned OK. Without this, a "refuse everything"
+// bug would false-pass every refusal cell above (the F-SAFE-2 trap superdeduper hit).
+#[test]
+fn akp_gui_negative_control_unprotected_is_actioned() {
+    let dir = fresh_dir("negctl");
+    let keeper = dir.join("keeper.bin");
+    let target = dir.join("loser.bin");   // DISTINCT file (own inode), byte-identical dup
+    payload(&keeper, CONTENT);
+    payload(&target, CONTENT);
+    let r = run_one_dedupe_action(DedupeAction::Remove, &target, &keeper, &[]);
+    assert!(r.is_ok(), "[neg-control] unprotected dedup must SUCCEED (gate is refuse-everything?), got: {:?}", r.err().map(|e| e.to_string()));
+    assert!(!target.exists(), "[neg-control] unprotected target should be removed");
+    assert!(intact(&keeper, CONTENT), "[neg-control] keeper must survive");
+    eprintln!("[neg-control / Remove] GREEN: unprotected target ACTIONED (removed), keeper survives — gate is not refuse-everything");
+}
+
+#[test]
+fn akp_gui_reference_clean() {
+    let refroot = fresh_dir("ref").join("refroot");
+    fs::create_dir_all(&refroot).unwrap();
+    let target = refroot.join("refdup.bin");       // UNDER the reference root
+    let keeper = refroot.parent().unwrap().join("keeper.bin"); // outside the reference
+    let refs = vec![refroot.clone()];
+    assert_protected_refused("REF-clean", &target, &keeper, &refs, ALL5);
+}
+#[test]
+fn akp_gui_reference_verbatim_alias() {
+    // load-bearing: a \\?\ alias to a file under the reference root must STILL be refused
+    // (old GUI raw starts_with missed the verbatim prefix).
+    let refroot = fresh_dir("refa").join("refroot");
+    fs::create_dir_all(&refroot).unwrap();
+    let real = refroot.join("refdup.bin");
+    payload(&real, b"PROTECTED-do-not-touch");
+    let alias = fs::canonicalize(&real).unwrap(); // \\?\ form
+    let keeper = refroot.parent().unwrap().join("keeper.bin");
+    let refs = vec![refroot.clone()];
+    assert_protected_refused("REF-\\\\?\\-alias", &alias, &keeper, &refs, ALL5);
 }
