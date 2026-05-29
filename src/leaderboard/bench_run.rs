@@ -23,8 +23,23 @@ pub struct BenchOutcome {
     pub files_scanned: u64,
     pub dedupe_secs: f64,
     pub result_digest: String,
-    pub submit: submission::SubmitOutcome,
+    /// The server outcome when submitted; `None` for a run-locally-only run.
+    pub submit: Option<submission::SubmitOutcome>,
+    /// The assembled submission inputs, retained so a run-locally result can be
+    /// submitted later ([Submit now]) without re-running the whole bench.
+    pub inputs: submission::SubmissionInputs,
 }
+
+/// Cancelled before completion (checked between stages). The GUI surfaces this
+/// as a clean abort with no partial submit.
+#[derive(Debug)]
+pub struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "benchmark cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
 
 /// Run the full canonical-bench loop. `progress(msg)` is called at each stage
 /// (CLI prints to stderr; GUI pushes to its status channel). `workroot` picks
@@ -36,8 +51,17 @@ pub fn run(
     tier: &str,
     workroot: Option<&Path>,
     fresh: bool,
+    submit: bool,
+    cancel: &std::sync::atomic::AtomicBool,
     mut progress: impl FnMut(&str),
 ) -> anyhow::Result<BenchOutcome> {
+    use std::sync::atomic::Ordering;
+    let check_cancel = || -> anyhow::Result<()> {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!(Cancelled);
+        }
+        Ok(())
+    };
     anyhow::ensure!(state.registered, "install not registered; run `superdeduper register`");
     let base = state.server_url.trim_end_matches('/').to_string();
 
@@ -77,6 +101,7 @@ pub fn run(
         .collect();
     let corpus_dir = workroot.join(format!("sd-bench-corpus-{slug}"));
     let complete = corpus_dir.join(".sd-bench-complete");
+    check_cancel()?;
     if fresh || !complete.exists() {
         let _ = std::fs::remove_dir_all(&corpus_dir);
         std::fs::create_dir_all(&corpus_dir)?;
@@ -91,6 +116,7 @@ pub fn run(
     }
 
     // 3. real full-content dedupe (reads EVERY byte: ranked wall + I/O signal)
+    check_cancel()?;
     progress("deduping (full-content)");
     let t = std::time::Instant::now();
     let (dupsets, bytes_scanned, files_scanned) = full_content_dedup(&corpus_dir)?;
@@ -141,8 +167,15 @@ pub fn run(
             client_found_dupsets: Some(dupsets.clone()),
         },
     };
-    progress("submitting");
-    let submit = submission::submit(state, &inputs);
+    // 6. submit (only on Run & submit; Run-locally returns inputs for later).
+    let submit_outcome = if submit {
+        check_cancel()?;
+        progress("submitting");
+        Some(submission::submit(state, &inputs))
+    } else {
+        progress("done (local only -- not submitted)");
+        None
+    };
 
     // corpus_dir is the persistent cache -- intentionally NOT removed, so the
     // next run reuses it (pass `fresh` to force a re-download).
@@ -154,7 +187,8 @@ pub fn run(
         files_scanned,
         dedupe_secs,
         result_digest,
-        submit,
+        submit: submit_outcome,
+        inputs,
     })
 }
 

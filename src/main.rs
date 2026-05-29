@@ -560,19 +560,25 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     let state = install::load_for(channel)
         .context("loading install state")?
         .ok_or_else(|| anyhow::anyhow!("not registered on {channel:?} -- run `superdeduper register` first"))?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
     let outcome = bench_run::run(
         &state,
         &args.corpus_version,
         &args.tier,
         args.workdir.as_deref(),
         args.fresh,
+        true, // CLI bench-me always submits
+        &cancel,
         |msg| eprintln!("bench: {msg}"),
     )?;
     eprintln!(
         "bench: result_digest={} ({} dup groups, {} bytes, {:.2}s)",
         outcome.result_digest, outcome.dup_groups, outcome.bytes_scanned, outcome.dedupe_secs
     );
-    println!("bench-me result: {:?}", outcome.submit);
+    match &outcome.submit {
+        Some(o) => println!("bench-me result: {o:?}"),
+        None => println!("bench-me: ran locally, not submitted"),
+    }
     Ok(())
 }
 
