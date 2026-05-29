@@ -255,29 +255,47 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
     // SAFETY: cpath is a valid NUL-terminated C string for the duration.
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
-    // O_DIRECT unsupported on this fs, or file not sector-aligned -> buffered.
-    if fd < 0 || size % ALIGN != 0 {
-        if fd >= 0 {
-            // SAFETY: fd is a valid open descriptor we are closing exactly once.
-            unsafe { libc::close(fd) };
-        }
+    if fd < 0 {
+        // O_DIRECT unsupported on this fs (tmpfs/overlay/drvfs) -> buffered.
         return Ok((std::fs::read(path)?, false));
     }
+    // O_DIRECT needs sector-aligned offset + count, so cold-read the
+    // sector-aligned BULK and read the sub-sector TAIL via a separate
+    // buffered handle (the tail is < 1 sector -> negligible cache warming).
+    // This makes cold-enforce work for ARBITRARY file sizes, not just
+    // 4KiB-multiples (the realistic corpus has varied sizes — benchmarker's
+    // r4 blocker). Sub-sector files (size < ALIGN) have an empty bulk -> the
+    // whole read is the buffered tail -> NOT cold (honest: cold=false).
+    let bulk = size - (size % ALIGN);
     // SAFETY: fd is a freshly-opened, owned descriptor; File takes ownership.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    // Sector-aligned CHUNK buffer (Vec is only word-aligned; slice into the
-    // aligned region). O_DIRECT requires buffer + count sector-aligned.
     let mut storage = vec![0u8; CHUNK + ALIGN];
     let pad = (ALIGN - (storage.as_ptr() as usize % ALIGN)) % ALIGN;
     let mut out = Vec::with_capacity(size);
-    loop {
-        let n = file.read(&mut storage[pad..pad + CHUNK])?;
+    let mut remaining = bulk;
+    while remaining > 0 {
+        // `want` stays sector-aligned: CHUNK is a sector multiple and
+        // `remaining` starts sector-aligned (== bulk) and only decreases by
+        // O_DIRECT reads (which return sector multiples below EOF).
+        let want = remaining.min(CHUNK);
+        let n = file.read(&mut storage[pad..pad + want])?;
         if n == 0 {
             break;
         }
         out.extend_from_slice(&storage[pad..pad + n]);
+        remaining -= n;
     }
-    Ok((out, true))
+    drop(file); // close the O_DIRECT fd before the buffered tail read
+    if out.len() < size {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut bf = std::fs::File::open(path)?;
+        bf.seek(SeekFrom::Start(out.len() as u64))?;
+        let mut tail = vec![0u8; size - out.len()];
+        bf.read_exact(&mut tail)?;
+        out.extend_from_slice(&tail);
+    }
+    // Cold-enforced iff we cold-read at least one full sector of bulk.
+    Ok((out, bulk > 0))
 }
 
 #[cfg(target_os = "macos")]
@@ -307,10 +325,13 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     const SECTOR: usize = 4096;
     const CHUNK: usize = 1 << 20;
     let size = std::fs::metadata(path)?.len() as usize;
-    // NO_BUFFERING needs the file sector-aligned; corpus files are. Else buffered.
-    if size % SECTOR != 0 {
-        return Ok((std::fs::read(path)?, false));
-    }
+    // NO_BUFFERING needs sector-aligned offset + count, so cold-read the
+    // sector-aligned BULK and read the sub-sector TAIL via a buffered handle
+    // (< 1 sector -> negligible warming). Works for ARBITRARY file sizes, not
+    // just 4KiB-multiples (the realistic corpus has varied sizes —
+    // benchmarker's r4 blocker). Sub-sector files (size < SECTOR) -> empty
+    // bulk -> whole read is the buffered tail -> NOT cold (honest cold=false).
+    let bulk = size - (size % SECTOR);
     let mut storage = vec![0u8; CHUNK + SECTOR];
     let pad = (SECTOR - (storage.as_ptr() as usize % SECTOR)) % SECTOR;
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -338,15 +359,20 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
             }
         }
     }
-    let _guard = Closer(handle);
+    let guard = Closer(handle);
     let mut out = Vec::with_capacity(size);
-    loop {
+    let mut remaining = bulk;
+    while remaining > 0 {
+        // `want` stays sector-aligned: CHUNK is a sector multiple and
+        // `remaining` (== bulk initially) decreases by sector-multiple reads
+        // (all below EOF since bulk <= size).
+        let want = remaining.min(CHUNK);
         let mut read_bytes: u32 = 0;
-        // SAFETY: buf is sector-aligned, len is a sector multiple, handle open.
+        // SAFETY: buf is sector-aligned, `want` is a sector multiple, handle open.
         unsafe {
             if ReadFile(
                 handle,
-                Some(&mut storage[pad..pad + CHUNK]),
+                Some(&mut storage[pad..pad + want]),
                 Some(&mut read_bytes as *mut u32),
                 None,
             )
@@ -359,8 +385,19 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
             break;
         }
         out.extend_from_slice(&storage[pad..pad + read_bytes as usize]);
+        remaining -= read_bytes as usize;
     }
-    Ok((out, true))
+    drop(guard); // close the NO_BUFFERING handle before the buffered tail read
+    if out.len() < size {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut bf = std::fs::File::open(path)?;
+        bf.seek(SeekFrom::Start(out.len() as u64))?;
+        let mut tail = vec![0u8; size - out.len()];
+        bf.read_exact(&mut tail)?;
+        out.extend_from_slice(&tail);
+    }
+    // Cold-enforced iff we cold-read at least one full sector of bulk.
+    Ok((out, bulk > 0))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -466,13 +503,39 @@ mod tests {
         // path actually engages, not just the tmpfs fallback.
         let dir = std::path::Path::new("target").join(format!("sd-uncached-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("f0000000001.bin");
-        // 40 KiB, a clean 4KiB multiple so O_DIRECT/NO_BUFFERING can read it.
-        let content: Vec<u8> = (0..40960u32).map(|i| (i % 251) as u8).collect();
-        std::fs::write(&p, &content).unwrap();
-        let (got, cold) = read_uncached(&p).unwrap();
-        assert_eq!(got, content, "uncached read must return byte-identical content");
-        eprintln!("read_uncached cold-enforced on this fs = {cold}");
+        let write = |name: &str, len: usize| -> std::path::PathBuf {
+            let p = dir.join(name);
+            let content: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&p, &content).unwrap();
+            p
+        };
+        let on_ext4 = {
+            // Detect whether the cache-bypass path actually engages here.
+            let probe = write("probe.bin", 40960);
+            let (_g, c) = read_uncached(&probe).unwrap();
+            c
+        };
+        // Byte-correctness across sizes: aligned (40 KiB), NON-aligned (5000 -
+        // benchmarker's r4 blocker: must NOT fall back to warm), and a clean
+        // 1 MiB. cold must hold for every file >= 1 sector.
+        for (name, len) in [("aligned.bin", 40960usize), ("nonaligned.bin", 5000), ("mib.bin", 1 << 20)] {
+            let p = write(name, len);
+            let want: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let (got, cold) = read_uncached(&p).unwrap();
+            assert_eq!(got, want, "{name}: uncached read must be byte-identical");
+            if on_ext4 {
+                // bulk >= 1 sector -> cold-enforced true even for the 5000-byte
+                // file (4096 cold bulk + 904 buffered tail). This is the fix:
+                // non-aligned sizes no longer fall back wholesale to warm.
+                assert!(cold, "{name}: must be cold-enforced (>= 1 sector) on a bypass-capable fs");
+            }
+        }
+        // Sub-sector file: can't be cold-read by O_DIRECT/NO_BUFFERING -> honest cold=false.
+        let tiny = write("tiny.bin", 100);
+        let (got, cold) = read_uncached(&tiny).unwrap();
+        assert_eq!(got.len(), 100, "tiny: byte-correct");
+        assert!(!cold, "tiny (< 1 sector): honestly NOT cold-enforced");
+        eprintln!("read_uncached cache-bypass engaged on this fs = {on_ext4}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
