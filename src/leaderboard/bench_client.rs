@@ -221,13 +221,17 @@ mod tests {
             *b = i as u8;
         }
         let (kc, _) = bench::corpus_keys(&seed);
-        let mut data = vec![0u8; 16];
-        bench::content_bytes_at(&kc, 0, 0, &mut data);
-        assert_eq!(
-            b64(&challenge_hash("f0000000000.bin", 0, 16, &data)),
-            "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=",
-            "challenge_hash (tag 0x02) must match research golden byte-for-byte"
-        );
+        // All 4 of web's regression vectors (their verifier byte-matched these
+        // against research's lock). content_id == path_index in the fixture.
+        let chash = |cid: u64, path: &str, off: u64, len: u64| -> String {
+            let mut data = vec![0u8; len as usize];
+            bench::content_bytes_at(&kc, cid, off, &mut data);
+            b64(&challenge_hash(path, off, len, &data))
+        };
+        assert_eq!(chash(0, "f0000000000.bin", 0, 16), "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=", "f0/0/16");
+        assert_eq!(chash(5, "f0000000005.bin", 0, 1000), "8cJYmV2EiWmEfhmfyGnoVn8NsGK7fK+ykxFnjEdJXvk=", "f5/0/1000");
+        assert_eq!(chash(7, "f0000000007.bin", 0, 4096), "L6lAnTK8/mvlMtECBESmZcIiylEa/n1g7sAuutP7/RQ=", "f7/0/4096");
+        assert_eq!(chash(7, "f0000000007.bin", 1_048_576, 64), "c+MrndAf17w6LwA6trqBC/3nZKdK6MYA5m4kGMqj4cA=", "f7 tail/1MiB/64");
     }
 
     #[test]
