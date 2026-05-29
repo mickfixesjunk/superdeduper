@@ -500,15 +500,19 @@ fn full_content_dedup(
     let any_candidate = !candidates.is_empty();
     total_out.store(candidates.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
-    // Dedicated, bounded pool sized to available parallelism — concurrent
-    // O_DIRECT issue lets the device absorb the IOPS instead of serializing.
-    // Each worker reads cold-bypassing + blake3-hashes; only the 49-byte
-    // (hash,pi,len,cold) tuple survives the closure, so peak memory stays at
-    // ~io_threads files, not the whole candidate set.
-    let io_threads = std::thread::available_parallelism()
+    // Dedicated, bounded pool that MIRRORS the production hasher's IO policy:
+    // config.rs defaults io_threads = cpu_threads * 3 (sd deliberately
+    // OVERSUBSCRIBES IO). For the synchronous O_DIRECT tiny-file workload each
+    // worker blocks on the device per read, so >cores threads keeps the device
+    // queue deep — 1x-cores undersubscribed it and left throughput on the table
+    // (codex-review note on 07b6907). Matching cpu*3 = fidelity with the shipping
+    // engine + the band measures what sd actually does. Each worker reads
+    // cold-bypassing + blake3-hashes; only the 49-byte (hash,pi,len,cold) tuple
+    // survives the closure, so peak memory stays at ~io_threads files.
+    let cpu_threads = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .max(1);
+        .unwrap_or(4);
+    let io_threads = cpu_threads.saturating_mul(3).max(1);
     let io_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(io_threads)
         .thread_name(|i| format!("superdeduper-bench-io-{i}"))
