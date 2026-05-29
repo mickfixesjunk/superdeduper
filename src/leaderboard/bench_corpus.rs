@@ -142,7 +142,7 @@ impl FilePlan {
 }
 
 /// Per-class file counts for the manifest's `size_class_counts`.
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SizeClassCounts {
     pub small: u64,
     pub medium: u64,
@@ -328,6 +328,48 @@ pub fn build_manifest(spec: &TierSpec, seed: &[u8; 32], plan: &CorpusPlan, k_con
     }
 }
 
+/// The PUBLIC manifest the server serves to a client (work-proof spec): it
+/// deliberately carries NO `merkle_root` and NO `groundtruth_dupsets`. The
+/// server keeps those private and regenerates them to validate a submission;
+/// the client must hash ALL leaves itself to compute the root (the proof of
+/// work) and cannot copy a served answer. `manifest_hash = BLAKE3(served
+/// bytes)` version-binds the BC to exactly this served manifest.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServedManifest {
+    pub corpus_version: String,
+    pub generator_id: String,
+    pub corpus_seed: String,
+    pub chunk_size: u64,
+    pub file_count: u64,
+    pub leaf_count: u64,
+    pub total_bytes: u64,
+    pub size_class_counts: SizeClassCounts,
+}
+
+/// Build the public served manifest from a plan — pure, NO leaf materialization
+/// (it carries no root), so it is cheap even for the full tier.
+pub fn served_manifest(spec: &TierSpec, seed: &[u8; 32], plan: &CorpusPlan) -> ServedManifest {
+    ServedManifest {
+        corpus_version: spec.corpus_version.to_string(),
+        generator_id: GENERATOR_ID.to_string(),
+        corpus_seed: hex_lower(seed),
+        chunk_size: CHUNK_SIZE,
+        file_count: plan.file_count,
+        leaf_count: plan.leaf_count,
+        total_bytes: plan.total_bytes,
+        size_class_counts: plan.size_class_counts,
+    }
+}
+
+/// `manifest_hash = BLAKE3(served manifest bytes)` — the 32-byte digest fed
+/// into the BC. The client hashes exactly the bytes the server sent; this
+/// helper is the offline/golden path over the canonical-JSON serialization.
+/// (The authoritative served bytes are the server's; byte-exactness is pinned
+/// by research's BC golden vector.)
+pub fn manifest_hash(served_bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(served_bytes).as_bytes()
+}
+
 /// Materialize the corpus to `dir` as `f{path_index:010}.bin` files (flat
 /// layout). Returns the total bytes written. The `--bench-me` dedupe pass then
 /// scans `dir`. Content is streamed a chunk at a time (bounded memory).
@@ -394,34 +436,39 @@ pub struct SampleProof {
     pub audit_path: Vec<String>,
 }
 
-/// The bench proof a `--bench-me` run submits: the committed root plus the
-/// challenged sample set. The proof hash is BLAKE3 throughout (cryptographic);
-/// river5 is NEVER used here (river5 stays the internal dedupe content hash).
+/// The bench proof a `--bench-me` run submits: the client-computed root (the
+/// work-proof — the canonical root is NEVER served, so a real run must hash
+/// ALL leaves to produce it) plus the BC-challenged sample set. The proof hash
+/// is BLAKE3 throughout (cryptographic); river5 is NEVER used here (river5
+/// stays the internal dedupe content hash). Field shape adopted verbatim by
+/// web's #160 verifier (samples / leaf_index / path_index / audit_path).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchProof {
-    pub bench_challenge_id: String,
+    /// The run this proof is bound to (the BC's bench_run_id).
+    pub bench_run_id: String,
     pub corpus_version: String,
     pub leaf_count: u64,
     pub merkle_root: String,
     pub samples: Vec<SampleProof>,
 }
 
-/// Build the bench proof for a challenge: materialize the leaves, derive the
-/// challenged positions, and emit each sample with its audit path. SELF-VERIFY:
-/// every sample's audit path is checked to reconstruct the committed root
-/// before it is emitted (a proof that fails its own verifier is never sent).
+/// Build the bench proof for a run: materialize the leaves, derive the
+/// challenged positions from the version-binding context `bc` (so the proof is
+/// bound to this exact corpus build + run and cannot be replayed), and emit
+/// each sample with its audit path. SELF-VERIFY: every sample's audit path is
+/// checked to reconstruct the committed root before it is emitted (a proof
+/// that fails its own verifier is never sent).
 pub fn build_bench_proof(
-    spec: &TierSpec,
     plan: &CorpusPlan,
     k_content: &[u8; 32],
-    bench_challenge_id: &str,
+    bc: &bench::BenchContext,
     sample_n: usize,
 ) -> BenchProof {
     let leaves = compute_leaves(k_content, plan);
     assert_eq!(leaves.len() as u64, plan.leaf_count, "self-verify: leaf count");
     let locs = leaf_locations(plan);
     let root = bench::merkle_root(&leaves).expect("non-empty corpus");
-    let positions = bench::challenge_positions(bench_challenge_id, plan.leaf_count, sample_n);
+    let positions = bench::challenge_positions_from_bc(&bc.encode(), plan.leaf_count, sample_n);
 
     let mut samples = Vec::with_capacity(positions.len());
     for pos in positions {
@@ -443,8 +490,8 @@ pub fn build_bench_proof(
         });
     }
     BenchProof {
-        bench_challenge_id: bench_challenge_id.to_string(),
-        corpus_version: spec.corpus_version.to_string(),
+        bench_run_id: bc.bench_run_id.to_string(),
+        corpus_version: bc.corpus_version.to_string(),
         leaf_count: plan.leaf_count,
         merkle_root: bench::root_base64(&root),
         samples,
@@ -623,6 +670,31 @@ mod tests {
     }
 
     #[test]
+    fn served_manifest_excludes_root_and_groundtruth() {
+        let seed = [0x33u8; 32];
+        let spec = tiny_tier();
+        let plan = plan_corpus(&spec);
+        let served = served_manifest(&spec, &seed, &plan);
+        // carries the public aggregates...
+        assert_eq!(served.leaf_count, plan.leaf_count);
+        assert_eq!(served.file_count, plan.file_count);
+        assert_eq!(served.total_bytes, plan.total_bytes);
+        assert_eq!(served.chunk_size, CHUNK_SIZE);
+        // ...but the serialized form leaks NEITHER the root NOR the groundtruth
+        // (the work-proof invariant: client must compute the root itself).
+        let json = serde_json::to_string(&served).unwrap();
+        assert!(!json.contains("merkle_root"), "served manifest must not carry the root");
+        assert!(!json.contains("groundtruth"), "served manifest must not carry groundtruth");
+        // manifest_hash is BLAKE3 of the served bytes, deterministic.
+        let h1 = manifest_hash(json.as_bytes());
+        let h2 = manifest_hash(serde_json::to_string(&served_manifest(&spec, &seed, &plan)).unwrap().as_bytes());
+        assert_eq!(h1, h2, "manifest_hash deterministic over served bytes");
+        // a different seed -> different served manifest -> different hash.
+        let other = served_manifest(&spec, &[0x44u8; 32], &plan);
+        assert_ne!(h1, manifest_hash(serde_json::to_string(&other).unwrap().as_bytes()));
+    }
+
+    #[test]
     fn leaf_locations_parallel_compute_leaves() {
         let plan = plan_corpus(&tiny_tier());
         let locs = leaf_locations(&plan);
@@ -648,7 +720,20 @@ mod tests {
         let (kc, _) = bench::corpus_keys(&seed);
         let spec = tiny_tier();
         let plan = plan_corpus(&spec);
-        let proof = build_bench_proof(&spec, &plan, &kc, "bench-chal-tiny", 32);
+        // BC binds the proof to this corpus build + run.
+        let mhash = manifest_hash(&serde_json::to_vec(&served_manifest(&spec, &seed, &plan)).unwrap());
+        let bc = bench::BenchContext {
+            protocol_version: "tcorpus-1",
+            corpus_version: spec.corpus_version,
+            manifest_hash: mhash,
+            install_id: "install-test",
+            bench_run_id: "run-tiny-1",
+            tier: "tiny",
+            leaf_count: plan.leaf_count,
+            chunk_size: CHUNK_SIZE as u32,
+        };
+        let proof = build_bench_proof(&plan, &kc, &bc, 32);
+        assert_eq!(proof.bench_run_id, "run-tiny-1");
 
         // sample_n (32) capped at leaf_count (13); positions distinct & in range.
         assert_eq!(proof.samples.len(), 13);

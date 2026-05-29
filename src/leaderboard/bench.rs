@@ -185,18 +185,18 @@ pub fn root_base64(root: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(root)
 }
 
-/// Single-round challenge positions (FROZEN): for k = 0,1,2,…
-/// `h_k = BLAKE3(ascii(bench_challenge_id) ‖ u32le(k))`; `pos =
-/// u64le(h_k[0..8]) mod leaf_count`; collect distinct positions until `n`
-/// (32 for v1) or until every leaf is covered.
-pub fn challenge_positions(bench_challenge_id: &str, leaf_count: u64, n: usize) -> Vec<u64> {
+/// Core single-round position derivation: for k = 0,1,2,… `h_k =
+/// BLAKE3(domain ‖ seed ‖ u32le(k))`; `pos = u64le(h_k[0..8]) mod leaf_count`;
+/// collect distinct positions until `n` (32 for v1) or every leaf is covered.
+fn derive_positions(domain: &[u8], seed: &[u8], leaf_count: u64, n: usize) -> Vec<u64> {
     let target = n.min(leaf_count as usize);
     let mut out = Vec::with_capacity(target);
     let mut seen = std::collections::HashSet::with_capacity(target);
     let mut k: u32 = 0;
     while out.len() < target {
         let mut h = blake3::Hasher::new();
-        h.update(bench_challenge_id.as_bytes());
+        h.update(domain);
+        h.update(seed);
         h.update(&k.to_le_bytes());
         let d = h.finalize();
         let pos = u64::from_le_bytes(d.as_bytes()[0..8].try_into().unwrap()) % leaf_count;
@@ -206,6 +206,65 @@ pub fn challenge_positions(bench_challenge_id: &str, leaf_count: u64, n: usize) 
         k = k.wrapping_add(1);
     }
     out
+}
+
+/// Legacy bare-challenge-id positions (no domain prefix). Superseded for the
+/// hardened v1 protocol by [`challenge_positions_from_bc`] — kept as the
+/// generic helper its test covers. Equivalent to an empty domain.
+pub fn challenge_positions(bench_challenge_id: &str, leaf_count: u64, n: usize) -> Vec<u64> {
+    derive_positions(b"", bench_challenge_id.as_bytes(), leaf_count, n)
+}
+
+/// FROZEN challenge domain-separation tag for the hardened v1 protocol.
+pub const CHALLENGE_DOMAIN_V1: &[u8] = b"tcorpus-challenge-v1";
+
+/// Hardened v1 challenge positions (work-proof spec, design 2026-05-29):
+/// `pos_k = BLAKE3(CHALLENGE_DOMAIN_V1 ‖ BC ‖ u32le(k))[0..8] mod leaf_count`,
+/// where `BC` is the version-binding context ([`BenchContext::encode`]). The
+/// positions are bound to the exact corpus build + run, so a proof cannot be
+/// replayed against a different manifest / tier / bench_run_id.
+pub fn challenge_positions_from_bc(bc: &[u8], leaf_count: u64, n: usize) -> Vec<u64> {
+    derive_positions(CHALLENGE_DOMAIN_V1, bc, leaf_count, n)
+}
+
+/// Length-prefix `b` with its `u32le` byte length, appending to `out`.
+fn push_lp(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+/// The bench-challenge binding context (BC) — version-binds a submission to a
+/// specific corpus build + run so a proof for one corpus/run cannot be replayed
+/// against another. Encoding (work-proof spec; byte-exactness pending
+/// research's BC golden vector cross-lock): the six leading fields are each
+/// `u32le`-length-prefixed in order, then `u64le(leaf_count)`, then
+/// `u32le(chunk_size)`. `manifest_hash = BLAKE3(served manifest)` where the
+/// served manifest carries NO root and NO groundtruth.
+pub struct BenchContext<'a> {
+    pub protocol_version: &'a str,
+    pub corpus_version: &'a str,
+    pub manifest_hash: [u8; 32],
+    pub install_id: &'a str,
+    pub bench_run_id: &'a str,
+    pub tier: &'a str,
+    pub leaf_count: u64,
+    pub chunk_size: u32,
+}
+
+impl BenchContext<'_> {
+    /// Serialize the BC to its canonical wire bytes (see type docs).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_lp(&mut out, self.protocol_version.as_bytes());
+        push_lp(&mut out, self.corpus_version.as_bytes());
+        push_lp(&mut out, &self.manifest_hash);
+        push_lp(&mut out, self.install_id.as_bytes());
+        push_lp(&mut out, self.bench_run_id.as_bytes());
+        push_lp(&mut out, self.tier.as_bytes());
+        out.extend_from_slice(&self.leaf_count.to_le_bytes());
+        out.extend_from_slice(&self.chunk_size.to_le_bytes());
+        out
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +530,68 @@ mod tests {
         for m in 0..3 {
             assert_eq!(root_from_path(l[m], &audit_path(m, &l), m, 3), merkle_root(&l).unwrap());
         }
+    }
+
+    fn sample_bc() -> BenchContext<'static> {
+        BenchContext {
+            protocol_version: "tcorpus-1",
+            corpus_version: "corpus-v1-quick",
+            manifest_hash: [0xABu8; 32],
+            install_id: "install-abc",
+            bench_run_id: "run-123",
+            tier: "quick",
+            leaf_count: 121_956,
+            chunk_size: 1 << 20,
+        }
+    }
+
+    #[test]
+    fn bc_encoding_is_length_prefixed_and_field_sensitive() {
+        let bc = sample_bc();
+        let enc = bc.encode();
+        // structural: 6 length-prefixed fields + u64 leaf_count + u32 chunk_size.
+        // lengths: 9 + 15 + 32 + 11 + 7 + 5 = 79 bytes of field data; 6*4 prefix
+        // bytes = 24; + 8 (leaf_count) + 4 (chunk_size) = 79+24+12 = 115.
+        assert_eq!(enc.len(), 79 + 24 + 12);
+        // first field's u32le length prefix == len("tcorpus-1") == 9.
+        assert_eq!(u32::from_le_bytes(enc[0..4].try_into().unwrap()), 9);
+        // every field independently changes the encoding (no field collision).
+        let mut b2 = sample_bc();
+        b2.bench_run_id = "run-124";
+        assert_ne!(bc.encode(), b2.encode(), "bench_run_id binds");
+        let mut b3 = sample_bc();
+        b3.manifest_hash = [0xACu8; 32];
+        assert_ne!(bc.encode(), b3.encode(), "manifest_hash binds");
+        let mut b4 = sample_bc();
+        b4.tier = "full";
+        assert_ne!(bc.encode(), b4.encode(), "tier binds");
+        let mut b5 = sample_bc();
+        b5.leaf_count += 1;
+        assert_ne!(bc.encode(), b5.encode(), "leaf_count binds");
+        // deterministic.
+        assert_eq!(bc.encode(), sample_bc().encode());
+    }
+
+    #[test]
+    fn challenge_positions_from_bc_bind_to_the_context() {
+        let bc = sample_bc();
+        let enc = bc.encode();
+        let a = challenge_positions_from_bc(&enc, bc.leaf_count, 32);
+        assert_eq!(a.len(), 32, "32 positions");
+        assert!(a.iter().all(|&p| p < bc.leaf_count), "in range");
+        let set: std::collections::HashSet<_> = a.iter().collect();
+        assert_eq!(set.len(), a.len(), "distinct");
+        assert_eq!(a, challenge_positions_from_bc(&bc.encode(), bc.leaf_count, 32), "deterministic");
+        // a different run_id (same corpus) yields different positions — replay
+        // of one run's proof against another fails the position check.
+        let mut other = sample_bc();
+        other.bench_run_id = "run-999";
+        assert_ne!(a, challenge_positions_from_bc(&other.encode(), bc.leaf_count, 32));
+        // domain separation: BC-derived != legacy bare-id over the same bytes.
+        assert_ne!(
+            a,
+            challenge_positions(std::str::from_utf8(&enc).unwrap_or(""), bc.leaf_count, 32)
+        );
     }
 
     #[test]
