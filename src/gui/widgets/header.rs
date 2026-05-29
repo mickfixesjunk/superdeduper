@@ -10,6 +10,8 @@ use crate::pipeline::hash::HashAlgo;
 pub enum HeaderAction {
     None,
     OpenSettings,
+    /// T-BENCH-ME: open the "Benchmark your machine" consent modal.
+    OpenBenchmark,
 }
 
 /// Output of one header render: action requested + (optionally) the
@@ -65,6 +67,31 @@ pub fn show(ui: &mut Ui, state: &UiState, hash_algo: HashAlgo, is_scanning: bool
         };
         if settings_resp.clicked() {
             action = HeaderAction::OpenSettings;
+        }
+
+        // T-BENCH-ME: "Benchmark" button beside Settings. Opens the
+        // consent/explainer modal (default opt-out — nothing downloads,
+        // runs, or submits until the user clicks an action inside it).
+        // Telemetry-gated; only present in builds that can submit.
+        #[cfg(feature = "telemetry")]
+        {
+            ui.add_space(8.0);
+            let bench_btn = egui::Button::new(RichText::new("🏁  Benchmark").color(theme::TEXT_HI))
+                .fill(theme::PANEL_DEEP)
+                .min_size(vec2(118.0, 28.0));
+            let bench_resp = ui.add_enabled(!is_scanning, bench_btn);
+            let bench_resp = if is_scanning {
+                bench_resp.on_hover_text("Finish the running scan before benchmarking.")
+            } else {
+                bench_resp.on_hover_text(
+                    "Time your machine on a standard synthetic corpus and \
+                     compare on the public Dedupe Hall of Fame. Touches no \
+                     personal files.",
+                )
+            };
+            if bench_resp.clicked() {
+                action = HeaderAction::OpenBenchmark;
+            }
         }
 
         ui.separator();

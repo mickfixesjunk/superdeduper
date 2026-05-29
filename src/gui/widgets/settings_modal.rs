@@ -2350,7 +2350,7 @@ mod truncate_tests {
 /// string. Used by the Preview-sample-submission button to render
 /// in a modal (and as a debug echo to stderr for headless cases).
 #[cfg(feature = "telemetry")]
-fn build_sample_payload_json() -> String {
+pub fn build_sample_payload_json() -> String {
     use crate::leaderboard::{hardware, submission};
     use submission::{FEATURE_BIT_CACHE, FEATURE_BIT_FORMAT_AWARE};
     let inputs = submission::SubmissionInputs {

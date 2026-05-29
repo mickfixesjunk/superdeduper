@@ -79,6 +79,10 @@ pub struct SuperdeduperApp {
     /// Sticky tab selection for the Settings modal. Persists across
     /// opens within a session; resets when the app restarts.
     settings_modal_state: crate::gui::widgets::settings_modal::SettingsModalState,
+    /// T-BENCH-ME "Benchmark" button + consent/progress/result modal.
+    /// Default opt-out: nothing runs until the user clicks an action.
+    #[cfg(feature = "telemetry")]
+    bench: crate::gui::widgets::bench_modal::BenchUiState,
     persisted: PersistedAppState,
     groups_state: groups_table::GroupsTableState,
     /// Cancel-token; the engine checks it cooperatively to honour
@@ -315,6 +319,8 @@ impl SuperdeduperApp {
             is_scanning: false,
             settings_open: false,
             settings_modal_state: Default::default(),
+            #[cfg(feature = "telemetry")]
+            bench: Default::default(),
             persisted,
             groups_state: groups_table::GroupsTableState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -3407,6 +3413,20 @@ impl eframe::App for SuperdeduperApp {
             }
         }
 
+        // T-BENCH-ME "Benchmark" modal (consent -> progress -> result).
+        // Default opt-out; nothing runs until the user clicks inside it.
+        // OpenSharePreview routes to Settings -> Privacy (the canonical
+        // full-payload preview surface) rather than duplicating it.
+        #[cfg(feature = "telemetry")]
+        {
+            use crate::gui::widgets::bench_modal::{self, BenchModalAction};
+            if let BenchModalAction::OpenSharePreview = bench_modal::show(&mut self.bench, ctx) {
+                self.settings_open = true;
+                self.settings_modal_state.tab =
+                    crate::gui::widgets::settings_modal::SettingsTab::Leaderboard;
+            }
+        }
+
         // Channel banner — always-on 32px coloured strip when the
         // active channel is not prod (per dev-channel-spec.md §3.4).
         // Rendered as the FIRST top panel so it sits at the very top
@@ -3570,6 +3590,10 @@ impl eframe::App for SuperdeduperApp {
                 );
                 if out.action == header::HeaderAction::OpenSettings {
                     want_settings = true;
+                }
+                #[cfg(feature = "telemetry")]
+                if out.action == header::HeaderAction::OpenBenchmark {
+                    self.bench.open();
                 }
                 stats_rect = out.stats_rect;
             });

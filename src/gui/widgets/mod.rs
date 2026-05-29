@@ -4,6 +4,8 @@
 pub mod action_progress;
 pub mod alpha_warning;
 pub mod archive_summary_modal;
+#[cfg(all(feature = "gui", feature = "telemetry"))]
+pub mod bench_modal;
 #[cfg(feature = "telemetry")]
 pub mod badge_multiplier_detail;
 #[cfg(feature = "telemetry")]
