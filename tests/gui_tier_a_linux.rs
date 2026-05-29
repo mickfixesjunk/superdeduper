@@ -746,3 +746,98 @@ fn tier_a_action_patches_scan_history_actually_reclaimed_bytes() {
     std::fs::remove_dir_all(&corpus).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// G-SYSTEM-PATH-REFUSED (§4 / v0.2.36 gate-2) — verifies relocation #1 +
+/// alias-hardening (372f42e + 1dd90ea): the GUI refuses a destructive action on
+/// a member that resolves (via symlink — the alias-hardening) to a SYSTEM PATH.
+/// guard_system_path checks is_system_path(raw) || is_system_path(canonical_key)
+/// at all 5 action entries, so a corpus symlink whose canonical target is under
+/// /etc//usr//bin//var/lib is refused. NOT telemetry-gated (core guard) — runs
+/// under both profiles. Real-state: the system-aliased member is PRESERVED and
+/// EXACTLY ONE plain copy survives (the keeper) ⟺ the guard refused the alias as
+/// a LOSER (anti-vacuous: if the alias were merely the keeper, both plains would
+/// be actioned -> 0 plains survive -> this FAILS, catching the vacuous case).
+#[test]
+fn tier_a_g_system_path_alias_refused_preserves_target() {
+    let _env = env_lock();
+    let home = isolated_env("syspath");
+
+    // A readable system file >=4 KiB (clears the GUI min_size) under a system
+    // prefix; SKIP-with-reason if none on this box (anti-vacuous: don't fake it).
+    let sys_file = ["/etc/services", "/etc/ssl/certs/ca-certificates.crt", "/etc/login.defs"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.len() >= 4096).unwrap_or(false)
+            && std::fs::read(p).is_ok()
+            && crate_is_system_like(p));
+    let sys_file = match sys_file {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP tier_a_g_system_path: no readable >=4KiB file under a system prefix on this box");
+            std::fs::remove_dir_all(&home).ok();
+            return;
+        }
+    };
+    let content = std::fs::read(&sys_file).unwrap();
+
+    let base = std::env::temp_dir().join(format!(
+        "sdd-tier-a-syspath-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    // Named so a path-ordered keeper pick lands on a plain file, not the alias.
+    let a_keep = base.join("a_keep.bin");
+    let b_loser = base.join("b_loser.bin");
+    let z_alias = base.join("z_sysalias.bin"); // symlink -> system file (canonical = system path)
+    std::fs::write(&a_keep, &content).unwrap();
+    std::fs::write(&b_loser, &content).unwrap();
+    std::os::unix::fs::symlink(&sys_file, &z_alias).unwrap();
+    // A1: prove the alias canonicalizes under a system prefix (else the cell is vacuous).
+    let canon = std::fs::canonicalize(&z_alias).unwrap();
+    assert!(
+        canon.starts_with("/etc/") || canon.starts_with("/usr/") || canon.starts_with("/bin/") || canon.starts_with("/var/lib/"),
+        "A1: alias canonical {canon:?} is not under a system prefix"
+    );
+
+    let base_for_closure = base.clone();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1400.0_f32, 900.0])
+        .build_eframe(move |cc| {
+            let mut app = SuperdeduperApp::new(cc);
+            app.add_root(base_for_closure.clone(), false);
+            app
+        });
+    drive_scan_to_table(&mut harness);
+    drive_bulk_action(&mut harness, "Nuke dupes", "DELETE");
+
+    // Effect: the system-aliased member is PRESERVED (guard refused it). The
+    // system target file itself is obviously untouched. Anti-vacuous: exactly one
+    // plain survives (the keeper) => the alias was a refused LOSER, not the keeper.
+    let preserved = run_until(&mut harness, || {
+        z_alias.exists() && ([a_keep.exists(), b_loser.exists()].iter().filter(|x| **x).count() == 1)
+    });
+    let plains_surviving = [a_keep.exists(), b_loser.exists()].iter().filter(|x| **x).count();
+    assert!(
+        z_alias.exists(),
+        "STEP=effect: system-path-aliased member must be PRESERVED (guard_system_path refused) — alias gone"
+    );
+    assert!(
+        std::fs::metadata(&sys_file).is_ok(),
+        "STEP=effect: the system target file must be untouched"
+    );
+    assert!(
+        preserved && plains_surviving == 1,
+        "STEP=effect: expected exactly 1 plain survivor (keeper) + alias refused as a LOSER; got {plains_surviving} plains surviving (0 => alias was keeper = vacuous; 2 => nothing actioned)"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Mirror of dedupe::is_system_path's Linux prefix check (that fn is pub but we
+/// avoid a cross-cfg import here) — used only to pre-validate the chosen target.
+fn crate_is_system_like(p: &std::path::Path) -> bool {
+    let s = p.to_string_lossy();
+    s.starts_with("/etc/") || s.starts_with("/usr/") || s.starts_with("/bin/") || s.starts_with("/var/lib/")
+}
