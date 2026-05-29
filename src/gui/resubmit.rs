@@ -123,7 +123,7 @@ pub fn request_resubmit(scan_id: &str) -> Result<(), String> {
             // archive on the resubmit path. The History row itself
             // is the durable trail.
             let new_state = match &outcome {
-                SubmitOutcome::Accepted { .. } | SubmitOutcome::DuplicateNoChange => {
+                SubmitOutcome::Accepted { .. } | SubmitOutcome::DuplicateNoChange { .. } => {
                     SubmissionState::Submitted
                 }
                 SubmitOutcome::Rejected { .. } | SubmitOutcome::FlaggedForReview { .. } => {

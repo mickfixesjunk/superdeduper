@@ -1200,7 +1200,7 @@ impl SuperdeduperApp {
             if matches!(
                 &outcome,
                 submission::SubmitOutcome::Accepted { .. }
-                    | submission::SubmitOutcome::DuplicateNoChange
+                    | submission::SubmitOutcome::DuplicateNoChange { .. }
             ) {
                 let _ = submission::take_pending();
             }
@@ -1209,9 +1209,15 @@ impl SuperdeduperApp {
             // even if THIS POST didn't re-create the record. Transition
             // the history row to Submitted so the user doesn't see a
             // stuck Pending. (Accepted is handled inline above where
-            // the submission_id is also stamped onto the row; this branch
-            // covers 409 where no new submission_id is issued.)
-            if matches!(&outcome, submission::SubmitOutcome::DuplicateNoChange) {
+            // the submission_id is also stamped onto the row.)
+            // #99/v0.2.37: the 409 now carries the EXISTING submission_id —
+            // store it (like Accepted does) so the post-action reclaim-credit
+            // PATCH / pending-credit queue can credit the existing row (fixes
+            // the re-submit-same-corpus flat-lifetime case).
+            if let submission::SubmitOutcome::DuplicateNoChange { submission_id } = &outcome {
+                if let Some(id) = submission_id {
+                    submission::store_pending_submission_id(id.clone());
+                }
                 if let Some(scan_id) = inputs.scan_id.as_deref() {
                     if let Err(e) = crate::scan_history::update_submission_state(
                         scan_id,

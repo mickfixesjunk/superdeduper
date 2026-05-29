@@ -2545,7 +2545,7 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &crate::leaderboard::submission::S
                 ui.hyperlink_to(RichText::new("view profile").color(theme::ACCENT), url);
             }
         }
-        SubmitOutcome::DuplicateNoChange => {
+        SubmitOutcome::DuplicateNoChange { .. } => {
             ui.label(
                 RichText::new("Already submitted (no change)")
                     .color(theme::TEXT_LO)

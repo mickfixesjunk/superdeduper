@@ -196,7 +196,11 @@ pub enum SubmitOutcome {
         profile_url: Option<String>,
     },
     /// 409 — same payload hash already on file. Neutral status.
-    DuplicateNoChange,
+    /// #99/v0.2.37: the 409 body now carries the EXISTING submission_id
+    /// (web contract A, live), so the post-action reclaim-credit PATCH can
+    /// credit the existing row (fixes the re-submit-same-corpus flat-lifetime
+    /// case). `None` if the server omitted it (older server / unresolvable).
+    DuplicateNoChange { submission_id: Option<String> },
     /// 4xx (other than 409). Caller should surface the reason; don't
     /// retry (the payload is wrong, not the network).
     Rejected { status: u16, reason: String },
@@ -480,10 +484,28 @@ fn parse_ok(resp: ureq::Response) -> SubmitOutcome {
     }
 }
 
+/// #99/v0.2.37 — extract the existing submission_id from a 409
+/// (duplicate_submission) response body. Web contract A: the field is
+/// `submission_id` (same key as the 200 path), omitted if unresolvable.
+/// Returns None on absent/non-string/unparseable. Pure for testability.
+fn duplicate_submission_id_from_409(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("submission_id"))
+        .and_then(|s| s.as_str())
+        .map(String::from)
+}
+
 fn parse_error(code: u16, resp: ureq::Response) -> SubmitOutcome {
     let body_text = resp.into_string().unwrap_or_default();
     if code == 409 {
-        return SubmitOutcome::DuplicateNoChange;
+        // #99/v0.2.37 (web contract A): the 409 body carries the EXISTING
+        // submission_id so the post-action reclaim-credit PATCH can credit the
+        // existing row. Omitted/unparseable -> None (older server / edge).
+        return SubmitOutcome::DuplicateNoChange {
+            submission_id: duplicate_submission_id_from_409(&body_text),
+        };
     }
     if (500..600).contains(&code) {
         return SubmitOutcome::Transient {
@@ -688,7 +710,7 @@ fn short_uuid(s: &str) -> String {
 fn outcome_kind_tag(o: &SubmitOutcome) -> &'static str {
     match o {
         SubmitOutcome::Accepted { .. } => "accepted",
-        SubmitOutcome::DuplicateNoChange => "duplicate",
+        SubmitOutcome::DuplicateNoChange { .. } => "duplicate",
         SubmitOutcome::Rejected { .. } => "rejected",
         SubmitOutcome::Transient { .. } => "transient",
         SubmitOutcome::FlaggedForReview { .. } => "flagged-for-review",
@@ -762,7 +784,7 @@ impl From<&SubmitOutcome> for SerializableOutcome {
                 achievements_unlocked: achievements_unlocked.clone(),
                 profile_url: profile_url.clone(),
             },
-            SubmitOutcome::DuplicateNoChange => SerializableOutcome::DuplicateNoChange,
+            SubmitOutcome::DuplicateNoChange { .. } => SerializableOutcome::DuplicateNoChange,
             SubmitOutcome::Rejected { status, reason } => SerializableOutcome::Rejected {
                 status: *status,
                 reason: reason.clone(),
@@ -1162,7 +1184,7 @@ mod tests {
             "accepted"
         );
         assert_eq!(
-            outcome_kind_tag(&SubmitOutcome::DuplicateNoChange),
+            outcome_kind_tag(&SubmitOutcome::DuplicateNoChange { submission_id: None }),
             "duplicate"
         );
         assert_eq!(
@@ -1187,6 +1209,33 @@ mod tests {
         );
     }
 
+    // #99/v0.2.37 — the 409 (duplicate) body parse for the reclaim-credit
+    // queue-flush trigger (web contract A: field `submission_id`).
+    #[test]
+    fn duplicate_submission_id_from_409_parses_web_contract() {
+        assert_eq!(
+            duplicate_submission_id_from_409(
+                r#"{"error":"duplicate_submission","reason":"no_change_since_last_submit","submission_id":"sub-abc-123"}"#
+            ),
+            Some("sub-abc-123".to_string()),
+            "must extract the existing submission_id the 409 carries"
+        );
+        // Omitted (older server / unresolvable) -> None.
+        assert_eq!(
+            duplicate_submission_id_from_409(
+                r#"{"error":"duplicate_submission","reason":"no_change_since_last_submit"}"#
+            ),
+            None
+        );
+        // Non-string / garbage / empty -> None, never panics.
+        assert_eq!(
+            duplicate_submission_id_from_409(r#"{"submission_id":123}"#),
+            None
+        );
+        assert_eq!(duplicate_submission_id_from_409("not json"), None);
+        assert_eq!(duplicate_submission_id_from_409(""), None);
+    }
+
     #[test]
     fn serializable_outcome_round_trips_all_variants() {
         // The archive + review JSON files store outcomes via
@@ -1205,7 +1254,7 @@ mod tests {
                 achievements_unlocked: vec!["hoarder".into(), "big-find".into()],
                 profile_url: Some("https://superdeduper.io/profile/abc".into()),
             },
-            SubmitOutcome::DuplicateNoChange,
+            SubmitOutcome::DuplicateNoChange { submission_id: None },
             SubmitOutcome::Rejected {
                 status: 422,
                 reason: "{\"error\":\"schema_invalid\"}".into(),

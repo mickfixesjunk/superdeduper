@@ -603,7 +603,7 @@ fn render_outcome(ui: &mut egui::Ui, outcome: &SubmitOutcome) {
                 ui.hyperlink_to(RichText::new("View profile →").color(theme::ACCENT), url);
             }
         }
-        SubmitOutcome::DuplicateNoChange => {
+        SubmitOutcome::DuplicateNoChange { .. } => {
             ui.label(RichText::new("Already submitted (no change)").color(theme::TEXT_LO));
         }
         SubmitOutcome::Rejected { status, reason } => {

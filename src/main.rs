@@ -231,7 +231,7 @@ fn run_scan_history_resubmit(scan_id: Option<String>, pending: bool) -> anyhow::
                     println!("✓ {id} accepted (submission_id={submission_id})");
                     Ok(())
                 }
-                SubmitOutcome::DuplicateNoChange => {
+                SubmitOutcome::DuplicateNoChange { .. } => {
                     scan_history::update_submission_state(&id, SubmissionState::Submitted, true)?;
                     println!("• {id} already-on-file (409) — marked submitted");
                     Ok(())
@@ -875,7 +875,7 @@ fn run_submit_pending(args: superdeduper::cli::SubmitPendingArgs) -> anyhow::Res
                     record.scan_id, submission_id
                 ));
             }
-            SubmitOutcome::DuplicateNoChange => {
+            SubmitOutcome::DuplicateNoChange { .. } => {
                 if let Err(e) = scan_history::update_submission_state(
                     &record.scan_id,
                     SubmissionState::Submitted,

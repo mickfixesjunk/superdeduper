@@ -387,7 +387,7 @@ fn store_last_outcome(scan_id: String, outcome: crate::leaderboard::submission::
         SubmitOutcome::Accepted { submission_id, .. } => {
             (format!("Resubmit accepted ({submission_id})."), theme::COOL)
         }
-        SubmitOutcome::DuplicateNoChange => (
+        SubmitOutcome::DuplicateNoChange { .. } => (
             "Resubmit: server already had this submission (no change).".to_string(),
             theme::COOL,
         ),
