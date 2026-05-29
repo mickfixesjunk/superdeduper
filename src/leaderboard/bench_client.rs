@@ -42,13 +42,14 @@ pub struct ChallengeAnswer {
     pub leaf_hash: String,
 }
 
-/// The challenge hash over a chunk: `BLAKE3(0x00 ‖ u32le(path_len) ‖ path_utf8
-/// ‖ u64le(offset) ‖ u64le(len) ‖ bytes)`. Identical to the (now-retired)
-/// Merkle leaf preimage — path-bound so an answer for one position can't be
-/// replayed for another, and byte-locked with web's #160 verifier already.
+/// The challenge hash over a chunk (FROZEN, research golden): `BLAKE3(0x02 ‖
+/// u32le(path_len) ‖ path_utf8 ‖ u64le(offset) ‖ u64le(len) ‖ bytes)`. Tag
+/// `0x02` is the CHALLENGE domain (distinct from the retired Merkle leaf `0x00`
+/// / node `0x01`). Path-bound so an answer for one position can't be replayed
+/// for another; the server reproduces it from the private seed.
 pub fn challenge_hash(path: &str, offset: u64, len: u64, bytes: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(&[0x00]);
+    h.update(&[0x02]);
     h.update(&(path.len() as u32).to_le_bytes());
     h.update(path.as_bytes());
     h.update(&offset.to_le_bytes());
@@ -83,23 +84,46 @@ pub fn answer_challenge_from_dir(
     Ok((answers, bytes_read))
 }
 
-/// Canonical `result_digest` over the client's found dupsets — a compact
-/// commitment to the dedupe RESULT the server compares against its private
-/// groundtruth. `dupsets` MUST already be canonical (sorted path_index lists,
-/// groups sorted — see `bench_corpus::client_found_dupsets`). FROZEN preimage:
-/// `BLAKE3(0x05 ‖ u64le(group_count) ‖ for each group: u64le(group_len) ‖
-/// u64le(path_index)*)`. std-base64.
-pub fn result_digest(dupsets: &[Vec<u64>]) -> String {
+/// FROZEN `result_digest` (research golden) over the client's found dupsets — a
+/// compact commitment to the dedupe RESULT the server compares against its
+/// private groundtruth. Canonical: clusters sorted by min(path_index), members
+/// ascending. Preimage: `BLAKE3( u32le(17) ‖ "tcorpus-result-v1" ‖
+/// u64le(cluster_count) ‖ per cluster: u64le(len) ‖ u64le(path_index)* )`.
+/// std-base64. (`client_found_dupsets` already yields canonical order, but we
+/// re-canonicalize here so the digest is correct regardless of input order.)
+pub const RESULT_DIGEST_DOMAIN: &[u8] = b"tcorpus-result-v1";
+
+pub fn result_digest_bytes(dupsets: &[Vec<u64>]) -> [u8; 32] {
+    let mut clusters: Vec<Vec<u64>> = dupsets
+        .iter()
+        .map(|c| {
+            let mut v = c.clone();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    clusters.sort_by_key(|c| c.first().copied().unwrap_or(0));
     let mut h = blake3::Hasher::new();
-    h.update(&[0x05]);
-    h.update(&(dupsets.len() as u64).to_le_bytes());
-    for set in dupsets {
-        h.update(&(set.len() as u64).to_le_bytes());
-        for pi in set {
+    h.update(&(RESULT_DIGEST_DOMAIN.len() as u32).to_le_bytes());
+    h.update(RESULT_DIGEST_DOMAIN);
+    h.update(&(clusters.len() as u64).to_le_bytes());
+    for c in &clusters {
+        h.update(&(c.len() as u64).to_le_bytes());
+        for &pi in c {
             h.update(&pi.to_le_bytes());
         }
     }
-    b64(h.finalize().as_bytes())
+    *h.finalize().as_bytes()
+}
+
+pub fn result_digest(dupsets: &[Vec<u64>]) -> String {
+    b64(&result_digest_bytes(dupsets))
+}
+
+/// Lowercase hex of a 32-byte digest (for cross-checking against research's
+/// hex goldens, which print hex; the wire form is [`b64`]).
+fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -141,13 +165,41 @@ mod tests {
     }
 
     #[test]
-    fn result_digest_canonical_and_order_sensitive() {
+    fn result_digest_canonical_and_content_sensitive() {
         let a = result_digest(&[vec![0, 6], vec![2, 8, 9]]);
         assert_eq!(a, result_digest(&[vec![0, 6], vec![2, 8, 9]]), "deterministic");
         assert_ne!(a, result_digest(&[vec![0, 7], vec![2, 8, 9]]), "membership binds");
-        assert_ne!(a, result_digest(&[vec![2, 8, 9], vec![0, 6]]), "group order binds (caller canonicalizes)");
+        // re-canonicalized internally: group order + member order do NOT matter.
+        assert_eq!(a, result_digest(&[vec![2, 8, 9], vec![0, 6]]), "group order canonicalized");
+        assert_eq!(a, result_digest(&[vec![6, 0], vec![9, 2, 8]]), "member order canonicalized");
         assert_ne!(a, result_digest(&[vec![0, 6]]), "group count binds");
         assert_eq!(result_digest(&[]).len(), 44, "empty result still a 44-char b64 digest");
+    }
+
+    #[test]
+    fn matches_research_challenge_and_result_golden() {
+        use super::super::bench;
+        // result_digest golden: dupsets [[1,4,6]] → research's d8093f61… (hex).
+        assert_eq!(
+            hex32(&result_digest_bytes(&[vec![1, 4, 6]])),
+            "d8093f61b09b2eef44fb186e8afd36e0f25ddce9d2e594cdccf26d0f387a686d",
+            "result_digest must match research golden byte-for-byte"
+        );
+        // challenge_hash golden: f0 (content_id 0, 16B) from the golden seed
+        // 000102…1f → research's T0ue6Dbv… (std-base64). Regenerates the corpus
+        // content to confirm the challenge form matches end-to-end.
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (kc, _) = bench::corpus_keys(&seed);
+        let mut data = vec![0u8; 16];
+        bench::content_bytes_at(&kc, 0, 0, &mut data);
+        assert_eq!(
+            b64(&challenge_hash("f0000000000.bin", 0, 16, &data)),
+            "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=",
+            "challenge_hash (tag 0x02) must match research golden byte-for-byte"
+        );
     }
 
     /// Emits the challenge-response + result_digest GOLDEN VECTOR for web to
