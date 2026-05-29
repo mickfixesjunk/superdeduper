@@ -271,11 +271,42 @@ impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
 /// * Windows: `FILE_FLAG_NO_BUFFERING` (same aligned scheme as `diagnose`).
 /// * macOS: `F_NOCACHE` (no alignment constraint).
 /// * other: buffered fallback (`was_cold == false`).
+/// Whether O_DIRECT actually BYPASSES the page cache in this environment.
+/// O_DIRECT is advisory: WSL2 (ext4-on-vhdx / drvfs) ACCEPTS the flag but
+/// silently serves from the Windows host cache — `open(O_DIRECT)` succeeds with
+/// no buffered fallback, yet the read is WARM. Reporting `cold=true` there is a
+/// false positive that would let a warm run land on the competitive cold board
+/// (testrunner's WSL finding — the 125x-leverage forge hole achievements
+/// flagged). Fail closed: detect WSL via /proc/version and treat it as not
+/// bypass-capable so `cold_enforced` honestly becomes false (-> casual board).
+/// Real Linux, where O_DIRECT is honoured, stays reliable. tmpfs/overlay
+/// already fail honestly via the `open` rejection -> buffered -> cold=false.
+#[cfg(target_os = "linux")]
+fn cold_bypass_reliable() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| match std::fs::read_to_string("/proc/version") {
+        Ok(v) => {
+            let v = v.to_ascii_lowercase();
+            !(v.contains("microsoft") || v.contains("wsl"))
+        }
+        // /proc/version unreadable (unusual) -> assume a real kernel that
+        // honours O_DIRECT; WSL is the targeted marker case.
+        Err(_) => true,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::FromRawFd;
+    // WSL accepts O_DIRECT but serves warm -> a false cold=true. Fail closed:
+    // buffered read + cold=false so the run cannot claim the competitive cold
+    // board on a bypass-incapable fs.
+    if !cold_bypass_reliable() {
+        return Ok((std::fs::read(path)?, false));
+    }
     const ALIGN: usize = 4096;
     const CHUNK: usize = 1 << 20;
     let size = std::fs::metadata(path)?.len() as usize;
