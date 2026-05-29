@@ -998,9 +998,9 @@ impl SuperdeduperApp {
         ));
 
         // Decide what to do based on the install's share preference.
-        let share = install::load()
-            .ok()
-            .flatten()
+        let loaded = install::load().ok().flatten();
+        let share = loaded
+            .as_ref()
             .map(|s| s.share_default)
             .unwrap_or(install::ShareDefault::AlwaysAsk);
 
@@ -1010,6 +1010,31 @@ impl SuperdeduperApp {
             }
             install::ShareDefault::AlwaysAsk => {
                 self.scan_complete_modal = ScanCompleteState::Ready;
+            }
+            install::ShareDefault::AskNThenSticky => {
+                // Ask for the first N scans, then stick to the last
+                // resolved choice (Submitted -> auto-submit, Skipped ->
+                // stop asking). Counter + last-choice are persisted; the
+                // count is bumped when the user resolves a prompt (see the
+                // ScanCompleteAction Submit/Skip handlers).
+                let count = loaded.as_ref().map(|s| s.share_prompt_count).unwrap_or(0);
+                let last = loaded.as_ref().and_then(|s| s.share_last_choice);
+                if count >= install::STICKY_PROMPT_THRESHOLD {
+                    match last {
+                        Some(install::ShareChoice::Submitted) => {
+                            self.scan_complete_modal = ScanCompleteState::Submitting;
+                            self.spawn_leaderboard_submit_worker();
+                        }
+                        Some(install::ShareChoice::Skipped) => {
+                            self.scan_complete_modal = ScanCompleteState::Hidden;
+                        }
+                        // No recorded choice at/after threshold: fall back
+                        // to asking rather than guessing.
+                        None => self.scan_complete_modal = ScanCompleteState::Ready,
+                    }
+                } else {
+                    self.scan_complete_modal = ScanCompleteState::Ready;
+                }
             }
             install::ShareDefault::AutoOptIn => {
                 self.scan_complete_modal = ScanCompleteState::Submitting;
@@ -1311,16 +1336,27 @@ impl SuperdeduperApp {
             } else {
                 None
             };
+        // Sticky-last-prompt note: only on the final ask of AskNThenSticky
+        // (the prompt that pushes the count to the threshold).
+        let sticky_last_prompt = matches!(
+            crate::leaderboard::install::load(),
+            Ok(Some(ref s))
+                if s.share_default == crate::leaderboard::install::ShareDefault::AskNThenSticky
+                    && s.share_prompt_count
+                        == crate::leaderboard::install::STICKY_PROMPT_THRESHOLD - 1
+        );
         let action = widget::show(
             ctx,
             self.scan_complete_modal,
             &data,
             outcome.as_ref(),
             payload_preview.as_deref(),
+            sticky_last_prompt,
         );
         if let Some(a) = action {
             match a {
                 ScanCompleteAction::Submit => {
+                    Self::record_share_prompt_if_sticky(crate::leaderboard::install::ShareChoice::Submitted);
                     self.scan_complete_modal = ScanCompleteState::Submitting;
                     self.spawn_leaderboard_submit_worker();
                 }
@@ -1330,6 +1366,7 @@ impl SuperdeduperApp {
                     self.spawn_leaderboard_submit_worker();
                 }
                 ScanCompleteAction::Skip => {
+                    Self::record_share_prompt_if_sticky(crate::leaderboard::install::ShareChoice::Skipped);
                     self.scan_complete_modal = ScanCompleteState::Hidden;
                     self.scan_complete_data = None;
                 }
@@ -1471,6 +1508,22 @@ impl SuperdeduperApp {
             s.share_default = install::ShareDefault::AutoOptIn;
             if let Err(e) = install::save(&s) {
                 eprintln!("leaderboard: failed to persist AutoOptIn: {e:?}");
+            }
+        }
+    }
+
+    /// When the share mode is `AskNThenSticky`, record the user's resolved
+    /// post-scan choice (bumps the prompt counter + stores last choice) so
+    /// the mode goes sticky after the threshold. No-op for every other
+    /// mode (Submit/Skip under AlwaysAsk must NOT count toward stickiness).
+    /// Best-effort persist, matching flip_share_to_auto_opt_in.
+    #[cfg(feature = "telemetry")]
+    fn record_share_prompt_if_sticky(choice: crate::leaderboard::install::ShareChoice) {
+        use crate::leaderboard::install;
+        if matches!(install::load(), Ok(Some(ref s)) if s.share_default == install::ShareDefault::AskNThenSticky)
+        {
+            if let Err(e) = install::record_share_prompt(choice) {
+                eprintln!("leaderboard: failed to record share prompt: {e:?}");
             }
         }
     }

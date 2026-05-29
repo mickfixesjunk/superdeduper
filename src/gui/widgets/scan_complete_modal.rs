@@ -118,6 +118,10 @@ pub fn show(
     data: &ScanCompleteData,
     outcome: Option<&SubmitOutcome>,
     payload_preview: Option<&str>,
+    // True on the FINAL "ask" prompt of AskNThenSticky — render an "I'll
+    // remember this choice from now on" note so the stickiness isn't a
+    // surprise (client-spec §10.2 sticky rule).
+    sticky_last_prompt: bool,
 ) -> Option<ScanCompleteAction> {
     if matches!(state, ScanCompleteState::Hidden) {
         return None;
@@ -152,6 +156,17 @@ pub fn show(
                 // catalog's current profile snapshot. No-op for
                 // already-signed-in users.
                 render_signin_cta(ui);
+                if sticky_last_prompt {
+                    ui.label(
+                        RichText::new(
+                            "This is the last time I'll ask — I'll remember this choice from \
+                             now on (change it anytime in Settings \u{2192} Privacy).",
+                        )
+                        .color(theme::ACCENT)
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                }
                 render_action_buttons(ui, &mut action);
             }
             ScanCompleteState::Submitting => {

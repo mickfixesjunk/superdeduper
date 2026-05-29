@@ -70,15 +70,44 @@ pub struct InstallState {
     /// load/mutate/save is always atomic.
     #[serde(default)]
     pub counters: InstallCounters,
+
+    /// How many post-scan share prompts have been shown+resolved while
+    /// `share_default == AskNThenSticky`. After [`STICKY_PROMPT_THRESHOLD`]
+    /// the mode goes sticky (see [`ShareDefault::AskNThenSticky`]).
+    /// `#[serde(default)]` so pre-existing install.json files load at 0.
+    #[serde(default)]
+    pub share_prompt_count: u32,
+    /// The user's most recent post-scan share decision, recorded while in
+    /// `AskNThenSticky`. Drives the sticky behavior once the threshold is
+    /// reached: `Submitted` -> auto-submit going forward, `Skipped` ->
+    /// stop asking.
+    #[serde(default)]
+    pub share_last_choice: Option<ShareChoice>,
 }
+
+/// Number of post-scan prompts shown before `AskNThenSticky` goes sticky.
+pub const STICKY_PROMPT_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShareDefault {
     #[default]
     AlwaysAsk,
+    /// Ask via the post-scan modal for the first [`STICKY_PROMPT_THRESHOLD`]
+    /// scans, then stick to the user's last choice (last submitted ->
+    /// auto-submit going forward; last skipped -> stop asking). The 3rd
+    /// prompt notes that the choice will be remembered.
+    AskNThenSticky,
     AutoOptIn,
     Never,
+}
+
+/// A resolved post-scan share decision (for `AskNThenSticky` stickiness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareChoice {
+    Submitted,
+    Skipped,
 }
 
 impl InstallState {
@@ -357,6 +386,8 @@ pub fn new_unregistered(server_url: String) -> InstallState {
         client_version_at_register: env!("CARGO_PKG_VERSION").to_string(),
         share_default: ShareDefault::default(),
         counters: InstallCounters::default(),
+        share_prompt_count: 0,
+        share_last_choice: None,
     }
 }
 
@@ -386,6 +417,22 @@ fn bump_counter(mutate: impl FnOnce(&mut InstallCounters)) -> io::Result<()> {
         None => return Ok(()),
     };
     mutate(&mut state.counters);
+    save(&state)
+}
+
+/// Record a resolved post-scan share decision under `AskNThenSticky`:
+/// bump `share_prompt_count` (saturating) and set `share_last_choice`,
+/// then persist. No-op when install.json doesn't exist. Atomic
+/// load/mutate/save like the counter bumps. Callers fire this on every
+/// Submit/Skip while the mode is `AskNThenSticky` so the stickiness
+/// threshold + last-choice are durable across restarts.
+pub fn record_share_prompt(choice: ShareChoice) -> io::Result<()> {
+    let mut state = match load()? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    state.share_prompt_count = state.share_prompt_count.saturating_add(1);
+    state.share_last_choice = Some(choice);
     save(&state)
 }
 
@@ -545,5 +592,28 @@ mod tests {
         assert_eq!(state.counters.exclude_pattern_edits, 0);
         assert_eq!(state.counters.achievements_verify_invocations, 0);
         assert_eq!(state.share_default, ShareDefault::AlwaysAsk);
+        // AskNThenSticky bookkeeping is also serde(default): a legacy
+        // file with neither field loads at the start-of-cycle values.
+        assert_eq!(state.share_prompt_count, 0);
+        assert_eq!(state.share_last_choice, None);
+    }
+
+    #[test]
+    fn share_sticky_state_round_trips() {
+        // The AskNThenSticky bookkeeping (prompt count + last choice) and
+        // the new ShareDefault variant must survive the on-disk JSON path.
+        let mut s = new_unregistered("https://example".into());
+        s.share_default = ShareDefault::AskNThenSticky;
+        s.share_prompt_count = 2;
+        s.share_last_choice = Some(ShareChoice::Submitted);
+        let bytes = serde_json::to_vec(&s).unwrap();
+        // Wire form is snake_case (matches the rest of the enum encoding).
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("ask_n_then_sticky"));
+        assert!(text.contains("submitted"));
+        let restored: InstallState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.share_default, ShareDefault::AskNThenSticky);
+        assert_eq!(restored.share_prompt_count, 2);
+        assert_eq!(restored.share_last_choice, Some(ShareChoice::Submitted));
     }
 }

@@ -1899,6 +1899,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
         let enabled = state_opt.is_some();
         let label_text = match current_share {
             install::ShareDefault::AlwaysAsk => "Always ask",
+            install::ShareDefault::AskNThenSticky => "Ask 3 times, then remember",
             install::ShareDefault::AutoOptIn => "Auto-submit",
             install::ShareDefault::Never => "Never",
         };
@@ -1918,6 +1919,20 @@ fn render_privacy_section(ui: &mut egui::Ui) {
                         .clicked()
                     {
                         chosen = Some(install::ShareDefault::AlwaysAsk);
+                    }
+                    if ui
+                        .selectable_label(
+                            current_share == install::ShareDefault::AskNThenSticky,
+                            "Ask 3 times, then remember",
+                        )
+                        .on_hover_text(
+                            "Ask after the next few scans, then stick with your last choice: \
+                             if you submitted, auto-submit going forward; if you skipped, stop \
+                             asking. The 3rd prompt tells you it's being remembered.",
+                        )
+                        .clicked()
+                    {
+                        chosen = Some(install::ShareDefault::AskNThenSticky);
                     }
                     if ui
                         .selectable_label(
