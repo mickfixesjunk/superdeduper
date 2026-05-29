@@ -50,3 +50,8 @@ pub mod bench; // G4
 /// plan (file descriptors + groundtruth_dupsets + aggregates) plus
 /// materialization (leaves / on-disk corpus / signed-shape manifest).
 pub mod bench_corpus; // G4
+/// G4 / T-BENCH-ME CLIENT bench primitives (post-Merkle-drop model): the public
+/// `--bench-me` answers the server's challenge by hashing downloaded bytes at
+/// server-issued offsets + commits to its dedupe result via `result_digest`.
+/// No generation / seed / Merkle tree — this is what survives the generator strip.
+pub mod bench_client; // G4
