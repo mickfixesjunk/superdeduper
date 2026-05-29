@@ -58,17 +58,21 @@ pub struct SubmissionInputs {
     pub bench: Option<CanonicalBench>,
 }
 
-/// T-BENCH-ME canonical-bench top-level submission fields (work-proof spec).
-/// `build_payload` lifts these to the top level of the body when present;
-/// `client_found_dupsets` rides in [`ResultSummary`] per web's envelope.
+/// T-BENCH-ME canonical-bench top-level submission fields (server-direct-verify
+/// model — Merkle DROPPED). `build_payload` lifts these to the top level when
+/// present; `client_found_dupsets` rides in [`ResultSummary`] per web's envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalBench {
     pub protocol_version: String,
     pub corpus_version: String,
     pub tier: String,
     pub bench_run_id: String,
-    /// `serde_json::to_value(bench_corpus::BenchProof)` — {merkle_root, samples[]}.
-    pub bench_proof: serde_json::Value,
+    /// Answers to the server-issued challenge positions: `[{leaf_index,
+    /// leaf_hash}]` (BLAKE3 tag-0x02 of the downloaded chunk). NO merkle_root,
+    /// NO audit_path — the server regenerates + direct-compares.
+    pub challenge_response: Vec<serde_json::Value>,
+    /// Canonical commitment to the dedupe result (`bench_client::result_digest`).
+    pub result_digest: String,
 }
 
 /// `run_shape` block per backend schema.
@@ -332,7 +336,8 @@ pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json:
         obj.insert("corpus_version".into(), bench.corpus_version.clone().into());
         obj.insert("tier".into(), bench.tier.clone().into());
         obj.insert("bench_run_id".into(), bench.bench_run_id.clone().into());
-        obj.insert("bench_proof".into(), bench.bench_proof.clone());
+        obj.insert("challenge_response".into(), bench.challenge_response.clone().into());
+        obj.insert("result_digest".into(), bench.result_digest.clone().into());
     }
     body
 }
@@ -1102,24 +1107,20 @@ mod tests {
             corpus_version: "corpus-v1-quick".into(),
             tier: "quick".into(),
             bench_run_id: "run-xyz".into(),
-            bench_proof: serde_json::json!({
-                "merkle_root": "a2bMC1+LJk79V2AB9/Nr1hitk5rISU01Sx1wQIgIbmk=",
-                "samples": [],
-            }),
+            challenge_response: vec![serde_json::json!({ "leaf_index": 5, "leaf_hash": "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=" })],
+            result_digest: "SpVnFZopIQwCJbqb+CpmCtaKAAi9vWQ44gwu1TactwQ=".into(),
         });
         let p = build_payload(&inputs, "id");
         assert_eq!(p.get("protocol_version").and_then(|v| v.as_str()), Some("tbench-1"));
         assert_eq!(p.get("corpus_version").and_then(|v| v.as_str()), Some("corpus-v1-quick"));
         assert_eq!(p.get("tier").and_then(|v| v.as_str()), Some("quick"));
         assert_eq!(p.get("bench_run_id").and_then(|v| v.as_str()), Some("run-xyz"));
-        assert_eq!(
-            p.pointer("/bench_proof/merkle_root").and_then(|v| v.as_str()),
-            Some("a2bMC1+LJk79V2AB9/Nr1hitk5rISU01Sx1wQIgIbmk=")
-        );
+        assert_eq!(p.get("result_digest").and_then(|v| v.as_str()), Some("SpVnFZopIQwCJbqb+CpmCtaKAAi9vWQ44gwu1TactwQ="));
+        assert_eq!(p.pointer("/challenge_response/0/leaf_index").and_then(|v| v.as_u64()), Some(5));
         assert!(p.pointer("/result_summary/client_found_dupsets").is_some());
         // ordinary (non-bench) submissions must NOT carry any of these keys.
         let plain = build_payload(&sample_inputs(), "id");
-        for k in ["protocol_version", "corpus_version", "tier", "bench_run_id", "bench_proof"] {
+        for k in ["protocol_version", "corpus_version", "tier", "bench_run_id", "challenge_response", "result_digest"] {
             assert!(plain.get(k).is_none(), "non-bench payload must omit '{k}'");
         }
     }

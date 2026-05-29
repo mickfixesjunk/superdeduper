@@ -126,6 +126,34 @@ fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Assemble the canonical-bench submission block (server-direct-verify model)
+/// from a completed `--bench-me` run: the challenge `answers` + the dedupe
+/// `found_dupsets`. NO Merkle, NO generator — this is the client-side replacement
+/// for the retired `bench_corpus::build_canonical_bench`. The `--bench-me` flow
+/// drops the returned block into a `SubmissionInputs` (scope=canonical-bench,
+/// dedupe-only wall, bytes_scanned=bytes_read) alongside
+/// `result_summary.client_found_dupsets = found_dupsets`.
+pub fn to_canonical_bench(
+    protocol_version: &str,
+    corpus_version: &str,
+    tier: &str,
+    bench_run_id: &str,
+    answers: &[ChallengeAnswer],
+    found_dupsets: &[Vec<u64>],
+) -> super::submission::CanonicalBench {
+    super::submission::CanonicalBench {
+        protocol_version: protocol_version.to_string(),
+        corpus_version: corpus_version.to_string(),
+        tier: tier.to_string(),
+        bench_run_id: bench_run_id.to_string(),
+        challenge_response: answers
+            .iter()
+            .map(|a| serde_json::to_value(a).expect("ChallengeAnswer serializes"))
+            .collect(),
+        result_digest: result_digest(found_dupsets),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +228,63 @@ mod tests {
             "T0ue6DbvgHrGSD8Zs93DvT3G5i8o3eNUKSSbeyJVisY=",
             "challenge_hash (tag 0x02) must match research golden byte-for-byte"
         );
+    }
+
+    #[test]
+    fn to_canonical_bench_assembles_submission_block() {
+        let answers = vec![
+            ChallengeAnswer { leaf_index: 0, leaf_hash: "AAAA".into() },
+            ChallengeAnswer { leaf_index: 9, leaf_hash: "BBBB".into() },
+        ];
+        let dupsets = vec![vec![1u64, 4, 6]];
+        let cb = to_canonical_bench("tbench-1", "corpus-v1-quick", "quick", "run-Z", &answers, &dupsets);
+        assert_eq!(cb.bench_run_id, "run-Z");
+        assert_eq!(cb.protocol_version, "tbench-1");
+        assert_eq!(cb.challenge_response.len(), 2);
+        assert_eq!(cb.challenge_response[1].get("leaf_index").and_then(|v| v.as_u64()), Some(9));
+        assert_eq!(cb.result_digest, result_digest(&dupsets));
+        // round-trips into a submission payload as the canonical-bench block.
+        let inputs = super::super::submission::SubmissionInputs {
+            client_version: "t".into(),
+            run_uuid: "u".into(),
+            scan_id: None,
+            bench: Some(cb),
+            hardware: super::super::hardware::detect(),
+            run_shape: super::super::submission::RunShape {
+                wall_clock_seconds: 2.0,
+                bytes_scanned: 1024,
+                files_scanned: 3,
+                hash_algorithm: "river5-aes-ni".into(),
+                walker_variant: "hybrid".into(),
+                scope: "canonical-bench".into(),
+                features_used_bitmap: 0,
+                corpus_kind: "canonical-bench".into(),
+                cache_hit_ratio: None,
+                easter_egg_hits: Vec::new(),
+                zero_byte_group_max: None,
+                max_hardlink_count_in_scan: None,
+                name_collision_count: None,
+                share_count_in_scope: None,
+                dry_run: None,
+                groups_reviewed_count: None,
+            },
+            result_summary: super::super::submission::ResultSummary {
+                duplicate_groups: 1,
+                duplicate_bytes_reclaimable: 100,
+                largest_single_group_bytes: 0,
+                actions_taken_summary: std::collections::BTreeMap::new(),
+                placeholder_skip_count: None,
+                placeholder_skip_bytes: None,
+                client_found_dupsets: Some(dupsets),
+            },
+        };
+        let p = super::super::submission::build_payload(&inputs, "id");
+        assert_eq!(p.get("bench_run_id").and_then(|v| v.as_str()), Some("run-Z"));
+        assert_eq!(p.pointer("/challenge_response/1/leaf_index").and_then(|v| v.as_u64()), Some(9));
+        assert!(p.get("result_digest").is_some());
+        assert!(p.pointer("/result_summary/client_found_dupsets").is_some());
+        // ordinary (non-bench) submission omits the bench keys.
+        assert!(p.get("bench_proof").is_none(), "Merkle bench_proof retired");
     }
 
     /// Emits the challenge-response + result_digest GOLDEN VECTOR for web to

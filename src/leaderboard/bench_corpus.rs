@@ -413,30 +413,9 @@ pub fn build_bench_proof_from_dir(
     Ok((proof, bytes_read))
 }
 
-/// Assemble the canonical-bench submission block for a completed bench run —
-/// **the caller of [`build_bench_proof`]** (wiring it into the live submission
-/// per design 2026-05-29). Returns the [`super::submission::CanonicalBench`]
-/// (top-level fields carrying the work-proof) plus the `client_found_dupsets`
-/// (which ride in `ResultSummary`). The `--bench-me` flow drops these into a
-/// `SubmissionInputs` with `scope`/`corpus_kind = "canonical-bench"` and the
-/// dedupe-only `wall_clock_seconds`.
-pub fn build_canonical_bench(
-    plan: &CorpusPlan,
-    k_content: &[u8; 32],
-    bc: &bench::BenchContext,
-    found_groups: &[Vec<String>],
-) -> (super::submission::CanonicalBench, Vec<Vec<u64>>) {
-    let proof = build_bench_proof(plan, k_content, bc, BENCH_SAMPLE_N);
-    let dupsets = client_found_dupsets(found_groups);
-    let bench = super::submission::CanonicalBench {
-        protocol_version: bc.protocol_version.to_string(),
-        corpus_version: bc.corpus_version.to_string(),
-        tier: bc.tier.to_string(),
-        bench_run_id: bc.bench_run_id.to_string(),
-        bench_proof: serde_json::to_value(&proof).expect("BenchProof serializes to JSON"),
-    };
-    (bench, dupsets)
-}
+// (The Merkle-based `build_canonical_bench` was removed when the model pivoted
+// to server-direct-verify; the CanonicalBench is now assembled client-side in
+// `bench_client::to_canonical_bench` from challenge answers + result_digest.)
 
 /// The PUBLIC manifest the server serves to a client (work-proof spec): it
 /// deliberately carries NO `merkle_root` and NO `groundtruth_dupsets`. The
@@ -935,94 +914,6 @@ mod tests {
         // a different seed -> different served manifest -> different hash.
         let other = served_manifest(&spec, &[0x44u8; 32], &plan);
         assert_ne!(h1, manifest_hash(serde_json::to_string(&other).unwrap().as_bytes()));
-    }
-
-    #[test]
-    fn build_canonical_bench_invokes_proof_and_carries_it() {
-        // Closes design's integration gap: build_bench_proof now has a caller,
-        // and the assembled block carries the proof + dupsets the submission needs.
-        let seed = [0x55u8; 32];
-        let (kc, _) = bench::corpus_keys(&seed);
-        let spec = tiny_tier();
-        let plan = plan_corpus(&spec);
-        let mhash = manifest_hash(&manifest_m(
-            "tbench-1", spec.corpus_version, &seed, CHUNK_SIZE as u32, "tiny",
-            plan.file_count, plan.leaf_count, plan.size_class_counts,
-        ));
-        let bc = bench::BenchContext {
-            protocol_version: "tbench-1",
-            corpus_version: spec.corpus_version,
-            manifest_hash: mhash,
-            install_id: "i",
-            bench_run_id: "run-cb-1",
-            tier: "tiny",
-            leaf_count: plan.leaf_count,
-            chunk_size: CHUNK_SIZE as u32,
-        };
-        // a perfect dedupe: groundtruth clusters rendered as corpus paths.
-        let groups: Vec<Vec<String>> = plan
-            .dupsets
-            .iter()
-            .map(|s| s.iter().map(|&pi| format!("f{pi:010}.bin")).collect())
-            .collect();
-        let (cb, dupsets) = build_canonical_bench(&plan, &kc, &bc, &groups);
-
-        assert_eq!(cb.bench_run_id, "run-cb-1");
-        assert_eq!(cb.protocol_version, "tbench-1");
-        assert_eq!(cb.tier, "tiny");
-        // the proof is carried (root + one sample per leaf, capped at leaf_count).
-        assert!(cb.bench_proof.get("merkle_root").and_then(|v| v.as_str()).is_some());
-        assert_eq!(
-            cb.bench_proof.pointer("/samples").and_then(|s| s.as_array()).map(Vec::len),
-            Some(plan.leaf_count as usize)
-        );
-        // dupsets == groundtruth (perfect dedupe).
-        let mut expected = plan.dupsets.clone();
-        for g in &mut expected {
-            g.sort_unstable();
-        }
-        expected.sort_unstable();
-        assert_eq!(dupsets, expected);
-        // round-trips through a full submission payload as the bench block.
-        let mut inputs = super::super::submission::SubmissionInputs {
-            client_version: "t".into(),
-            run_uuid: "u".into(),
-            scan_id: None,
-            bench: Some(cb),
-            hardware: super::super::hardware::detect(),
-            run_shape: super::super::submission::RunShape {
-                wall_clock_seconds: 1.0,
-                bytes_scanned: plan.total_bytes,
-                files_scanned: plan.file_count,
-                hash_algorithm: "river5-aes-ni".into(),
-                walker_variant: "hybrid".into(),
-                scope: "canonical-bench".into(),
-                features_used_bitmap: 0,
-                corpus_kind: "canonical-bench".into(),
-                cache_hit_ratio: None,
-                easter_egg_hits: Vec::new(),
-                zero_byte_group_max: None,
-                max_hardlink_count_in_scan: None,
-                name_collision_count: None,
-                share_count_in_scope: None,
-                dry_run: None,
-                groups_reviewed_count: None,
-            },
-            result_summary: super::super::submission::ResultSummary {
-                duplicate_groups: dupsets.len() as u64,
-                duplicate_bytes_reclaimable: plan.reclaimable_ceiling_bytes(),
-                largest_single_group_bytes: 0,
-                actions_taken_summary: std::collections::BTreeMap::new(),
-                placeholder_skip_count: None,
-                placeholder_skip_bytes: None,
-                client_found_dupsets: Some(dupsets),
-            },
-        };
-        inputs.run_uuid = "u".into();
-        let payload = super::super::submission::build_payload(&inputs, "id");
-        assert_eq!(payload.get("bench_run_id").and_then(|v| v.as_str()), Some("run-cb-1"));
-        assert!(payload.pointer("/bench_proof/merkle_root").is_some());
-        assert!(payload.pointer("/result_summary/client_found_dupsets").is_some());
     }
 
     #[test]
