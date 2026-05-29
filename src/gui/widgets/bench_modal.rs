@@ -274,10 +274,18 @@ fn consent_view(state: &mut BenchUiState, ui: &mut egui::Ui, action: &mut BenchM
     ui.label("3. Submits your result to the public Dedupe Hall of Fame.");
     ui.add_space(6.0);
     ui.label(egui::RichText::new("Privacy").strong());
+    // Consent-copy per corrected spec §2 (testdesign G3 / consent-integrity):
+    // category gist + firm no-PII; NO "only [closed list]" (the wire has ~12
+    // hardware fields and a hand-list drifts); CPU model + ISA flags are sent
+    // AS-IS (not "bucketed"); the "What exactly gets shared?" preview, rendered
+    // from the REAL payload, is the single authoritative source of truth.
     ui.label(
-        "This benchmark touches NO personal files — the corpus is synthetic. We submit only your \
-         dedup throughput, a bucketed anonymous hardware profile (CPU/disk/RAM/OS), and your \
-         anonymous install ID. No file names, paths, contents, hashes, username, or machine name.",
+        "This benchmark touches no personal files — the corpus is synthetic test data, not your \
+         disk. We submit your dedup result plus an anonymous hardware profile (CPU model + \
+         instruction-set flags, disk class, RAM, OS, and similar hardware fields) and your \
+         anonymous install ID. We never send file names, paths, contents, hashes, username, \
+         machine name, or IP. The exact, complete list of every field is in \"What exactly gets \
+         shared?\" below — that preview is the authoritative source of truth.",
     );
     if ui.link("What exactly gets shared?").clicked() {
         *action = BenchModalAction::OpenSharePreview;

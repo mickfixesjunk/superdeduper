@@ -2152,6 +2152,45 @@ fn render_public_profile_visibility(
         return;
     }
 
+    // §10.2 UX fix (design 2026-05-29): these flags are ACCOUNT-level —
+    // an unlinked (anonymous) install has no account row, so a PATCH
+    // /account/privacy 401s and the toggle would silently revert (the
+    // "looks dead" control Mick saw). Gate on link status: when unlinked,
+    // show a Link CTA and render the toggles DISABLED rather than letting
+    // them no-op. Don't even kick the fetch (it would 401 too).
+    let linked = matches!(
+        crate::leaderboard::oauth::status_for(crate::channel::active_channel()),
+        Ok(crate::leaderboard::oauth::AccountStatus::Linked { .. })
+    );
+    if !linked {
+        ui.label(
+            RichText::new(
+                "Link a Google or Discord account (Settings \u{2192} Account) to manage \
+                 public-profile visibility. These control an account-level public profile, \
+                 so they're available once this install is linked.",
+            )
+            .color(theme::TEXT_LO)
+            .small()
+            .italics(),
+        );
+        ui.add_space(4.0);
+        // Render the toggles disabled so users see WHAT is configurable
+        // without being able to fire a doomed 401 PATCH.
+        let mut preview = PrivacyFlags::default();
+        ui.add_enabled_ui(false, |ui| {
+            let row = |ui: &mut egui::Ui, f: &mut bool, label: &str| {
+                ui.checkbox(f, RichText::new(label).color(theme::TEXT_LO));
+            };
+            row(ui, &mut preview.show_display_name, "Display name");
+            row(ui, &mut preview.show_provider, "Linked-provider badge");
+            row(ui, &mut preview.show_avatar, "Discord avatar");
+            row(ui, &mut preview.show_install_breakdown, "Per-install grant breakdown");
+            row(ui, &mut preview.show_hardware_history, "Hardware history table");
+            row(ui, &mut preview.show_recent_runs, "Recent runs table");
+        });
+        return;
+    }
+
     // First render after install becomes available: kick a fetch.
     if cache().lock().is_none() && !*in_flight().lock() {
         if let Some(state) = install_state {
