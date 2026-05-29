@@ -193,6 +193,25 @@ pub struct CorpusPlan {
     pub size_class_counts: SizeClassCounts,
 }
 
+impl CorpusPlan {
+    /// Bytes the size-grouped dedup actually READS: the sum of sizes of files
+    /// that share their size with >=1 other file (a size-group of >=2). A
+    /// unique-size file is never read (it can't be a duplicate). This is the
+    /// throughput-numerator basis the leaderboard band MUST use — NOT
+    /// `total_bytes`, which over-states (~2.5x on the multi-size corpora) and
+    /// false-rejects honest runs (testrunner L-LEGIT finding). Equals the
+    /// client's `run_shape.bytes_scanned` for an honest run.
+    pub fn candidate_bytes(&self) -> u64 {
+        let mut by_size: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
+        for f in &self.files {
+            let e = by_size.entry(f.size).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += f.size;
+        }
+        by_size.values().filter(|(count, _)| *count >= 2).map(|(_, bytes)| *bytes).sum()
+    }
+}
+
 /// Build the pure layout plan for a tier. Single forward pass per class; every
 /// dup references a strictly-lower (already-assigned) file-local index, so one
 /// pass suffices. No I/O, no content generation — safe to call for any tier.
@@ -461,6 +480,10 @@ pub struct ServedManifest {
     pub file_count: u64,
     pub leaf_count: u64,
     pub total_bytes: u64,
+    /// Bytes the size-grouped dedup actually reads (size-group >=2). The
+    /// leaderboard band's throughput numerator MUST use THIS, not total_bytes
+    /// (which over-states + false-rejects). See `CorpusPlan::candidate_bytes`.
+    pub candidate_bytes: u64,
     pub size_class_counts: SizeClassCounts,
 }
 
@@ -475,6 +498,7 @@ pub fn served_manifest(spec: &TierSpec, seed: &[u8; 32], plan: &CorpusPlan) -> S
         file_count: plan.file_count,
         leaf_count: plan.leaf_count,
         total_bytes: plan.total_bytes,
+        candidate_bytes: plan.candidate_bytes(),
         size_class_counts: plan.size_class_counts,
     }
 }
@@ -755,6 +779,10 @@ mod tests {
         assert_eq!(dups, (295_000 + 250 * 20) + (520 + 3 * 20), "full duplicate-file count");
         let frac = full_tier().reclaimable_fraction();
         assert!((0.29..0.30).contains(&frac), "full reclaimable ~29%, got {frac}");
+        // candidate-bytes = small(1M x4KiB) + medium(1800 x1MiB); the lone
+        // large (unique size) is PRUNED. This is the band's throughput
+        // numerator (NOT total_bytes). Must match the server constant 5.98GB.
+        assert_eq!(plan.candidate_bytes(), 4_096_000_000 + 1_887_436_800, "full candidate_bytes (5.98GB, large pruned)");
     }
 
     #[test]
