@@ -1984,10 +1984,12 @@ fn render_privacy_section(ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.label(
         RichText::new(
-            "Per-field overrides (toggle individual SUBMISSION payload fields off) — \
-             coming in a follow-up slice. Today the leaderboard payload itself is \
-             all-or-nothing; the toggles above control PUBLIC PROFILE visibility \
-             only.",
+            "Submission fields: every hardware field in the submission is currently REQUIRED \
+             for leaderboard ranking — none can be dropped without giving up your rank. \
+             \"Preview a sample submission\" shows the complete payload (full transparency). \
+             A privacy opt-in to omit GPU details will arrive together with GPU detection. \
+             (The toggles above control PUBLIC PROFILE visibility, a separate account-level \
+             surface.)",
         )
         .color(theme::TEXT_LO)
         .small()

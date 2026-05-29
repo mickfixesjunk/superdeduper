@@ -48,14 +48,16 @@ pub struct BenchTierChoice {
 }
 
 /// User-exposed ranked tiers, in selector order. Default is index 0.
-/// Per design's reconciled corpus ids (2026-05-29): corpus-v1-quick is
-/// the 2.5GB RANKED corpus (NOT the old 100MB). Add further ranked tiers
-/// here as web hosts them; smoke stays CLI-only.
+/// Per design's CORRECTED corpus ids (2026-05-29): the 2.5GB RANKED quick
+/// tier is `corpus-v2-quick` (live on dev: 2.41GB / 8600 files); the old
+/// corpus-v1-quick is now the 100MB SMOKE (test-only, CLI-only). The 6GB
+/// ranked `corpus-v2-full` slots in here when web hosts it (HoF). Using a
+/// fresh v2 id (not overwriting v1-quick) also keeps the cache key honest.
 pub const USER_TIERS: &[BenchTierChoice] = &[BenchTierChoice {
-    corpus_version: "corpus-v1-quick",
+    corpus_version: "corpus-v2-quick",
     tier: "quick",
-    label: "Quick (ranked, ~2.5 GB)",
-    approx_size: "~2.5 GB",
+    label: "Quick (ranked, ~2.4 GB)",
+    approx_size: "~2.4 GB",
 }];
 
 /// GUI-side bench state, held in the app. `None` modal => button not clicked.
