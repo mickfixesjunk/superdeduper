@@ -127,22 +127,28 @@ pub fn quick_tier() -> TierSpec {
     }
 }
 
-/// `corpus-v2-full` — the COMPETITIVE Hall-of-Fame tier (design call [A],
-/// 2026-05-29): ~1.5M tiny 4KiB files / ~6.14 GB / ~30% reclaimable, a SINGLE
-/// size class. File COUNT (not byte volume) is the point — ~1.5M file-opens
-/// make the dedup SYSCALL-BOUND, which (a) bounds the forge (in-memory recovery
-/// can't fake 1.5M open() syscalls) and (b) is self-cold even on high-RAM rigs
-/// (the 22k/6.29GB build fit in RAM -> read-bound -> not self-cold; that was a
-/// deviation). O_DIRECT cold-enforce still applies (defense-in-depth). Single
-/// size class => size-group prunes nothing => candidate-bytes == full 6.14 GB.
-/// `corpus_version` here is the generator's internal label; web sets the SERVED
-/// id. Constants are tunable; the layout logic never changes.
+/// `corpus-v2-full` — the COMPETITIVE Hall-of-Fame tier. design BLESSED
+/// research's 3-CLASS composition (2026-05-29): ~1M x 4KiB small (the
+/// syscall-bound forge invariant — 1M file-opens dominate the wall, which
+/// in-memory recovery can't fake + makes it self-cold even on high-RAM rigs)
+/// + ~2.1 GB medium/large for realism (mixed sizes = representative dedup).
+/// ~6.25 GB total, ~29% reclaimable.
+///
+/// ALL three size classes are 4KiB-MULTIPLES (4KiB / 1 MiB / 256 MiB) so every
+/// file is sector-aligned and the cold-enforce read-path (O_DIRECT /
+/// NO_BUFFERING) cold-reads all of it — the "uniform 4K-multiple sizes" half of
+/// the Windows cold-enforce fix (the engine read-path is the other half).
+///
+/// `corpus_version` is the generator's internal label; web sets the SERVED id.
+/// Per-class dup constants are engine-proposed to unblock the launch critical
+/// path (design-macro-aligned); research/design may tune them before the corpus
+/// is finalized — only constants change, the layout logic never does.
 pub fn full_tier() -> TierSpec {
     TierSpec {
         corpus_version: "corpus-v2-full",
-        small: SizeClassSpec { file_size: SMALL_SIZE, file_count: 1_500_000, size2_clusters: 442_500, big_clusters: 375, big_size: 21 },
-        medium: SizeClassSpec { file_size: MEDIUM_SIZE, file_count: 0, size2_clusters: 0, big_clusters: 0, big_size: 0 },
-        large: SizeClassSpec { file_size: LARGE_SIZE, file_count: 0, size2_clusters: 0, big_clusters: 0, big_size: 0 },
+        small: SizeClassSpec { file_size: SMALL_SIZE, file_count: 1_000_000, size2_clusters: 295_000, big_clusters: 250, big_size: 21 },
+        medium: SizeClassSpec { file_size: MEDIUM_SIZE, file_count: 1_800, size2_clusters: 520, big_clusters: 3, big_size: 21 },
+        large: SizeClassSpec { file_size: LARGE_SIZE, file_count: 1, size2_clusters: 0, big_clusters: 0, big_size: 0 },
     }
 }
 
@@ -736,17 +742,19 @@ mod tests {
 
     #[test]
     fn full_tier_matches_published_aggregates() {
-        // corpus-v2-full (design [A]): single 4KiB class, ~1.5M tiny files.
+        // corpus-v2-full: research's 3-class (1M x4KiB small + 1800 x1MiB
+        // medium + 1 x256MiB large), all 4KiB-aligned. ~6.25 GB, ~29%.
         let plan = plan_corpus(&full_tier());
-        assert_eq!(plan.file_count, 1_500_000, "full file_count");
-        // 4KiB < 1MiB => exactly 1 leaf per file.
-        assert_eq!(plan.leaf_count, 1_500_000, "full leaf_count");
-        assert_eq!(plan.total_bytes, 6_144_000_000, "full total_bytes (~6.14 GB)");
+        assert_eq!(plan.file_count, 1_000_000 + 1_800 + 1, "full file_count");
+        assert_eq!(plan.size_class_counts, SizeClassCounts { small: 1_000_000, medium: 1_800, large: 1 });
+        // leaves: small 1 each, medium 1 each (1MiB), large 256 (256MiB).
+        assert_eq!(plan.leaf_count, 1_000_000 + 1_800 + 256, "full leaf_count");
+        assert_eq!(plan.total_bytes, 6_251_872_256, "full total_bytes (~6.25 GB)");
         let dups: u64 = plan.dupsets.iter().map(|s| s.len() as u64 - 1).sum();
-        // size2: 442_500 clusters * 1 dup; big: 375 clusters * (21-1) dups.
-        assert_eq!(dups, 442_500 + 375 * 20, "full duplicate-file count");
+        // small: 295_000 + 250*20 ; medium: 520 + 3*20 ; large: 0.
+        assert_eq!(dups, (295_000 + 250 * 20) + (520 + 3 * 20), "full duplicate-file count");
         let frac = full_tier().reclaimable_fraction();
-        assert!((0.299..0.301).contains(&frac), "full reclaimable ~30%, got {frac}");
+        assert!((0.29..0.30).contains(&frac), "full reclaimable ~29%, got {frac}");
     }
 
     #[test]
