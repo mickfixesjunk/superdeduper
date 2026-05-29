@@ -50,6 +50,25 @@ pub struct SubmissionInputs {
     /// freshly-finished scan (e.g. resubmit from history, which
     /// already has the scan_id from a different path).
     pub scan_id: Option<String>,
+    /// T-BENCH-ME: present only for `scope = "canonical-bench"` submissions.
+    /// Carries the work-proof + version-binding fields web's
+    /// `verifyHardenedBench` requires; `None` for every ordinary scan
+    /// submission (then `build_payload` emits no bench keys). Not serialized
+    /// directly — `build_payload` lifts it into the wire body.
+    pub bench: Option<CanonicalBench>,
+}
+
+/// T-BENCH-ME canonical-bench top-level submission fields (work-proof spec).
+/// `build_payload` lifts these to the top level of the body when present;
+/// `client_found_dupsets` rides in [`ResultSummary`] per web's envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalBench {
+    pub protocol_version: String,
+    pub corpus_version: String,
+    pub tier: String,
+    pub bench_run_id: String,
+    /// `serde_json::to_value(bench_corpus::BenchProof)` — {merkle_root, samples[]}.
+    pub bench_proof: serde_json::Value,
 }
 
 /// `run_shape` block per backend schema.
@@ -159,6 +178,12 @@ pub struct ResultSummary {
     pub placeholder_skip_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder_skip_bytes: Option<u64>,
+    /// T-BENCH-ME: the client's found duplicate sets as canonical global
+    /// `path_index` lists (sorted within + across), for the server's
+    /// client==groundtruth correctness gate. Present only on canonical-bench
+    /// submissions; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_found_dupsets: Option<Vec<Vec<u64>>>,
 }
 
 /// Locked key for the "delete-to-recycle bytes" entry in
@@ -289,7 +314,7 @@ pub fn wire_schema_json() -> String {
 /// current install state is always used — guards against a stale
 /// pending payload outliving a "Reset install" rotation.
 pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json::Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "schema_version": "v1",
         "client_version": inputs.client_version,
         "install_id": install_id,
@@ -297,7 +322,19 @@ pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json:
         "hardware": inputs.hardware,
         "run_shape": inputs.run_shape,
         "result_summary": inputs.result_summary,
-    })
+    });
+    // T-BENCH-ME: lift the canonical-bench work-proof + version-binding fields
+    // to the top level (only for scope=canonical-bench; ordinary scans omit
+    // them entirely, keeping the v1 schema's top-level key set unchanged).
+    if let Some(bench) = &inputs.bench {
+        let obj = body.as_object_mut().expect("json object");
+        obj.insert("protocol_version".into(), bench.protocol_version.clone().into());
+        obj.insert("corpus_version".into(), bench.corpus_version.clone().into());
+        obj.insert("tier".into(), bench.tier.clone().into());
+        obj.insert("bench_run_id".into(), bench.bench_run_id.clone().into());
+        obj.insert("bench_proof".into(), bench.bench_proof.clone());
+    }
+    body
 }
 
 /// #41 — re-POST a previously-recorded canonical payload. Same
@@ -1000,6 +1037,7 @@ mod tests {
             client_version: "0.1.0".into(),
             run_uuid: "9d4a0000-0000-0000-0000-000000000001".into(),
             scan_id: None,
+            bench: None,
             hardware: crate::leaderboard::hardware::detect(),
             run_shape: RunShape {
                 wall_clock_seconds: 5.678,
@@ -1026,6 +1064,7 @@ mod tests {
                 actions_taken_summary: std::collections::BTreeMap::new(),
                 placeholder_skip_count: None,
                 placeholder_skip_bytes: None,
+                client_found_dupsets: None,
             },
         }
     }
@@ -1050,6 +1089,39 @@ mod tests {
             Some("test-install-id")
         );
         assert_eq!(p.get("schema_version").and_then(|v| v.as_str()), Some("v1"));
+    }
+
+    #[test]
+    fn build_payload_emits_canonical_bench_block_when_present() {
+        let mut inputs = sample_inputs();
+        inputs.run_shape.scope = "canonical-bench".into();
+        inputs.run_shape.corpus_kind = "canonical-bench".into();
+        inputs.result_summary.client_found_dupsets = Some(vec![vec![0, 6], vec![2, 8, 9]]);
+        inputs.bench = Some(CanonicalBench {
+            protocol_version: "tbench-1".into(),
+            corpus_version: "corpus-v1-quick".into(),
+            tier: "quick".into(),
+            bench_run_id: "run-xyz".into(),
+            bench_proof: serde_json::json!({
+                "merkle_root": "a2bMC1+LJk79V2AB9/Nr1hitk5rISU01Sx1wQIgIbmk=",
+                "samples": [],
+            }),
+        });
+        let p = build_payload(&inputs, "id");
+        assert_eq!(p.get("protocol_version").and_then(|v| v.as_str()), Some("tbench-1"));
+        assert_eq!(p.get("corpus_version").and_then(|v| v.as_str()), Some("corpus-v1-quick"));
+        assert_eq!(p.get("tier").and_then(|v| v.as_str()), Some("quick"));
+        assert_eq!(p.get("bench_run_id").and_then(|v| v.as_str()), Some("run-xyz"));
+        assert_eq!(
+            p.pointer("/bench_proof/merkle_root").and_then(|v| v.as_str()),
+            Some("a2bMC1+LJk79V2AB9/Nr1hitk5rISU01Sx1wQIgIbmk=")
+        );
+        assert!(p.pointer("/result_summary/client_found_dupsets").is_some());
+        // ordinary (non-bench) submissions must NOT carry any of these keys.
+        let plain = build_payload(&sample_inputs(), "id");
+        for k in ["protocol_version", "corpus_version", "tier", "bench_run_id", "bench_proof"] {
+            assert!(plain.get(k).is_none(), "non-bench payload must omit '{k}'");
+        }
     }
 
     #[test]

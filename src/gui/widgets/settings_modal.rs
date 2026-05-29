@@ -2383,7 +2383,9 @@ fn build_sample_payload_json() -> String {
             actions_taken_summary: std::collections::BTreeMap::new(),
             placeholder_skip_count: None,
             placeholder_skip_bytes: None,
+            client_found_dupsets: None,
         },
+        bench: None,
     };
     let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");
     serde_json::to_string_pretty(&payload).unwrap_or_else(|e| format!("(render failed: {e})"))

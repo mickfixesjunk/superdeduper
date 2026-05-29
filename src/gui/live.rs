@@ -1978,7 +1978,9 @@ fn run(
                     }
                 },
                 placeholder_skip_bytes: None,
+                client_found_dupsets: None,
             },
+            bench: None,
         };
         // Diagnostic-only payload preview. install_id is empty string
         // here because the engine doesn't load the install state at

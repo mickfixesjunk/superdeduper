@@ -1937,7 +1937,9 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
                         Some(skipped.len() as u64)
                     },
                     placeholder_skip_bytes: None,
+                    client_found_dupsets: None,
                 },
+                bench: None,
             };
             let payload = submission::build_payload(&inputs, &install_state.install_id);
             record = record.with_submission_payload(payload, install_state.install_id);
