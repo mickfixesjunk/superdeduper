@@ -265,6 +265,10 @@ jobs:
             superdeduper-${{ env.VERSION_TAG }}-linux-x86_64.tar.gz
 
   build-macos:
+    # v0.2.37: DISABLED — macOS is DEFERRED (ships from an M-series mac after
+    # #159/#158/#157/#156 are fixed; Mick's decouple call). Re-enable by
+    # removing `if: false` once mac is verified.
+    if: false
     # macOS side of the release. Separate job so the two arches
     # (Intel x86_64 + Apple Silicon aarch64) build in parallel on
     # macos-latest. macos-latest is an Apple Silicon (M-series)
@@ -363,6 +367,9 @@ jobs:
             superdeduper-${{ env.VERSION_TAG }}-${{ matrix.platform }}.tar.gz
 
   build-freebsd:
+    # v0.2.37: DISABLED — FreeBSD is experimental/unverified (no hardware
+    # validation); deferred. Re-enable by removing `if: false`.
+    if: false
     # FreeBSD x86_64 build. cargo-zigbuild was the originally-stated
     # approach in #105 but zig 0.13 ships no FreeBSD libc headers in
     # its bundled libc collection — `zig targets` libc list has the
@@ -455,7 +462,7 @@ jobs:
     # draft. Per #11 spec, one canonical file at the release root
     # is the source-of-truth for download-integrity verification.
     name: checksums
-    needs: [build, build-linux, build-macos, build-freebsd]
+    needs: [build, build-linux]  # v0.2.37: mac + FreeBSD jobs disabled (deferred)
     runs-on: ubuntu-latest
     env:
       VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
