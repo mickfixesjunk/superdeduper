@@ -269,9 +269,11 @@ pub enum DebugCommand {
         /// Output directory (created if absent).
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
-        /// 32-byte corpus seed as 64 hex chars. Defaults to the dev seed.
-        /// (The PUBLISHED corpus-v1 seed is pinned by research; until that
-        /// lands this dev seed lets the rig be timed against a real corpus.)
+        /// REQUIRED 32-byte corpus seed as 64 hex chars. There is NO default —
+        /// the corpus seed is private (held server-side) and never hardcoded in
+        /// this public source. Clients use `--bench-me` (which DOWNLOADS the
+        /// corpus and never needs the seed); this generator tool is dev/server
+        /// only. For a perf/throughput pass any 64-hex value works.
         #[arg(long, value_name = "HEX")]
         seed: Option<String>,
         /// Also compute + print the Merkle root (base64) after writing, with

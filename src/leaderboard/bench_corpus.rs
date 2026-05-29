@@ -21,8 +21,8 @@
 #![cfg(feature = "telemetry")]
 
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use super::bench::{self, CHUNK_SIZE};
 
@@ -330,6 +330,88 @@ pub fn build_manifest(spec: &TierSpec, seed: &[u8; 32], plan: &CorpusPlan, k_con
 
 /// Number of challenge samples in a v1 bench proof.
 pub const BENCH_SAMPLE_N: usize = 32;
+
+/// Enumerate the on-disk corpus files (`f{path_index:010}.bin`) in global
+/// path-lex order (== `path_index` order) with their byte sizes. The DOWNLOAD
+/// flow (`--bench-me`) uses this: the client has the bytes on disk, not the
+/// seed/plan. Non-corpus files (e.g. `manifest.json`) are skipped.
+pub fn scan_corpus_dir(dir: &Path) -> std::io::Result<Vec<(u64, PathBuf, u64)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if let Some(pi) = parse_corpus_path_index(name) {
+            let size = entry.metadata()?.len();
+            files.push((pi, path, size));
+        }
+    }
+    files.sort_by_key(|(pi, _, _)| *pi);
+    Ok(files)
+}
+
+/// Build the bench proof from the DOWNLOADED corpus on disk — the seedless,
+/// real-IO path for `--bench-me`. Reads every chunk from disk (the work-proof
+/// AND the I/O signature web's gate requires), hashes the leaves, folds the
+/// Merkle root, derives the BC-bound challenge positions, and emits each
+/// sample with its audit path. Returns the proof plus `bytes_read` (the total
+/// bytes pulled from disk — a no-IO submission has `bytes_read == 0`). The
+/// leaf order + hashing match the seed-derived path, so the root equals what
+/// the server (which holds the seed) computes.
+pub fn build_bench_proof_from_dir(
+    dir: &Path,
+    bc: &bench::BenchContext,
+    sample_n: usize,
+) -> std::io::Result<(BenchProof, u64)> {
+    let files = scan_corpus_dir(dir)?;
+    let mut leaves: Vec<[u8; 32]> = Vec::new();
+    let mut locs: Vec<(u64, u64, u64)> = Vec::new(); // (path_index, offset, len)
+    let mut bytes_read = 0u64;
+    let mut buf = vec![0u8; CHUNK_SIZE as usize];
+    for (pi, path, size) in &files {
+        let name = format!("f{pi:010}.bin");
+        let mut f = std::fs::File::open(path)?;
+        let mut off = 0u64;
+        while off < *size {
+            let len = ((*size - off).min(CHUNK_SIZE)) as usize;
+            f.read_exact(&mut buf[..len])?; // real disk IO — the I/O signature
+            leaves.push(bench::leaf_hash(&name, off, len as u64, &buf[..len]));
+            locs.push((*pi, off, len as u64));
+            off += len as u64;
+            bytes_read += len as u64;
+        }
+    }
+    let root = bench::merkle_root(&leaves).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "empty corpus directory")
+    })?;
+    let positions = bench::challenge_positions_from_bc(&bc.encode(), leaves.len() as u64, sample_n);
+    let mut samples = Vec::with_capacity(positions.len());
+    for pos in positions {
+        let m = pos as usize;
+        let path = bench::audit_path(m, &leaves);
+        debug_assert_eq!(bench::root_from_path(leaves[m], &path, m, leaves.len()), root);
+        let (path_index, byte_offset, byte_length) = locs[m];
+        samples.push(SampleProof {
+            leaf_index: pos,
+            path_index,
+            byte_offset,
+            byte_length,
+            leaf_hash: bench::root_base64(&leaves[m]),
+            audit_path: path.iter().map(bench::root_base64).collect(),
+        });
+    }
+    let proof = BenchProof {
+        bench_run_id: bc.bench_run_id.to_string(),
+        corpus_version: bc.corpus_version.to_string(),
+        leaf_count: leaves.len() as u64,
+        merkle_root: bench::root_base64(&root),
+        samples,
+    };
+    Ok((proof, bytes_read))
+}
 
 /// Assemble the canonical-bench submission block for a completed bench run —
 /// **the caller of [`build_bench_proof`]** (wiring it into the live submission
@@ -941,6 +1023,48 @@ mod tests {
         assert_eq!(payload.get("bench_run_id").and_then(|v| v.as_str()), Some("run-cb-1"));
         assert!(payload.pointer("/bench_proof/merkle_root").is_some());
         assert!(payload.pointer("/result_summary/client_found_dupsets").is_some());
+    }
+
+    #[test]
+    fn disk_proof_equals_seed_proof_and_records_io() {
+        // The DOWNLOAD flow: the server generates the corpus from the private
+        // seed; the client downloads the bytes and builds the proof from DISK
+        // (no seed). The disk-derived root MUST equal the seed-derived root, so
+        // the server's verifier (which holds the seed) accepts the client proof.
+        let seed = [0x6Cu8; 32];
+        let (kc, _) = bench::corpus_keys(&seed);
+        let spec = tiny_tier();
+        let plan = plan_corpus(&spec);
+        let dir = std::env::temp_dir().join(format!("sd-bench-dlproof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let written = write_corpus(&dir, &kc, &plan).expect("write corpus"); // server side
+
+        let mhash = manifest_hash(&manifest_m(
+            "tbench-1", spec.corpus_version, &seed, CHUNK_SIZE as u32, "tiny",
+            plan.file_count, plan.leaf_count, plan.size_class_counts,
+        ));
+        let bc = bench::BenchContext {
+            protocol_version: "tbench-1",
+            corpus_version: spec.corpus_version,
+            manifest_hash: mhash,
+            install_id: "i",
+            bench_run_id: "run-dl",
+            tier: "tiny",
+            leaf_count: plan.leaf_count,
+            chunk_size: CHUNK_SIZE as u32,
+        };
+
+        // seed-derived (server / golden) proof vs disk-derived (client) proof.
+        let seed_proof = build_bench_proof(&plan, &kc, &bc, 32);
+        let (disk_proof, bytes_read) = build_bench_proof_from_dir(&dir, &bc, 32).expect("disk proof");
+
+        assert_eq!(disk_proof.merkle_root, seed_proof.merkle_root, "disk root == seed root");
+        assert_eq!(disk_proof.leaf_count, seed_proof.leaf_count);
+        assert_eq!(disk_proof, seed_proof, "full proof identical (same challenge → same samples)");
+        // I/O signature: the client actually read every byte from disk.
+        assert_eq!(bytes_read, written, "bytes_read == corpus bytes on disk (real IO)");
+        assert_eq!(bytes_read, plan.total_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

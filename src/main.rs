@@ -489,22 +489,27 @@ fn run_make_bench_corpus(
     Ok(())
 }
 
-/// Parse the optional `--seed` (64 hex chars → 32 bytes); default = the
-/// deterministic dev seed `BLAKE3("superdeduper-bench-dev-v1")`.
+/// Parse the REQUIRED `--seed` (64 hex chars → 32 bytes). There is NO default:
+/// the corpus seed is private (held by the server), never hardcoded in this
+/// public source. `make-bench-corpus` is a dev/server generation tool; callers
+/// supply the seed explicitly (clients use `--bench-me`, which downloads the
+/// corpus rather than generating it, and never needs the seed).
 #[cfg(feature = "telemetry")]
 fn parse_bench_seed(seed: Option<String>) -> anyhow::Result<[u8; 32]> {
-    match seed {
-        Some(h) => {
-            anyhow::ensure!(h.len() == 64, "--seed must be exactly 64 hex chars (32 bytes)");
-            let mut a = [0u8; 32];
-            for (i, byte) in a.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16)
-                    .map_err(|_| anyhow::anyhow!("--seed must be valid hex"))?;
-            }
-            Ok(a)
-        }
-        None => Ok(*blake3::hash(b"superdeduper-bench-dev-v1").as_bytes()),
+    let h = seed.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--seed is required (64 hex chars). The corpus seed is private; there is no \
+             default. For a perf/throughput pass any 64-hex value works (throughput is \
+             seed-independent); for a real corpus use the server's published seed."
+        )
+    })?;
+    anyhow::ensure!(h.len() == 64, "--seed must be exactly 64 hex chars (32 bytes)");
+    let mut a = [0u8; 32];
+    for (i, byte) in a.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16)
+            .map_err(|_| anyhow::anyhow!("--seed must be valid hex"))?;
     }
+    Ok(a)
 }
 
 /// G-track: `superdeduper achievements` — list / refetch the install's
