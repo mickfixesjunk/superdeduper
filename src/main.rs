@@ -450,6 +450,7 @@ fn run_make_bench_corpus(
     let spec = match tier {
         BenchTier::Quick => bc::quick_tier(),
         BenchTier::Full => bc::full_tier(),
+        BenchTier::Sample => bc::sample_tier(),
     };
     let seed = parse_bench_seed(seed)?;
     let (k_content, _) = bench::corpus_keys(&seed);
@@ -502,6 +503,7 @@ fn run_make_bench_corpus(
             match tier {
                 BenchTier::Quick => "quick",
                 BenchTier::Full => "full",
+                BenchTier::Sample => "sample",
             },
             plan.file_count,
             plan.leaf_count,

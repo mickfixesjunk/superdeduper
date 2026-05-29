@@ -101,6 +101,22 @@ impl TierSpec {
     }
 }
 
+/// `corpus-sample` — a tiny cross-validation fixture (~34 MB, 1030 files)
+/// that exercises EVERY content_id-assignment branch (originals, size-2 dups,
+/// big-cluster dups) across two size classes, so an independent verifier
+/// (e.g. web's TS `bench-corpus-gen.ts`) can byte-lock its layout port against
+/// the engine generator BEFORE any large regen. Not a leaderboard tier — no
+/// `large` (256 MiB) class to keep it small; the large-class cid logic is
+/// byte-identical (only file_size differs).
+pub fn sample_tier() -> TierSpec {
+    TierSpec {
+        corpus_version: "corpus-sample",
+        small: SizeClassSpec { file_size: SMALL_SIZE, file_count: 1_000, size2_clusters: 200, big_clusters: 10, big_size: 5 },
+        medium: SizeClassSpec { file_size: MEDIUM_SIZE, file_count: 30, size2_clusters: 5, big_clusters: 2, big_size: 3 },
+        large: SizeClassSpec { file_size: LARGE_SIZE, file_count: 0, size2_clusters: 0, big_clusters: 0, big_size: 0 },
+    }
+}
+
 /// `corpus-v1-quick` — the `--bench-me` default (~2.53 GB, ~26.8% reclaimable).
 pub fn quick_tier() -> TierSpec {
     TierSpec {
@@ -698,6 +714,24 @@ mod tests {
         assert_eq!(dups, 36_000 + 510, "quick duplicate-file count");
         let frac = quick_tier().reclaimable_fraction();
         assert!((0.267..0.269).contains(&frac), "quick reclaimable ~26.8%, got {frac}");
+    }
+
+    #[test]
+    fn sample_tier_xval_fixture_is_pinned() {
+        // The cross-validation fixture web byte-locks its TS layout port
+        // against. If these aggregates drift, web's pinned merkle_root +
+        // groundtruth break — so pin them here as a regression guard.
+        let plan = plan_corpus(&sample_tier());
+        assert_eq!(plan.file_count, 1_030, "sample file_count");
+        assert_eq!(plan.size_class_counts, SizeClassCounts { small: 1_000, medium: 30, large: 0 });
+        assert_eq!(plan.total_bytes, 35_553_280, "sample total_bytes (~34 MB)");
+        // dups: small 200 + 10*(5-1)=240 ; medium 5 + 2*(3-1)=9 ; total 249.
+        let dups: u64 = plan.dupsets.iter().map(|s| s.len() as u64 - 1).sum();
+        assert_eq!(dups, 240 + 9, "sample duplicate-file count");
+        // 217 non-singleton dup groups (small 200+10, medium 5+2).
+        assert_eq!(plan.dupsets.len(), 200 + 10 + 5 + 2, "sample dup-group count");
+        // Exercises all branches across two classes for the verifier port.
+        assert_eq!(plan.dupsets[0], vec![0, 760], "first size-2 set = {{original 0, dup at u=760}}");
     }
 
     #[test]

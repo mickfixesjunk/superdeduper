@@ -334,6 +334,9 @@ pub enum SnapshotFormat {
 pub enum BenchTier {
     Quick,
     Full,
+    /// Tiny cross-validation fixture (~34 MB, 1030 files) — exercises every
+    /// content_id branch for an independent verifier to byte-lock against.
+    Sample,
 }
 
 #[derive(Debug, Args)]
