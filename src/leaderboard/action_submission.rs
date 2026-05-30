@@ -267,6 +267,140 @@ pub fn clear_status() {
 /// Transient outcomes; bails immediately on Rejected /
 /// Unauthorised. Writes status to the process-wide slot at every
 /// state change so the modal polls fresh values each frame.
+/// v0.2.39 (E) — fire a 2-phase worker that first POSTs `/api/v1/submit`
+/// (silently submitting the scan the user skipped) using the supplied
+/// `SubmissionInputs`, then PATCHes `/api/v1/submit/{new_submission_id}/actions`
+/// with the action-credit summary. Preserves correct attribution: the credit
+/// lands under the scan that produced it, not under some unrelated future
+/// submission. Used when `peek_pending_submission_id()` is None at action-fire
+/// time but `peek_pending()` still has the scan's SubmissionInputs (i.e., the
+/// user clicked Skip in the post-scan modal then performed a dedupe action
+/// before closing the session).
+///
+/// On Phase-1 transient failure: queues the action credit to disk via
+/// `pending_actions::append` (drained on the next successful /submit).
+/// On Phase-1 terminal failure (Rejected / Unauthorised): same — queue to
+/// disk so a re-auth + re-submit recovers the credit. On Phase-2 retry-
+/// exhausted: existing `spawn_submit_worker` writes ActionSubmissionStatus::
+/// Queued; the disk fallback covers the next-launch drain.
+pub fn spawn_auto_submit_then_patch(
+    state: InstallState,
+    inputs: super::submission::SubmissionInputs,
+    actions_taken_summary: BTreeMap<String, u64>,
+) {
+    store_status(ActionSubmissionStatus::Submitting);
+    let run_uuid = inputs.run_uuid.clone();
+    std::thread::Builder::new()
+        .name("sd-auto-submit-then-action".into())
+        .spawn(move || {
+            crate::log_info!(
+                "v0.2.39 (E): auto-submit triggered for skipped scan run_uuid={} (actions: {:?})",
+                run_uuid,
+                actions_taken_summary
+            );
+            // Phase 1: POST /submit.
+            let outcome = super::submission::submit(&state, &inputs);
+            let submission_id = match outcome {
+                super::submission::SubmitOutcome::Accepted { submission_id, .. } => {
+                    super::submission::store_pending_submission_id(submission_id.clone());
+                    // We've consumed the in-memory pending inputs; clear so a
+                    // double-fire doesn't re-submit.
+                    let _ = super::submission::take_pending();
+                    crate::log_info!(
+                        "v0.2.39 (E): auto-submit Accepted submission_id={} run_uuid={}",
+                        submission_id,
+                        run_uuid
+                    );
+                    submission_id
+                }
+                other => {
+                    crate::log_warn!(
+                        "v0.2.39 (E): auto-submit failed ({other:?}); queueing action credit to disk for next /submit"
+                    );
+                    queue_to_disk(&actions_taken_summary, &run_uuid);
+                    store_status(ActionSubmissionStatus::Queued {
+                        reason: format!("auto-submit failed: {other:?}"),
+                    });
+                    return;
+                }
+            };
+            // Phase 2: PATCH /actions — delegate to the existing worker so
+            // retry budget + state-machine semantics are shared.
+            spawn_submit_worker(state, submission_id, actions_taken_summary);
+        })
+        .expect("spawn auto-submit-then-action thread");
+}
+
+/// Queue every (action_key, ok_bytes) entry in `summary` to the disk queue,
+/// stamped with `run_uuid` + now. Drains on next /submit Accepted.
+fn queue_to_disk(summary: &BTreeMap<String, u64>, run_uuid: &str) {
+    let now = crate::time::now_unix_i64();
+    for (k, v) in summary {
+        let entry = super::pending_actions::PendingAction {
+            action_key: k.clone(),
+            ok_bytes: *v,
+            run_uuid: run_uuid.to_string(),
+            queued_at: now,
+        };
+        if let Err(e) = super::pending_actions::append(&entry) {
+            crate::log_err!(
+                "pending_actions::append failed for {k}={v} run={run_uuid}: {e}"
+            );
+        } else {
+            crate::log_info!(
+                "pending_actions::append queued {k}={v} run={run_uuid} (will drain on next /submit Accepted)"
+            );
+        }
+    }
+}
+
+/// v0.2.39 #99 — drain the disk queue after a successful /submit Accepted.
+/// Aggregates queued entries by action_key (PATCH UPSERT semantics make this
+/// safe), folds them into `current` if provided, and PATCHes the merged
+/// summary against the new submission_id. Clears the disk queue on PATCH
+/// success; leaves it (or appends new) on Transient.
+///
+/// Called from the GUI submit success path AFTER store_pending_submission_id.
+/// If `current` is empty (no in-flight current-scan actions, the drain is
+/// pure-queue catch-up), the merged summary is just the aggregate.
+pub fn drain_pending_after_submit(
+    state: InstallState,
+    submission_id: String,
+    current: BTreeMap<String, u64>,
+) {
+    if super::pending_actions::is_empty() && current.is_empty() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("sd-pending-actions-drain".into())
+        .spawn(move || {
+            let queued = match super::pending_actions::drain_aggregated() {
+                Ok(a) => a,
+                Err(e) => {
+                    crate::log_err!("pending_actions::drain failed: {e}; skipping");
+                    return;
+                }
+            };
+            // Merge queued + current (sum by key — PATCH UPSERT).
+            let mut merged: BTreeMap<String, u64> = current;
+            for (k, v) in &queued {
+                *merged.entry(k.clone()).or_insert(0) += *v;
+            }
+            if merged.is_empty() {
+                return;
+            }
+            crate::log_info!(
+                "v0.2.39 #99: draining {} queued action credits onto submission_id={} (merged: {:?})",
+                queued.len(),
+                submission_id,
+                merged
+            );
+            // Reuse the standard worker for the PATCH + retry semantics.
+            spawn_submit_worker(state, submission_id, merged);
+        })
+        .expect("spawn pending-actions-drain thread");
+}
+
 pub fn spawn_submit_worker(
     state: InstallState,
     submission_id: String,

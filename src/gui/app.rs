@@ -1077,26 +1077,82 @@ impl SuperdeduperApp {
     /// None.
     #[cfg(feature = "telemetry")]
     fn spawn_action_patch_for_dedupe(&self, summary: crate::dedupe::DedupeActionSummary) {
-        let submission_id = match crate::leaderboard::submission::peek_pending_submission_id() {
-            Some(id) => id,
-            None => {
-                eprintln!("#79: dedupe PATCH skipped — no pending submission_id");
-                return;
-            }
-        };
+        // v0.2.39 (E + #99): the old code returned silently when no pending
+        // submission_id was in memory, which dropped the lifetime credit for
+        // a user who skipped the post-scan submit then performed a dedupe
+        // action (Mick's live bug 2026-05-29). New layered recovery:
+        //   1. Fast path: peek_pending_submission_id has a recent /submit's id.
+        //   2. Auto-submit path: peek_pending() still has the scan's
+        //      SubmissionInputs in memory — silently submit the skipped scan,
+        //      get a fresh submission_id, PATCH actions against it.
+        //   3. Disk-queue path: neither available (process restart between
+        //      scan + action) — persist to pending_actions.json, drained on
+        //      the next successful /submit Accepted.
         let actions =
             match crate::leaderboard::action_submission::actions_summary_from_dedupe(&summary) {
                 Some(m) => m,
-                None => return,
+                None => return, // SafeRename or 0 bytes; nothing to credit
             };
         let state = match crate::leaderboard::install::load() {
             Ok(Some(s)) if s.registered => s,
             _ => {
-                eprintln!("#79: dedupe PATCH skipped — install not registered");
+                crate::log_warn!(
+                    "v0.2.39: dedupe PATCH skipped — install not registered (actions: {:?})",
+                    actions
+                );
                 return;
             }
         };
-        crate::leaderboard::action_submission::spawn_submit_worker(state, submission_id, actions);
+        // 1. Fast path: in-memory submission_id from a recent /submit Accepted.
+        if let Some(submission_id) = crate::leaderboard::submission::peek_pending_submission_id() {
+            crate::log_info!(
+                "v0.2.39 fast: dedupe PATCH using existing submission_id={} (actions: {:?})",
+                submission_id,
+                actions
+            );
+            crate::leaderboard::action_submission::spawn_submit_worker(
+                state,
+                submission_id,
+                actions,
+            );
+            return;
+        }
+        // 2. Auto-submit path (E): submission inputs still in memory.
+        if let Some(inputs) = crate::leaderboard::submission::peek_pending() {
+            crate::log_info!(
+                "v0.2.39 (E): no pending submission_id; auto-submitting scan run_uuid={} then PATCH actions",
+                inputs.run_uuid
+            );
+            crate::leaderboard::action_submission::spawn_auto_submit_then_patch(
+                state, inputs, actions,
+            );
+            return;
+        }
+        // 3. Disk-queue path (#99): persist for next /submit drain.
+        crate::log_warn!(
+            "v0.2.39 #99: no submission_id and no pending inputs in memory; queueing action credit to disk for next /submit (actions: {:?})",
+            actions
+        );
+        let now = crate::time::now_unix_i64();
+        // DedupeActionSummary doesn't carry run_uuid today; use a placeholder.
+        // run_uuid is forensic-only on the queue (PATCH doesn't include it),
+        // so a marker string is fine. If we later thread the scan's run_uuid
+        // through DedupeActionSummary, replace this.
+        let run_uuid = "<unknown-skipped-scan>".to_string();
+        let _ = &summary; // silence unused-binding when no scan_history fallback fires
+        for (k, v) in &actions {
+            let entry = crate::leaderboard::pending_actions::PendingAction {
+                action_key: k.clone(),
+                ok_bytes: *v,
+                run_uuid: run_uuid.clone(),
+                queued_at: now,
+            };
+            if let Err(e) = crate::leaderboard::pending_actions::append(&entry) {
+                crate::log_err!(
+                    "pending_actions::append failed for {k}={v}: {e}"
+                );
+            }
+        }
     }
 
     /// Spawn the submit worker thread. Reads `take_pending()` (so a
@@ -1198,6 +1254,17 @@ impl SuperdeduperApp {
                 );
                 // #79 — stash for the post-Go PATCH client.
                 submission::store_pending_submission_id(submission_id.clone());
+                // v0.2.39 #99: drain the pending action-credit queue. If a
+                // prior session staged dedupe actions WITHOUT a submission_id
+                // (skip-submit-then-recycle, or process restart between scan
+                // and action), pending_actions.json holds the credits. This
+                // Accepted is the moment to fold them onto the new
+                // submission_id and clear the queue.
+                crate::leaderboard::action_submission::drain_pending_after_submit(
+                    state.clone(),
+                    submission_id.clone(),
+                    std::collections::BTreeMap::new(),
+                );
                 // #82 — stamp the server-issued submission_id onto
                 // the History row that produced this submission so
                 // the History panel can render scan-vs-reclaim. The
@@ -1248,6 +1315,13 @@ impl SuperdeduperApp {
             if let submission::SubmitOutcome::DuplicateNoChange { submission_id } = &outcome {
                 if let Some(id) = submission_id {
                     submission::store_pending_submission_id(id.clone());
+                    // v0.2.39 #99: 409 also carries a submission_id we can
+                    // credit queued actions to (re-submit-same-corpus case).
+                    crate::leaderboard::action_submission::drain_pending_after_submit(
+                        state.clone(),
+                        id.clone(),
+                        std::collections::BTreeMap::new(),
+                    );
                 }
                 if let Some(scan_id) = inputs.scan_id.as_deref() {
                     if let Err(e) = crate::scan_history::update_submission_state(
