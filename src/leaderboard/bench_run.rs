@@ -194,6 +194,18 @@ pub fn run(
         progress(&format!("reusing cached corpus at {} ({} challenges)", corpus_dir.display(), challenges.len()));
     }
 
+    // 2b. Signal dedup-ready (cert-blocker #5, web 2d247e8 deployed 10:59 PDT).
+    // POST /api/v1/bench/dedup-ready AFTER corpus download/untar, BEFORE the
+    // dedup wall-clock starts. Server stamps dedup_start_ts on the bench_run
+    // row so the verifier's `server_observed_wall_ms` becomes (received_at -
+    // dedup_start_ts) — i.e. just the dedup window, not (download + dedup).
+    // Honest cold-fast users no longer get their wall conflated with the ~60s
+    // download. Fully back-compat: if this call fails for any reason (network
+    // / 503 / etc.) we log + continue, server falls back to the existing
+    // (received_at - server_start_ts) window. The endpoint is one-time-use
+    // server-side (409 on second call) which we just absorb via log_warn.
+    let _ = signal_dedup_ready(&base, &state.install_id, &install_key, &bench_run_id);
+
     // 3. real size-grouped exact dedupe (the ranked wall + I/O signal). The
     // timed window covers enumerate + size-group + hash-candidates;
     // bytes_scanned = candidate bytes hashed (the throughput numerator).
@@ -365,6 +377,75 @@ impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
 /// O_DIRECT is advisory: WSL2 (ext4-on-vhdx / drvfs) ACCEPTS the flag but
 /// silently serves from the Windows host cache — `open(O_DIRECT)` succeeds with
 /// no buffered fallback, yet the read is WARM. Reporting `cold=true` there is a
+/// Cert-blocker #5 (web 2d247e8): notify server "corpus downloaded, dedup
+/// about to start" so it can stamp `dedup_start_ts` on the `bench_run` row.
+/// The verifier then computes `server_observed_wall_ms = received_at -
+/// dedup_start_ts`, i.e. just the dedup window — not (download + dedup).
+/// Honest cold-fast users no longer get their wall conflated with the ~60s
+/// download.
+///
+/// Body shape `{install_id, bench_run_id}`, HMAC-signed exactly like
+/// `/bench/start` (X-Sd-Install-Id + X-Sd-Signature over the canonical
+/// body bytes). One-time use server-side: a second call on the same
+/// bench_run_id returns 409 (which we just log + ignore).
+///
+/// Failure mode is fully back-compat: any network / status error here is
+/// non-fatal. The server falls back to the existing
+/// `received_at - server_start_ts` window, which is what every engine
+/// <= v0.2.49 used. So this is a strict improvement when it succeeds and
+/// a no-op when it doesn't.
+fn signal_dedup_ready(
+    base: &str,
+    install_id: &str,
+    install_key: &super::install::InstallKey,
+    bench_run_id: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "install_id": install_id,
+        "bench_run_id": bench_run_id,
+    });
+    let canonical = super::hmac_signer::canonical_body(&body);
+    let signature = super::hmac_signer::sign(install_key, &canonical);
+    match ureq::post(&format!("{base}/api/v1/bench/dedup-ready"))
+        .set("Content-Type", "application/json")
+        .set("X-Sd-Install-Id", install_id)
+        .set("X-Sd-Signature", &signature)
+        .timeout(std::time::Duration::from_secs(10))
+        .send_bytes(&canonical)
+    {
+        Ok(resp) => {
+            let dedup_start_ts = resp
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("dedup_start_ts").and_then(|s| s.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "(missing dedup_start_ts in response)".to_string());
+            crate::log_info!(
+                "bench: dedup-ready stamped (bench_run_id={bench_run_id}, dedup_start_ts={dedup_start_ts})"
+            );
+            Ok(())
+        }
+        Err(ureq::Error::Status(409, _)) => {
+            crate::log_warn!(
+                "bench: dedup-ready 409 already_stamped (bench_run_id={bench_run_id}) — server keeps the first stamp; safe to continue"
+            );
+            Ok(())
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            crate::log_warn!(
+                "bench: dedup-ready HTTP {code}: {body} (back-compat fallback: server uses received_at - server_start_ts window)"
+            );
+            Ok(())
+        }
+        Err(ureq::Error::Transport(t)) => {
+            crate::log_warn!(
+                "bench: dedup-ready transport error: {t} (back-compat fallback: server uses received_at - server_start_ts window)"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// false positive that would let a warm run land on the competitive cold board
 /// (testrunner's WSL finding — the 125x-leverage forge hole achievements
 /// flagged). Fail closed: detect WSL via /proc/version and treat it as not
