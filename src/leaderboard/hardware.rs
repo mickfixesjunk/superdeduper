@@ -95,7 +95,15 @@ pub fn detect_with_root_hint(root_hint: Option<&std::path::Path>) -> HardwareFin
         ram_total_gb_bucket: snap_ram_bucket(ram_gb_raw),
         os_version: detect_os_version(),
         os_edition: detect_os_edition_enum(),
-        disk_class: detect_disk_class(),
+        // Phase B.5 (design 2026-05-30 15:44 PDT): prefer the WORKDIR's
+        // actual disk_class over the system-disk-derived value. Closes the
+        // attack surface where a forger could bench on a slow USB SSD but
+        // report disk_class=NVMe-Gen4 (system disk) to fit looser caps.
+        // When root_hint is absent or workdir detection fails, falls back
+        // to detect_disk_class() (system-disk-derived; pre-B.5 behavior).
+        disk_class: root_hint
+            .and_then(detect_workdir_disk_class)
+            .unwrap_or_else(detect_disk_class),
         filesystem,
         cluster_size_kb: 4,
         volume_size_gb_bucket: "1024".to_string(),
@@ -262,12 +270,134 @@ fn platform_detect_is_dev_drive(_root_hint: Option<&std::path::Path>) -> Option<
 // and related signals.
 // ============================================================
 
+/// Phase B.5 (design 2026-05-30 15:44 PDT): detect disk_class for the
+/// SPECIFIC disk underlying `workdir`, not the system-disk default.
+/// Returns the canonical disk_class string ("NVMe-Gen5"|"NVMe-Gen4"|...|
+/// "SATA-SSD"|"HDD"|"USB-SSD"|...) when the workdir resolves to a known
+/// physical device. Returns None on per-platform lookup failure (caller
+/// falls back to [`detect_disk_class`] = system-disk-derived legacy
+/// behavior, which is what every pre-v0.2.57 engine reported).
+fn detect_workdir_disk_class(workdir: &std::path::Path) -> Option<String> {
+    workdir_disk_class_platform(workdir)
+}
+
+/// Linux: stat(workdir).st_dev gives the partition's (major, minor); look
+/// up the device in /sys/dev/block + walk up to the block-device root,
+/// then check /queue/rotational + (for NVMe) the parent controller's
+/// /device/current_link_speed to derive the PCIe-gen suffix. Falls back
+/// through SATA-SSD / HDD / None per the rotational signal.
+#[cfg(target_os = "linux")]
+fn workdir_disk_class_platform(workdir: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(workdir).ok()?;
+    // Linux `dev_t`: 8-bit major | 8-bit minor (legacy) or 12-bit major | 20-bit
+    // minor (modern). Use the standard major()/minor() macros via libc.
+    let st_dev = meta.dev();
+    let major = libc::major(st_dev);
+    let minor = libc::minor(st_dev);
+
+    // /sys/dev/block/<major>:<minor> is a symlink into /sys/devices/...
+    let sys_dev_block = format!("/sys/dev/block/{major}:{minor}");
+    let canonical = std::fs::canonicalize(&sys_dev_block).ok()?;
+
+    // Walk UP from the canonical path to find the block-device root (the
+    // dir that contains "queue/rotational"). For a partition like
+    // /sys/devices/.../block/nvme0n1/nvme0n1p2 we want the parent
+    // (nvme0n1) which holds the queue/ subdir. Bound the walk to a few
+    // levels so we don't traverse the whole sysfs on a weird state.
+    let mut cur: Option<&std::path::Path> = Some(canonical.as_path());
+    for _ in 0..6 {
+        let path = cur?;
+        if path.join("queue").join("rotational").exists() {
+            let dev_name = path.file_name()?.to_string_lossy().into_owned();
+            // NVMe disk: dev_name is nvme<X>n<Y>. The controller is nvme<X>
+            // (sysfs class symlinks under /sys/class/nvme/nvme<X>).
+            if dev_name.starts_with("nvme") {
+                if let Some(controller) = dev_name.split('n').next() {
+                    let ctrl_speed =
+                        format!("/sys/class/nvme/{controller}/device/current_link_speed");
+                    if let Ok(raw) = std::fs::read_to_string(&ctrl_speed) {
+                        if let Some(g) = raw
+                            .trim()
+                            .split_whitespace()
+                            .next()
+                            .and_then(|t| t.parse::<f64>().ok())
+                            .and_then(pcie_gts_to_gen)
+                        {
+                            return Some(format!("NVMe-Gen{g}"));
+                        }
+                    }
+                }
+                // NVMe but unknown gen: report "NVMe-Gen4" as a conservative
+                // default rather than None (mirrors the Windows path's
+                // conservative-default behavior in platform_detect_disk_class).
+                return Some("NVMe-Gen4".to_string());
+            }
+            // USB-attached disk detection: walk the path's parents looking
+            // for a "subsystem" symlink pointing at "usb". If found,
+            // report "USB-SSD" or "USB-HDD" instead of bare SATA-SSD/HDD.
+            // Closes the attack-surface case benchmarker hit today
+            // (D: USB T5 SSD reporting as NVMe via system-disk default).
+            let is_usb = path
+                .ancestors()
+                .filter_map(|p| std::fs::read_link(p.join("subsystem")).ok())
+                .any(|target| {
+                    target
+                        .file_name()
+                        .map(|n| n == "usb")
+                        .unwrap_or(false)
+                });
+            let rotational = std::fs::read_to_string(path.join("queue").join("rotational"))
+                .ok()
+                .map(|s| s.trim().to_string());
+            return Some(match (rotational.as_deref(), is_usb) {
+                (Some("0"), true) => "USB-SSD".to_string(),
+                (Some("0"), false) => "SATA-SSD".to_string(),
+                (Some("1"), true) => "USB-HDD".to_string(),
+                (Some("1"), false) => "HDD".to_string(),
+                _ => return None,
+            });
+        }
+        cur = path.parent();
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn workdir_disk_class_platform(_workdir: &std::path::Path) -> Option<String> {
+    // v0.2.58 ships the Windows slice (GetVolumePathName + QueryDosDeviceW
+    // + IOCTL_STORAGE_QUERY_PROPERTY). Until then, fall through to the
+    // existing system-disk-derived detect_disk_class() so the wire shape
+    // stays valid; the attack-surface gap stays open on Windows for one
+    // day. Tracked as task #132 v0.2.58.
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn workdir_disk_class_platform(_workdir: &std::path::Path) -> Option<String> {
+    // v0.2.58 ships the macOS slice (statfs + IOServiceMatching(IOMedia)).
+    // Until then, fall through to detect_disk_class() (currently returns
+    // None on macOS so the engine reports "mixed"). Tracked as task #132
+    // v0.2.58.
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn workdir_disk_class_platform(_workdir: &std::path::Path) -> Option<String> {
+    None
+}
+
 /// Detect the disk class for the *primary* boot/data device.
 ///
 /// A real multi-disk machine may host both NVMe + SATA + HDD;
 /// schema-wise we still need a single label, so we pick the
 /// fastest detected class (NVMe-Gen5 > Gen4 > Gen3 > SATA-SSD >
 /// HDD). Falls back to "mixed" when nothing can be detected.
+///
+/// Pre-Phase-B.5 (pre-v0.2.57) legacy entry point; v0.2.57+ calls
+/// [`detect_workdir_disk_class`] first and falls back to this when the
+/// workdir-aware lookup fails. Kept for the `None root_hint` path
+/// (settings previews, integration tests).
 fn detect_disk_class() -> String {
     if let Some(class) = platform_detect_disk_class() {
         return class;
