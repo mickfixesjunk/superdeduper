@@ -693,6 +693,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// DISK-loop end-to-end reproducer for benchmarker's 295,772 cert miss.
+    /// Writes the FULL tier corpus to a tempdir via `bench_corpus::write_corpus`
+    /// (engine's OWN materializer, byte-for-byte matching `content_bytes_at`
+    /// by construction), then runs the production `full_content_dedup` against
+    /// it. This exercises every disk-IO path the real bench takes — including
+    /// `read_uncached` — but on a corpus that CANNOT be off-by-one by
+    /// materialization (it's our own writer's output).
+    ///
+    /// Expected: 295,773 dup groups. If it returns 295,772, the bug reproduces
+    /// in our own write_corpus + full_content_dedup loop and the parallel
+    /// Pass-2 + read_uncached interaction is the cause. On WSL the
+    /// `cold_bypass_reliable()` fail-closed forces the buffered fallback path,
+    /// so this exercises buffered+parallel; on Windows native NTFS it exercises
+    /// FILE_FLAG_NO_BUFFERING+parallel — running on both isolates which backend.
+    ///
+    /// HEAVY: writes ~6.25 GB to disk + reads it back. 1M tiny files stresses
+    /// NTFS/ext4 directory limits. ~10-30 min depending on disk. #[ignore]'d.
+    /// Run with: cargo test --release --features 'telemetry similar-images
+    /// similar-audio' --lib full_tier_engine_self_loop_disk -- --ignored --nocapture.
+    /// Override target dir via SD_BENCH_DISKLOOP_DIR.
+    #[test]
+    #[ignore = "writes ~6.25 GB; run only post-bench-done to avoid contending the cold timing"]
+    fn full_tier_engine_self_loop_disk_yields_295773_dup_groups() {
+        use super::super::bench;
+        use super::super::bench_corpus::{full_tier, plan_corpus, write_corpus};
+
+        let seed = [0x42u8; 32];
+        let (k_content, _) = bench::corpus_keys(&seed);
+        let plan = plan_corpus(&full_tier());
+
+        let dir = match std::env::var("SD_BENCH_DISKLOOP_DIR") {
+            Ok(d) => std::path::PathBuf::from(d),
+            Err(_) => std::env::temp_dir()
+                .join(format!("sd-bench-diskloop-{}", uuid::Uuid::new_v4())),
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("[diskloop] writing corpus to {}", dir.display());
+        let t0 = std::time::Instant::now();
+        let written = write_corpus(&dir, &k_content, &plan).expect("write_corpus");
+        eprintln!(
+            "[diskloop] wrote {} bytes in {:.2}s",
+            written,
+            t0.elapsed().as_secs_f64()
+        );
+        assert_eq!(written, plan.total_bytes, "bytes written == planned total");
+
+        // Production parallel Pass-2 against the materialized engine-written corpus.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let done = std::sync::atomic::AtomicU64::new(0);
+        let total = std::sync::atomic::AtomicU64::new(0);
+        let t1 = std::time::Instant::now();
+        let (dupsets, _bytes, files, _cold) =
+            full_content_dedup(&dir, &cancel, &done, &total).expect("full_content_dedup");
+        eprintln!(
+            "[diskloop] deduped {} files, {} dup groups in {:.2}s",
+            files,
+            dupsets.len(),
+            t1.elapsed().as_secs_f64()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            dupsets.len(),
+            295_773,
+            "production full_content_dedup against engine-written corpus must yield 295,773"
+        );
+    }
+
     #[test]
     fn dedup_aborts_when_cancel_preset() {
         let dir = std::env::temp_dir().join(format!("sd-bench-canceltest-{}", uuid::Uuid::new_v4()));
