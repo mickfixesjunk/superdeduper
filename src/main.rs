@@ -432,7 +432,121 @@ fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
         }
         #[cfg(feature = "telemetry")]
         DebugCommand::BenchDedupDiff { dir } => run_bench_dedup_diff(dir),
+        #[cfg(feature = "telemetry")]
+        DebugCommand::BenchClusterAudit { dir, tier } => run_bench_cluster_audit(dir, tier),
     }
+}
+
+/// DEBUG (#116): hash every corpus file on disk, group by hash, and report
+/// any plan cluster whose files DON'T all share one hash (the materialized
+/// corpus broke that cluster — exactly the off-by-one signature).
+#[cfg(feature = "telemetry")]
+fn run_bench_cluster_audit(
+    dir: std::path::PathBuf,
+    tier: superdeduper::cli::BenchTier,
+) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use superdeduper::cli::BenchTier;
+    use superdeduper::leaderboard::bench_corpus as bc;
+
+    let spec = match tier {
+        BenchTier::Quick => bc::quick_tier(),
+        BenchTier::Full => bc::full_tier(),
+        BenchTier::Sample => bc::sample_tier(),
+    };
+    let plan = bc::plan_corpus(&spec);
+    eprintln!(
+        "[audit] {} plan: {} files, {} dupsets analytic",
+        spec.corpus_version,
+        plan.file_count,
+        plan.dupsets.len()
+    );
+    eprintln!("[audit] hashing files in {} (buffered)", dir.display());
+
+    let t0 = std::time::Instant::now();
+    let mut hash_by_pi: HashMap<u64, [u8; 32]> = HashMap::with_capacity(plan.file_count as usize);
+    let mut missing: Vec<u64> = Vec::new();
+    for fp in &plan.files {
+        let path = dir.join(fp.path());
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let h = *blake3::hash(&bytes).as_bytes();
+                hash_by_pi.insert(fp.path_index, h);
+            }
+            Err(_) => missing.push(fp.path_index),
+        }
+    }
+    eprintln!("[audit] hashed in {:.2}s", t0.elapsed().as_secs_f64());
+
+    if !missing.is_empty() {
+        eprintln!("[audit] WARNING: {} planned files missing on disk", missing.len());
+    }
+
+    let mut broken: Vec<(usize, &Vec<u64>, Vec<(u64, [u8; 32])>)> = Vec::new();
+    for (cluster_idx, set) in plan.dupsets.iter().enumerate() {
+        let mut members: Vec<(u64, [u8; 32])> = Vec::with_capacity(set.len());
+        let mut all_present = true;
+        for pi in set {
+            match hash_by_pi.get(pi) {
+                Some(h) => members.push((*pi, *h)),
+                None => {
+                    all_present = false;
+                    break;
+                }
+            }
+        }
+        if !all_present {
+            continue;
+        }
+        let first_hash = members[0].1;
+        if members.iter().any(|(_, h)| *h != first_hash) {
+            broken.push((cluster_idx, set, members));
+        }
+    }
+
+    println!(
+        "tier                 = {}\nplan_files           = {}\nplan_dupsets         = {}\nfiles_hashed         = {}\nfiles_missing        = {}\nbroken_clusters      = {}",
+        spec.corpus_version,
+        plan.file_count,
+        plan.dupsets.len(),
+        hash_by_pi.len(),
+        missing.len(),
+        broken.len(),
+    );
+    if broken.is_empty() {
+        println!("\nNO BROKEN CLUSTERS — every plan dupset's files share one hash on disk.");
+        println!("(If full_content_dedup count is still off, look for clusters MERGED on disk via");
+        println!(" content collision — though content_bytes_at makes this cryptographically impossible.)");
+    } else {
+        let cap = 25usize;
+        println!(
+            "\nFirst {} broken cluster(s) — plan dupsets whose files DON'T all share one disk hash:",
+            cap.min(broken.len())
+        );
+        for (idx, set, members) in broken.iter().take(cap) {
+            let hex = |h: &[u8; 32]| {
+                let mut s = String::with_capacity(64);
+                for b in h.iter() {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{b:02x}");
+                }
+                s
+            };
+            println!(
+                "  cluster_idx={:>6}  size={:>3} files  path_indices={:?}",
+                idx,
+                set.len(),
+                set
+            );
+            for (pi, h) in members {
+                println!("    pi={:>10}  hash={}", pi, hex(h));
+            }
+        }
+        if broken.len() > cap {
+            println!("  ... {} more", broken.len() - cap);
+        }
+    }
+    Ok(())
 }
 
 /// DEBUG (#116): dedup a corpus dir three ways and print per-candidate diffs.

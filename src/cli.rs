@@ -334,6 +334,25 @@ pub enum DebugCommand {
         #[arg(value_name = "DIR")]
         dir: PathBuf,
     },
+
+    /// DEBUG (#116): given a materialized corpus dir + a tier spec, hash every
+    /// file from disk (buffered) and AUDIT against the plan's groundtruth
+    /// clusters (`plan_corpus(tier).dupsets`). Reports any plan cluster whose
+    /// files DON'T all share one content hash — i.e., a cluster the
+    /// materialized corpus broke (one cluster file's bytes differ from its
+    /// cluster-mates). This is the direct diagnostic for the
+    /// 295,772-vs-295,773 cert mismatch when per-file reads all agree
+    /// (engine-correct) but the dedup count is off by one (corpus
+    /// materialization staged a defective cluster). Telemetry-only.
+    #[cfg(feature = "telemetry")]
+    BenchClusterAudit {
+        /// Path to a materialized corpus dir.
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+        /// Tier spec to compare against (full/quick/sample).
+        #[arg(long, value_enum, default_value_t = BenchTier::Full)]
+        tier: BenchTier,
+    },
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
