@@ -178,6 +178,15 @@ pub fn migrate_legacy_install_json() -> io::Result<bool> {
     Ok(true)
 }
 
+/// `<data_dir>` for engine state. Per-platform: %LOCALAPPDATA%\superdeduper on
+/// Windows, ~/Library/Application Support/superdeduper on macOS, $XDG_DATA_HOME
+/// or ~/.local/share/superdeduper on Linux. Public so the crate::log persister
+/// + the #99 pending_actions queue (both v0.2.39) can sit alongside install.json
+/// without dragging install module APIs around.
+pub fn data_dir_public() -> io::Result<PathBuf> {
+    data_dir()
+}
+
 #[cfg(windows)]
 fn data_dir() -> io::Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")

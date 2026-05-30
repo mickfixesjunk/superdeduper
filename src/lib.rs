@@ -35,6 +35,7 @@ pub mod error;
 pub mod exclusions;
 pub mod inventory;
 pub mod keep;
+pub mod log;
 pub mod output;
 pub mod path_display;
 pub mod pipeline;
