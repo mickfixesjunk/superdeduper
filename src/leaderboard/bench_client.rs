@@ -212,12 +212,12 @@ pub fn result_digest_v2(dupsets: &[Vec<u64>], server_blob: &[u8; 32]) -> String 
 // repeats across runs, so the attacker must re-do the work each run.
 //
 // Wire shape:
-//   /bench/start response  -> top-level `K` (32 bytes, base64-std)
+//   /bench/start response  -> top-level `k_b64` (32 bytes, base64-std)
 //   challenge_hash_v3      -> tag 0x04, K appended (cryptographically
 //                              distinct from V1 tag 0x02 + V2 tag 0x03)
 //   result_digest_v3       -> domain "tcorpus-result-v3", K mixed before
 //                              cluster data
-//   bench_proof.K_echo     -> client echoes K so server can confirm the
+//   bench_proof.k_echo     -> client echoes K so server can confirm the
 //                              client used the K it was issued
 //
 // Dupsets in V3 are computed over MUTATED content (post-XOR). Two files
@@ -405,9 +405,10 @@ pub fn answer_challenge_from_dir_v3(
 }
 
 /// V3 assembly of the canonical-bench submission block. `bench_proof`
-/// carries `answers`, the V3 `result_digest`, and the `K_echo` (base64-
+/// carries `answers`, the V3 `result_digest`, and the `k_echo` (base64-
 /// std encoded K) so the server can confirm the client used the K it
-/// was issued on /bench/start.
+/// was issued on /bench/start. Field name matches web's bench_proof
+/// schema (web commit 932b297).
 #[allow(clippy::too_many_arguments)]
 pub fn to_canonical_bench_v3(
     protocol_version: &str,
@@ -422,7 +423,7 @@ pub fn to_canonical_bench_v3(
     let bench_proof = serde_json::json!({
         "answers": answers,
         "result_digest": result_digest_v3(found_dupsets, k),
-        "K_echo": b64(k),
+        "k_echo": b64(k),
     });
     super::submission::CanonicalBench {
         protocol_version: protocol_version.to_string(),
@@ -944,9 +945,9 @@ mod tests {
             true,
             &k,
         );
-        // K_echo is base64-std of K (44 chars).
-        let echo = cb.bench_proof.get("K_echo").and_then(|v| v.as_str())
-            .expect("K_echo present in V3 bench_proof");
+        // k_echo is base64-std of K (44 chars).
+        let echo = cb.bench_proof.get("k_echo").and_then(|v| v.as_str())
+            .expect("k_echo present in V3 bench_proof");
         assert_eq!(echo, b64(&k));
         // result_digest is V3 (distinct from V1 + V2 over same dupsets).
         let digest = cb.bench_proof.get("result_digest").and_then(|v| v.as_str()).unwrap();

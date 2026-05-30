@@ -111,26 +111,27 @@ pub fn run(
         serde_json::from_value(start.get("challenges").cloned().unwrap_or_default())
             .context("parsing challenges[]")?;
     // A3 / v3-mutate (v0.3.0 HARD CUTOVER per design 2026-05-30 07:44 PST):
-    // /bench/start MUST return a top-level `K` (32-byte per-run mutation
-    // key, base64-std, 44 chars). No fallback to V1/V2 — a missing or
-    // malformed K is a fatal /bench/start parse error. K binds into both
+    // /bench/start MUST return a top-level `k_b64` (32-byte per-run mutation
+    // key, base64-std, 44 chars). Field name matches web's BenchRun.k_b64
+    // column (web commit 4ae9ac3). No fallback to V1/V2 — a missing or
+    // malformed k_b64 is a fatal /bench/start parse error. K binds into both
     // the challenge_hash preimage (tag 0x04) and the result_digest
     // preimage (domain "tcorpus-result-v3"), and is mirrored back as
-    // bench_proof.K_echo so the server can confirm the client used the
+    // bench_proof.k_echo so the server can confirm the client used the
     // K it was issued.
     let k: [u8; 32] = {
         use base64::Engine;
         let k_b64 = start
-            .get("K")
+            .get("k_b64")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!(
-                "/bench/start response missing 'K' (v3-mutate is mandatory; v1/v2 protocols are retired in v0.3.0)"
+                "/bench/start response missing 'k_b64' (v3-mutate is mandatory; v1/v2 protocols are retired in v0.3.0)"
             ))?;
         let raw = base64::engine::general_purpose::STANDARD
             .decode(k_b64)
-            .context("decoding base64 'K' from /bench/start")?;
+            .context("decoding base64 'k_b64' from /bench/start")?;
         <[u8; 32]>::try_from(raw.as_slice())
-            .map_err(|_| anyhow::anyhow!("/bench/start 'K' is not 32 bytes after base64 decode"))?
+            .map_err(|_| anyhow::anyhow!("/bench/start 'k_b64' is not 32 bytes after base64 decode"))?
     };
     {
         use base64::Engine;
@@ -140,7 +141,7 @@ pub fn run(
         // needing a separate server-side source (mirrors the V2 blob log
         // precedent from v0.2.46).
         crate::log_info!(
-            "bench: A3 v3-mutate — K={} (using tag-0x04 challenge_hash + tcorpus-result-v3 + bench_proof.K_echo)",
+            "bench: A3 v3-mutate — k_b64={} (using tag-0x04 challenge_hash + tcorpus-result-v3 + bench_proof.k_echo)",
             k_b64
         );
     }
@@ -228,7 +229,7 @@ pub fn run(
     .context("answering V3 challenge from disk")?;
     let result_digest = bench_client::result_digest_v3(&dupsets, &k);
 
-    // 5. assemble + 6. submit — bench_proof carries K_echo (V3-mandatory).
+    // 5. assemble + 6. submit — bench_proof carries k_echo (V3-mandatory).
     let bench = bench_client::to_canonical_bench_v3(
         &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
         cold_enforced,
