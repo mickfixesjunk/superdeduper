@@ -26,12 +26,31 @@ fn main() {
 
     write_app_icon_rgba();
 
-    // CARGO_CFG_TARGET_OS reflects the TARGET (not the host), so this
-    // fires for cross-compile-from-Linux to Windows via cargo-zigbuild.
-    // `#[cfg(target_os = "windows")]` would only fire on a Windows host
-    // build — wrong for our release pipeline.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        embed_windows_icon();
+    // CARGO_CFG_TARGET_OS reflects the TARGET (not the host). Embed the
+    // Windows .exe icon only on TARGET=windows. Further: skip when
+    // cross-compiling from Linux via cargo-zigbuild, because zigbuild's
+    // linker wrapper rejects the static `libresource.a` link-arg
+    // winresource emits (errors with "unsupported linker arg: ...
+    // libresource.a"). Native Windows builds (host=target=windows) work
+    // fine and DO get the .exe icon embedded.
+    let target_is_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let host_is_windows = cfg!(target_os = "windows");
+    if target_is_windows {
+        if host_is_windows {
+            embed_windows_icon();
+        } else {
+            // Linux/macOS host cross-compiling to Windows via zigbuild:
+            // surface clearly so the gap is visible at build time, and
+            // skip the embed. The runtime egui icon (set in the GUI bin
+            // from OUT_DIR/app_icon.bin) still works.
+            println!(
+                "cargo:warning=skipping winresource .exe-icon embed: cross-compile from non-Windows host \
+                 (zigbuild linker rejects winresource's libresource.a link-arg). \
+                 The runtime egui title-bar icon still works on Windows; only the \
+                 Explorer/taskbar/alt-tab .exe icon is affected. Build natively on \
+                 Windows to embed the .exe icon (or resolve zigbuild+winresource compat)."
+            );
+        }
     }
 }
 
