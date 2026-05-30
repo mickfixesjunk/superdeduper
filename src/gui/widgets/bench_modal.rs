@@ -14,6 +14,13 @@ pub enum Phase {
     /// the consent/explainer. Default-selected reflects install.json's
     /// last_bench_lane; click either Ranked or Casual to persist + advance.
     Lane,
+    /// Mick P0 hotfix (2026-05-30): when the user picks Ranked but the
+    /// install isn't OAuth-linked yet, fire the loopback link flow before
+    /// advancing to Consent. Worker thread runs `link_via_loopback_no_browser_fallback`;
+    /// the UI shows a "signing in…" status and, if browser-open fails, the
+    /// URL the user can paste into any browser to finish auth. Casual skips
+    /// this phase entirely (anonymous submissions don't need an account).
+    Linking,
     /// Pre-run consent/explainer (the load-bearing warnings).
     Consent,
     /// Worker running; `status` carries the current stage line.
@@ -44,6 +51,15 @@ pub struct Shared {
     /// Post-bench rank rows from /submit Accepted's ranks[] (empty when the
     /// async ranks-poll hasn't resolved yet — rendered as "pending").
     pub ranks: Vec<crate::leaderboard::submission::RankEntry>,
+    /// Mick P0 (2026-05-30): OAuth link worker result. None while linking
+    /// is in progress; Some(Ok(display_name + provider)) on success (main
+    /// thread advances to Phase::Consent); Some(Err(msg)) on failure (main
+    /// thread surfaces the error on Phase::Linking with retry/casual/cancel).
+    pub linking_done: Option<Result<String, String>>,
+    /// Mick P0 (2026-05-30): when the system browser can't be launched
+    /// (no-browser fallback), the link worker writes the auth URL here for
+    /// the linking_view to render. User pastes into any browser to finish.
+    pub linking_url_fallback: Option<String>,
 }
 
 /// A user-selectable benchmark tier. The 100MB `corpus-v1-smoke` tier is
@@ -90,6 +106,10 @@ pub struct BenchUiState {
     /// on the Lane phase; threaded into run_worker so the server scores
     /// authoritatively per web d7df4c9.
     pub lane: Option<crate::leaderboard::install::BenchLane>,
+    /// Mick P0 (2026-05-30): sticky error from the last OAuth link attempt,
+    /// rendered on Phase::Linking with [Try again / Use Casual / Cancel].
+    /// Cleared when the user picks one of those actions.
+    pub linking_error: Option<String>,
     pub shared: Arc<Mutex<Shared>>,
     pub cancel: Arc<AtomicBool>,
 }
@@ -103,6 +123,7 @@ impl Default for BenchUiState {
             tier_idx: 0,
             show_share_preview: false,
             lane: None,
+            linking_error: None,
             shared: Arc::new(Mutex::new(Shared::default())),
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -124,6 +145,7 @@ impl BenchUiState {
             .ok()
             .flatten()
             .and_then(|s| s.last_bench_lane);
+        self.linking_error = None;
         self.cancel.store(false, Ordering::Relaxed);
         *self.shared.lock().unwrap() = Shared::default();
     }
@@ -326,10 +348,31 @@ pub fn show(state: &mut BenchUiState, ctx: &egui::Context) -> BenchModalAction {
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| match state.phase.clone() {
             Phase::Lane => lane_view(state, ui),
+            Phase::Linking => linking_view(state, ui),
             Phase::Consent => consent_view(state, ui, &mut action),
             Phase::Running => running_view(state, ui, ctx),
             Phase::Done => done_view(state, ui),
         });
+    // Mick P0 (2026-05-30): drive the linking-phase state machine — poll the
+    // worker thread's result from `Shared::linking_done` and either advance
+    // to Consent (on success) or stash the error on BenchUiState so the
+    // linking_view shows it with retry/casual/cancel. Keep repainting while
+    // linking is active so the URL fallback / status updates land
+    // immediately instead of waiting for the user to move the mouse.
+    if matches!(state.phase, Phase::Linking) {
+        let done = state.shared.lock().unwrap().linking_done.take();
+        match done {
+            Some(Ok(_who)) => {
+                state.linking_error = None;
+                state.phase = Phase::Consent;
+            }
+            Some(Err(msg)) => {
+                state.linking_error = Some(msg);
+            }
+            None => {}
+        }
+        ctx.request_repaint();
+    }
     // window [x] closed: treat as cancel (abort any run).
     if !open {
         state.cancel.store(true, Ordering::Relaxed);
@@ -371,7 +414,11 @@ fn lane_view(state: &mut BenchUiState, ui: &mut egui::Ui) {
     {
         state.lane = Some(BenchLane::Ranked);
         persist_lane(BenchLane::Ranked);
-        state.phase = Phase::Consent;
+        // Mick P0 fix (2026-05-30): Ranked requires an OAuth link. If the
+        // install isn't linked yet, route through Phase::Linking which fires
+        // the loopback flow; otherwise skip straight to Consent. Mirrors the
+        // CLI gate in main::run_bench_me.
+        advance_from_lane_to_ranked(state);
     }
     ui.add_space(4.0);
     if ui.add_sized([320.0, 36.0], egui::Button::new(casual_label)).clicked()
@@ -379,12 +426,180 @@ fn lane_view(state: &mut BenchUiState, ui: &mut egui::Ui) {
     {
         state.lane = Some(BenchLane::Casual);
         persist_lane(BenchLane::Casual);
+        // Casual is anonymous — no OAuth needed.
         state.phase = Phase::Consent;
     }
     ui.add_space(8.0);
     if ui.button("Cancel").clicked() {
         state.open = false;
     }
+}
+
+/// Mick P0 (2026-05-30): user picked Ranked on the lane modal. If already
+/// OAuth-linked, advance to Consent (no extra friction). If anonymous, set
+/// Phase::Linking and spawn the link worker — the worker handles install
+/// load/register + the loopback OAuth flow, writing the outcome back via
+/// `Shared::linking_done` for the main thread to poll. If status_for itself
+/// errors (rare — disk i/o on the token file), surface that as a Linking
+/// error so the user can retry/cancel/casual rather than getting wedged.
+fn advance_from_lane_to_ranked(state: &mut BenchUiState) {
+    use crate::leaderboard::oauth;
+    let channel = crate::channel::active_channel();
+    match oauth::status_for(channel) {
+        Ok(oauth::AccountStatus::Linked { .. }) => {
+            state.phase = Phase::Consent;
+        }
+        Ok(oauth::AccountStatus::Anonymous) => {
+            start_oauth_link(state);
+        }
+        Err(e) => {
+            state.linking_error = Some(format!(
+                "Couldn't read sign-in status: {e}. Try again, or pick Casual."
+            ));
+            state.phase = Phase::Linking;
+        }
+    }
+}
+
+/// Spawn the OAuth link worker thread and switch to Phase::Linking. Resets
+/// any prior linking state on `Shared` and clears the sticky error on
+/// `BenchUiState` so a Retry click re-arms cleanly.
+fn start_oauth_link(state: &mut BenchUiState) {
+    state.linking_error = None;
+    {
+        let mut s = state.shared.lock().unwrap();
+        s.linking_done = None;
+        s.linking_url_fallback = None;
+        s.status = "Opening your browser for sign-in…".into();
+    }
+    state.phase = Phase::Linking;
+    let shared = Arc::clone(&state.shared);
+    std::thread::spawn(move || link_worker(&shared));
+}
+
+/// Worker body: load/auto-register the install (CLI parity), then run the
+/// loopback OAuth link with the no-browser fallback writing the URL back to
+/// `Shared::linking_url_fallback` so the linking_view can render it. Final
+/// outcome lands in `Shared::linking_done` for the main thread to drive the
+/// phase transition.
+fn link_worker(shared: &Arc<Mutex<Shared>>) {
+    use crate::leaderboard::{install, oauth, registration};
+    let channel = crate::channel::active_channel();
+
+    let state = match install::load_for(channel) {
+        Ok(Some(s)) if s.registered => s,
+        Ok(Some(mut s)) => match registration::register_cli(&mut s) {
+            Ok(()) => s,
+            Err(e) => {
+                shared.lock().unwrap().linking_done =
+                    Some(Err(format!("Couldn't register this install: {e:?}")));
+                return;
+            }
+        },
+        Ok(None) => {
+            let url = crate::channel::resolve_server_url(channel);
+            let mut s = install::new_unregistered(url);
+            match registration::register_cli(&mut s) {
+                Ok(()) => s,
+                Err(e) => {
+                    shared.lock().unwrap().linking_done =
+                        Some(Err(format!("Couldn't register this install: {e:?}")));
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            shared.lock().unwrap().linking_done =
+                Some(Err(format!("Install state error: {e}")));
+            return;
+        }
+    };
+
+    let server_url = crate::channel::server_url_for(channel);
+    let shared_for_fallback = Arc::clone(shared);
+    let result = oauth::link_via_loopback_no_browser_fallback(
+        oauth::Provider::Google,
+        channel,
+        server_url,
+        &state.install_id,
+        std::time::Duration::from_secs(300),
+        move |url: &str| {
+            shared_for_fallback.lock().unwrap().linking_url_fallback = Some(url.to_string());
+        },
+    );
+
+    let outcome = match result {
+        Ok(token) => Ok(format!(
+            "{} ({})",
+            token.display_name,
+            token.provider.display_name()
+        )),
+        Err(e) => Err(format!("Sign-in failed: {e:?}")),
+    };
+    shared.lock().unwrap().linking_done = Some(outcome);
+}
+
+/// Mick P0 (2026-05-30): Phase::Linking view. Shows progress/URL fallback +
+/// the sticky error from a failed attempt with [Try again / Use Casual /
+/// Cancel] controls. "Use Casual" demotes the run lane so the user can
+/// proceed without sign-in (Casual submissions are anonymous).
+fn linking_view(state: &mut BenchUiState, ui: &mut egui::Ui) {
+    use crate::leaderboard::install::BenchLane;
+    ui.label(
+        egui::RichText::new("Signing in for Ranked submission")
+            .strong()
+            .size(16.0),
+    );
+    ui.add_space(4.0);
+
+    let (url_fallback, status_line) = {
+        let s = state.shared.lock().unwrap();
+        (s.linking_url_fallback.clone(), s.status.clone())
+    };
+
+    if let Some(err) = state.linking_error.as_ref() {
+        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+        ui.add_space(4.0);
+        ui.label(
+            "You can try again, switch to Casual (anonymous submission), or cancel.",
+        );
+    } else if let Some(url) = url_fallback {
+        ui.label("Couldn't open a browser automatically. Open this URL in any browser to finish signing in:");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.code(&url);
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(url.clone());
+            }
+        });
+        ui.add_space(4.0);
+        ui.label("Waiting for sign-in (up to 5 minutes)…");
+    } else {
+        ui.label(if status_line.is_empty() {
+            "Opening your browser for Google sign-in… waiting for callback (up to 5 minutes).".to_string()
+        } else {
+            status_line
+        });
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if state.linking_error.is_some() {
+            if ui.button("Try again").clicked() {
+                start_oauth_link(state);
+            }
+        }
+        if ui.button("Use Casual instead").clicked() {
+            state.lane = Some(BenchLane::Casual);
+            persist_lane(BenchLane::Casual);
+            state.linking_error = None;
+            state.phase = Phase::Consent;
+        }
+        if ui.button("Cancel").clicked() {
+            state.linking_error = None;
+            state.open = false;
+        }
+    });
 }
 
 /// Save the chosen lane to install.json. Best-effort; failure is logged but
