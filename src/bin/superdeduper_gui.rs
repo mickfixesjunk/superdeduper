@@ -76,11 +76,25 @@ fn main() -> eframe::Result<()> {
         env!("CARGO_PKG_VERSION"),
         env!("SD_BUILD_SHA"),
     );
+    // App icon: build.rs pre-decoded assets/sdd.png into RGBA bytes at
+    // OUT_DIR/app_icon.bin (4-byte u32le width, 4-byte u32le height, then
+    // width*height*4 raw RGBA). Including it via include_bytes! avoids
+    // pulling the `image` crate into the runtime tree. egui scales for
+    // the title bar; the Windows .exe icon (Explorer / taskbar / alt-tab)
+    // is embedded separately via winresource in build.rs.
+    let icon = {
+        const ICON_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app_icon.bin"));
+        let w = u32::from_le_bytes([ICON_BYTES[0], ICON_BYTES[1], ICON_BYTES[2], ICON_BYTES[3]]);
+        let h = u32::from_le_bytes([ICON_BYTES[4], ICON_BYTES[5], ICON_BYTES[6], ICON_BYTES[7]]);
+        let rgba = ICON_BYTES[8..].to_vec();
+        egui::IconData { rgba, width: w, height: h }
+    };
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1100.0, 720.0])
-            .with_title(&window_title),
+            .with_title(&window_title)
+            .with_icon(std::sync::Arc::new(icon)),
         vsync: true,
         ..Default::default()
     };

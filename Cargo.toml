@@ -1,6 +1,6 @@
 [package]
 name = "superdeduper"
-version = "0.2.50"
+version = "0.2.51"
 edition = "2021"
 rust-version = "1.87"
 description = "superdeduper — the fastest duplicate file finder for Windows / NTFS."
@@ -229,6 +229,22 @@ features = [
     # SHCreateItemFromParsingName/IShellItem family.
     "Win32_System_Com",
 ]
+
+# App icon embedding. `image` (build-only) decodes the SDD logo PNG
+# into raw RGBA bytes that build.rs serialises into OUT_DIR for the
+# GUI bin to set via egui::ViewportBuilder::with_icon. `winresource`
+# (Windows-target only) embeds the multi-resolution .ico into the
+# Windows .exe so Explorer / taskbar / alt-tab show the SDD shield.
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+# `winresource` is needed when build.rs cross-compiles for windows-target
+# from a Linux host (cargo-zigbuild path). Cargo's [target.cfg.build-deps]
+# matches HOST cfg, not target — so a target-gated entry wouldn't pull
+# the crate when we need it most. Cost on non-Windows builds: a tiny
+# build-only crate that the build.rs invokes only when
+# CARGO_CFG_TARGET_OS=="windows", so the cross-compile lift happens
+# exactly where it should.
+winresource = "0.1"
 
 [dev-dependencies]
 proptest = "1.5"
