@@ -758,12 +758,32 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
                 "bench: Ranked requires an OAuth account linkage. Starting browser sign-in..."
             );
             let server_url = superdeduper::channel::server_url_for(channel);
-            let token = oauth::link_via_loopback(
+            // No-browser fallback (Mick GO 12:48 PST): when the system browser
+            // can't be launched (SSH session, headless host, no graphical env),
+            // we print the auth URL prominently + keep the loopback listener
+            // bound until the existing 300s timeout. The user copy-pastes the
+            // URL into any browser (local workstation, phone, remote desktop)
+            // to complete the flow; the loopback receives the callback
+            // regardless of which device opened the URL.
+            let token = oauth::link_via_loopback_no_browser_fallback(
                 oauth::Provider::Google,
                 channel,
                 server_url,
                 &state.install_id,
                 std::time::Duration::from_secs(300),
+                |url: &str| {
+                    eprintln!();
+                    eprintln!("============================================================");
+                    eprintln!("  Couldn't open a browser automatically.");
+                    eprintln!("  Open this URL in any browser to finish signing in:");
+                    eprintln!();
+                    eprintln!("    {url}");
+                    eprintln!();
+                    eprintln!("  This terminal will wait up to 5 minutes for the callback.");
+                    eprintln!("  Press Ctrl-C to abort and use --lane=casual instead.");
+                    eprintln!("============================================================");
+                    eprintln!();
+                },
             ).map_err(|e| anyhow::anyhow!(
                 "OAuth sign-in failed/cancelled: {e:?}. \
                  Try again with --lane=ranked when ready, or use --lane=casual to bench without sign-in."

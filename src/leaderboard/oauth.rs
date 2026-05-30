@@ -420,7 +420,40 @@ pub fn link_via_loopback(
     install_id: &str,
     timeout: Duration,
 ) -> Result<OauthToken, OauthError> {
-    link_via_loopback_inner(provider, channel, server_url, install_id, timeout, None)
+    link_via_loopback_inner(provider, channel, server_url, install_id, timeout, None, None)
+}
+
+/// Same as [`link_via_loopback`] but with a no-browser fallback: if the
+/// system browser can't be launched (SSH session, headless host, no
+/// graphical env), `on_browser_fail(&url)` is invoked with the auth URL
+/// and the loopback listener STAYS BOUND — the user can copy the URL
+/// into any browser (local machine, phone, remote desktop) to complete
+/// the OAuth flow. The same timeout applies to the wait.
+///
+/// CLI use case: print the URL prominently to stderr so a user on an
+/// SSH session can copy-paste it into a browser on their workstation.
+/// GUI use case: not currently needed (modal can render the URL in a
+/// fallback panel; same Phase::Lane wiring could surface it).
+pub fn link_via_loopback_no_browser_fallback<F>(
+    provider: Provider,
+    channel: Channel,
+    server_url: &str,
+    install_id: &str,
+    timeout: Duration,
+    on_browser_fail: F,
+) -> Result<OauthToken, OauthError>
+where
+    F: Fn(&str) + Send + 'static,
+{
+    link_via_loopback_inner(
+        provider,
+        channel,
+        server_url,
+        install_id,
+        timeout,
+        None,
+        Some(Box::new(on_browser_fail)),
+    )
 }
 
 /// Same as [`link_via_loopback`] but cooperative-cancellable via an
@@ -444,6 +477,7 @@ pub fn link_via_loopback_cancellable(
         install_id,
         timeout,
         Some(cancel),
+        None,
     )
 }
 
@@ -735,6 +769,7 @@ fn link_via_loopback_inner(
     install_id: &str,
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
+    on_browser_fail: Option<Box<dyn Fn(&str) + Send>>,
 ) -> Result<OauthToken, OauthError> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -864,10 +899,20 @@ fn link_via_loopback_inner(
     ));
     if !try_open_browser(&auth_url) {
         log_oauth_event("browser_open_failed");
-        return Err(OauthError::BrowserOpenFailed {
-            url: auth_url.clone(),
-            detail: "could not launch system browser".to_string(),
-        });
+        if let Some(cb) = on_browser_fail.as_ref() {
+            // Caller provided a no-browser fallback (CLI use case):
+            // hand them the URL so they can print it prominently, and
+            // let the listener continue waiting for the callback. The
+            // user copy-pastes the URL into any browser (local, phone,
+            // remote workstation) and the loopback receives the callback
+            // when they finish auth.
+            cb(&auth_url);
+        } else {
+            return Err(OauthError::BrowserOpenFailed {
+                url: auth_url.clone(),
+                detail: "could not launch system browser".to_string(),
+            });
+        }
     }
 
     // Outer wait. Same cancel-friendly poll-tick pattern as before.
