@@ -37,19 +37,16 @@ fn main() {
     let host_is_windows = cfg!(target_os = "windows");
     if target_is_windows {
         if host_is_windows {
-            embed_windows_icon();
+            embed_windows_icon_via_winresource();
         } else {
-            // Linux/macOS host cross-compiling to Windows via zigbuild:
-            // surface clearly so the gap is visible at build time, and
-            // skip the embed. The runtime egui icon (set in the GUI bin
-            // from OUT_DIR/app_icon.bin) still works.
-            println!(
-                "cargo:warning=skipping winresource .exe-icon embed: cross-compile from non-Windows host \
-                 (zigbuild linker rejects winresource's libresource.a link-arg). \
-                 The runtime egui title-bar icon still works on Windows; only the \
-                 Explorer/taskbar/alt-tab .exe icon is affected. Build natively on \
-                 Windows to embed the .exe icon (or resolve zigbuild+winresource compat)."
-            );
+            // Cross-compile path (Linux/macOS host -> Windows target via
+            // cargo-zigbuild). winresource produces a static archive
+            // (libresource.a) that zigbuild's linker wrapper rejects. We
+            // instead invoke the mingw windres directly to compile a
+            // tiny .rc -> .o object, then pass it via
+            // cargo:rustc-link-arg-bins so the linker picks it up.
+            // zigbuild forwards .o object files in the link command.
+            embed_windows_icon_via_windres_o();
         }
     }
 }
@@ -121,7 +118,10 @@ fn write_app_icon_rgba() {
 /// `winresource`. Affects ALL binaries in the crate (both the CLI and the
 /// GUI superdeduper.exe inherit the icon) so Explorer, taskbar, alt-tab,
 /// and the Programs list all show the SDD shield instead of the default.
-fn embed_windows_icon() {
+/// Native-Windows-host path: winresource wraps rc.exe / windres into a
+/// static archive that the MSVC / mingw linker picks up automatically.
+/// Used when host==target==windows.
+fn embed_windows_icon_via_winresource() {
     let ico_path = "assets/sdd.ico";
     println!("cargo:rerun-if-changed={ico_path}");
     let mut res = winresource::WindowsResource::new();
@@ -129,10 +129,77 @@ fn embed_windows_icon() {
     res.set("ProductName", "SuperDeDuper");
     res.set("FileDescription", "SuperDeDuper — duplicate file finder");
     if let Err(e) = res.compile() {
-        // Don't fail the build for cross-compile environments that can't run
-        // windres / rc.exe; just warn so the .exe still produces (without
-        // the embedded icon, which is a polish loss but not a correctness
-        // issue). winresource itself prefers windres on mingw cross targets.
         println!("cargo:warning=winresource embed failed: {e} (continuing without .exe icon)");
     }
+}
+
+/// Cross-compile-from-Linux path: invoke `x86_64-w64-mingw32-windres`
+/// directly on a tiny `.rc` file that references `assets/sdd.ico`, write
+/// the resulting `.o` to OUT_DIR, then add it as a per-bin link-arg.
+/// The .o file is a regular ELF/COFF object, which cargo-zigbuild's
+/// linker wrapper forwards unchanged (unlike winresource's
+/// static-archive `libresource.a` which it rejects with
+/// "unsupported linker arg").
+///
+/// Result: the same .exe-icon-in-Explorer outcome as winresource but
+/// reachable from a Linux host with `cargo zigbuild --target
+/// x86_64-pc-windows-gnu` in the release pipeline.
+fn embed_windows_icon_via_windres_o() {
+    let ico_path = "assets/sdd.ico";
+    println!("cargo:rerun-if-changed={ico_path}");
+
+    // Locate mingw windres. The release pipeline runs on a WSL host
+    // where x86_64-w64-mingw32-windres is installed at /usr/bin; the
+    // pure-zigbuild path doesn't include it. Probe PATH and bail
+    // gracefully (warn + skip) if absent.
+    let windres = ["x86_64-w64-mingw32-windres", "windres"]
+        .iter()
+        .find_map(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|_| name.to_string())
+        });
+    let windres = match windres {
+        Some(w) => w,
+        None => {
+            println!(
+                "cargo:warning=skipping .exe-icon embed: mingw windres not found on PATH \
+                 (apt install binutils-mingw-w64-x86-64). Runtime egui icon still works."
+            );
+            return;
+        }
+    };
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+    let rc_path = format!("{out_dir}/sdd_icon.rc");
+    let o_path = format!("{out_dir}/sdd_icon.o");
+
+    // Minimal Windows .rc syntax: resource_id ICON "path/to/file.ico".
+    // ID 1 (IDI_APPLICATION default) is what Explorer / Win32
+    // LoadIcon(NULL, IDI_APPLICATION) resolves to as the main app icon
+    // when the binary is launched.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set");
+    let ico_abs = format!("{manifest_dir}/{ico_path}");
+    let rc_contents = format!("1 ICON \"{}\"\n", ico_abs.replace('\\', "/"));
+    std::fs::write(&rc_path, rc_contents).unwrap_or_else(|e| panic!("write {rc_path}: {e}"));
+
+    let status = std::process::Command::new(&windres)
+        .args(["-O", "coff", "-i", &rc_path, "-o", &o_path])
+        .status()
+        .unwrap_or_else(|e| panic!("spawn {windres}: {e}"));
+    if !status.success() {
+        println!(
+            "cargo:warning=skipping .exe-icon embed: {windres} exit code {:?}",
+            status.code()
+        );
+        return;
+    }
+
+    // Pass the .o through to every binary's linker invocation. zigbuild
+    // forwards .o files in the link command (unlike .a static archives
+    // wrapped in --whole-archive).
+    println!("cargo:rustc-link-arg-bins={o_path}");
 }
