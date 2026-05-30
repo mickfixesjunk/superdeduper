@@ -110,13 +110,18 @@ pub fn run(
     let challenges: Vec<bench_client::ChallengePosition> =
         serde_json::from_value(start.get("challenges").cloned().unwrap_or_default())
             .context("parsing challenges[]")?;
-    // #4(a) — V2 server-bound challenge: /bench/start MAY now return a
-    // top-level `server_challenge_blob` (32 random bytes, base64-std,
-    // 44 chars). Present => V2 verifier path on the server (tag 0x03 +
-    // tcorpus-result-v2); absent => V1 fallback during the transition
-    // window (web's BENCH_SERVER_BLOB_REQUIRED flag, default false until
-    // engine ships V2). Auto-detect rather than force a mode on the
-    // client, so a single engine binary speaks both protocols.
+    // Wire protocol auto-detect: parse the server's response and pick the
+    // engine path off `protocol_version` (the authoritative server signal).
+    //   protocol_version == "v3-mutate" && k_b64 present  -> V3 (tag 0x04,
+    //                                                          per-file mutation, K_echo)
+    //   server_challenge_blob present                     -> V2 (tag 0x03,
+    //                                                          blob appended)
+    //   else                                              -> V1 (tag 0x02)
+    // The dev server emits BOTH server_challenge_blob (V2) and k_b64 (V3,
+    // since web's 4ae9ac3) on every /bench/start; routing off
+    // protocol_version means web flips a server-side switch (the v3-mutate
+    // verifier slice GA) and the same engine binary starts speaking V3
+    // automatically. No engine re-cut needed for the V3 cutover.
     let server_blob: Option<[u8; 32]> = start
         .get("server_challenge_blob")
         .and_then(|v| v.as_str())
@@ -125,14 +130,25 @@ pub fn run(
             base64::engine::general_purpose::STANDARD.decode(s).ok()
         })
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
-    if let Some(blob_bytes) = server_blob.as_ref() {
+    let k_v3: Option<[u8; 32]> = start
+        .get("k_b64")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(s).ok()
+        })
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    let use_v3 = protocol_version == "v3-mutate" && k_v3.is_some();
+    if use_v3 {
+        use base64::Engine;
+        let k_b64 = base64::engine::general_purpose::STANDARD.encode(k_v3.as_ref().unwrap());
+        crate::log_info!(
+            "bench: A3 v3-mutate — k_b64={} (using tag-0x04 challenge_hash + tcorpus-result-v3 + bench_proof.k_echo)",
+            k_b64
+        );
+    } else if let Some(blob_bytes) = server_blob.as_ref() {
         use base64::Engine;
         let blob_b64 = base64::engine::general_purpose::STANDARD.encode(blob_bytes);
-        // Emit the actual blob bytes in the log so testrunner's V2 oracle
-        // cross-check (and sdd-testwin's verify-script regex) can pick it
-        // up from the bench-me stderr / disk log without needing a separate
-        // server-side source. Per benchmarker's #73 v0.2.45 issue 3 (the
-        // blob was never printed in -vv mode -> oracle cross-check blocked).
         crate::log_info!(
             "bench: #4(a) V2 detected — server_challenge_blob={} (using tag-0x03 challenge_hash + tcorpus-result-v2 + bench_proof.challenge_blob_echo)",
             blob_b64
@@ -216,25 +232,42 @@ pub fn run(
         dupsets.len()
     ));
 
-    // 4. answer the possession challenge — V2 (tag 0x03 + appended blob) when
-    // /bench/start returned a server_challenge_blob; else V1 (tag 0x02).
-    let (answers, _read) = bench_client::answer_challenge_from_dir_v(
-        &corpus_dir,
-        &challenges,
-        server_blob.as_ref(),
-    )
-    .context("answering challenge from disk")?;
-    let result_digest = match server_blob.as_ref() {
-        Some(b) => bench_client::result_digest_v2(&dupsets, b),
-        None => bench_client::result_digest(&dupsets),
+    // 4. answer the possession challenge — V3 (tag 0x04 + per-file mutation
+    // + K appended) when use_v3; V2 (tag 0x03 + appended blob) when V2; V1
+    // (tag 0x02) otherwise.
+    let (answers, _read, result_digest) = if use_v3 {
+        let k = k_v3.as_ref().unwrap();
+        let (answers, bytes_read) = bench_client::answer_challenge_from_dir_v3(
+            &corpus_dir, &challenges, k,
+        ).context("answering V3 challenge from disk")?;
+        let digest = bench_client::result_digest_v3(&dupsets, k);
+        (answers, bytes_read, digest)
+    } else {
+        let (answers, bytes_read) = bench_client::answer_challenge_from_dir_v(
+            &corpus_dir, &challenges, server_blob.as_ref(),
+        ).context("answering challenge from disk")?;
+        let digest = match server_blob.as_ref() {
+            Some(b) => bench_client::result_digest_v2(&dupsets, b),
+            None => bench_client::result_digest(&dupsets),
+        };
+        (answers, bytes_read, digest)
     };
 
-    // 5. assemble + 6. submit — bench_proof carries challenge_blob_echo when V2.
-    let bench = bench_client::to_canonical_bench_v(
-        &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
-        cold_enforced,
-        server_blob.as_ref(),
-    );
+    // 5. assemble + 6. submit — bench_proof carries k_echo when V3,
+    // challenge_blob_echo when V2, neither when V1.
+    let bench = if use_v3 {
+        bench_client::to_canonical_bench_v3(
+            &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
+            cold_enforced,
+            k_v3.as_ref().unwrap(),
+        )
+    } else {
+        bench_client::to_canonical_bench_v(
+            &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
+            cold_enforced,
+            server_blob.as_ref(),
+        )
+    };
     let largest = dupsets.iter().map(|g| g.len() as u64).max().unwrap_or(0);
     let inputs = submission::SubmissionInputs {
         client_version: env!("CARGO_PKG_VERSION").to_string(),
