@@ -125,9 +125,17 @@ pub fn run(
             base64::engine::general_purpose::STANDARD.decode(s).ok()
         })
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
-    if server_blob.is_some() {
+    if let Some(blob_bytes) = server_blob.as_ref() {
+        use base64::Engine;
+        let blob_b64 = base64::engine::general_purpose::STANDARD.encode(blob_bytes);
+        // Emit the actual blob bytes in the log so testrunner's V2 oracle
+        // cross-check (and sdd-testwin's verify-script regex) can pick it
+        // up from the bench-me stderr / disk log without needing a separate
+        // server-side source. Per benchmarker's #73 v0.2.45 issue 3 (the
+        // blob was never printed in -vv mode -> oracle cross-check blocked).
         crate::log_info!(
-            "bench: #4(a) V2 detected — server_challenge_blob present; using tag-0x03 challenge_hash + tcorpus-result-v2 + bench_proof.challenge_blob_echo"
+            "bench: #4(a) V2 detected — server_challenge_blob={} (using tag-0x03 challenge_hash + tcorpus-result-v2 + bench_proof.challenge_blob_echo)",
+            blob_b64
         );
     } else {
         crate::log_info!(
