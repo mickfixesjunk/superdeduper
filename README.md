@@ -1,6 +1,6 @@
 # superdeduper
 
-The fastest duplicate file finder for Windows + Linux.
+A rocket-fast, reliable, safety-first duplicate file finder for Windows, macOS, and Linux.
 
 > ⚠️  **ALPHA SOFTWARE — USE AT YOUR OWN RISK.**
 >
