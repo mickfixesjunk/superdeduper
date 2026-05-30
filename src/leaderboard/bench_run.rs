@@ -86,6 +86,13 @@ pub fn run(
         "install_id": state.install_id,
         "corpus_version": corpus_version,
         "tier": tier,
+        // A3 / v3-mutate (v0.3.0 HARD CUTOVER): opt into V3 explicitly on the
+        // /bench/start request. Per web's commit 81517bd, server defaults to
+        // tbench-1 (no k_b64) when this field is absent — that would fail the
+        // engine-side "missing 'k_b64'" check downstream. Sending "v3-mutate"
+        // tells the server to mint K + return k_b64 (and rejects with 400
+        // protocol_unsupported_for_corpus if the corpus isn't opted in).
+        "protocol_version": "v3-mutate",
     });
     let start_body = super::hmac_signer::canonical_body(&start_payload);
     let start_signature = super::hmac_signer::sign(&install_key, &start_body);
