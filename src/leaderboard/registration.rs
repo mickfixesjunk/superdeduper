@@ -273,8 +273,21 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
     if state.registered {
         return Err(RegisterError::AlreadyRegistered);
     }
+    // D0 (web ad6f7fe, 2026-05-29) — server-bound PoW: client must first call
+    // POST /api/v1/pow/challenge to obtain a server-issued challenge plus
+    // an iat+signature that the server later verifies via
+    // HMAC(POW_SIGNING_KEY, install_id||iat||challenge). Previously we used
+    // state.install_id as the challenge directly; that's now rejected by
+    // dev. iat+signature get echoed in the /register body so the server can
+    // close the loop.
+    let pow = fetch_pow_challenge(&state.server_url, &state.install_id)?;
+    crate::log_info!(
+        "register_cli: fetched D0 pow_challenge (difficulty={}, ttl={}s)",
+        pow.difficulty,
+        pow.ttl_secs
+    );
     let nonce =
-        compute_pow(&state.install_id, DEFAULT_POW_DIFFICULTY).ok_or(RegisterError::PoWTimeout)?;
+        compute_pow(&pow.challenge, pow.difficulty).ok_or(RegisterError::PoWTimeout)?;
 
     // Register is the bootstrap: the server doesn't have our
     // install_key_hex yet, so it can't verify the X-Sd-Signature
@@ -289,12 +302,76 @@ pub fn register_cli(state: &mut InstallState) -> Result<(), RegisterError> {
         "install_key_hex": state.install_key_hex,
         "registration_proof": {
             "kind": "pow",
-            "challenge": state.install_id,
+            "challenge": pow.challenge,
             "nonce": nonce,
-            "difficulty": DEFAULT_POW_DIFFICULTY,
+            "difficulty": pow.difficulty,
+            // D0 fields — server-signed handshake from /pow/challenge.
+            "iat": pow.iat,
+            "signature": pow.signature,
         }
     });
     submit_registration(state, &body)
+}
+
+/// D0 (web ad6f7fe) — server-bound PoW challenge fetched from
+/// `POST /api/v1/pow/challenge`. The server signs `(install_id || iat ||
+/// challenge)` with a server-private key; the engine echoes `iat` and
+/// `signature` back in the `/register` body's `registration_proof` so the
+/// server can verify both the PoW solution AND that the challenge was
+/// genuinely issued by it (binds the client to a specific server-issued
+/// challenge, prevents pre-computed solutions).
+struct PowChallenge {
+    challenge: String,
+    iat: i64,
+    signature: String,
+    difficulty: u8,
+    ttl_secs: u64,
+}
+
+fn fetch_pow_challenge(server_url: &str, install_id: &str) -> Result<PowChallenge, RegisterError> {
+    let url = format!("{}/api/v1/pow/challenge", server_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "install_id": install_id });
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(15))
+        .send_json(&body)
+        .map_err(|e| match e {
+            ureq::Error::Status(code, r) => RegisterError::ServerRejected {
+                status: code,
+                reason: r.into_string().unwrap_or_default(),
+            },
+            ureq::Error::Transport(t) => RegisterError::Network(format!("transport: {t}")),
+        })?;
+    let v: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| RegisterError::Network(format!("pow_challenge body parse: {e}")))?;
+    let challenge = v
+        .get("challenge")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| RegisterError::Network("pow_challenge: missing 'challenge'".into()))?
+        .to_string();
+    let iat = v
+        .get("iat")
+        .and_then(|x| x.as_i64())
+        .ok_or_else(|| RegisterError::Network("pow_challenge: missing 'iat'".into()))?;
+    let signature = v
+        .get("signature")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| RegisterError::Network("pow_challenge: missing 'signature'".into()))?
+        .to_string();
+    let difficulty = v
+        .get("difficulty")
+        .and_then(|x| x.as_u64())
+        .map(|n| n.min(64) as u8)
+        .unwrap_or(DEFAULT_POW_DIFFICULTY);
+    let ttl_secs = v.get("ttl").and_then(|x| x.as_u64()).unwrap_or(300);
+    Ok(PowChallenge {
+        challenge,
+        iat,
+        signature,
+        difficulty,
+        ttl_secs,
+    })
 }
 
 /// GUI registration via loopback HTTP server. Opens the system
