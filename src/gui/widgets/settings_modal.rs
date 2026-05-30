@@ -169,13 +169,13 @@ fn request_reset_confirm() {
 fn perform_install_reset(active: crate::channel::Channel) {
     use crate::leaderboard::install;
     std::thread::spawn(move || {
-        eprintln!("leaderboard: install reset confirmed — backing up + rotating install_id");
+        crate::log_info!("leaderboard: install reset confirmed — backing up + rotating install_id");
         match install::back_up_for(active) {
             Ok(Some(path)) => {
-                eprintln!("leaderboard: prior install backed up to {}", path.display())
+                crate::log_info!("leaderboard: prior install backed up to {}", path.display())
             }
-            Ok(None) => eprintln!("leaderboard: no prior install to back up"),
-            Err(e) => eprintln!("leaderboard: backup failed: {e}"),
+            Ok(None) => crate::log_info!("leaderboard: no prior install to back up"),
+            Err(e) => crate::log_err!("leaderboard: backup failed: {e}"),
         }
         // resolve_server_url so a reset under a mock/override re-creates
         // the install pointed at the same endpoint (consistent with G1).
@@ -183,9 +183,8 @@ fn perform_install_reset(active: crate::channel::Channel) {
         let fresh = install::new_unregistered(server_url);
         match install::save_for(active, &fresh) {
             Ok(()) => {
-                eprintln!(
-                    "leaderboard: reset complete. new install_id={}. \
-                     Click Register to push it to the leaderboard server.",
+                crate::log_info!(
+                    "leaderboard: reset complete. new install_id={}. Click Register to push it to the leaderboard server.",
                     fresh.install_id
                 );
                 show_done_dialog(format!(
@@ -197,7 +196,7 @@ fn perform_install_reset(active: crate::channel::Channel) {
                 ));
             }
             Err(e) => {
-                eprintln!("leaderboard: reset failed: {e:?}");
+                crate::log_err!("leaderboard: reset failed: {e:?}");
                 show_done_dialog(format!("Install reset FAILED: {e}"));
             }
         }
@@ -1281,7 +1280,7 @@ fn render_network(ui: &mut egui::Ui, state: &mut SettingsModalState) {
                     // disk write fails (the user gets the switch
                     // for this session at least).
                     if let Err(e) = channel::write_persisted_channel(pick) {
-                        eprintln!("channel: write_persisted_channel failed: {e}");
+                        crate::log_err!("channel: write_persisted_channel failed: {e}");
                     }
                     channel::set_active_channel(pick);
                     state.channel_switch_confirm = None;
@@ -1353,12 +1352,12 @@ fn render_account(ui: &mut egui::Ui) {
         oauth::record_toast(&result);
         ui.ctx().request_repaint();
         match &result {
-            Ok(token) => eprintln!(
+            Ok(token) => crate::log_info!(
                 "account: linked {} as {}",
                 token.provider.display_name(),
                 token.display_name
             ),
-            Err(e) => eprintln!("account: link failed: {e}"),
+            Err(e) => crate::log_err!("account: link failed: {e}"),
         }
     }
 
@@ -1369,9 +1368,9 @@ fn render_account(ui: &mut egui::Ui) {
     if let Some(reg_result) = crate::leaderboard::registration::poll_register_session() {
         match &reg_result {
             Ok(id) => {
-                eprintln!("account: register OK, install_id={id}");
+                crate::log_info!("account: register OK, install_id={id}");
                 if let Some(provider) = oauth::take_pending_retry_provider() {
-                    eprintln!(
+                    crate::log_info!(
                         "account: auto-retrying OAuth with {} after register",
                         provider.display_name()
                     );
@@ -1385,7 +1384,7 @@ fn render_account(ui: &mut egui::Ui) {
                     )
                     .is_err()
                     {
-                        eprintln!("account: couldn't auto-retry OAuth (session already in flight)");
+                        crate::log_warn!("account: couldn't auto-retry OAuth (session already in flight)");
                     }
                 }
                 show_done_dialog(format!(
@@ -1394,7 +1393,7 @@ fn render_account(ui: &mut egui::Ui) {
                 ));
             }
             Err(e) => {
-                eprintln!("account: register failed: {e:?}");
+                crate::log_err!("account: register failed: {e:?}");
                 show_done_dialog(format!("Register failed:\n\n{e:?}"));
             }
         }
@@ -1609,7 +1608,7 @@ fn render_account(ui: &mut egui::Ui) {
                 "this machine".to_string()
             };
             if let Err(e) = oauth::unlink_for(active) {
-                eprintln!("account: unlink failed: {e}");
+                crate::log_err!("account: unlink failed: {e}");
                 show_done_dialog(format!("Unlink failed:\n\n{e}"));
             } else {
                 show_done_dialog(format!(
@@ -1756,25 +1755,25 @@ fn render_leaderboard(ui: &mut egui::Ui) {
                             ),
                         };
                         if state.registered {
-                            eprintln!(
+                            crate::log_info!(
                                 "leaderboard: already registered ({})",
                                 state.install_id
                             );
                             return;
                         }
-                        eprintln!(
+                        crate::log_info!(
                             "leaderboard: opening browser captcha (install_id={})...",
                             state.install_id
                         );
                         match crate::leaderboard::registration::register_gui_via_loopback(
                             &mut state,
                         ) {
-                            Ok(()) => eprintln!(
+                            Ok(()) => crate::log_info!(
                                 "leaderboard: registered via captcha. id={}",
                                 state.install_id
                             ),
                             Err(e) => {
-                                eprintln!("leaderboard: captcha register failed: {e:?}")
+                                crate::log_err!("leaderboard: captcha register failed: {e:?}")
                             }
                         }
                     });
@@ -1805,22 +1804,22 @@ fn render_leaderboard(ui: &mut egui::Ui) {
                             ),
                         };
                         if state.registered {
-                            eprintln!(
+                            crate::log_info!(
                                 "leaderboard: already registered ({})",
                                 state.install_id
                             );
                             return;
                         }
-                        eprintln!(
+                        crate::log_info!(
                             "leaderboard: solving PoW + POSTing /api/v1/register (install_id={})...",
                             state.install_id
                         );
                         match crate::leaderboard::registration::register_cli(&mut state) {
-                            Ok(()) => eprintln!(
+                            Ok(()) => crate::log_info!(
                                 "leaderboard: registered via PoW. id={}",
                                 state.install_id
                             ),
-                            Err(e) => eprintln!("leaderboard: register failed: {e:?}"),
+                            Err(e) => crate::log_err!("leaderboard: register failed: {e:?}"),
                         }
                     });
                 }
@@ -1962,7 +1961,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
                         if chosen != s.share_default {
                             s.share_default = chosen;
                             if let Err(e) = install::save(&s) {
-                                eprintln!("leaderboard: failed to persist share preference: {e:?}");
+                                crate::log_err!("leaderboard: failed to persist share preference: {e:?}");
                             }
                         }
                     }
@@ -2048,10 +2047,10 @@ fn render_privacy_section(ui: &mut egui::Ui) {
         if let Some(result) = crate::leaderboard::registration::poll_register_session() {
             match result {
                 Ok(id) => {
-                    eprintln!("leaderboard: register OK, install_id={id}");
+                    crate::log_info!("leaderboard: register OK, install_id={id}");
                 }
                 Err(e) => {
-                    eprintln!("leaderboard: register failed: {e:?}");
+                    crate::log_err!("leaderboard: register failed: {e:?}");
                 }
             }
         }
@@ -2082,7 +2081,7 @@ fn render_privacy_section(ui: &mut egui::Ui) {
         {
             let active = crate::channel::active_channel();
             if crate::leaderboard::registration::try_start_register_session(active).is_err() {
-                eprintln!("leaderboard: another register flow is already in flight");
+                crate::log_warn!("leaderboard: another register flow is already in flight");
             }
         }
     });
@@ -2702,7 +2701,7 @@ fn render_submit_section(ui: &mut egui::Ui) {
                     submission::archive_attempt(&inputs, &state.install_id, &outcome);
                     // 5xx / transport failures queue for retry.
                     if let submission::SubmitOutcome::Transient { reason } = &outcome {
-                        eprintln!("leaderboard: submit transient ({reason}); enqueueing");
+                        crate::log_warn!("leaderboard: submit transient ({reason}); enqueueing");
                         let body = crate::leaderboard::hmac_signer::canonical_body(
                             &submission::build_payload(&inputs, &state.install_id),
                         );
@@ -2712,7 +2711,7 @@ fn render_submit_section(ui: &mut egui::Ui) {
                         };
                         if let Err(e) = submission::enqueue(&inputs, &state.install_id, &signature)
                         {
-                            eprintln!("leaderboard: enqueue failed: {e:?}");
+                            crate::log_err!("leaderboard: enqueue failed: {e:?}");
                         }
                     }
                     submission::store_last_outcome(outcome);
