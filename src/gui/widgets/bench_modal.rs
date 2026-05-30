@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 /// Where the modal is in its lifecycle.
 #[derive(Clone, PartialEq)]
 pub enum Phase {
+    /// Mick bench-lane UX (2026-05-30): user picks Ranked vs Casual before
+    /// the consent/explainer. Default-selected reflects install.json's
+    /// last_bench_lane; click either Ranked or Casual to persist + advance.
+    Lane,
     /// Pre-run consent/explainer (the load-bearing warnings).
     Consent,
     /// Worker running; `status` carries the current stage line.
@@ -29,6 +33,17 @@ pub struct Shared {
     pub is_error: bool,
     /// true when the run submitted (vs local-only).
     pub submitted: bool,
+    /// Post-bench deep-link URL ("View on leaderboard"). Built from the
+    /// channel's frontend URL + the chosen lane + the server-assigned
+    /// submission_id; `None` until /submit returns Accepted or
+    /// DuplicateNoChange with an id.
+    pub deep_link: Option<String>,
+    /// Post-bench throughput, GB/s. Computed from bytes_scanned / dedupe_secs;
+    /// rendered in the Done view's rank panel.
+    pub throughput_gbps: Option<f64>,
+    /// Post-bench rank rows from /submit Accepted's ranks[] (empty when the
+    /// async ranks-poll hasn't resolved yet — rendered as "pending").
+    pub ranks: Vec<crate::leaderboard::submission::RankEntry>,
 }
 
 /// A user-selectable benchmark tier. The 100MB `corpus-v1-smoke` tier is
@@ -70,6 +85,11 @@ pub struct BenchUiState {
     pub tier_idx: usize,
     /// Show the "What gets shared?" full-JSON preview inline.
     pub show_share_preview: bool,
+    /// Mick bench-lane choice for this run. Defaulted to install.json's
+    /// last_bench_lane on open; set when the user clicks Ranked or Casual
+    /// on the Lane phase; threaded into run_worker so the server scores
+    /// authoritatively per web d7df4c9.
+    pub lane: Option<crate::leaderboard::install::BenchLane>,
     pub shared: Arc<Mutex<Shared>>,
     pub cancel: Arc<AtomicBool>,
 }
@@ -78,10 +98,11 @@ impl Default for BenchUiState {
     fn default() -> Self {
         Self {
             open: false,
-            phase: Phase::Consent,
+            phase: Phase::Lane,
             fresh: false,
             tier_idx: 0,
             show_share_preview: false,
+            lane: None,
             shared: Arc::new(Mutex::new(Shared::default())),
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -89,13 +110,20 @@ impl Default for BenchUiState {
 }
 
 impl BenchUiState {
-    /// Open the consent modal (called by the "Benchmark" button). Resets state.
+    /// Open the bench modal (called by the "Benchmark" button). Resets state
+    /// and starts at the Lane-prompt phase. Pre-populates lane from
+    /// install.json's last_bench_lane (the default-selected button) so the
+    /// modal is effectively one-click after first time.
     pub fn open(&mut self) {
         self.open = true;
-        self.phase = Phase::Consent;
+        self.phase = Phase::Lane;
         self.fresh = false;
         self.tier_idx = 0;
         self.show_share_preview = false;
+        self.lane = crate::leaderboard::install::load()
+            .ok()
+            .flatten()
+            .and_then(|s| s.last_bench_lane);
         self.cancel.store(false, Ordering::Relaxed);
         *self.shared.lock().unwrap() = Shared::default();
     }
@@ -118,8 +146,9 @@ impl BenchUiState {
         let cancel = Arc::clone(&self.cancel);
         let fresh = self.fresh;
         let tier = self.tier();
+        let lane = self.lane;
         std::thread::spawn(move || {
-            run_worker(&shared, &cancel, fresh, submit, tier);
+            run_worker(&shared, &cancel, fresh, submit, tier, lane);
         });
     }
 }
@@ -132,6 +161,7 @@ fn run_worker(
     fresh: bool,
     submit: bool,
     tier: BenchTierChoice,
+    lane: Option<crate::leaderboard::install::BenchLane>,
 ) {
     use crate::leaderboard::{bench_run, install, registration, submission};
 
@@ -189,11 +219,7 @@ fn run_worker(
         submit,
         cancel,
         |m| set_status(m),
-        // GUI v0.2.54 wires no explicit lane yet (the modal-with-Ranked/Casual
-        // choice ships as v0.2.55). For now the GUI bench-modal path leaves
-        // lane=None, which means server falls back to has_account_linkage
-        // gating — same behavior as pre-v0.2.54.
-        None,
+        lane.map(|l| l.as_slug()),
     );
 
     match outcome {
@@ -216,17 +242,35 @@ fn run_worker(
                 "Deduped the test corpus in {:.2}s — hashed {size} of duplicate candidates, {} groups.",
                 o.dedupe_secs, o.dup_groups
             );
+            // Mick UX: compute throughput + deep-link URL for the rank panel.
+            // GB/s = bytes_scanned / dedupe_secs / 1e9. Deep link uses the
+            // chosen lane (or "ranked" default) so the tab matches what the
+            // user picked.
+            let gbps = if o.dedupe_secs > 0.0 {
+                o.bytes_scanned as f64 / o.dedupe_secs / 1e9
+            } else {
+                0.0
+            };
+            shared.lock().unwrap().throughput_gbps = Some(gbps);
+            let frontend = crate::channel::frontend_url_for(channel);
+            let tab = lane.map(|l| l.as_slug()).unwrap_or("ranked");
             match o.submit {
                 None => finish(
                     format!("{perf}\nRan locally — not submitted."),
                     false,
                     false,
                 ),
-                Some(submission::SubmitOutcome::Accepted { ranks, achievements_unlocked, .. }) => {
+                Some(submission::SubmitOutcome::Accepted { submission_id, ranks, achievements_unlocked, .. }) => {
                     // Honest result: the GUI only runs RANKED tiers
                     // (corpus-v1-quick = 2.5GB ranked). A returned rank is
                     // shown verbatim; an empty ranks[] means submitted-OK
                     // but the rank isn't computed yet (don't fabricate one).
+                    let deep_link = format!("{frontend}/leaderboard?tab={tab}&highlight={submission_id}");
+                    {
+                        let mut s = shared.lock().unwrap();
+                        s.deep_link = Some(deep_link);
+                        s.ranks = ranks.clone();
+                    }
                     let mut msg = if let Some(top) = ranks.first() {
                         format!("Verified! You ranked on the Dedupe Hall of Fame.\n{top:?}")
                     } else {
@@ -239,6 +283,15 @@ fn run_worker(
                         msg.push_str(&format!("\nAchievements: {}", achievements_unlocked.join(", ")));
                     }
                     finish(format!("{perf}\n{msg}"), false, true)
+                }
+                Some(submission::SubmitOutcome::DuplicateNoChange { submission_id: Some(id) }) => {
+                    let deep_link = format!("{frontend}/leaderboard?tab={tab}&highlight={id}");
+                    shared.lock().unwrap().deep_link = Some(deep_link);
+                    finish(
+                        format!("{perf}\nAlready on the leaderboard (same payload).\nView the existing entry below."),
+                        false,
+                        true,
+                    )
                 }
                 Some(submission::SubmitOutcome::Rejected { status, reason }) => finish(
                     format!("{perf}\nNot accepted (status {status}): {reason}"),
@@ -272,6 +325,7 @@ pub fn show(state: &mut BenchUiState, ctx: &egui::Context) -> BenchModalAction {
         .open(&mut open)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| match state.phase.clone() {
+            Phase::Lane => lane_view(state, ui),
             Phase::Consent => consent_view(state, ui, &mut action),
             Phase::Running => running_view(state, ui, ctx),
             Phase::Done => done_view(state, ui),
@@ -282,6 +336,69 @@ pub fn show(state: &mut BenchUiState, ctx: &egui::Context) -> BenchModalAction {
         state.open = false;
     }
     action
+}
+
+/// Mick bench-lane UX (2026-05-30): two-button modal — Ranked (primary) vs
+/// Casual (secondary). Default-selected button reflects install.json's
+/// `last_bench_lane`; click either to persist the choice and advance to the
+/// existing Consent phase. Keyboard nav: Enter -> primary (Ranked); Escape ->
+/// closes modal (caller treats as Cancel).
+fn lane_view(state: &mut BenchUiState, ui: &mut egui::Ui) {
+    use crate::leaderboard::install::BenchLane;
+    ui.label(egui::RichText::new("Choose a bench lane").strong().size(16.0));
+    ui.add_space(4.0);
+    ui.label(
+        "Ranked submissions land on the public Hall of Fame and require an account \
+         (Google or Discord sign-in). Casual submissions just run the bench and show \
+         your throughput — no account needed.",
+    );
+    ui.add_space(8.0);
+
+    let default_is_ranked = matches!(state.lane, None | Some(BenchLane::Ranked));
+    let ranked_label = if default_is_ranked {
+        egui::RichText::new("● Ranked — I'm not here to play games").strong()
+    } else {
+        egui::RichText::new("Ranked — I'm not here to play games")
+    };
+    let casual_label = if !default_is_ranked {
+        egui::RichText::new("● Casual — just for fun").strong()
+    } else {
+        egui::RichText::new("Casual — just for fun")
+    };
+
+    if ui.add_sized([320.0, 36.0], egui::Button::new(ranked_label)).clicked()
+        || (ui.input(|i| i.key_pressed(egui::Key::Enter)) && default_is_ranked)
+    {
+        state.lane = Some(BenchLane::Ranked);
+        persist_lane(BenchLane::Ranked);
+        state.phase = Phase::Consent;
+    }
+    ui.add_space(4.0);
+    if ui.add_sized([320.0, 36.0], egui::Button::new(casual_label)).clicked()
+        || (ui.input(|i| i.key_pressed(egui::Key::Enter)) && !default_is_ranked)
+    {
+        state.lane = Some(BenchLane::Casual);
+        persist_lane(BenchLane::Casual);
+        state.phase = Phase::Consent;
+    }
+    ui.add_space(8.0);
+    if ui.button("Cancel").clicked() {
+        state.open = false;
+    }
+}
+
+/// Save the chosen lane to install.json. Best-effort; failure is logged but
+/// not user-surfaced (the bench still runs with the chosen lane in-memory).
+fn persist_lane(lane: crate::leaderboard::install::BenchLane) {
+    let channel = crate::channel::active_channel();
+    if let Ok(Some(mut s)) = crate::leaderboard::install::load_for(channel) {
+        if s.last_bench_lane != Some(lane) {
+            s.last_bench_lane = Some(lane);
+            if let Err(e) = crate::leaderboard::install::save_for(channel, &s) {
+                crate::log_warn!("bench-modal: failed to persist last_bench_lane: {e}");
+            }
+        }
+    }
 }
 
 fn consent_view(state: &mut BenchUiState, ui: &mut egui::Ui, action: &mut BenchModalAction) {
@@ -375,16 +492,57 @@ fn running_view(state: &mut BenchUiState, ui: &mut egui::Ui, ctx: &egui::Context
 }
 
 fn done_view(state: &mut BenchUiState, ui: &mut egui::Ui) {
-    let (result, is_error) = {
+    let (result, is_error, deep_link, throughput_gbps, ranks) = {
         let s = state.shared.lock().unwrap();
-        (s.result.clone().unwrap_or_default(), s.is_error)
+        (s.result.clone().unwrap_or_default(),
+         s.is_error,
+         s.deep_link.clone(),
+         s.throughput_gbps,
+         s.ranks.clone())
     };
     let color = if is_error { egui::Color32::from_rgb(220, 120, 90) } else { egui::Color32::from_rgb(120, 200, 140) };
     ui.label(egui::RichText::new(result).color(color));
+
+    // Mick post-bench rank panel (Mick UX 2026-05-30): on a successful submit
+    // (deep_link populated), show throughput + rank rows + a 'View on
+    // leaderboard' button that opens the deep link in the system browser via
+    // platform::open_url.
+    if let Some(deep_link) = deep_link.as_deref() {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        if let Some(gbps) = throughput_gbps {
+            ui.label(egui::RichText::new(format!("Throughput: {gbps:.2} GB/s")).size(14.0));
+        }
+        if ranks.is_empty() {
+            ui.label(
+                egui::RichText::new("Rank: pending (resolving asynchronously; check the leaderboard shortly)")
+                    .italics(),
+            );
+        } else {
+            for r in &ranks {
+                ui.label(format!(
+                    "Rank: #{} of {} in {} / {}",
+                    r.rank, r.bucket_size, r.category, r.bracket
+                ));
+            }
+        }
+        ui.add_space(8.0);
+        if ui.button(egui::RichText::new("View on leaderboard").strong()).clicked() {
+            if let Err(e) = crate::platform::open_url(deep_link) {
+                crate::log_warn!("bench-modal: failed to open leaderboard URL ({deep_link}): {e}");
+            }
+        }
+    }
+
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button("Run again").clicked() {
-            state.phase = Phase::Consent;
+            state.phase = Phase::Lane;
+            state.lane = crate::leaderboard::install::load()
+                .ok()
+                .flatten()
+                .and_then(|s| s.last_bench_lane);
         }
         if ui.button("Close").clicked() {
             state.open = false;
