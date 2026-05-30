@@ -726,6 +726,7 @@ mod tests {
             run_uuid: "u".into(),
             scan_id: None,
             bench: Some(cb),
+            lane: None,
             hardware: super::super::hardware::detect(),
             run_shape: super::super::submission::RunShape {
                 wall_clock_seconds: 2.0,

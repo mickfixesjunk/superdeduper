@@ -2542,6 +2542,7 @@ pub fn build_sample_payload_json() -> String {
             client_found_dupsets: None,
         },
         bench: None,
+        lane: None,
     };
     let payload = submission::build_payload(&inputs, "00000000-0000-0000-0000-000000000000");
     serde_json::to_string_pretty(&payload).unwrap_or_else(|e| format!("(render failed: {e})"))
@@ -2591,6 +2592,7 @@ pub fn build_bench_sample_payload_json() -> String {
             placeholder_skip_bytes: None,
             client_found_dupsets: None,
         },
+        lane: None,
         bench: Some(submission::CanonicalBench {
             protocol_version: "tcorpus-1".into(),
             corpus_version: "corpus-v2-quick".into(),

@@ -178,6 +178,34 @@ pub struct BenchMeArgs {
     /// so the dedupe read is disk-bound + disk-class is detected correctly.
     #[arg(long, value_name = "DIR")]
     pub workdir: Option<PathBuf>,
+    /// Bench lane (Mick UX 2026-05-30 12:13 PDT).
+    /// `ranked`  = ensure OAuth linkage first; prompts for sign-in on-demand
+    ///             if not already linked. Submissions are eligible for the
+    ///             competitive leaderboard.
+    /// `casual`  = just run the bench. No OAuth prompt. Submissions are
+    ///             treated as casual (Ignition single-run grants) unless the
+    ///             install already has an OAuth linkage (server-side decision).
+    /// When omitted, the engine uses the most recently persisted choice from
+    /// install.json. If install.json has no choice AND stdout is a tty, the
+    /// engine prompts interactively. If install.json has no choice AND stdout
+    /// is NOT a tty, the engine errors with a helpful message asking for
+    /// `--lane=ranked|casual` explicitly.
+    #[arg(long, value_name = "LANE", value_enum)]
+    pub lane: Option<CliBenchLane>,
+    /// Suppress the post-bench browser deep-link open (CLI prints the URL but
+    /// does not invoke any platform browser-open helpers).
+    #[arg(long, default_value_t = false)]
+    pub no_deep_link: bool,
+}
+
+/// CLI representation of `superdeduper::leaderboard::install::BenchLane`.
+/// Mirrored here (rather than `#[derive(ValueEnum)]` on the install-side
+/// enum) so the install module doesn't pull a clap dep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum CliBenchLane {
+    Ranked,
+    Casual,
 }
 
 #[derive(Debug, Subcommand)]

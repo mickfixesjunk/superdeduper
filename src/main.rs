@@ -716,17 +716,15 @@ fn parse_bench_seed(seed: Option<String>) -> anyhow::Result<[u8; 32]> {
 
 /// T-BENCH-ME `--bench-me`: thin CLI wrapper over the shared
 /// `leaderboard::bench_run::run` orchestration (the GUI button calls the same
-/// fn -> parity by construction). Loads the install, runs the loop with stderr
-/// progress, prints the outcome.
+/// fn -> parity by construction). Loads the install, resolves the bench
+/// lane (Ranked vs Casual, Mick UX 2026-05-30), optionally fires
+/// OAuth-on-demand for the Ranked path, runs the loop with stderr progress,
+/// prints the outcome + rank summary + deep link.
 #[cfg(feature = "telemetry")]
 fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
-    use superdeduper::leaderboard::{bench_run, install};
+    use superdeduper::leaderboard::install::BenchLane;
+    use superdeduper::leaderboard::{bench_run, install, oauth, submission};
     let channel = superdeduper::channel::active_channel();
-    // PROD-DARK (launch hold, Mick option-2): the public prod bench backend
-    // isn't live yet. Refuse on the prod channel with a clear message rather
-    // than firing a doomed request at a missing /bench endpoint. Works on
-    // dev/local (set SUPERDEDUPER_CHANNEL=dev). Lifts when the prod
-    // leaderboard launches.
     if !channel.is_non_prod() {
         anyhow::bail!(
             "bench-me is not yet available on the production leaderboard \
@@ -734,9 +732,50 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
              SUPERDEDUPER_CHANNEL=dev to try it."
         );
     }
-    let state = install::load_for(channel)
+    let mut state = install::load_for(channel)
         .context("loading install state")?
         .ok_or_else(|| anyhow::anyhow!("not registered on {channel:?} -- run `superdeduper register` first"))?;
+
+    // Lane resolution: --lane > install.json last_bench_lane > tty prompt
+    // > error-if-non-tty. Records the resolved choice back to install.json
+    // so the next run defaults to the same lane.
+    let lane = resolve_bench_lane(args.lane, state.last_bench_lane)?;
+    if state.last_bench_lane != Some(lane) {
+        state.last_bench_lane = Some(lane);
+        if let Err(e) = install::save_for(channel, &state) {
+            eprintln!("bench-me: WARNING failed to persist last_bench_lane: {e}");
+        }
+    }
+    eprintln!("bench: lane = {}", lane.display_name());
+
+    // Ranked path: ensure OAuth linkage before bench (else server scores casual
+    // per web af57f4d gating). Casual path: skip the OAuth pre-prompt.
+    if lane == BenchLane::Ranked {
+        let status = oauth::status_for(channel)
+            .context("checking OAuth link status")?;
+        if matches!(status, oauth::AccountStatus::Anonymous) {
+            eprintln!(
+                "bench: Ranked requires an OAuth account linkage. Starting browser sign-in..."
+            );
+            let server_url = superdeduper::channel::server_url_for(channel);
+            let token = oauth::link_via_loopback(
+                oauth::Provider::Google,
+                channel,
+                server_url,
+                &state.install_id,
+                std::time::Duration::from_secs(300),
+            ).map_err(|e| anyhow::anyhow!(
+                "OAuth sign-in failed/cancelled: {e:?}. \
+                 Try again with --lane=ranked when ready, or use --lane=casual to bench without sign-in."
+            ))?;
+            eprintln!(
+                "bench: linked {} as {}; proceeding to bench.",
+                token.provider.display_name(),
+                token.display_name
+            );
+        }
+    }
+
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let outcome = bench_run::run(
         &state,
@@ -747,6 +786,7 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
         true, // CLI bench-me always submits
         &cancel,
         |msg| eprintln!("bench: {msg}"),
+        Some(lane.as_slug()),
     )?;
     eprintln!(
         "bench: result_digest={} ({} dup groups, {} candidate bytes, {:.2}s, cold-enforced={})",
@@ -763,11 +803,111 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
              ranked cold measurement."
         );
     }
+
+    // Post-bench rank summary + deep link. Pulls rank from the Accepted
+    // outcome (ranks[] is populated server-side at /submit time when the
+    // category buckets resolve immediately; the async ranks-poll worker
+    // fills slower-resolving categories — for the CLI we surface what's
+    // available right now).
+    let bytes_per_sec = if outcome.dedupe_secs > 0.0 {
+        outcome.bytes_scanned as f64 / outcome.dedupe_secs
+    } else {
+        0.0
+    };
+    let gb_per_sec = bytes_per_sec / 1e9;
+    let frontend = superdeduper::channel::frontend_url_for(channel);
     match &outcome.submit {
-        Some(o) => println!("bench-me result: {o:?}"),
-        None => println!("bench-me: ran locally, not submitted"),
+        Some(submission::SubmitOutcome::Accepted { submission_id, ranks, .. }) => {
+            println!("bench-me ACCEPTED");
+            println!("  throughput  : {gb_per_sec:.2} GB/s");
+            println!("  submission  : {submission_id}");
+            if ranks.is_empty() {
+                println!("  rank        : pending (async resolve; check leaderboard shortly)");
+            } else {
+                for r in ranks {
+                    println!("  rank        : #{} of {} in {} / {}", r.rank, r.bucket_size, r.category, r.bracket);
+                }
+            }
+            let tab = lane.as_slug();
+            let deep_link = format!("{frontend}/leaderboard?tab={tab}&highlight={submission_id}");
+            println!("  view        : {deep_link}");
+            if !args.no_deep_link {
+                // CLI is best-effort about browser-open; respect --no-deep-link
+                // for headless / CI. open_url returns Result so we just log on
+                // failure (the URL is already printed above).
+                if let Err(e) = superdeduper::platform::open_url(&deep_link) {
+                    eprintln!("bench: (browser open skipped: {e})");
+                }
+            }
+        }
+        Some(submission::SubmitOutcome::DuplicateNoChange { submission_id }) => {
+            println!("bench-me DUPLICATE (same payload already on leaderboard, no change)");
+            if let Some(id) = submission_id {
+                println!("  submission  : {id}");
+                let tab = lane.as_slug();
+                let deep_link = format!("{frontend}/leaderboard?tab={tab}&highlight={id}");
+                println!("  view        : {deep_link}");
+            }
+        }
+        Some(other) => {
+            println!("bench-me: {other:?}");
+        }
+        None => {
+            println!("bench-me: ran locally, not submitted");
+        }
     }
     Ok(())
+}
+
+/// Resolve the bench lane from CLI args > persisted install.json > tty prompt.
+/// When stdout is NOT a tty AND no lane is on-disk or in-flag, errors with a
+/// helpful message asking for `--lane=ranked|casual`.
+#[cfg(feature = "telemetry")]
+fn resolve_bench_lane(
+    arg: Option<superdeduper::cli::CliBenchLane>,
+    persisted: Option<superdeduper::leaderboard::install::BenchLane>,
+) -> anyhow::Result<superdeduper::leaderboard::install::BenchLane> {
+    use superdeduper::cli::CliBenchLane;
+    use superdeduper::leaderboard::install::BenchLane;
+    if let Some(a) = arg {
+        return Ok(match a {
+            CliBenchLane::Ranked => BenchLane::Ranked,
+            CliBenchLane::Casual => BenchLane::Casual,
+        });
+    }
+    if let Some(p) = persisted {
+        return Ok(p);
+    }
+    // No flag, no persisted choice. Interactive tty prompt; non-interactive
+    // bail with a clear ask.
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "no bench lane chosen — pass --lane=ranked or --lane=casual \
+             (or run interactively so the engine can prompt). \
+             `ranked` = OAuth sign-in required before bench; \
+             `casual` = just runs the bench."
+        );
+    }
+    eprintln!();
+    eprintln!("Choose a bench lane:");
+    eprintln!("  [1] Ranked - I'm not here to play games (OAuth sign-in required)");
+    eprintln!("  [2] Casual - just for fun (no sign-in)");
+    loop {
+        eprint!("Enter 1 or 2 (default: 1): ");
+        use std::io::{BufRead, Write};
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("reading lane prompt response")?;
+        match line.trim() {
+            "" | "1" | "r" | "R" | "ranked" | "Ranked" => return Ok(BenchLane::Ranked),
+            "2" | "c" | "C" | "casual" | "Casual" => return Ok(BenchLane::Casual),
+            _ => eprintln!("(didn't understand that; please enter 1 or 2)"),
+        }
+    }
 }
 
 /// G-track: `superdeduper achievements` — list / refetch the install's
@@ -2203,6 +2343,7 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
                     client_found_dupsets: None,
                 },
                 bench: None,
+                lane: None,
             };
             let payload = submission::build_payload(&inputs, &install_state.install_id);
             record = record.with_submission_payload(payload, install_state.install_id);

@@ -56,6 +56,17 @@ pub struct SubmissionInputs {
     /// submission (then `build_payload` emits no bench keys). Not serialized
     /// directly — `build_payload` lifts it into the wire body.
     pub bench: Option<CanonicalBench>,
+    /// Mick bench-lane UX (2026-05-30): the user's explicit lane choice
+    /// for this submission. Server treats this as authoritative per design
+    /// 12:29 PST / web d7df4c9 — when present, body.lane overrides the
+    /// server-derived has_account_linkage gating so an OAuth-linked user
+    /// who picks Casual genuinely lands on the casual board. `None` for
+    /// non-bench submissions (server falls back to existing gating).
+    /// Wire form: `"lane": "ranked"` or `"lane": "casual"` at the top
+    /// level of the /submit body. (No `#[serde(default)]` needed — the
+    /// struct isn't serde-derived; `build_payload` lifts the value into
+    /// the JSON body manually.)
+    pub lane: Option<String>,
 }
 
 /// T-BENCH-ME canonical-bench top-level submission fields (server-direct-verify
@@ -345,6 +356,14 @@ pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json:
         // field path). false (warm/unverifiable, incl. WSL fail-closed) -> the
         // server routes the run to the casual board, not competitive cold.
         obj.insert("cold_enforced".into(), bench.cold_enforced.into());
+    }
+    // Mick bench-lane UX (2026-05-30): user's explicit lane choice goes
+    // top-level. Server treats body.lane as authoritative (design 12:29 PST
+    // + web d7df4c9). When `None` (ordinary scan / pre-v0.2.54 callers),
+    // server falls back to has_account_linkage gating.
+    if let Some(lane) = &inputs.lane {
+        body.as_object_mut().expect("json object")
+            .insert("lane".into(), lane.clone().into());
     }
     body
 }
@@ -1050,6 +1069,7 @@ mod tests {
             run_uuid: "9d4a0000-0000-0000-0000-000000000001".into(),
             scan_id: None,
             bench: None,
+            lane: None,
             hardware: crate::leaderboard::hardware::detect(),
             run_shape: RunShape {
                 wall_clock_seconds: 5.678,
