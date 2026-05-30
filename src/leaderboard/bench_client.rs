@@ -201,6 +201,239 @@ pub fn result_digest_v2(dupsets: &[Vec<u64>], server_blob: &[u8; 32]) -> String 
     b64(&result_digest_bytes_v2(dupsets, server_blob))
 }
 
+// ----------------------------------------------------------------------------
+// A3 / v3-mutate (v0.3.0 HARD CUTOVER). Per-run content mutation defeats the
+// "precompute-once forge" attack: an attacker who knows the corpus + dedupe
+// algorithm can normally precompute the answer table once and replay it
+// across runs. v3-mutate derives a per-run, per-file key from the server-
+// issued K and the file's own raw content hash, then XORs a ChaCha20
+// keystream over the file content before dedupe runs. The mutated content
+// is what gets hashed for dedupe AND for the sampled challenge. K never
+// repeats across runs, so the attacker must re-do the work each run.
+//
+// Wire shape:
+//   /bench/start response  -> top-level `K` (32 bytes, base64-std)
+//   challenge_hash_v3      -> tag 0x04, K appended (cryptographically
+//                              distinct from V1 tag 0x02 + V2 tag 0x03)
+//   result_digest_v3       -> domain "tcorpus-result-v3", K mixed before
+//                              cluster data
+//   bench_proof.K_echo     -> client echoes K so server can confirm the
+//                              client used the K it was issued
+//
+// Dupsets in V3 are computed over MUTATED content (post-XOR). Two files
+// identical raw → identical file_hash → identical per_file_key →
+// identical keystream → identical mutated content. So dedupe still
+// surfaces them as a cluster.
+// ----------------------------------------------------------------------------
+
+/// V3 result_digest domain. Same prefix-with-length-prefix framing as V1/V2;
+/// the changed string + the K mix make V3 cryptographically non-interchangeable
+/// with V1 or V2 even when the server happens to issue an all-zero K.
+pub const RESULT_DIGEST_DOMAIN_V3: &[u8] = b"tcorpus-result-v3";
+
+/// Derive the per-file mutation key for V3. Inputs: the server-issued
+/// per-run key `K` (delivered by /bench/start) and the file's own raw
+/// content hash. The HMAC binds the per-file key to BOTH the per-run K
+/// (so it can't be replayed across runs) AND the file's actual content
+/// (so an attacker who swaps the file's bytes mid-stream changes its
+/// key derivation and breaks the mutation).
+pub fn per_file_key_v3(k: &[u8; 32], file_hash: &[u8; 32]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(k)
+        .expect("HMAC accepts any key length");
+    mac.update(file_hash);
+    let out = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out);
+    key
+}
+
+/// Fill `buf` with `len` bytes of the V3 mutation keystream starting at
+/// absolute file offset `offset`. ChaCha20 keyed by `per_file_key` with
+/// a zero nonce — the absolute offset is provided via `StreamCipherSeek`
+/// so any (offset, len) window can be regenerated independently without
+/// hashing forward (essential for the sparse-challenge path where the
+/// server samples bytes deep into a file).
+pub fn keystream_at_v3(per_file_key: &[u8; 32], offset: u64, buf: &mut [u8]) {
+    use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+    let key = chacha20::Key::from(*per_file_key);
+    let nonce = chacha20::Nonce::from([0u8; 12]);
+    let mut cipher = chacha20::ChaCha20::new(&key, &nonce);
+    cipher.seek(offset);
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    cipher.apply_keystream(buf);
+}
+
+/// XOR the V3 mutation keystream over `raw`, returning the mutated bytes.
+/// `offset` is the absolute file offset at which `raw` starts (so the
+/// keystream is taken from the same position the dedupe pipeline will
+/// emit for that file slice).
+pub fn mutate_bytes_v3(per_file_key: &[u8; 32], offset: u64, raw: &[u8]) -> Vec<u8> {
+    let mut ks = vec![0u8; raw.len()];
+    keystream_at_v3(per_file_key, offset, &mut ks);
+    raw.iter().zip(ks.iter()).map(|(a, b)| a ^ b).collect()
+}
+
+/// V3 challenge_hash: `BLAKE3(0x04 ‖ u32le(path_len) ‖ path ‖ u64le(offset)
+/// ‖ u64le(len) ‖ mutated_bytes ‖ K)`. Tag 0x04 + K appended make this
+/// cryptographically distinct from V1 (tag 0x02, no K) and V2 (tag 0x03,
+/// server_blob appended). `mutated_bytes` MUST be the bytes after
+/// keystream XOR — passing raw bytes will produce a hash the server
+/// rejects (which is the point: the mutation IS the forge defence).
+pub fn challenge_hash_v3(
+    path: &str,
+    offset: u64,
+    len: u64,
+    mutated_bytes: &[u8],
+    k: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&[0x04]);
+    h.update(&(path.len() as u32).to_le_bytes());
+    h.update(path.as_bytes());
+    h.update(&offset.to_le_bytes());
+    h.update(&len.to_le_bytes());
+    h.update(mutated_bytes);
+    h.update(k);
+    *h.finalize().as_bytes()
+}
+
+/// V3 result_digest preimage: `BLAKE3( u32le(17) ‖ "tcorpus-result-v3" ‖ K ‖
+/// u64le(cluster_count) ‖ per cluster: u64le(len) ‖ u64le(path_index)* )`.
+/// Same canonical ordering rule as V1/V2 (clusters sorted by min member,
+/// members ascending). dupsets are taken from a dedupe pass run OVER
+/// MUTATED content — V3 mutation is deterministic per (K, file_hash) so
+/// dupes survive the mutation as identical mutated content.
+pub fn result_digest_bytes_v3(dupsets: &[Vec<u64>], k: &[u8; 32]) -> [u8; 32] {
+    let mut clusters: Vec<Vec<u64>> = dupsets
+        .iter()
+        .map(|c| {
+            let mut v = c.clone();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    clusters.sort_by_key(|c| c.first().copied().unwrap_or(0));
+    let mut h = blake3::Hasher::new();
+    h.update(&(RESULT_DIGEST_DOMAIN_V3.len() as u32).to_le_bytes());
+    h.update(RESULT_DIGEST_DOMAIN_V3);
+    h.update(k);
+    h.update(&(clusters.len() as u64).to_le_bytes());
+    for c in &clusters {
+        h.update(&(c.len() as u64).to_le_bytes());
+        for &pi in c {
+            h.update(&pi.to_le_bytes());
+        }
+    }
+    *h.finalize().as_bytes()
+}
+
+pub fn result_digest_v3(dupsets: &[Vec<u64>], k: &[u8; 32]) -> String {
+    b64(&result_digest_bytes_v3(dupsets, k))
+}
+
+/// Compute BLAKE3 over a file's entire raw content. Used to derive the
+/// per-file mutation key (`per_file_key_v3(K, file_hash)`). The whole-
+/// file read is the forge-defence cost: a precompute-once attacker
+/// can't shortcut to a final answer without materialising every file
+/// each run (since K changes per run, file_hash binds into the key,
+/// and a fake stream of bytes would produce a different file_hash and
+/// therefore a different per_file_key → different mutation → different
+/// challenge_hash → server reject).
+pub fn file_raw_hash(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut f = std::fs::File::open(path)?;
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(*h.finalize().as_bytes())
+}
+
+/// V3 answer the challenge from the downloaded corpus, applying the
+/// per-run mutation. For each unique file referenced in `positions`,
+/// reads the whole file once to compute `file_hash`, derives
+/// `per_file_key = HMAC(K, file_hash)`, then for each (offset, len)
+/// targeting that file: reads the raw bytes, XORs them with the
+/// keystream at that offset, hashes the mutated result via
+/// [`challenge_hash_v3`]. `bytes_read` counts the SAMPLED bytes only
+/// (not the whole-file reads used to derive file_hash) so the server's
+/// `bytes_scanned == manifest.total_bytes` cross-check keeps its
+/// existing meaning (the sampled-bytes work the server expects).
+pub fn answer_challenge_from_dir_v3(
+    dir: &Path,
+    positions: &[ChallengePosition],
+    k: &[u8; 32],
+) -> std::io::Result<(Vec<ChallengeAnswer>, u64)> {
+    use std::collections::HashMap;
+    let mut per_file_keys: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut answers = Vec::with_capacity(positions.len());
+    let mut bytes_read = 0u64;
+    for p in positions {
+        let name = format!("f{:010}.bin", p.path_index);
+        let file_path = dir.join(&name);
+        let pf_key = if let Some(k) = per_file_keys.get(&p.path_index) {
+            *k
+        } else {
+            let file_hash = file_raw_hash(&file_path)?;
+            let pf_key = per_file_key_v3(k, &file_hash);
+            per_file_keys.insert(p.path_index, pf_key);
+            pf_key
+        };
+        let mut f = std::fs::File::open(&file_path)?;
+        f.seek(SeekFrom::Start(p.byte_offset))?;
+        let mut raw = vec![0u8; p.byte_length as usize];
+        f.read_exact(&mut raw)?;
+        bytes_read += p.byte_length;
+        let mutated = mutate_bytes_v3(&pf_key, p.byte_offset, &raw);
+        let h = challenge_hash_v3(&name, p.byte_offset, p.byte_length, &mutated, k);
+        answers.push(ChallengeAnswer {
+            path_index: p.path_index,
+            byte_offset: p.byte_offset,
+            byte_length: p.byte_length,
+            challenge_hash: b64(&h),
+        });
+    }
+    Ok((answers, bytes_read))
+}
+
+/// V3 assembly of the canonical-bench submission block. `bench_proof`
+/// carries `answers`, the V3 `result_digest`, and the `K_echo` (base64-
+/// std encoded K) so the server can confirm the client used the K it
+/// was issued on /bench/start.
+#[allow(clippy::too_many_arguments)]
+pub fn to_canonical_bench_v3(
+    protocol_version: &str,
+    corpus_version: &str,
+    tier: &str,
+    bench_run_id: &str,
+    answers: &[ChallengeAnswer],
+    found_dupsets: &[Vec<u64>],
+    cold_enforced: bool,
+    k: &[u8; 32],
+) -> super::submission::CanonicalBench {
+    let bench_proof = serde_json::json!({
+        "answers": answers,
+        "result_digest": result_digest_v3(found_dupsets, k),
+        "K_echo": b64(k),
+    });
+    super::submission::CanonicalBench {
+        protocol_version: protocol_version.to_string(),
+        corpus_version: corpus_version.to_string(),
+        tier: tier.to_string(),
+        bench_run_id: bench_run_id.to_string(),
+        bench_proof,
+        cold_enforced,
+    }
+}
+
 /// Lowercase hex of a 32-byte digest (for cross-checking against research's
 /// hex goldens, which print hex; the wire form is [`b64`]). Test-only.
 #[cfg(test)]
@@ -552,5 +785,242 @@ mod tests {
         // determinism self-check.
         assert_eq!(result_digest(&dupsets), result_digest(&dupsets));
         assert_eq!(challenge_hash("f0000000000.bin", 0, 8, b"BENCHME0"), challenge_hash("f0000000000.bin", 0, 8, b"BENCHME0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // A3 / v3-mutate (v0.3.0). All tests below this line exercise V3 only.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic V3 K for tests. 0x80..0x9f — distinct from any V1 seed
+    /// (0x00..0x1f) or V2 blob (0x10..0x2f) used in this file so a slip
+    /// between V1/V2/V3 vectors localises immediately.
+    fn v3_test_k() -> [u8; 32] {
+        std::array::from_fn(|i| (0x80 + i) as u8)
+    }
+
+    #[test]
+    fn v3_per_file_key_binds_k_and_file_hash() {
+        let k = v3_test_k();
+        let h1: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let h2: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_add(1));
+        let k_other: [u8; 32] = std::array::from_fn(|i| (i as u8) ^ 0xff);
+        let a = per_file_key_v3(&k, &h1);
+        // determinism
+        assert_eq!(a, per_file_key_v3(&k, &h1));
+        // K binds: distinct K -> distinct per_file_key (same file_hash)
+        assert_ne!(a, per_file_key_v3(&k_other, &h1));
+        // file_hash binds: distinct file_hash -> distinct per_file_key (same K)
+        assert_ne!(a, per_file_key_v3(&k, &h2));
+    }
+
+    #[test]
+    fn v3_mutate_bytes_is_deterministic_and_involutive() {
+        let k = v3_test_k();
+        let file_hash: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let pf_key = per_file_key_v3(&k, &file_hash);
+        let raw = b"the-quick-brown-fox-jumps-over-the-lazy-dog";
+        let m1 = mutate_bytes_v3(&pf_key, 0, raw);
+        let m2 = mutate_bytes_v3(&pf_key, 0, raw);
+        assert_eq!(m1, m2, "mutation is deterministic");
+        assert_ne!(m1.as_slice(), raw.as_slice(), "mutation actually XORs (not no-op)");
+        // XOR is its own inverse: mutating the mutated content reproduces raw.
+        let restored = mutate_bytes_v3(&pf_key, 0, &m1);
+        assert_eq!(restored.as_slice(), raw.as_slice(), "XOR is involutive");
+        // offset binds: same bytes at offset 0 vs offset 100 produce
+        // different mutated output (different keystream region).
+        let m_at_100 = mutate_bytes_v3(&pf_key, 100, raw);
+        assert_ne!(m1, m_at_100, "absolute offset binds into the keystream");
+    }
+
+    #[test]
+    fn v3_is_cryptographically_distinct_from_v1_and_v2() {
+        // challenge_hash: V1 (tag 0x02) vs V2 (tag 0x03, zero blob) vs V3
+        // (tag 0x04, zero K) must all differ even when the only changing
+        // inputs are tag + appended bytes.
+        let zero32 = [0u8; 32];
+        let bytes = b"abcd";
+        let v1 = challenge_hash("f0000000001.bin", 0, 4, bytes);
+        let v2 = challenge_hash_v2("f0000000001.bin", 0, 4, bytes, &zero32);
+        let v3 = challenge_hash_v3("f0000000001.bin", 0, 4, bytes, &zero32);
+        assert_ne!(v1, v2, "V1 vs V2 distinct");
+        assert_ne!(v1, v3, "V1 vs V3 distinct");
+        assert_ne!(v2, v3, "V2 vs V3 distinct");
+        // K binds into V3 challenge_hash: distinct K -> distinct hash.
+        let one32 = [1u8; 32];
+        let v3_one = challenge_hash_v3("f0000000001.bin", 0, 4, bytes, &one32);
+        assert_ne!(v3, v3_one, "K binds into V3 challenge_hash");
+
+        // result_digest: V1 vs V2-zero vs V3-zero must differ for the same
+        // dupsets, and V3 must bind to K.
+        let dupsets = vec![vec![0u64, 7], vec![1, 8]];
+        let r1 = result_digest_bytes(&dupsets);
+        let r2 = result_digest_bytes_v2(&dupsets, &zero32);
+        let r3 = result_digest_bytes_v3(&dupsets, &zero32);
+        assert_ne!(r1, r2);
+        assert_ne!(r1, r3);
+        assert_ne!(r2, r3);
+        let r3_one = result_digest_bytes_v3(&dupsets, &one32);
+        assert_ne!(r3, r3_one, "K binds into V3 result_digest");
+    }
+
+    #[test]
+    fn v3_challenge_hash_is_position_and_k_bound_and_stable() {
+        let k = v3_test_k();
+        let bytes = b"abcd";
+        let base = challenge_hash_v3("f0000000001.bin", 0, 4, bytes, &k);
+        assert_eq!(base, challenge_hash_v3("f0000000001.bin", 0, 4, bytes, &k), "stable");
+        assert_ne!(base, challenge_hash_v3("f0000000002.bin", 0, 4, bytes, &k), "path binds");
+        assert_ne!(base, challenge_hash_v3("f0000000001.bin", 1, 4, bytes, &k), "offset binds");
+        assert_ne!(base, challenge_hash_v3("f0000000001.bin", 0, 4, b"abce", &k), "bytes bind");
+        let k_other: [u8; 32] = std::array::from_fn(|i| (i as u8) ^ 0xff);
+        assert_ne!(base, challenge_hash_v3("f0000000001.bin", 0, 4, bytes, &k_other), "K binds");
+    }
+
+    #[test]
+    fn v3_result_digest_canonical_and_k_bound() {
+        let k = v3_test_k();
+        let a = result_digest_v3(&[vec![0, 6], vec![2, 8, 9]], &k);
+        assert_eq!(a, result_digest_v3(&[vec![0, 6], vec![2, 8, 9]], &k), "deterministic");
+        // canonicalisation: group / member order doesn't matter.
+        assert_eq!(a, result_digest_v3(&[vec![2, 8, 9], vec![0, 6]], &k), "group order canonicalised");
+        assert_eq!(a, result_digest_v3(&[vec![6, 0], vec![9, 2, 8]], &k), "member order canonicalised");
+        // membership binds.
+        assert_ne!(a, result_digest_v3(&[vec![0, 7], vec![2, 8, 9]], &k), "membership binds");
+        // K binds.
+        let k_other: [u8; 32] = std::array::from_fn(|i| (i as u8) ^ 0xff);
+        assert_ne!(a, result_digest_v3(&[vec![0, 6], vec![2, 8, 9]], &k_other), "K binds");
+        // empty still a 44-char b64 digest.
+        let e: Vec<Vec<u64>> = Vec::new();
+        assert_eq!(result_digest_v3(&e, &k).len(), 44);
+    }
+
+    #[test]
+    fn v3_answer_challenge_reads_mutates_and_hashes() {
+        // tiny on-disk corpus: file content is fully under our control so we
+        // can compute the expected mutated challenge_hash externally and
+        // check the V3 read path matches byte-for-byte.
+        let k = v3_test_k();
+        let dir = std::env::temp_dir().join(format!("sd-bench-client-v3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let content_a: &[u8] = b"the-quick-brown-fox-jumps-over-the-lazy-dog!!!!";
+        let content_b: &[u8] = b"another-totally-different-file-content!!!!!!!!!";
+        std::fs::write(dir.join("f0000000000.bin"), content_a).unwrap();
+        std::fs::write(dir.join("f0000000001.bin"), content_b).unwrap();
+
+        let positions = vec![
+            ChallengePosition { path_index: 0, byte_offset: 4, byte_length: 11 }, // "quick-brown"
+            ChallengePosition { path_index: 1, byte_offset: 0, byte_length: 7 },  // "another"
+            ChallengePosition { path_index: 0, byte_offset: 20, byte_length: 5 }, // "jumps" — same file as pos 0
+        ];
+        let (answers, bytes_read) = answer_challenge_from_dir_v3(&dir, &positions, &k).unwrap();
+        assert_eq!(bytes_read, 11 + 7 + 5);
+        assert_eq!(answers.len(), 3);
+
+        // External recomputation: derive per_file_key from raw file_hash,
+        // mutate the slice, hash. Must match what the V3 read path produced.
+        for (i, pos) in positions.iter().enumerate() {
+            let name = format!("f{:010}.bin", pos.path_index);
+            let raw_file = std::fs::read(dir.join(&name)).unwrap();
+            let file_hash: [u8; 32] = *blake3::hash(&raw_file).as_bytes();
+            let pf_key = per_file_key_v3(&k, &file_hash);
+            let slice = &raw_file[pos.byte_offset as usize ..
+                                  (pos.byte_offset + pos.byte_length) as usize];
+            let mutated = mutate_bytes_v3(&pf_key, pos.byte_offset, slice);
+            let expected = b64(&challenge_hash_v3(&name, pos.byte_offset, pos.byte_length, &mutated, &k));
+            assert_eq!(answers[i].challenge_hash, expected,
+                "V3 read-path mismatch on position {i} ({pos:?})");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_to_canonical_bench_emits_k_echo_and_v3_digest() {
+        let k = v3_test_k();
+        let cb = to_canonical_bench_v3(
+            "v3-mutate", "corpus-v3-quick", "quick", "run-V3",
+            &[],
+            &[vec![1u64, 2, 7]],
+            true,
+            &k,
+        );
+        // K_echo is base64-std of K (44 chars).
+        let echo = cb.bench_proof.get("K_echo").and_then(|v| v.as_str())
+            .expect("K_echo present in V3 bench_proof");
+        assert_eq!(echo, b64(&k));
+        // result_digest is V3 (distinct from V1 + V2 over same dupsets).
+        let digest = cb.bench_proof.get("result_digest").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(digest, result_digest_v3(&[vec![1u64, 2, 7]], &k));
+        assert_ne!(digest, result_digest(&[vec![1u64, 2, 7]]));
+        // No V2 fields linger.
+        assert!(cb.bench_proof.get("challenge_blob_echo").is_none(),
+            "V3 bench_proof must not carry V2 challenge_blob_echo");
+        assert_eq!(cb.protocol_version, "v3-mutate");
+    }
+
+    /// Emits the V3 GOLDEN VECTOR for web to byte-match (run:
+    /// cargo test --features telemetry -- --nocapture print_v3_client_golden_vector).
+    /// Inputs are fully hard-coded so a tag / endianness / framing bug between
+    /// this Rust impl and web's TS impl localises immediately. Cross-stack
+    /// lock procedure: web runs the V3 TS impl over identical inputs and
+    /// asserts every line below matches. Asserts internal determinism here;
+    /// the printed values go to web-superdeduper for cross-impl lock.
+    #[test]
+    fn print_v3_client_golden_vector() {
+        let k: [u8; 32] = std::array::from_fn(|i| (0x80 + i) as u8);
+        eprintln!("--- A3 / V3-MUTATE GOLDEN VECTOR (engine-side) ---");
+        eprintln!("K = {} (b64-std of 0x80..0x9f)", b64(&k));
+
+        // -- per_file_key_v3 --
+        // file_hash = BLAKE3 of fixed raw content; derive per_file_key.
+        let raw_a: &[u8] = b"alpha-content-for-v3-vector";
+        let raw_b: &[u8] = b"beta-content-for-v3-vector";
+        let fh_a: [u8; 32] = *blake3::hash(raw_a).as_bytes();
+        let fh_b: [u8; 32] = *blake3::hash(raw_b).as_bytes();
+        let pk_a = per_file_key_v3(&k, &fh_a);
+        let pk_b = per_file_key_v3(&k, &fh_b);
+        eprintln!("per_file_key_v3 = HMAC-SHA256(K, file_hash):");
+        eprintln!("  file_hash(BLAKE3({:?})) -> per_file_key {}", "alpha-content-for-v3-vector", hex32(&pk_a));
+        eprintln!("  file_hash(BLAKE3({:?})) -> per_file_key {}", "beta-content-for-v3-vector",  hex32(&pk_b));
+
+        // -- mutate_bytes_v3 + challenge_hash_v3 --
+        // mutated = raw XOR ChaCha20(pf_key, nonce=0, seek=offset).
+        // challenge_hash_v3 = BLAKE3(0x04 || u32le(plen) || path || u64le(off) || u64le(len) || mutated || K).
+        eprintln!("challenge_hash_v3 (tag 0x04 + K appended), std-base64:");
+        let cases: [(&str, u64, &[u8]); 3] = [
+            ("f0000000000.bin", 0, raw_a),
+            ("f0000000007.bin", 11, raw_a),
+            ("f0000000042.bin", 0, raw_b),
+        ];
+        for (path, off, raw) in cases {
+            let fh: [u8; 32] = *blake3::hash(raw).as_bytes();
+            let pf = per_file_key_v3(&k, &fh);
+            let mutated = mutate_bytes_v3(&pf, off, raw);
+            let h = challenge_hash_v3(path, off, raw.len() as u64, &mutated, &k);
+            eprintln!("  path={path} off={off} len={} raw={:?} mutated={} -> {}",
+                raw.len(),
+                std::str::from_utf8(raw).unwrap(),
+                hex32(&{
+                    let mut arr = [0u8; 32];
+                    for (i, b) in mutated.iter().take(32).enumerate() { arr[i] = *b; }
+                    arr
+                })[..2 * mutated.len().min(32)].to_string(),
+                b64(&h));
+        }
+
+        // -- result_digest_v3 --
+        // domain "tcorpus-result-v3" + K mixed before cluster data.
+        let dupsets = vec![vec![0u64, 84000], vec![1, 84001], vec![2, 84002, 84003]];
+        eprintln!("result_digest_v3 preimage = u32le(17)||\"tcorpus-result-v3\"||K||u64le(cluster_count)||(u64le(len)||u64le(pi)*)*");
+        eprintln!("  canonical dupsets {dupsets:?}");
+        eprintln!("  result_digest_v3 -> {}", result_digest_v3(&dupsets, &k));
+
+        // Determinism self-check (printed vector must be stable).
+        assert_eq!(result_digest_v3(&dupsets, &k), result_digest_v3(&dupsets, &k));
+        let again = challenge_hash_v3("f0000000000.bin", 0, raw_a.len() as u64,
+            &mutate_bytes_v3(&pk_a, 0, raw_a), &k);
+        let twice = challenge_hash_v3("f0000000000.bin", 0, raw_a.len() as u64,
+            &mutate_bytes_v3(&pk_a, 0, raw_a), &k);
+        assert_eq!(again, twice);
     }
 }
