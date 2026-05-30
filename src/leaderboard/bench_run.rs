@@ -196,6 +196,39 @@ pub fn run(
             return Err(anyhow::Error::new(e).context("extracting corpus tar"));
         }
         std::fs::write(&complete, corpus_version.as_bytes()).context("writing cache sentinel")?;
+        // #124 page-eviction (design 2026-05-30 13:33 PDT GO Path A). Evict the
+        // just-written corpus pages from the OS page cache so the subsequent
+        // dedup pass reads measure ACTUAL cold I/O, not warm-from-RAM. Driven
+        // by benchmarker's warm-leak finding (2.39 vs 1.21 GB/s on quick-tier).
+        // Per-platform:
+        //   Linux  : posix_fadvise(fd, 0, len, POSIX_FADV_DONTNEED) per file
+        //            (post-write eviction; honest cold reads follow).
+        //   macOS  : fcntl F_NOCACHE on a re-opened fd + msync (best-effort;
+        //            macOS unified buffer cache semantics are looser than
+        //            Linux's, but F_NOCACHE marks the file's pages for
+        //            opportunistic eviction).
+        //   Windows: Path B baseline (FlushFileBuffers + VirtualUnlock per
+        //            file post-untar). Per benchmarker 13:15 PST, these don't
+        //            evict the standby list — they evict process-locked pages
+        //            (tiny fraction) + flush dirty pages. The bulk of Windows
+        //            standby eviction is sdd-testwin's standby-purge work
+        //            (NtSetSystemInformation MemoryPurgeStandbyList), which
+        //            needs SeProfileSingleProcessPrivilege and runs as their
+        //            SYSTEM scheduled task (Path B / 1h ETA).
+        //            DESIGN GO'd Path A (FILE_FLAG_NO_BUFFERING on the
+        //            download write) per 13:33 PST; that requires re-implementing
+        //            the tar untar to write sector-aligned chunks with the
+        //            no-buffering flag. Deferred to v0.2.57+ pending
+        //            benchmarker's A/B baseline so we can measure whether
+        //            Path B alone (paired with sdd-testwin's purge) tightens
+        //            the distribution enough. If it does, Path A becomes
+        //            optional; if not, v0.2.57 ships the custom-untar.
+        // All failure modes are silent + non-fatal: eviction is a polish, not a
+        // correctness gate. Logs a warn line if the per-platform call returns
+        // an error so testrunner / sdd-testwin can correlate.
+        if let Err(e) = evict_corpus_pages(&corpus_dir) {
+            crate::log_warn!("bench: page-eviction post-untar failed: {e} (continuing; reads may be warm)");
+        }
     } else {
         progress(&format!("reusing cached corpus at {} ({} challenges)", corpus_dir.display(), challenges.len()));
     }
@@ -451,6 +484,128 @@ fn signal_dedup_ready(
             Ok(())
         }
     }
+}
+
+/// #124 page-eviction: walk every regular file under `corpus_dir` and hint the
+/// OS to evict its pages from the file cache. Called once post-untar so the
+/// downstream dedup pass measures ACTUAL cold I/O. Returns the first error
+/// encountered (best-effort: keeps evicting other files even after an
+/// individual failure; the returned error is just the most-recent message,
+/// surfaced to the caller as a single log_warn line).
+fn evict_corpus_pages(corpus_dir: &Path) -> std::io::Result<()> {
+    let mut first_err: Option<std::io::Error> = None;
+    for entry in std::fs::read_dir(corpus_dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => { first_err.get_or_insert(e); continue; }
+        };
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) => { first_err.get_or_insert(e); continue; }
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        if let Err(e) = evict_file_pages(&path) {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Per-platform single-file page eviction. Linux: posix_fadvise DONTNEED.
+/// macOS: F_NOCACHE + msync (best-effort given mac's unified buffer cache).
+/// Windows: FlushFileBuffers + VirtualUnlock (Path B baseline; the bulk of
+/// Windows standby eviction is sdd-testwin's standby-purge work — see the
+/// design comment at the eviction call-site).
+#[cfg(target_os = "linux")]
+fn evict_file_pages(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path)?;
+    let fd = f.as_raw_fd();
+    // SAFETY: fd is valid for the duration of the call; offset 0 len 0 is
+    // documented as "the whole file" per the posix_fadvise(2) manpage. Return
+    // value 0 = success; nonzero = errno (treated as warning, not fatal).
+    let rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn evict_file_pages(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path)?;
+    let fd = f.as_raw_fd();
+    // F_NOCACHE marks this fd's I/O as non-caching going forward; pairing with
+    // msync on the file's mapping (best-effort; we don't mmap here so this is
+    // just the fcntl path) is what the Apple docs recommend for "treat as
+    // cold". Other tools (e.g. dd if=... iflag=nocache) follow the same shape.
+    let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1i32) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn evict_file_pages(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FlushFileBuffers, FILE_FLAG_NO_BUFFERING, FILE_GENERIC_WRITE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    // Path B baseline: open the file briefly + FlushFileBuffers. This forces
+    // any dirty buffers for the file to disk (a no-op on a just-untarred file
+    // we haven't modified, but cheap insurance). VirtualUnlock would also
+    // unlock process-locked pages, but the just-untarred corpus has no
+    // process-locked pages (tar's unpack doesn't VirtualLock), so we skip
+    // that step. NB: this does NOT evict CLEAN standby-list pages — those
+    // need NtSetSystemInformation MemoryPurgeStandbyList (sdd-testwin's
+    // SYSTEM scheduled task, gated on SeProfileSingleProcessPrivilege).
+    // Engine #124 Windows half is intentionally minimal until benchmarker's
+    // A/B measures whether Path B + their purge tightens the distribution
+    // enough to skip Path A (full FILE_FLAG_NO_BUFFERING custom-untar). The
+    // FlushFileBuffers call uses FILE_FLAG_NO_BUFFERING-compatible flags as
+    // a forward-compat hint; opening with the flag has no eviction effect
+    // by itself (Windows only honors it for that handle's I/O).
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+            None,
+        )
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => return Err(std::io::Error::other(format!("CreateFileW: {e:?}"))),
+    };
+    let res = unsafe { FlushFileBuffers(handle) };
+    unsafe { let _ = CloseHandle(handle); }
+    res.map_err(|e| std::io::Error::other(format!("FlushFileBuffers: {e:?}")))?;
+    Ok(())
+}
+
+/// Other platforms (FreeBSD, OpenBSD, etc.): we don't have a portable cache-
+/// eviction call. Return success silently so the engine still runs the bench;
+/// reads may be warm but cold_enforce + the cold-band gating still gives an
+/// honest classification.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn evict_file_pages(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// false positive that would let a warm run land on the competitive cold board
