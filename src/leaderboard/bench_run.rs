@@ -72,14 +72,29 @@ pub fn run(
     anyhow::ensure!(state.registered, "install not registered; run `superdeduper register`");
     let base = state.server_url.trim_end_matches('/').to_string();
 
-    // 1. POST /bench/start
+    // 1. POST /bench/start — HMAC-authed per the G fix coupled with #4(a)
+    // (web dev rev 584089d + the cap-table swap). Pre-G the endpoint was
+    // unsigned; benchmarker hit 401 on v0.2.44 against the upgraded server
+    // because the signed-body / X-Sd-Install-Id headers were missing.
+    // Sign with install_key over the canonical body; matches every other
+    // authed endpoint (submission, action_submission, etc.).
     progress(&format!("requesting bench run ({corpus_version}, {tier})"));
+    let install_key = state
+        .install_key()
+        .ok_or_else(|| anyhow::anyhow!("install_key_hex malformed; re-register"))?;
+    let start_payload = serde_json::json!({
+        "install_id": state.install_id,
+        "corpus_version": corpus_version,
+        "tier": tier,
+    });
+    let start_body = super::hmac_signer::canonical_body(&start_payload);
+    let start_signature = super::hmac_signer::sign(&install_key, &start_body);
     let start: serde_json::Value = ureq::post(&format!("{base}/api/v1/bench/start"))
-        .send_json(serde_json::json!({
-            "install_id": state.install_id,
-            "corpus_version": corpus_version,
-            "tier": tier,
-        }))
+        .set("Content-Type", "application/json")
+        .set("X-Sd-Install-Id", &state.install_id)
+        .set("X-Sd-Signature", &start_signature)
+        .timeout(std::time::Duration::from_secs(15))
+        .send_bytes(&start_body)
         .context("POST /bench/start failed")?
         .into_json()
         .context("parsing /bench/start response")?;
