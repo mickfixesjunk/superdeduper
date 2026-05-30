@@ -786,6 +786,7 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
         true, // CLI bench-me always submits
         &cancel,
         |msg| eprintln!("bench: {msg}"),
+        Some(lane.as_slug()),
     )?;
     eprintln!(
         "bench: result_digest={} ({} dup groups, {} candidate bytes, {:.2}s, cold-enforced={})",
@@ -2342,6 +2343,7 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
                     client_found_dupsets: None,
                 },
                 bench: None,
+                lane: None,
             };
             let payload = submission::build_payload(&inputs, &install_state.install_id);
             record = record.with_submission_payload(payload, install_state.install_id);

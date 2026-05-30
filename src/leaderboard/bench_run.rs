@@ -49,6 +49,7 @@ impl std::error::Error for Cancelled {}
 /// (CLI prints to stderr; GUI pushes to its status channel). `workroot` picks
 /// where the corpus downloads (default temp; pass a real disk if temp is
 /// RAM-backed). The corpus dir is removed unless `keep`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     state: &install::InstallState,
     corpus_version: &str,
@@ -61,6 +62,11 @@ pub fn run(
     // `progress` for the duration of the dedup. Both callers (CLI -> stderr,
     // GUI -> status channel) are Send.
     mut progress: impl FnMut(&str) + Send,
+    // Mick bench-lane UX (2026-05-30): user's explicit lane choice. Lifted
+    // into the /submit body.lane (web d7df4c9; design 12:29 PST source-of-
+    // truth). `None` keeps the pre-v0.2.54 behavior (server falls back to
+    // has_account_linkage gating).
+    lane: Option<&str>,
 ) -> anyhow::Result<BenchOutcome> {
     use std::sync::atomic::Ordering;
     let check_cancel = || -> anyhow::Result<()> {
@@ -286,6 +292,7 @@ pub fn run(
         run_uuid: uuid::Uuid::new_v4().to_string(),
         scan_id: None,
         bench: Some(bench),
+        lane: lane.map(str::to_string),
         hardware: hardware::detect_with_root_hint(Some(&corpus_dir)),
         run_shape: submission::RunShape {
             wall_clock_seconds: dedupe_secs,

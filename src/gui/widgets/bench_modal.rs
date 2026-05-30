@@ -189,6 +189,11 @@ fn run_worker(
         submit,
         cancel,
         |m| set_status(m),
+        // GUI v0.2.54 wires no explicit lane yet (the modal-with-Ranked/Casual
+        // choice ships as v0.2.55). For now the GUI bench-modal path leaves
+        // lane=None, which means server falls back to has_account_linkage
+        // gating — same behavior as pre-v0.2.54.
+        None,
     );
 
     match outcome {
