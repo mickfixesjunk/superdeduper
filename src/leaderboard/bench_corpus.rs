@@ -965,6 +965,93 @@ mod tests {
         );
     }
 
+    /// PARALLEL-path reproducer: mirrors full_content_dedup's exact Pass-2
+    /// shape (size-group filter -> bounded rayon io_pool sized cpu*3 ->
+    /// into_par_iter -> per-worker generate full content + blake3::hash one-shot
+    /// -> serial fold by hash) but substitutes content_bytes_at for
+    /// read_uncached so we exercise the parallel logic on the engine's OWN
+    /// content function, free of any disk-IO confound.
+    ///
+    /// testrunner's on-disk evidence (2026-05-29): on the SAME corpus bytes,
+    /// pre-parallelize SERIAL client reports 3/3 stable 295,773 + Nu1IeGup...;
+    /// post-c0e630b PARALLEL client reports 3/3 stable 295,772 + DA2hse0h....
+    /// Corpus byte-equivalence is locked, so the divergence lives in the
+    /// parallel Pass-2. If this test fails (i.e., yields 295,772), the bug
+    /// reproduces in-memory and is internal to the parallel-fold path
+    /// (rayon scatter+collect, blake3 internal parallelism interaction with
+    /// per-worker allocations, etc.). If it stays at 295,773, the bug needs
+    /// disk-IO to manifest (read_uncached interaction with NTFS / O_DIRECT).
+    #[test]
+    #[ignore = "heavy parallel-path reproducer for the bench cert mismatch"]
+    fn full_tier_engine_self_loop_parallel_pass2_yields_295773_dup_groups() {
+        use rayon::prelude::*;
+        let seed = [0x42u8; 32];
+        let (k_content, _) = bench::corpus_keys(&seed);
+        let plan = plan_corpus(&full_tier());
+
+        // Mirror the production size-group filter (candidates = files whose
+        // size has >=1 other file at the same size). Large class (256 MiB,
+        // file_count=1) is its own size-group of 1 -> filtered out, exactly
+        // like full_content_dedup.
+        let mut by_size_files: std::collections::HashMap<u64, Vec<&FilePlan>> =
+            std::collections::HashMap::new();
+        for fp in &plan.files {
+            by_size_files.entry(fp.size).or_default().push(fp);
+        }
+        let candidates: Vec<&FilePlan> = by_size_files
+            .into_iter()
+            .filter(|(_size, group)| group.len() >= 2)
+            .flat_map(|(_size, group)| group.into_iter())
+            .collect();
+
+        // Pool sized cpu*3, matching the production io_pool exactly.
+        let cpu_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let io_threads = cpu_threads.saturating_mul(3).max(1);
+        let io_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(io_threads)
+            .build()
+            .expect("rayon pool");
+
+        // Per-worker: allocate the FULL file content (matches read_uncached
+        // returning Vec<u8>), then blake3::hash one-shot (matches production).
+        let hashed: Vec<([u8; 32], u64)> = io_pool.install(|| {
+            candidates
+                .into_par_iter()
+                .map(|fp| {
+                    let mut data = vec![0u8; fp.size as usize];
+                    let mut off = 0u64;
+                    while off < fp.size {
+                        let len = ((fp.size - off).min(bench::CHUNK_SIZE)) as usize;
+                        let start = off as usize;
+                        bench::content_bytes_at(
+                            &k_content,
+                            fp.content_id,
+                            off,
+                            &mut data[start..start + len],
+                        );
+                        off += len as u64;
+                    }
+                    (*blake3::hash(&data).as_bytes(), fp.path_index)
+                })
+                .collect()
+        });
+
+        // Serial fold, exactly like full_content_dedup.
+        let mut by_hash: std::collections::HashMap<[u8; 32], Vec<u64>> =
+            std::collections::HashMap::with_capacity(hashed.len());
+        for (hash, pi) in hashed {
+            by_hash.entry(hash).or_default().push(pi);
+        }
+        let dup_groups = by_hash.values().filter(|v| v.len() >= 2).count();
+        assert_eq!(
+            dup_groups, 295_773,
+            "PARALLEL self-loop dup_groups. If this fails at 295,772, the bug \
+             reproduces in-memory in the parallel-fold path itself."
+        );
+    }
+
     #[test]
     fn parse_corpus_path_index_handles_paths_and_rejects_noise() {
         assert_eq!(parse_corpus_path_index("f0000000012.bin"), Some(12));
