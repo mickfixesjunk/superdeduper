@@ -36,7 +36,22 @@ fn main() {
     let target_is_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
     let host_is_windows = cfg!(target_os = "windows");
     if target_is_windows {
-        if host_is_windows {
+        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        if target_arch == "aarch64" {
+            // Arm64 Windows target: we don't have an arm64 mingw windres on
+            // the WSL toolchain (only x86_64-w64-mingw32-windres is in
+            // /usr/bin), so producing an arm64-compatible .o for the icon
+            // resource isn't a one-line `cargo:warning` we can emit and
+            // continue. Skip the .exe icon embed on arm64; the runtime egui
+            // title-bar icon (from OUT_DIR/app_icon.bin) still works. v0.2.56
+            // ships the aarch64-pc-windows-msvc target without the .exe icon
+            // in Explorer; follow-up if needed once binutils-mingw-w64-aarch64
+            // or llvm-rc is available.
+            println!(
+                "cargo:warning=skipping .exe-icon embed on aarch64-pc-windows-* target \
+                 (no arm64 mingw windres available; runtime egui icon still works)"
+            );
+        } else if host_is_windows {
             embed_windows_icon_via_winresource();
         } else {
             // Cross-compile path (Linux/macOS host -> Windows target via

@@ -93,16 +93,31 @@ echo "==> Windows GUI (gui + telemetry + audio; cross-compile via cargo-zigbuild
 cargo zigbuild --release --features "gui telemetry audio similar-images similar-audio" --bin superdeduper-gui \
   --target x86_64-pc-windows-gnu
 
+echo "==> Windows-on-ARM CLI (telemetry; cross-compile via cargo-zigbuild)"
+# aarch64-pc-windows-gnullvm (NOT -msvc): zigbuild ships LLVM mingw libs that
+# satisfy the libc dep without needing MSVC headers. -msvc would need a real
+# Windows host or a Wine-mounted MSVC redist. River5's AES-NI gate (35533ce)
+# falls through to xxhash3-128 on arm64 — no perf claim on Windows-on-ARM.
+# Closes engine GH #22.
+cargo zigbuild --release --features "telemetry similar-images similar-audio" --bin superdeduper \
+  --target aarch64-pc-windows-gnullvm
+
+echo "==> Windows-on-ARM GUI (gui + telemetry + audio; cross-compile via cargo-zigbuild)"
+cargo zigbuild --release --features "gui telemetry audio similar-images similar-audio" --bin superdeduper-gui \
+  --target aarch64-pc-windows-gnullvm
+
 # Stage into the archive dir FIRST (never overwrite an existing
 # per-sha folder). The latest-dir promote is gated on the fast-subset
 # gate below, so it happens AFTER, conditionally.
 mkdir -p "$ARCHIVE_DIR"
 
 declare -a BINARIES=(
-  "target/x86_64-unknown-linux-musl/release/superdeduper           superdeduper-linux-x86_64"
-  "target/x86_64-unknown-linux-musl/release/superdeduper-gui       superdeduper-gui-linux-x86_64"
-  "target/x86_64-pc-windows-gnu/release/superdeduper.exe           superdeduper-windows-x86_64.exe"
-  "target/x86_64-pc-windows-gnu/release/superdeduper-gui.exe       superdeduper-gui-windows-x86_64.exe"
+  "target/x86_64-unknown-linux-musl/release/superdeduper                   superdeduper-linux-x86_64"
+  "target/x86_64-unknown-linux-musl/release/superdeduper-gui               superdeduper-gui-linux-x86_64"
+  "target/x86_64-pc-windows-gnu/release/superdeduper.exe                   superdeduper-windows-x86_64.exe"
+  "target/x86_64-pc-windows-gnu/release/superdeduper-gui.exe               superdeduper-gui-windows-x86_64.exe"
+  "target/aarch64-pc-windows-gnullvm/release/superdeduper.exe              superdeduper-windows-arm64.exe"
+  "target/aarch64-pc-windows-gnullvm/release/superdeduper-gui.exe          superdeduper-gui-windows-arm64.exe"
 )
 
 for entry in "${BINARIES[@]}"; do
@@ -116,7 +131,9 @@ done
   superdeduper-linux-x86_64 \
   superdeduper-gui-linux-x86_64 \
   superdeduper-windows-x86_64.exe \
-  superdeduper-gui-windows-x86_64.exe > SHA256SUMS)
+  superdeduper-gui-windows-x86_64.exe \
+  superdeduper-windows-arm64.exe \
+  superdeduper-gui-windows-arm64.exe > SHA256SUMS)
 
 # LATEST.txt sidecar — `cat /mnt/c/.../LATEST.txt` answers
 # "what version is this drop?" in one command. Single file
@@ -133,11 +150,14 @@ built_at: $BUILT_AT
 targets:
   - x86_64-unknown-linux-musl
   - x86_64-pc-windows-gnu
+  - aarch64-pc-windows-gnullvm
 binaries:
   - superdeduper-linux-x86_64
   - superdeduper-gui-linux-x86_64
   - superdeduper-windows-x86_64.exe
   - superdeduper-gui-windows-x86_64.exe
+  - superdeduper-windows-arm64.exe
+  - superdeduper-gui-windows-arm64.exe
 EOF
 
 echo "==> archive staged: ${ARCHIVE_DIR}"
