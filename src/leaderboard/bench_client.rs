@@ -180,10 +180,13 @@ pub fn result_digest_bytes_v2(dupsets: &[Vec<u64>], server_blob: &[u8; 32]) -> [
         .collect();
     clusters.sort_by_key(|c| c.first().copied().unwrap_or(0));
     let mut h = blake3::Hasher::new();
-    // PREPENDED per web 584089d wire spec.
-    h.update(server_blob);
+    // V1 framing kept (u32le(domain_len) || domain || u64le(cluster_count) ||
+    // ...), with the server_blob PREPENDED per web 584089d wire spec — but
+    // here "prepended" means INSIDE the V1 preimage, after the domain tag,
+    // before the cluster data. Golden-locked by `v2_matches_web_golden_vectors`.
     h.update(&(RESULT_DIGEST_DOMAIN_V2.len() as u32).to_le_bytes());
     h.update(RESULT_DIGEST_DOMAIN_V2);
+    h.update(server_blob);
     h.update(&(clusters.len() as u64).to_le_bytes());
     for c in &clusters {
         h.update(&(c.len() as u64).to_le_bytes());
@@ -283,6 +286,53 @@ mod tests {
         assert_ne!(base, challenge_hash("f0000000002.bin", 0, 4, b"abcd"), "path binds");
         assert_ne!(base, challenge_hash("f0000000001.bin", 1, 4, b"abcd"), "offset binds");
         assert_ne!(base, challenge_hash("f0000000001.bin", 0, 4, b"abce"), "bytes bind");
+    }
+
+    /// #4(a) — byte-for-byte cross-stack golden vectors, pinned by web 503a37b
+    /// (tests/bench-content.test.ts). Inputs are fully hard-coded so a tag /
+    /// endianness / framing bug between this Rust impl and the TS server impl
+    /// localizes immediately. Any mismatch here = engine and server will
+    /// produce different digests on the real wire => bench rejection.
+    #[test]
+    fn v2_matches_web_golden_vectors() {
+        use super::super::bench;
+        // SEED = 0x00..0x1f, BLOB = 0x10..0x2f per web 503a37b.
+        let seed: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let blob: [u8; 32] = std::array::from_fn(|i| (0x10 + i) as u8);
+        let (k_content, _) = bench::corpus_keys(&seed);
+        let mk_bytes = |content_id: u64, offset: u64, len: usize| -> Vec<u8> {
+            let mut buf = vec![0u8; len];
+            bench::content_bytes_at(&k_content, content_id, offset, &mut buf);
+            buf
+        };
+        // challenge_hash_v2 vectors (path -> content_id from f%010d filename).
+        let cases: [(&str, u64, u64, u64, &str); 4] = [
+            ("f0000000000.bin", 0, 0, 16, "WzL+JY6LdG5oU+7zfhWmeHN6dr0jfxk/s975iCH3EbI="),
+            ("f0000000005.bin", 5, 0, 1000, "mSj8nuThsvGHjXtFqPYYzBSNuy3sY8EEx0Bg2xMA0lk="),
+            ("f0000000007.bin", 7, 0, 4096, "wxo6q2vc0onvDVgZszo6+J6YzTtBwYjMReeQsWhyf38="),
+            ("f0000000007.bin", 7, 1048576, 64, "g/ozJHJcMFMZdtKGw+JJNVYi7jBUz9rkQnmZkOS90Xg="),
+        ];
+        for (path, cid, off, len, expected_b64) in cases {
+            let bytes = mk_bytes(cid, off, len as usize);
+            let got = b64(&challenge_hash_v2(path, off, len, &bytes, &blob));
+            assert_eq!(
+                got, expected_b64,
+                "V2 challenge_hash golden mismatch for {path} off={off} len={len}"
+            );
+        }
+        // result_digest_v2 vectors.
+        let one_cluster = vec![vec![1u64, 4, 6]];
+        assert_eq!(
+            result_digest_v2(&one_cluster, &blob),
+            "3xrx5Ue8ZJtJgLwHksGD0GbrSNwHmxTppyigC43o4dI=",
+            "V2 result_digest golden mismatch for [[1,4,6]]"
+        );
+        let empty: Vec<Vec<u64>> = Vec::new();
+        assert_eq!(
+            result_digest_v2(&empty, &blob),
+            "BOt3wuuNnC8VQ9VDltkNMlD6Nq5AG8Muy1TGAidautA=",
+            "V2 result_digest golden mismatch for empty dupsets"
+        );
     }
 
     /// #4(a) — V2 challenge_hash + V2 result_digest must be cryptographically
