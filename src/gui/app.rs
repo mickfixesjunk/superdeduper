@@ -817,8 +817,44 @@ impl SuperdeduperApp {
         use crate::gui::checkpoint;
         let path = checkpoint::default_checkpoint_path().ok()?;
         let cp = checkpoint::load(&path).ok().flatten()?;
-        if cp.roots == self.persisted.roots && cp.settings == self.persisted.settings {
+
+        // #157 — exact-eq drift was firing on every macOS resume even when the
+        // user changed nothing. The OS file picker on macOS can return the
+        // SAME directory through different path forms across sessions (the
+        // /Users -> /private/var/users symlink-canonicalization in
+        // particular). Treat roots as equal when their CANONICALIZED forms
+        // match — only fall back to a strict-eq drift when canonicalization
+        // says they really differ. Plus emit a diagnostic so future
+        // false-positive reports surface the exact diverging field via the
+        // disk log instead of needing another live retest.
+        let roots_match = roots_equivalent(&cp.roots, &self.persisted.roots);
+        let settings_match = cp.settings == self.persisted.settings;
+        if roots_match && settings_match {
             return None;
+        }
+        // Log the diff so it lands in the persistent disk log (#117 P1).
+        // Whichever side(s) drift get noted; users hitting the modal can
+        // grep the log for 'settings_drift:'.
+        if !roots_match {
+            crate::log_warn!(
+                "settings_drift: roots differ (raw): cp={:?} current={:?}",
+                cp.roots
+                    .iter()
+                    .map(|r| r.path.display().to_string())
+                    .collect::<Vec<_>>(),
+                self.persisted
+                    .roots
+                    .iter()
+                    .map(|r| r.path.display().to_string())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if !settings_match {
+            crate::log_warn!(
+                "settings_drift: settings differ; cp={:?} current={:?}",
+                cp.settings,
+                self.persisted.settings
+            );
         }
         Some(checkpoint::CheckpointSummary {
             created_at_unix: cp.created_at_unix,
@@ -4133,8 +4169,10 @@ fn action_kind_label(action: &GroupAction) -> &'static str {
 fn describe_destructive_action(action: &GroupAction) -> String {
     match action {
         GroupAction::RecycleOthers { keeper, dupes } => format!(
-            "Move {} file(s) to the Recycle Bin, keeping:\n  {}",
+            "Move {} file(s) to the {}, keeping:\n  {}",
             dupes.len(),
+            // #159 — Trash on macOS, Recycle Bin elsewhere.
+            if cfg!(target_os = "macos") { "Trash" } else { "Recycle Bin" },
             keeper.display()
         ),
         GroupAction::HardlinkOthers { keeper, dupes } => format!(
@@ -4171,16 +4209,31 @@ fn describe_destructive_action(action: &GroupAction) -> String {
                 .to_string()
         }
         GroupAction::RecycleAllVisible => {
-            "Send EVERY non-keeper across EVERY currently visible duplicate group to the OS Recycle \
-             Bin. Recoverable from the recycle bin until you empty it. Reference paths are never \
-             touched."
-                .to_string()
+            // #159 — per-platform noun ("Trash" on macOS, "Recycle Bin" elsewhere).
+            if cfg!(target_os = "macos") {
+                "Send EVERY non-keeper across EVERY currently visible duplicate group to the macOS \
+                 Trash. Recoverable from the Trash until you empty it. Reference paths are never \
+                 touched."
+                    .to_string()
+            } else {
+                "Send EVERY non-keeper across EVERY currently visible duplicate group to the OS Recycle \
+                 Bin. Recoverable from the recycle bin until you empty it. Reference paths are never \
+                 touched."
+                    .to_string()
+            }
         }
         GroupAction::NukeAllVisible => {
-            "PERMANENTLY DELETE every non-keeper across every currently visible duplicate group. \
-             No recycle bin, no .superdeduper rename, no undo. Reference paths are never touched. \
-             Only use when you're certain you don't need any of these files."
-                .to_string()
+            if cfg!(target_os = "macos") {
+                "PERMANENTLY DELETE every non-keeper across every currently visible duplicate group. \
+                 No Trash, no .superdeduper rename, no undo. Reference paths are never touched. \
+                 Only use when you're certain you don't need any of these files."
+                    .to_string()
+            } else {
+                "PERMANENTLY DELETE every non-keeper across every currently visible duplicate group. \
+                 No recycle bin, no .superdeduper rename, no undo. Reference paths are never touched. \
+                 Only use when you're certain you don't need any of these files."
+                    .to_string()
+            }
         }
         // Reveal / Open* should never reach this code path — they
         // bypass the modal in `dispatch_group_action` — but
@@ -4429,6 +4482,34 @@ fn open_url_in_browser(url: &str) {
     if let Err(e) = crate::platform::open_url(url) {
         eprintln!("failed to open browser to {url}: {e:?}");
     }
+}
+
+/// #157 — true when two RootEntry lists are equivalent for the
+/// settings-drift check. Strict structural equality fires false-positives on
+/// macOS because the OS file picker can return the same directory through
+/// different path forms across sessions (most notably the /Users vs
+/// /private/var/users symlink canonicalization). Compare via
+/// `fs::canonicalize` when available; fall back to raw eq if the path no
+/// longer resolves (the underlying drive ejected, the path was deleted, etc.).
+fn roots_equivalent(a: &[crate::gui::state::RootEntry], b: &[crate::gui::state::RootEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (ra, rb) in a.iter().zip(b.iter()) {
+        if ra.is_reference != rb.is_reference {
+            return false;
+        }
+        if ra.path == rb.path {
+            continue; // fast path: already byte-identical
+        }
+        let ca = std::fs::canonicalize(&ra.path).ok();
+        let cb = std::fs::canonicalize(&rb.path).ok();
+        match (ca, cb) {
+            (Some(x), Some(y)) if x == y => continue,
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]

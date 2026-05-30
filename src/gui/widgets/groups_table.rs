@@ -110,7 +110,17 @@ impl BulkAction {
             BulkAction::SafeRenameDupes => "🛡 Safe-rename dupes",
             BulkAction::ArchiveMoveDupes => "📦 Archive (Move) dupes",
             BulkAction::ArchiveCopyDupes => "📋 Archive (Copy) dupes",
-            BulkAction::RecycleDupes => "♻ Recycle dupes",
+            // #159 — macOS users expect "Trash", everyone else "Recycle".
+            // The underlying OS API (NSFileManager.trashItemAtURL: / Win
+            // SHFileOperation with FO_DELETE+FOF_ALLOWUNDO) is what it is;
+            // only the user-visible noun changes.
+            BulkAction::RecycleDupes => {
+                if cfg!(target_os = "macos") {
+                    "♻ Move dupes to Trash"
+                } else {
+                    "♻ Recycle dupes"
+                }
+            }
             BulkAction::NukeDupes => "💀 Nuke dupes (permanent)",
         }
     }
@@ -335,16 +345,30 @@ pub fn show_filtered(
                  No confirmation prompt because nothing is destroyed."
             }
             BulkAction::RecycleDupes => {
-                "Send every non-keeper across every visible group to the \
-                 OS Recycle Bin. Reference paths never touched. Recoverable \
-                 from the recycle bin until you empty it. Requires \
-                 confirmation."
+                // #159 — per-platform noun.
+                if cfg!(target_os = "macos") {
+                    "Send every non-keeper across every visible group to the \
+                     macOS Trash. Reference paths never touched. Recoverable \
+                     from the Trash until you empty it. Requires confirmation."
+                } else {
+                    "Send every non-keeper across every visible group to the \
+                     OS Recycle Bin. Reference paths never touched. Recoverable \
+                     from the recycle bin until you empty it. Requires \
+                     confirmation."
+                }
             }
             BulkAction::NukeDupes => {
-                "PERMANENTLY delete every non-keeper across every visible \
-                 group — no recycle bin, no undo. Reference paths never \
-                 touched. Requires typing DELETE to confirm. Only use when \
-                 you're certain."
+                if cfg!(target_os = "macos") {
+                    "PERMANENTLY delete every non-keeper across every visible \
+                     group — no Trash, no undo. Reference paths never touched. \
+                     Requires typing DELETE to confirm. Only use when you're \
+                     certain."
+                } else {
+                    "PERMANENTLY delete every non-keeper across every visible \
+                     group — no recycle bin, no undo. Reference paths never \
+                     touched. Requires typing DELETE to confirm. Only use when \
+                     you're certain."
+                }
             }
         };
         // Gate Go on (a) something to act on AND (b) the scan having
@@ -376,7 +400,13 @@ pub fn show_filtered(
             BulkAction::SafeRenameDupes => "safe-mode (no files deleted)",
             BulkAction::ArchiveMoveDupes => "moves dupes, writes manifest",
             BulkAction::ArchiveCopyDupes => "copies dupes (no reclaim, no confirm)",
-            BulkAction::RecycleDupes => "recoverable from recycle bin",
+            BulkAction::RecycleDupes => {
+                if cfg!(target_os = "macos") {
+                    "recoverable from Trash"
+                } else {
+                    "recoverable from recycle bin"
+                }
+            }
             BulkAction::NukeDupes => "PERMANENT delete — no undo",
         };
         ui.label(
@@ -645,11 +675,18 @@ pub fn show_filtered(
                                         }
                                         if ui
                                             .small_button(
-                                                RichText::new("♻ Recycle").color(theme::WARN),
+                                                RichText::new(if cfg!(target_os = "macos") {
+                                                    "♻ Trash"
+                                                } else {
+                                                    "♻ Recycle"
+                                                })
+                                                .color(theme::WARN),
                                             )
-                                            .on_hover_text(
-                                                "Send every dupe to the Recycle Bin. Reversible.",
-                                            )
+                                            .on_hover_text(if cfg!(target_os = "macos") {
+                                                "Send every dupe to the Trash. Reversible."
+                                            } else {
+                                                "Send every dupe to the Recycle Bin. Reversible."
+                                            })
                                             .clicked()
                                         {
                                             clicked = Some(GroupAction::RecycleOthers {
@@ -723,7 +760,15 @@ pub fn show_filtered(
                                     .as_ref()
                                     .map(|p| format_path(p))
                                     .unwrap_or_default();
-                                let arrow = if is_open { "▾ " } else { "▸ " };
+                                // #156 — macOS rendered ▾/▸ (U+25BE/25B8, small
+                                // triangles in Geometric Shapes) as tofu because
+                                // egui's bundled font doesn't carry those code
+                                // points on mac. Swap to ▼/▶ (U+25BC/25B6) which
+                                // are already used elsewhere in the GUI
+                                // (resume_modal, roots_panel "▶  Start scan")
+                                // without tofu reports — proves the bigger
+                                // triangles ARE in the font on every platform.
+                                let arrow = if is_open { "▼ " } else { "▶ " };
                                 if ui
                                     .selectable_label(false, format!("{}{}", arrow, label))
                                     .clicked()

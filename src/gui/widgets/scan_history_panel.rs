@@ -488,8 +488,12 @@ fn action_breakdown_tooltip(record: &ScanRecord) -> String {
         }
     }
     lines.push(String::new()); // blank between header + body
+    // #159 — macOS users see "Trash" for the recycle action. The action_key
+    // on the wire stays `deleted_to_recycle_bytes` (server contract); only
+    // the user-visible label flips.
+    let recycle_label = if cfg!(target_os = "macos") { "Trash" } else { "Recycle" };
     let labels = [
-        ("deleted_to_recycle_bytes", "Recycle"),
+        ("deleted_to_recycle_bytes", recycle_label),
         ("deleted_permanently_bytes", "Remove"),
         ("hardlink_replaced_bytes", "Hardlink"),
         ("reflink_replaced_bytes", "Reflink"),
