@@ -321,6 +321,19 @@ pub enum DebugCommand {
         #[arg(long, value_name = "FILE")]
         private_manifest: Option<PathBuf>,
     },
+
+    /// DEBUG (#116 cert digest mismatch triage): dedup a materialized corpus
+    /// dir THREE WAYS — production parallel cold-bypass, serial cold-bypass,
+    /// serial buffered — and print any per-candidate hash divergence. The
+    /// parallel pass runs FIRST so the page cache is coldest for the suspect
+    /// path. Used to isolate the SPECIFIC file(s) whose parallel-cold read
+    /// returns different bytes than serial/buffered. Telemetry-only.
+    #[cfg(feature = "telemetry")]
+    BenchDedupDiff {
+        /// Path to a materialized corpus dir (untar'd or `write_corpus`d).
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]

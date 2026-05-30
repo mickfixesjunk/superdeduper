@@ -430,7 +430,56 @@ fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
         DebugCommand::MakeBenchCorpus { tier, out, seed, emit_root, private_manifest } => {
             run_make_bench_corpus(tier, out, seed, emit_root, private_manifest)
         }
+        #[cfg(feature = "telemetry")]
+        DebugCommand::BenchDedupDiff { dir } => run_bench_dedup_diff(dir),
     }
+}
+
+/// DEBUG (#116): dedup a corpus dir three ways and print per-candidate diffs.
+#[cfg(feature = "telemetry")]
+fn run_bench_dedup_diff(dir: std::path::PathBuf) -> anyhow::Result<()> {
+    use superdeduper::leaderboard::bench_run;
+
+    eprintln!("[diff] enumerating + 3-way dedup on {}", dir.display());
+    let t0 = std::time::Instant::now();
+    let report = bench_run::debug_dedup_diff(&dir)?;
+    eprintln!("[diff] done in {:.2}s", t0.elapsed().as_secs_f64());
+
+    println!(
+        "files_enumerated     = {}\ncandidate_count      = {}\nparallel_dup_groups  = {}\nserial_dup_groups    = {}\nbuffered_dup_groups  = {}\ndiff_count           = {}",
+        report.files_enumerated,
+        report.candidate_count,
+        report.parallel_dup_groups,
+        report.serial_dup_groups,
+        report.buffered_dup_groups,
+        report.diffs.len(),
+    );
+    if report.diffs.is_empty() {
+        println!("\nNO DIVERGENCE — parallel == serial == buffered for every candidate.");
+        println!("(If parallel_dup_groups still != serial_dup_groups here, the bug is in the");
+        println!(" by-hash grouping / fold path rather than per-file reads.)");
+    } else {
+        let cap = 25usize;
+        println!("\nFirst {} diff(s) (parallel != serial OR != buffered):", cap.min(report.diffs.len()));
+        for d in report.diffs.iter().take(cap) {
+            let hex = |h: &[u8; 32]| {
+                let mut s = String::with_capacity(64);
+                for b in h.iter() { use std::fmt::Write; let _ = write!(s, "{b:02x}"); }
+                s
+            };
+            println!(
+                "  pi={:>10}  size={:>11}  path={}\n    parallel({:<5}) = {}\n    serial  ({:<5}) = {}\n    buffered        = {}",
+                d.path_index, d.size, d.path.display(),
+                if d.parallel_cold { "cold" } else { "warm" }, hex(&d.parallel_hash),
+                if d.serial_cold { "cold" } else { "warm" }, hex(&d.serial_hash),
+                hex(&d.buffered_hash),
+            );
+        }
+        if report.diffs.len() > cap {
+            println!("  ... {} more", report.diffs.len() - cap);
+        }
+    }
+    Ok(())
 }
 
 /// T-BENCH-ME: materialize a canonical-bench corpus tier to `out`

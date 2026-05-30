@@ -466,6 +466,175 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((std::fs::read(path)?, false))
 }
 
+/// Per-candidate diff report for `debug_dedup_diff`. One entry per
+/// candidate whose three reads (parallel cold-bypass, serial cold-bypass,
+/// serial buffered) don't all agree on `blake3(content)`.
+pub struct DebugDedupDiff {
+    pub path_index: u64,
+    pub path: std::path::PathBuf,
+    pub size: u64,
+    pub parallel_hash: [u8; 32],
+    pub parallel_cold: bool,
+    pub serial_hash: [u8; 32],
+    pub serial_cold: bool,
+    pub buffered_hash: [u8; 32],
+}
+
+/// Aggregate report from `debug_dedup_diff`. The three dup-group counts
+/// should agree on a correct dedup; any divergence is the bug.
+pub struct DebugDedupDiffReport {
+    pub files_enumerated: u64,
+    pub candidate_count: u64,
+    pub parallel_dup_groups: usize,
+    pub serial_dup_groups: usize,
+    pub buffered_dup_groups: usize,
+    /// candidates where the three reads disagree, sorted by path_index.
+    pub diffs: Vec<DebugDedupDiff>,
+}
+
+/// DEBUG helper for the cert digest mismatch (#116): dedup a corpus dir
+/// THREE WAYS — production parallel cold-bypass, serial cold-bypass, and
+/// serial buffered — and report any per-candidate hash divergence. Runs the
+/// PARALLEL pass FIRST so the OS page cache is coldest for the suspect path.
+/// Cheap on a cached corpus (a few minutes for 1M files), no submission, no
+/// network. Telemetry-only.
+///
+/// Use to isolate the SPECIFIC file(s) whose parallel-cold read returns
+/// different bytes than serial/buffered — turns the speculative "parallel x
+/// web-staged layout" bug into a concrete file + hash mismatch we can chase
+/// down to the actual read backend issue.
+pub fn debug_dedup_diff(dir: &Path) -> anyhow::Result<DebugDedupDiffReport> {
+    use rayon::prelude::*;
+
+    // Pass 1: enumerate (matches full_content_dedup exactly).
+    let mut by_size: HashMap<u64, Vec<(u64, std::path::PathBuf)>> = HashMap::new();
+    let mut files_enumerated: u64 = 0;
+    for entry in std::fs::read_dir(dir).context("reading corpus dir")? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let pi = match super::bench_corpus::parse_corpus_path_index(&name) {
+            Some(p) => p,
+            None => continue,
+        };
+        let size = entry
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len();
+        files_enumerated += 1;
+        by_size.entry(size).or_default().push((pi, path));
+    }
+
+    // Build the same candidates list the production parallel Pass-2 uses.
+    let candidates: Vec<(u64, std::path::PathBuf, u64)> = by_size
+        .into_iter()
+        .filter(|(_size, group)| group.len() >= 2)
+        .flat_map(|(size, group)| group.into_iter().map(move |(pi, path)| (pi, path, size)))
+        .collect();
+    let candidate_count = candidates.len() as u64;
+
+    // ---- PARALLEL cold-bypass (runs FIRST — coldest cache, matches prod) ----
+    let cpu_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let io_threads = cpu_threads.saturating_mul(3).max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(io_threads)
+        .thread_name(|i| format!("sd-diff-par-{i}"))
+        .build()
+        .map_err(|e| anyhow::anyhow!("rayon pool: {e}"))?;
+    let par_hashed: Vec<(u64, [u8; 32], bool, u64)> = pool.install(|| {
+        candidates
+            .par_iter()
+            .map(|(pi, path, size)| {
+                let (data, cold) = read_uncached(path)
+                    .with_context(|| format!("parallel read {}", path.display()))?;
+                let hash = *blake3::hash(&data).as_bytes();
+                Ok::<_, anyhow::Error>((*pi, hash, cold, *size))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })?;
+    anyhow::ensure!(
+        par_hashed.len() == candidate_count as usize,
+        "parallel pass: rayon collect produced {} != {} candidates",
+        par_hashed.len(),
+        candidate_count
+    );
+
+    // ---- SERIAL cold-bypass (caches now likely warm; still uses NO_BUFFERING) ----
+    let mut ser_hashed: Vec<(u64, [u8; 32], bool)> = Vec::with_capacity(candidates.len());
+    for (pi, path, _size) in &candidates {
+        let (data, cold) = read_uncached(path)
+            .with_context(|| format!("serial read {}", path.display()))?;
+        let hash = *blake3::hash(&data).as_bytes();
+        ser_hashed.push((*pi, hash, cold));
+    }
+
+    // ---- BUFFERED serial reference (always-cached path, ground truth) ----
+    let mut buf_hashed: Vec<(u64, [u8; 32])> = Vec::with_capacity(candidates.len());
+    for (pi, path, _size) in &candidates {
+        let data = std::fs::read(path)
+            .with_context(|| format!("buffered read {}", path.display()))?;
+        let hash = *blake3::hash(&data).as_bytes();
+        buf_hashed.push((*pi, hash));
+    }
+
+    // Map per pi for diffing.
+    let par_map: HashMap<u64, ([u8; 32], bool, u64)> = par_hashed
+        .iter()
+        .map(|(pi, h, c, s)| (*pi, (*h, *c, *s)))
+        .collect();
+    let ser_map: HashMap<u64, ([u8; 32], bool)> = ser_hashed
+        .iter()
+        .map(|(pi, h, c)| (*pi, (*h, *c)))
+        .collect();
+    let buf_map: HashMap<u64, [u8; 32]> = buf_hashed.iter().copied().collect();
+
+    let mut diffs: Vec<DebugDedupDiff> = Vec::new();
+    for (pi, path, size) in &candidates {
+        let (par_h, par_cold, _) = par_map[pi];
+        let (ser_h, ser_cold) = ser_map[pi];
+        let buf_h = buf_map[pi];
+        if par_h != ser_h || par_h != buf_h || ser_h != buf_h {
+            diffs.push(DebugDedupDiff {
+                path_index: *pi,
+                path: path.clone(),
+                size: *size,
+                parallel_hash: par_h,
+                parallel_cold: par_cold,
+                serial_hash: ser_h,
+                serial_cold: ser_cold,
+                buffered_hash: buf_h,
+            });
+        }
+    }
+    diffs.sort_by_key(|d| d.path_index);
+
+    // Aggregate dup-group counts per read path.
+    fn count_dup_groups<I: Iterator<Item = [u8; 32]>>(iter: I) -> usize {
+        let mut m: HashMap<[u8; 32], usize> = HashMap::new();
+        for h in iter {
+            *m.entry(h).or_insert(0) += 1;
+        }
+        m.values().filter(|v| **v >= 2).count()
+    }
+    let parallel_dup_groups = count_dup_groups(par_hashed.iter().map(|(_, h, _, _)| *h));
+    let serial_dup_groups = count_dup_groups(ser_hashed.iter().map(|(_, h, _)| *h));
+    let buffered_dup_groups = count_dup_groups(buf_hashed.iter().map(|(_, h)| *h));
+
+    Ok(DebugDedupDiffReport {
+        files_enumerated,
+        candidate_count,
+        parallel_dup_groups,
+        serial_dup_groups,
+        buffered_dup_groups,
+        diffs,
+    })
+}
+
 /// Size-grouped exact-dedupe — the work a REAL dedup actually does. A
 /// byte-identical pair necessarily shares a size, so size is a sound
 /// prefilter: we only need to HASH files that share a size with >=1 other
@@ -758,6 +927,41 @@ mod tests {
             dupsets.len(),
             295_773,
             "production full_content_dedup against engine-written corpus must yield 295,773"
+        );
+    }
+
+    #[test]
+    fn debug_dedup_diff_reports_no_divergence_on_known_correct_corpus() {
+        // Self-validates the diff helper: on a corpus the engine wrote itself
+        // (byte-correct by construction), all three reads must agree on every
+        // candidate -> zero diffs. Uses sample_tier (35 MB, ~1k files) so the
+        // test is fast.
+        use super::super::bench;
+        use super::super::bench_corpus::{plan_corpus, sample_tier, write_corpus};
+
+        let seed = [0x33u8; 32];
+        let (k_content, _) = bench::corpus_keys(&seed);
+        let plan = plan_corpus(&sample_tier());
+        let dir = std::env::temp_dir().join(format!("sd-diff-self-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_corpus(&dir, &k_content, &plan).expect("write corpus");
+
+        let report = debug_dedup_diff(&dir).expect("debug_dedup_diff");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            report.diffs.len(),
+            0,
+            "no per-file divergence on self-written corpus (got {} diffs)",
+            report.diffs.len()
+        );
+        assert_eq!(
+            report.parallel_dup_groups, report.serial_dup_groups,
+            "parallel and serial agree on dup-group count for self-written corpus"
+        );
+        assert_eq!(
+            report.serial_dup_groups, report.buffered_dup_groups,
+            "serial and buffered agree on dup-group count for self-written corpus"
         );
     }
 
