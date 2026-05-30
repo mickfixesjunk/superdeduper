@@ -1088,7 +1088,7 @@ impl SuperdeduperApp {
         let submission_id = match crate::leaderboard::submission::peek_pending_submission_id() {
             Some(id) => id,
             None => {
-                eprintln!("#79: archive PATCH skipped — no pending submission_id");
+                crate::log_warn!("#79: archive PATCH skipped — no pending submission_id");
                 return;
             }
         };
@@ -1100,7 +1100,7 @@ impl SuperdeduperApp {
         let state = match crate::leaderboard::install::load() {
             Ok(Some(s)) if s.registered => s,
             _ => {
-                eprintln!("#79: archive PATCH skipped — install not registered");
+                crate::log_warn!("#79: archive PATCH skipped — install not registered");
                 return;
             }
         };
@@ -1209,9 +1209,8 @@ impl SuperdeduperApp {
             let state = match install::load() {
                 Ok(Some(s)) if s.registered => s,
                 Ok(Some(mut s)) => {
-                    eprintln!(
-                        "submit: install present but not registered on web; \
-                         auto-registering before submit"
+                    crate::log_warn!(
+                        "submit: install present but not registered on web; auto-registering before submit"
                     );
                     match registration::register_cli(&mut s) {
                         Ok(()) => s,
@@ -1225,7 +1224,7 @@ impl SuperdeduperApp {
                     }
                 }
                 Ok(None) => {
-                    eprintln!("submit: no install state on disk; auto-registering before submit");
+                    crate::log_warn!("submit: no install state on disk; auto-registering before submit");
                     let server_url =
                         crate::channel::server_url_for(crate::channel::active_channel())
                             .to_string();
@@ -1279,7 +1278,7 @@ impl SuperdeduperApp {
             // the badge wall. Without this, badge tiles only update
             // on app restart.
             if let submission::SubmitOutcome::Accepted { submission_id, .. } = &outcome {
-                eprintln!(
+                crate::log_info!(
                     "submit: Accepted (submission_id={}); spawning ranks-poll + profile-refresh",
                     submission_id
                 );
@@ -1374,7 +1373,7 @@ impl SuperdeduperApp {
                 }
             }
             if let submission::SubmitOutcome::Transient { reason } = &outcome {
-                eprintln!("leaderboard: submit transient ({reason}); enqueueing");
+                crate::log_warn!("leaderboard: submit transient ({reason}); enqueueing");
                 let body = crate::leaderboard::hmac_signer::canonical_body(
                     &submission::build_payload(&inputs, &state.install_id),
                 );
@@ -1383,7 +1382,7 @@ impl SuperdeduperApp {
                     .map(|k| crate::leaderboard::hmac_signer::sign(&k, &body))
                     .unwrap_or_default();
                 if let Err(e) = submission::enqueue(&inputs, &state.install_id, &signature) {
-                    eprintln!("leaderboard: enqueue failed: {e:?}");
+                    crate::log_err!("leaderboard: enqueue failed: {e:?}");
                 }
             }
             submission::store_last_outcome(outcome);
@@ -1516,14 +1515,14 @@ impl SuperdeduperApp {
             let state = match install::load() {
                 Ok(Some(s)) => s,
                 _ => {
-                    eprintln!("review: install not loaded; skipping");
+                    crate::log_warn!("review: install not loaded; skipping");
                     return;
                 }
             };
             let inputs = match submission::peek_pending() {
                 Some(i) => i,
                 None => {
-                    eprintln!("review: no pending payload to flag");
+                    crate::log_warn!("review: no pending payload to flag");
                     return;
                 }
             };
@@ -1543,7 +1542,7 @@ impl SuperdeduperApp {
             };
             match submission::flag_for_review(&state, &inputs, &rejection, None) {
                 Ok((path, review_id)) => {
-                    eprintln!(
+                    crate::log_info!(
                         "review: saved to {} (review_id={:?})",
                         path.display(),
                         review_id
@@ -1556,7 +1555,7 @@ impl SuperdeduperApp {
                     });
                 }
                 Err(e) => {
-                    eprintln!("review: local save failed: {e:?}");
+                    crate::log_err!("review: local save failed: {e:?}");
                     submission::store_last_outcome(submission::SubmitOutcome::Rejected {
                         status: 0,
                         reason: format!("Review-save failed: {e}"),
@@ -1579,7 +1578,7 @@ impl SuperdeduperApp {
         use crate::leaderboard::install;
         match action {
             BadgeWallAction::TileClicked(id) => {
-                eprintln!("badge-wall: tile clicked: {id}");
+                crate::log_info!("badge-wall: tile clicked: {id}");
             }
             BadgeWallAction::TileClickedMultiplier { achievement_id } => {
                 // #77 v2 — pop the per-install detail modal next
@@ -1617,7 +1616,7 @@ impl SuperdeduperApp {
         if let Ok(Some(mut s)) = install::load() {
             s.share_default = install::ShareDefault::AutoOptIn;
             if let Err(e) = install::save(&s) {
-                eprintln!("leaderboard: failed to persist AutoOptIn: {e:?}");
+                crate::log_err!("leaderboard: failed to persist AutoOptIn: {e:?}");
             }
         }
     }
@@ -1633,7 +1632,7 @@ impl SuperdeduperApp {
         if matches!(install::load(), Ok(Some(ref s)) if s.share_default == install::ShareDefault::AskNThenSticky)
         {
             if let Err(e) = install::record_share_prompt(choice) {
-                eprintln!("leaderboard: failed to record share prompt: {e:?}");
+                crate::log_err!("leaderboard: failed to record share prompt: {e:?}");
             }
         }
     }
@@ -2562,7 +2561,7 @@ impl SuperdeduperApp {
         // fired without confirm" report can be triaged from the
         // user's stderr without source access.
         let bypass = self.persisted.settings.bypass_destructive_confirmation;
-        eprintln!(
+        crate::log_info!(
             "dispatch_group_action: destructive variant {} — bypass_destructive_confirmation={bypass}",
             action_kind_label(&action),
         );
@@ -2599,10 +2598,8 @@ impl SuperdeduperApp {
                 | GroupAction::NukeAllVisible
         );
         if is_destructive && !confirmed_destructive {
-            eprintln!(
-                "dispatch_group_action_unchecked: BLOCKED destructive variant {} — \
-                 caller did not pass confirmed_destructive=true. This is a bug; the \
-                 user did NOT see the type-DELETE modal. NOT dispatching.",
+            crate::log_err!(
+                "dispatch_group_action_unchecked: BLOCKED destructive variant {} — caller did not pass confirmed_destructive=true. This is a bug; the user did NOT see the type-DELETE modal. NOT dispatching.",
                 action_kind_label(&action),
             );
             return;
@@ -2642,7 +2639,7 @@ impl SuperdeduperApp {
                 self.run_bulk_destructive_threaded(DedupeAction::Recycle, "♻ Recycle");
             }
             GroupAction::NukeAllVisible => {
-                eprintln!(
+                crate::log_info!(
                     "dispatch_group_action_unchecked: NUKE authorized (confirmed_destructive=true); spawning worker"
                 );
                 self.run_bulk_destructive_threaded(DedupeAction::Remove, "💀 Nuke");
@@ -3551,7 +3548,7 @@ impl eframe::App for SuperdeduperApp {
                 });
             });
             if confirm {
-                eprintln!("destructive-modal: user confirmed via DELETE input; dispatching action");
+                crate::log_info!("destructive-modal: user confirmed via DELETE input; dispatching action");
                 self.pending_destructive = None;
                 self.destructive_confirm_input.clear();
                 self.dispatch_group_action_unchecked(action, true);
@@ -4480,7 +4477,7 @@ fn iso_timestamp_for_filename() -> String {
 #[cfg(feature = "telemetry")]
 fn open_url_in_browser(url: &str) {
     if let Err(e) = crate::platform::open_url(url) {
-        eprintln!("failed to open browser to {url}: {e:?}");
+        crate::log_err!("failed to open browser to {url}: {e:?}");
     }
 }
 
