@@ -83,6 +83,51 @@ pub struct InstallState {
     /// stop asking.
     #[serde(default)]
     pub share_last_choice: Option<ShareChoice>,
+
+    /// The user's most recent bench-lane choice (Mick UX 2026-05-30 12:13 PDT).
+    /// `Ranked` means the engine prompts for OAuth-on-demand before bench when
+    /// the install isn't linked; `Casual` means just run the bench without
+    /// the OAuth detour. `#[serde(default)]` so pre-existing install.json
+    /// files load with `None` and surface the lane prompt on next bench
+    /// (no silent defaulting that could surprise the user with an unexpected
+    /// OAuth modal). Persisted only when the user explicitly chooses.
+    #[serde(default)]
+    pub last_bench_lane: Option<BenchLane>,
+}
+
+/// Mick bench-lane UX. `Ranked` = enforce OAuth linkage before bench;
+/// `Casual` = skip the OAuth prompt and just run. The actual lane the
+/// server scores the submission as is determined by `has_account_linkage`
+/// server-side (web af57f4d) — engine `Casual` doesn't downgrade an
+/// already-linked install; it just doesn't push the user through the
+/// OAuth flow if they're not linked yet. Server is source-of-truth.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchLane {
+    /// Make sure the install has an OAuth linkage before running the bench
+    /// (prompt + complete OAuth on-demand if not already linked). Submissions
+    /// land on the competitive leaderboard.
+    #[default]
+    Ranked,
+    /// Just run the bench. No OAuth pre-prompt. Submissions land as casual
+    /// (Ignition single-run) unless the install happens to already have an
+    /// OAuth linkage, in which case the server scores it competitive anyway.
+    Casual,
+}
+
+impl BenchLane {
+    pub fn as_slug(&self) -> &'static str {
+        match self {
+            BenchLane::Ranked => "ranked",
+            BenchLane::Casual => "casual",
+        }
+    }
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            BenchLane::Ranked => "Ranked",
+            BenchLane::Casual => "Casual",
+        }
+    }
 }
 
 /// Number of post-scan prompts shown before `AskNThenSticky` goes sticky.
@@ -397,6 +442,7 @@ pub fn new_unregistered(server_url: String) -> InstallState {
         counters: InstallCounters::default(),
         share_prompt_count: 0,
         share_last_choice: None,
+        last_bench_lane: None,
     }
 }
 
