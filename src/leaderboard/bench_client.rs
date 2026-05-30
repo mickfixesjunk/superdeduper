@@ -56,6 +56,31 @@ pub fn challenge_hash(path: &str, offset: u64, len: u64, bytes: &[u8]) -> [u8; 3
     *h.finalize().as_bytes()
 }
 
+/// #4(a) V2 challenge_hash — tag 0x03, server-issued 32-byte blob APPENDED
+/// to the V1 preimage. Distinct tag means V1/V2 are cryptographically
+/// non-interchangeable (no replay risk across protocol versions). Used when
+/// /bench/start returns a top-level `server_challenge_blob`; absent =>
+/// V1 fallback during the transition window (web's
+/// `BENCH_SERVER_BLOB_REQUIRED` flag, default false until engine ships V2).
+pub fn challenge_hash_v2(
+    path: &str,
+    offset: u64,
+    len: u64,
+    bytes: &[u8],
+    server_blob: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&[0x03]);
+    h.update(&(path.len() as u32).to_le_bytes());
+    h.update(path.as_bytes());
+    h.update(&offset.to_le_bytes());
+    h.update(&len.to_le_bytes());
+    h.update(bytes);
+    // APPENDED per web 584089d wire spec.
+    h.update(server_blob);
+    *h.finalize().as_bytes()
+}
+
 /// Answer the server's challenge from the DOWNLOADED corpus on disk. Seeks to
 /// each position and reads its bytes (real IO — the work + the I/O signal),
 /// hashes them, and returns the answers plus `bytes_read` (total bytes pulled
@@ -64,6 +89,19 @@ pub fn challenge_hash(path: &str, offset: u64, len: u64, bytes: &[u8]) -> [u8; 3
 pub fn answer_challenge_from_dir(
     dir: &Path,
     positions: &[ChallengePosition],
+) -> std::io::Result<(Vec<ChallengeAnswer>, u64)> {
+    answer_challenge_from_dir_v(dir, positions, None)
+}
+
+/// #4(a) — answer the server's challenge with optional V2 mode. When
+/// `server_blob` is `Some`, uses [`challenge_hash_v2`] (tag 0x03, blob
+/// appended) for every position so the server's V2 verifier accepts.
+/// `None` keeps V1 (tag 0x02) — pre-#4(a) servers + the transition
+/// window's V1-fallback path.
+pub fn answer_challenge_from_dir_v(
+    dir: &Path,
+    positions: &[ChallengePosition],
+    server_blob: Option<&[u8; 32]>,
 ) -> std::io::Result<(Vec<ChallengeAnswer>, u64)> {
     let mut answers = Vec::with_capacity(positions.len());
     let mut bytes_read = 0u64;
@@ -74,11 +112,15 @@ pub fn answer_challenge_from_dir(
         let mut buf = vec![0u8; p.byte_length as usize];
         f.read_exact(&mut buf)?;
         bytes_read += p.byte_length;
+        let h = match server_blob {
+            Some(b) => challenge_hash_v2(&name, p.byte_offset, p.byte_length, &buf, b),
+            None => challenge_hash(&name, p.byte_offset, p.byte_length, &buf),
+        };
         answers.push(ChallengeAnswer {
             path_index: p.path_index,
             byte_offset: p.byte_offset,
             byte_length: p.byte_length,
-            challenge_hash: b64(&challenge_hash(&name, p.byte_offset, p.byte_length, &buf)),
+            challenge_hash: b64(&h),
         });
     }
     Ok((answers, bytes_read))
@@ -92,6 +134,10 @@ pub fn answer_challenge_from_dir(
 /// std-base64. (`client_found_dupsets` already yields canonical order, but we
 /// re-canonicalize here so the digest is correct regardless of input order.)
 pub const RESULT_DIGEST_DOMAIN: &[u8] = b"tcorpus-result-v1";
+/// #4(a) V2 result_digest domain tag. Web 584089d publishes this verbatim;
+/// the prefix change pairs with the blob PREPEND so V1/V2 hashes cannot
+/// collide.
+pub const RESULT_DIGEST_DOMAIN_V2: &[u8] = b"tcorpus-result-v2";
 
 pub fn result_digest_bytes(dupsets: &[Vec<u64>]) -> [u8; 32] {
     let mut clusters: Vec<Vec<u64>> = dupsets
@@ -120,6 +166,38 @@ pub fn result_digest(dupsets: &[Vec<u64>]) -> String {
     b64(&result_digest_bytes(dupsets))
 }
 
+/// #4(a) V2 result_digest — `tcorpus-result-v2` prefix, server-issued 32-byte
+/// blob PREPENDED into the hash input (before the domain tag). Distinct
+/// prefix + prepend position make V1/V2 cryptographically non-interchangeable.
+pub fn result_digest_bytes_v2(dupsets: &[Vec<u64>], server_blob: &[u8; 32]) -> [u8; 32] {
+    let mut clusters: Vec<Vec<u64>> = dupsets
+        .iter()
+        .map(|c| {
+            let mut v = c.clone();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    clusters.sort_by_key(|c| c.first().copied().unwrap_or(0));
+    let mut h = blake3::Hasher::new();
+    // PREPENDED per web 584089d wire spec.
+    h.update(server_blob);
+    h.update(&(RESULT_DIGEST_DOMAIN_V2.len() as u32).to_le_bytes());
+    h.update(RESULT_DIGEST_DOMAIN_V2);
+    h.update(&(clusters.len() as u64).to_le_bytes());
+    for c in &clusters {
+        h.update(&(c.len() as u64).to_le_bytes());
+        for &pi in c {
+            h.update(&pi.to_le_bytes());
+        }
+    }
+    *h.finalize().as_bytes()
+}
+
+pub fn result_digest_v2(dupsets: &[Vec<u64>], server_blob: &[u8; 32]) -> String {
+    b64(&result_digest_bytes_v2(dupsets, server_blob))
+}
+
 /// Lowercase hex of a 32-byte digest (for cross-checking against research's
 /// hex goldens, which print hex; the wire form is [`b64`]). Test-only.
 #[cfg(test)]
@@ -143,15 +221,53 @@ pub fn to_canonical_bench(
     found_dupsets: &[Vec<u64>],
     cold_enforced: bool,
 ) -> super::submission::CanonicalBench {
+    to_canonical_bench_v(
+        protocol_version,
+        corpus_version,
+        tier,
+        bench_run_id,
+        answers,
+        found_dupsets,
+        cold_enforced,
+        None,
+    )
+}
+
+/// #4(a) — assembly with optional V2 server_challenge_blob. When
+/// `server_blob` is Some, [`result_digest_v2`] (tcorpus-result-v2 prefix,
+/// blob prepended) is used + `bench_proof.challenge_blob_echo` is included
+/// as the base64-std blob so web's verifier can confirm the echo matches
+/// what /bench/start issued. `None` ships V1 unchanged (transition-window
+/// path; web's BENCH_SERVER_BLOB_REQUIRED is default false until engine
+/// ships V2).
+#[allow(clippy::too_many_arguments)]
+pub fn to_canonical_bench_v(
+    protocol_version: &str,
+    corpus_version: &str,
+    tier: &str,
+    bench_run_id: &str,
+    answers: &[ChallengeAnswer],
+    found_dupsets: &[Vec<u64>],
+    cold_enforced: bool,
+    server_blob: Option<&[u8; 32]>,
+) -> super::submission::CanonicalBench {
+    let bench_proof = match server_blob {
+        Some(blob) => serde_json::json!({
+            "answers": answers,
+            "result_digest": result_digest_v2(found_dupsets, blob),
+            "challenge_blob_echo": b64(blob),
+        }),
+        None => serde_json::json!({
+            "answers": answers,
+            "result_digest": result_digest(found_dupsets),
+        }),
+    };
     super::submission::CanonicalBench {
         protocol_version: protocol_version.to_string(),
         corpus_version: corpus_version.to_string(),
         tier: tier.to_string(),
         bench_run_id: bench_run_id.to_string(),
-        bench_proof: serde_json::json!({
-            "answers": answers,
-            "result_digest": result_digest(found_dupsets),
-        }),
+        bench_proof,
         cold_enforced,
     }
 }
@@ -167,6 +283,77 @@ mod tests {
         assert_ne!(base, challenge_hash("f0000000002.bin", 0, 4, b"abcd"), "path binds");
         assert_ne!(base, challenge_hash("f0000000001.bin", 1, 4, b"abcd"), "offset binds");
         assert_ne!(base, challenge_hash("f0000000001.bin", 0, 4, b"abce"), "bytes bind");
+    }
+
+    /// #4(a) — V2 challenge_hash + V2 result_digest must be cryptographically
+    /// distinct from V1 (distinct tag 0x03 vs 0x02 + distinct domain prefix +
+    /// blob mix). Web's BENCH_SERVER_BLOB_REQUIRED transition flag relies on
+    /// the two paths being non-interchangeable: a V1 client's old digest
+    /// MUST NOT accidentally match a V2 server's expectation, even when the
+    /// blob happens to be all-zeros.
+    #[test]
+    fn v2_is_cryptographically_distinct_from_v1() {
+        // challenge_hash: V1 vs V2 (even with all-zero blob) must differ.
+        let v1 = challenge_hash("f0000000001.bin", 0, 4, b"abcd");
+        let zero_blob = [0u8; 32];
+        let v2_zero = challenge_hash_v2("f0000000001.bin", 0, 4, b"abcd", &zero_blob);
+        assert_ne!(
+            v1, v2_zero,
+            "V1 (tag 0x02) and V2-with-zero-blob (tag 0x03 + appended) must produce different digests"
+        );
+        // V2 binds to the blob: distinct blobs -> distinct hashes.
+        let one_blob = [1u8; 32];
+        let v2_one = challenge_hash_v2("f0000000001.bin", 0, 4, b"abcd", &one_blob);
+        assert_ne!(v2_zero, v2_one, "V2 blob must bind into challenge_hash");
+
+        // result_digest: V1 vs V2 differ for the same dupsets (even with zero blob).
+        let dupsets = vec![vec![0u64, 7], vec![1, 8]];
+        let r1 = result_digest_bytes(&dupsets);
+        let r2_zero = result_digest_bytes_v2(&dupsets, &zero_blob);
+        assert_ne!(r1, r2_zero, "V1 and V2 result_digest must produce different digests");
+        // V2 result binds to the blob: distinct blobs -> distinct digests.
+        let r2_one = result_digest_bytes_v2(&dupsets, &one_blob);
+        assert_ne!(r2_zero, r2_one, "V2 blob must bind into result_digest");
+    }
+
+    /// #4(a) — to_canonical_bench_v with Some(blob) emits challenge_blob_echo
+    /// in bench_proof and uses V2 result_digest; None omits the echo and
+    /// uses V1.
+    #[test]
+    fn to_canonical_bench_v_emits_challenge_blob_echo_in_v2() {
+        let blob = [0x55u8; 32];
+        let bench_v2 = to_canonical_bench_v(
+            "v3-mutate", "corpus-v2-quick", "quick", "run-X",
+            &[],
+            &[vec![1u64, 2]],
+            true,
+            Some(&blob),
+        );
+        // Echo field present and base64-equal to the blob (44 chars std-base64).
+        let echo = bench_v2.bench_proof
+            .get("challenge_blob_echo")
+            .and_then(|v| v.as_str())
+            .expect("challenge_blob_echo present in V2 bench_proof");
+        assert_eq!(echo, b64(&blob));
+        // V2 result_digest used (distinct from V1 over the same dupsets).
+        let v2_digest = bench_v2.bench_proof.get("result_digest").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(v2_digest, result_digest_v2(&[vec![1u64, 2]], &blob));
+        assert_ne!(v2_digest, result_digest(&[vec![1u64, 2]]));
+
+        // V1 path: no echo field, V1 digest.
+        let bench_v1 = to_canonical_bench_v(
+            "tcorpus-1", "corpus-v2-quick", "quick", "run-X",
+            &[],
+            &[vec![1u64, 2]],
+            true,
+            None,
+        );
+        assert!(bench_v1.bench_proof.get("challenge_blob_echo").is_none(),
+            "V1 must NOT carry challenge_blob_echo");
+        assert_eq!(
+            bench_v1.bench_proof.get("result_digest").and_then(|v| v.as_str()).unwrap(),
+            result_digest(&[vec![1u64, 2]]),
+        );
     }
 
     #[test]

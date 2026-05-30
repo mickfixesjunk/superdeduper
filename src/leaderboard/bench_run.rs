@@ -95,6 +95,30 @@ pub fn run(
     let challenges: Vec<bench_client::ChallengePosition> =
         serde_json::from_value(start.get("challenges").cloned().unwrap_or_default())
             .context("parsing challenges[]")?;
+    // #4(a) — V2 server-bound challenge: /bench/start MAY now return a
+    // top-level `server_challenge_blob` (32 random bytes, base64-std,
+    // 44 chars). Present => V2 verifier path on the server (tag 0x03 +
+    // tcorpus-result-v2); absent => V1 fallback during the transition
+    // window (web's BENCH_SERVER_BLOB_REQUIRED flag, default false until
+    // engine ships V2). Auto-detect rather than force a mode on the
+    // client, so a single engine binary speaks both protocols.
+    let server_blob: Option<[u8; 32]> = start
+        .get("server_challenge_blob")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(s).ok()
+        })
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    if server_blob.is_some() {
+        crate::log_info!(
+            "bench: #4(a) V2 detected — server_challenge_blob present; using tag-0x03 challenge_hash + tcorpus-result-v2 + bench_proof.challenge_blob_echo"
+        );
+    } else {
+        crate::log_info!(
+            "bench: #4(a) V1 fallback — no server_challenge_blob in /bench/start response (legacy/transition path)"
+        );
+    }
 
     // 2. download + untar the corpus -- CACHED per corpus_version so repeat
     // runs reuse the bytes instead of re-pulling 100MB+ every time. The corpus
@@ -169,15 +193,24 @@ pub fn run(
         dupsets.len()
     ));
 
-    // 4. answer the possession challenge
-    let (answers, _read) = bench_client::answer_challenge_from_dir(&corpus_dir, &challenges)
-        .context("answering challenge from disk")?;
-    let result_digest = bench_client::result_digest(&dupsets);
+    // 4. answer the possession challenge — V2 (tag 0x03 + appended blob) when
+    // /bench/start returned a server_challenge_blob; else V1 (tag 0x02).
+    let (answers, _read) = bench_client::answer_challenge_from_dir_v(
+        &corpus_dir,
+        &challenges,
+        server_blob.as_ref(),
+    )
+    .context("answering challenge from disk")?;
+    let result_digest = match server_blob.as_ref() {
+        Some(b) => bench_client::result_digest_v2(&dupsets, b),
+        None => bench_client::result_digest(&dupsets),
+    };
 
-    // 5. assemble + 6. submit
-    let bench = bench_client::to_canonical_bench(
+    // 5. assemble + 6. submit — bench_proof carries challenge_blob_echo when V2.
+    let bench = bench_client::to_canonical_bench_v(
         &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
         cold_enforced,
+        server_blob.as_ref(),
     );
     let largest = dupsets.iter().map(|g| g.len() as u64).max().unwrap_or(0);
     let inputs = submission::SubmissionInputs {
