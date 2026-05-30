@@ -907,6 +907,65 @@ mod tests {
     }
 
     #[test]
+    fn full_tier_plan_dupsets_count_is_295773() {
+        // Pure-analytic check on the plan itself: does plan_corpus(full_tier())
+        // emit exactly 295,773 groundtruth clusters? Cheap, no I/O. If this
+        // passes, the off-by-one between an empirical 295,772 (benchmarker
+        // r3-FULL-v2 on c0e630b) and the plan must originate at materialization,
+        // not in the plan layer.
+        let plan = plan_corpus(&full_tier());
+        assert_eq!(plan.dupsets.len(), 295_773, "full_tier plan emits 295,773 dupsets");
+        // All emitted dupsets are clusters (size >= 2); singletons are not in
+        // the dupsets list per the plan_corpus contract.
+        let n_clusters: usize = plan.dupsets.iter().filter(|s| s.len() >= 2).count();
+        assert_eq!(n_clusters, 295_773);
+    }
+
+    /// Engine-self-loop: given just (plan + content_bytes_at + blake3) — no
+    /// disk, no network, no tar — does the engine's content function produce
+    /// EXACTLY the plan's 295,773 dup groups for the full tier? If yes, the
+    /// engine is internally consistent and an empirical 295,772 from a real
+    /// downloaded corpus (benchmarker r3-FULL-v2) must come from materialization
+    /// divergence (the staged tar doesn't match content_bytes_at for at least
+    /// one content_id — web's TS port bug, S3/CDN corruption, etc.).
+    ///
+    /// Heavy: streams ~6.25 GB of ChaCha20 keystream through blake3 in-memory
+    /// (~5-10s on a fast box, no disk). #[ignore]'d so it doesn't slow the
+    /// default suite; run with `cargo test --release -- --ignored
+    /// full_tier_engine_self_loop`.
+    #[test]
+    #[ignore = "heavy (~6 GB keystream + 1M blake3 hashes); diagnostic for the bench cert mismatch"]
+    fn full_tier_engine_self_loop_yields_295773_dup_groups() {
+        let seed = [0x42u8; 32];
+        let (k_content, _) = bench::corpus_keys(&seed);
+        let plan = plan_corpus(&full_tier());
+
+        let mut by_hash: std::collections::HashMap<[u8; 32], Vec<u64>> =
+            std::collections::HashMap::with_capacity(plan.files.len());
+        let mut chunk = vec![0u8; bench::CHUNK_SIZE as usize];
+        for fp in &plan.files {
+            let mut hasher = blake3::Hasher::new();
+            let mut off = 0u64;
+            while off < fp.size {
+                let len = ((fp.size - off).min(bench::CHUNK_SIZE)) as usize;
+                let slice = &mut chunk[..len];
+                bench::content_bytes_at(&k_content, fp.content_id, off, slice);
+                hasher.update(slice);
+                off += len as u64;
+            }
+            let h = *hasher.finalize().as_bytes();
+            by_hash.entry(h).or_default().push(fp.path_index);
+        }
+        let dup_groups = by_hash.values().filter(|v| v.len() >= 2).count();
+        assert_eq!(
+            dup_groups, 295_773,
+            "engine self-loop (plan + content_bytes_at + blake3) must yield 295,773 dup groups; \
+             a mismatch with the empirical 295,772 from a downloaded corpus would prove the bug \
+             is in materialization (web's tar), not in engine logic"
+        );
+    }
+
+    #[test]
     fn parse_corpus_path_index_handles_paths_and_rejects_noise() {
         assert_eq!(parse_corpus_path_index("f0000000012.bin"), Some(12));
         assert_eq!(parse_corpus_path_index("/tmp/corpus/f0000000007.bin"), Some(7));
