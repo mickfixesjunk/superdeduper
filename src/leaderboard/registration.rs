@@ -86,7 +86,7 @@ impl RegisterSession {
             // Backup old file if present.
             let backup_result = crate::leaderboard::install::back_up_for(channel);
             if let Err(e) = &backup_result {
-                eprintln!("register: backup failed: {e} (continuing anyway)");
+                crate::log_warn!("register: backup failed: {e} (continuing anyway)");
             }
             // Generate fresh install state for this channel.
             let server_url = crate::channel::server_url_for(channel).to_string();

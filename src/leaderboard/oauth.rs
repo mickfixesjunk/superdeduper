@@ -690,9 +690,11 @@ pub fn log_oauth_event(line: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(formatted.as_bytes());
     }
-    // Also fan to stderr for terminal users (CLI invocations + dev
-    // builds without the windows_subsystem attribute).
-    eprintln!("oauth: {line}");
+    // Also fan via the central log (#117 P2): stderr (for terminal users +
+    // dev builds without the windows_subsystem attribute) + the persistent
+    // disk log at <data_dir>/log/superdeduper.*.log. oauth.log keeps its
+    // dedicated stream too for OAuth-only chronology.
+    crate::log_info!("oauth: {line}");
 }
 
 /// Canonical path for the OAuth event log. Lives next to the

@@ -335,7 +335,7 @@ pub fn spawn_initial_fetch(server_url: String, install_id: Option<String>) {
 /// testers can confirm the path executed.
 pub fn spawn_profile_refresh(server_url: String, install_id: String) {
     std::thread::spawn(move || {
-        eprintln!(
+        crate::log_info!(
             "catalog: profile refresh fired (install_id={}, server_url={})",
             install_id, server_url
         );
@@ -343,7 +343,7 @@ pub fn spawn_profile_refresh(server_url: String, install_id: String) {
             Ok(p) => {
                 let granted = p.achievements.iter().filter(|g| g.granted).count();
                 let total = p.achievements.len();
-                eprintln!(
+                crate::log_info!(
                     "catalog: profile refresh OK (granted={}, total={}, lifetime_reclaimed={})",
                     granted,
                     total,
@@ -352,7 +352,7 @@ pub fn spawn_profile_refresh(server_url: String, install_id: String) {
                 set_profile(Ok(p));
             }
             Err(e) => {
-                eprintln!("catalog: profile refresh failed: {e:?}");
+                crate::log_warn!("catalog: profile refresh failed: {e:?}");
                 // Deliberately don't overwrite a previously-good
                 // profile with an error — a transient network blip
                 // shouldn't grey out the badge wall.

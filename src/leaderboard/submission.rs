@@ -622,7 +622,7 @@ pub fn archive_attempt(inputs: &SubmissionInputs, install_id: &str, outcome: &Su
         payload: body,
     };
     if let Err(e) = write_archive_entry(&entry) {
-        eprintln!("leaderboard: archive write failed: {e:?}");
+        crate::log_err!("leaderboard: archive write failed: {e:?}");
     }
 }
 
@@ -661,7 +661,7 @@ pub fn flag_for_review(
     // surfaces to the user.
     let review_id = match try_upload_review(state, &entry) {
         Ok(review_id) => {
-            eprintln!(
+            crate::log_info!(
                 "review: uploaded ({}). Backend review_id={review_id}. Local copy at {}",
                 state.server_url,
                 path.display()
@@ -669,7 +669,7 @@ pub fn flag_for_review(
             Some(review_id)
         }
         Err(e) => {
-            eprintln!(
+            crate::log_warn!(
                 "review: upload failed ({e}). Local copy at {}",
                 path.display()
             );

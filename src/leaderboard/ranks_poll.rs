@@ -102,7 +102,7 @@ pub fn poll_once(
 /// Silent-give-up on timeout or persistent error.
 pub fn spawn_ranks_poll_worker(submission_id: String) {
     if submission_id.is_empty() {
-        eprintln!(
+        crate::log_warn!(
             "ranks-poll: empty submission_id; skipping (web won't have known what to look up)"
         );
         return;
@@ -114,14 +114,14 @@ fn run(submission_id: String) {
     let state: InstallState = match crate::leaderboard::install::load() {
         Ok(Some(s)) if s.registered => s,
         _ => {
-            eprintln!("ranks-poll: install not registered; skipping");
+            crate::log_warn!("ranks-poll: install not registered; skipping");
             return;
         }
     };
     let key = match state.install_key() {
         Some(k) => k,
         None => {
-            eprintln!("ranks-poll: install_key malformed; skipping");
+            crate::log_err!("ranks-poll: install_key malformed; skipping");
             return;
         }
     };
@@ -136,17 +136,17 @@ fn run(submission_id: String) {
             }
             PollResult::Pending => continue,
             PollResult::NotFound => {
-                eprintln!(
+                crate::log_warn!(
                     "ranks-poll: submission_id={submission_id} 404 — backend doesn't know about it; giving up"
                 );
                 return;
             }
             PollResult::Err(e) => {
-                eprintln!("ranks-poll: poll {i} failed ({e}); will retry");
+                crate::log_warn!("ranks-poll: poll {i} failed ({e}); will retry");
             }
         }
     }
-    eprintln!(
+    crate::log_warn!(
         "ranks-poll: submission_id={submission_id} timed out after {}s with no ranks; silent give-up",
         POLL_TIMEOUT_TOTAL.as_secs()
     );
