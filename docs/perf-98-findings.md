@@ -339,6 +339,56 @@ HOLD decision was reached: Linux measurement → warm-cache
 regime callout → Windows replication → HOLD with
 power-user recommendation retained.
 
+## Cross-storage consolidation — `--io-threads` curve shape across three regimes
+
+> **Compiled by:** benchmarker, 2026-05-31. Folded into this doc by overflow as the closing engineering-record addendum. The Linux-SSD section above + the Windows-NVMe negative-replication appendix above are the per-regime narratives; this section is the consolidated normalized view across all three reproductions (the third being sdd-testwin's Win-HDD sweep, which post-dates both earlier sections).
+>
+> **Purpose:** consolidate three independent reproductions of the `--io-threads` sweep into one table so the curve shape across storage/OS regimes is legible. Closes #98 from an engineering-record standpoint — the code decision (HOLD the default change) was already made per Mick's #98 close, design-superdeduper 2026-05-31 11:15 PST.
+
+### The three reproductions
+
+| # | Agent | OS | Storage | Binary | Corpus | Regime |
+|---|-------|----|---------|--------|--------|--------|
+| 1 | overflow | Linux x86_64 | SSD | sd 0.3.0 (33ea5f9) | 3.3 GiB / 5310 f / 2.92 GiB hash-load | warm page-cache, **CPU-bound** |
+| 2 | benchmarker | Windows 11 (NEO) | NVMe-Gen4 (990 PRO) | sd 0.3.0 (33ea5f9) | exact mirror of #1 (2.92 GiB hash-load, validated) | warm page-cache, **CPU-bound** |
+| 3 | sdd-testwin | Windows | USB-HDD (Seagate 8TB) | sd 0.3.1→0.3.3 | 80 MB then 10 GB | **cache-bound (NOT true-cold)** |
+
+Absolute walls are **not** comparable across rows (different corpus sizes, CPUs, cache state). The comparable signal is **curve shape**, so each sweep below is normalized to **its own fastest point (= 1.00×)**.
+
+### Normalized sweep (× each regime's own optimum; lower = faster)
+
+| io-threads | #1 Linux-SSD | #2 Win-NVMe | #3 Win-HDD (cache-bound) |
+|-----------:|-------------:|------------:|-------------------------:|
+| 1          | 1.25 | 2.66 | 1.71 |
+| 2          | —    | —    | 1.23 |
+| 4          | —    | —    | **1.01** |
+| 8          | 1.05 | 1.03 | **1.00** |
+| 16         | **1.00** | 1.07 | 1.01 |
+| 32         | 1.19 | **1.00** | 1.04 |
+| 64         | 1.47 | 1.04 | — |
+| 96 (`threads×3`, current default) | **2.22** | 1.07 | 1.20 |
+| optimum (io-threads) | 16 | 32 (flat 8–96) | 4–8 |
+| **default-96 penalty vs optimum** | **2.21×** | **1.07×** | **1.20×** |
+| absolute optimum wall | 0.204 s | 0.351 s | 0.162 s |
+
+### Findings
+
+1. **Linux-SSD is the outlier.** It is the *only* regime with a catastrophic high-thread cliff (2.21× at the default). Both Windows storage classes top out at a *mild* penalty (NVMe 1.07×, USB-HDD 1.20×). The oversubscription pathology overflow documented is Linux-thread-scheduler-specific; the Windows scheduler absorbs 96 io-threads on 32 logical CPUs without the cliff.
+
+2. **Curve-shape agreement on Windows.** Both Win-NVMe and Win-HDD show the same shape: parallelism helps from 1 up to a knee (~4–8 threads), then **plateaus**, with only a slight regression at 96. No regime is hurt by *adding* threads up to the knee; only Linux is badly hurt *past* it.
+
+3. **Secondary signal (holds across all three): 96 is on the high side everywhere.** A more modest default (≈ `threads` or `threads/2`) would be neutral-to-slightly-better on both Windows regimes **and** would fix Linux's 2.21×. This is the honest "why didn't we just ship the smaller default" answer: it would not have *hurt* anyone — it simply was not *motivated* on the Windows reference rig (no cz-beats-sd gap there; sd is 1.5–1.6× faster than cz at both default and optimum on NEO-NVMe), and Mick weighed the small Windows delta against config-complexity and chose HOLD.
+
+### Why HOLD is the right call (without dismissing Linux)
+
+The default-multiplier change stays **on HOLD** as a config recommendation, not a default flip (per Mick's #98 close, design-superdeduper 2026-05-31 11:15 PST). This consolidation *justifies* the HOLD — the Windows delta is small and the cfg-complexity tradeoff is real — **without** claiming Linux's 2.21× is irrelevant. For Linux/SSD deployments, `--io-threads 16` (or `threads/2`) remains a legitimate per-user tuning win; it is simply not safe to assert as a universal default off a single Linux corpus when two Windows storage classes show no such cliff.
+
+### Caveats (consolidation-specific)
+
+- **#3 is cache-bound, not true-cold.** sdd-testwin's USB-HDD walls (~0.16 s for 80 MB ≈ 470 MB/s, well above the USB-HDD seq ceiling) show the corpus is being served from cache layers RAMMap could not evict; even the 10 GB v0.3.3 run stayed RAM-cached (would need a >64 GB corpus to force true-cold). The *shape* (knee + plateau) is real, but the absolute HDD walls under-represent true-cold by an estimated 5–10×. The **true-cold HDD regime remains open** — under real seek pressure, 96 concurrent threads could thrash *or* overlap-help; that is sdd-testwin/design's to close.
+- **Internal-HDD corner is untested.** #3 is USB-HDD; no internal-HDD rig was available (NEO has none). Recommendation: **defer post-launch** — the cached-regime caveat already covers the unknown cold-HDD question, and real-user reports will surface an internal-HDD regime if it ever matters.
+- **Two binaries in the matrix.** #1/#2 are sd 0.3.0 (33ea5f9, identical); #3 is sd 0.3.1→0.3.3. The hashing path is unchanged across these; the io-threads default (`threads×3`) is the same. Curve-shape comparison is robust to the version delta.
+
 ## Reproduction recipe
 
 Build the corpus:
