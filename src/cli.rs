@@ -1083,7 +1083,13 @@ pub enum ScanMode {
 pub enum DedupeAction {
     /// Permanently remove the file.
     Remove,
-    /// Send the file to the Recycle Bin (uses IFileOperation).
+    /// Send the file to the OS soft-delete location: Recycle Bin on
+    /// Windows (IFileOperation), Trash on macOS (NSFileManager) and on
+    /// Linux (XDG Trash spec). Accepts `trash` as an alias on every
+    /// platform -- `--action trash` and `--action recycle` are
+    /// equivalent, so scripts written for one platform's vocabulary
+    /// work everywhere. #159.
+    #[value(alias = "trash")]
     Recycle,
     /// Replace the file with a hardlink to the keeper.
     Hardlink,
@@ -1152,5 +1158,20 @@ mod tests {
         assert!(parse_size("abc").is_err());
         assert!(parse_size("4X").is_err());
         assert!(parse_size("K").is_err());
+    }
+
+    /// #159 -- A-trash-vocab. `--action trash` and `--action recycle`
+    /// must produce the same DedupeAction variant so macOS / Linux
+    /// users can write `--action trash` in scripts and Windows users
+    /// can write `--action recycle` against the same engine binary.
+    /// The clap `#[value(alias = "trash")]` on the Recycle variant
+    /// is what wires this; this test pins the contract.
+    #[test]
+    fn dedupe_action_trash_alias_parses_to_recycle() {
+        use clap::ValueEnum;
+        let parsed_recycle = DedupeAction::from_str("recycle", true).expect("recycle parses");
+        let parsed_trash = DedupeAction::from_str("trash", true).expect("trash alias parses");
+        assert!(matches!(parsed_recycle, DedupeAction::Recycle));
+        assert!(matches!(parsed_trash, DedupeAction::Recycle));
     }
 }

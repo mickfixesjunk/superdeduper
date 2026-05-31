@@ -211,11 +211,13 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
         }
     } else {
         ui.label(RichText::new("—").color(theme::TEXT_LO).monospace().small())
-            .on_hover_text(
+            .on_hover_text(format!(
+                // #159 -- A-trash-vocab.
                 "Scan only — no actions were taken on this run. Run \
-             Recycle / Hardlink / Reflink / Archive on the groups \
+             {} / Hardlink / Reflink / Archive on the groups \
              to credit reclaim bytes to your profile.",
-            );
+                crate::platform::trash_action_verb(),
+            ));
     }
 
     // Status pill. v1 always reads "pending" because the resubmit
@@ -488,10 +490,11 @@ fn action_breakdown_tooltip(record: &ScanRecord) -> String {
         }
     }
     lines.push(String::new()); // blank between header + body
-    // #159 — macOS users see "Trash" for the recycle action. The action_key
-    // on the wire stays `deleted_to_recycle_bytes` (server contract); only
-    // the user-visible label flips.
-    let recycle_label = if cfg!(target_os = "macos") { "Trash" } else { "Recycle" };
+    // #159 -- A-trash-vocab: macOS + Linux users see "Trash" for the
+    // soft-delete action; Windows users see "Recycle". The action_key
+    // on the wire stays `deleted_to_recycle_bytes` (server contract);
+    // only the user-visible label flips.
+    let recycle_label = crate::platform::trash_action_verb();
     let labels = [
         ("deleted_to_recycle_bytes", recycle_label),
         ("deleted_permanently_bytes", "Remove"),

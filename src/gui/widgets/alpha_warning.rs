@@ -58,12 +58,14 @@ pub fn show(ctx: &egui::Context) -> Option<AlphaWarningChoice> {
             );
             ui.add_space(8.0);
             ui.label(
-                RichText::new(
+                // #159 -- A-trash-vocab.
+                RichText::new(format!(
                     "It performs destructive operations on your files \
-                 (Recycle, hardlink replacement, archive move, \
+                 ({}, hardlink replacement, archive move, \
                  safe-rename). Defaults are reversible — but bugs \
                  in this codebase CAN result in permanent data loss.",
-                )
+                    crate::platform::trash_action_verb(),
+                ))
                 .color(theme::TEXT_HI),
             );
             ui.add_space(8.0);

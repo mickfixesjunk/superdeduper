@@ -3499,12 +3499,15 @@ impl eframe::App for SuperdeduperApp {
                 );
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new(
+                    // #159 -- A-trash-vocab: per-platform verb + noun.
+                    egui::RichText::new(format!(
                         "This cannot be auto-undone from the app. \
-                         Recycle is reversible from the Recycle Bin; \
+                         {verb} is reversible from the {noun}; \
                          Safe-rename is reversible via the Unsuperdeduper button; \
                          Hardlink is NOT reversible without the original data still being elsewhere.",
-                    )
+                        verb = crate::platform::trash_action_verb(),
+                        noun = crate::platform::trash_bin_noun(),
+                    ))
                     .color(theme::TEXT_LO)
                     .small(),
                 );
@@ -4166,8 +4169,8 @@ fn describe_destructive_action(action: &GroupAction) -> String {
         GroupAction::RecycleOthers { keeper, dupes } => format!(
             "Move {} file(s) to the {}, keeping:\n  {}",
             dupes.len(),
-            // #159 — Trash on macOS, Recycle Bin elsewhere.
-            if cfg!(target_os = "macos") { "Trash" } else { "Recycle Bin" },
+            // #159 -- A-trash-vocab: macOS + Linux = "Trash", Windows = "Recycle Bin".
+            crate::platform::trash_bin_noun(),
             keeper.display()
         ),
         GroupAction::HardlinkOthers { keeper, dupes } => format!(
@@ -4204,18 +4207,12 @@ fn describe_destructive_action(action: &GroupAction) -> String {
                 .to_string()
         }
         GroupAction::RecycleAllVisible => {
-            // #159 — per-platform noun ("Trash" on macOS, "Recycle Bin" elsewhere).
-            if cfg!(target_os = "macos") {
-                "Send EVERY non-keeper across EVERY currently visible duplicate group to the macOS \
-                 Trash. Recoverable from the Trash until you empty it. Reference paths are never \
-                 touched."
-                    .to_string()
-            } else {
-                "Send EVERY non-keeper across EVERY currently visible duplicate group to the OS Recycle \
-                 Bin. Recoverable from the recycle bin until you empty it. Reference paths are never \
-                 touched."
-                    .to_string()
-            }
+            // #159 -- A-trash-vocab: macOS + Linux = "Trash", Windows = "Recycle Bin".
+            format!(
+                "Send EVERY non-keeper across EVERY currently visible duplicate group to the OS {noun}. \
+                 Recoverable from the {noun} until you empty it. Reference paths are never touched.",
+                noun = crate::platform::trash_bin_noun(),
+            )
         }
         GroupAction::NukeAllVisible => {
             if cfg!(target_os = "macos") {

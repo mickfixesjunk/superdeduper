@@ -1196,9 +1196,9 @@ fn render_safety(ui: &mut egui::Ui, settings: &mut ScanSettings) {
             theme::TEXT_HI
         }),
     );
-    bypass_check.on_hover_text(
+    bypass_check.on_hover_text(format!(
         "OFF (default): every destructive action shows a modal asking you to \
-         type the matching verb before it fires (DELETE for Recycle / Nuke, \
+         type the matching verb before it fires (DELETE for {verb} / Nuke, \
          RENAME for Safe-rename, ARCHIVE for Archive (Move), HARDLINK for \
          Hardlink).\n\n\
          ON: actions fire immediately on click — no prompt. Use only when \
@@ -1208,7 +1208,8 @@ fn render_safety(ui: &mut egui::Ui, settings: &mut ScanSettings) {
          Reveal-in-Explorer, Unsuperdeduper, and Archive (Copy) never prompt \
          regardless of this setting — Reveal touches nothing, Unsuperdeduper \
          is a reversal, and Archive (Copy) doesn't touch the source files.",
-    );
+        verb = crate::platform::trash_action_verb(),
+    ));
     if settings.bypass_destructive_confirmation {
         ui.label(
             RichText::new("⚠ Destructive actions will fire WITHOUT confirmation.")

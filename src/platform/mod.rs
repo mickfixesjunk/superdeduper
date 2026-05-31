@@ -116,6 +116,64 @@ pub fn clone_file(_src: &Path, _dst: &Path) -> PlatformResult<()> {
 }
 
 // ============================================================
+// #159 -- A-trash-vocab: per-platform "Trash" vs "Recycle Bin"
+// terminology. macOS calls the bin "Trash" and the verb
+// "Move to Trash"; Linux follows XDG ("Trash"); Windows is
+// "Recycle Bin" / "Recycle". The helpers below centralize the
+// platform branch so every user-facing label, tooltip, modal
+// text, and CLI help string reads the same per-OS noun + verb
+// without each call site re-writing the cfg ladder. Adding a
+// new platform = one change here, not a sweep.
+// ============================================================
+
+/// Per-platform name of the OS-level "soft delete" destination
+/// directory the user sees in their file manager. macOS + Linux =
+/// "Trash"; Windows = "Recycle Bin". Use this in any user-facing
+/// label that refers to WHERE the file goes ("file is in the Trash"
+/// vs "file is in the Recycle Bin").
+pub const fn trash_bin_noun() -> &'static str {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        "Trash"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "Recycle Bin"
+    }
+}
+
+/// Per-platform verb for the soft-delete ACTION. macOS = "Trash"
+/// (matches Finder's "Move to Trash" menu); Linux = "Trash"; Windows =
+/// "Recycle". Use this in any button label / action verb that names
+/// what the user is about to do.
+pub const fn trash_action_verb() -> &'static str {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        "Trash"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "Recycle"
+    }
+}
+
+/// Per-platform full "Move to <trash>" phrase. macOS + Linux = "Move
+/// to Trash" (mirrors Finder + GNOME Files); Windows = "Move to
+/// Recycle Bin" (mirrors File Explorer). Convenience over
+/// `format!("Move to {}", trash_bin_noun())` so the call site reads
+/// closer to the displayed text.
+pub const fn move_to_trash_phrase() -> &'static str {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        "Move to Trash"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "Move to Recycle Bin"
+    }
+}
+
+// ============================================================
 // Trash — move a file to the user's trash / Recycle Bin.
 //
 // Windows: IFileOperation with FOF_ALLOWUNDO.
@@ -201,4 +259,59 @@ pub fn open_url(_url: &str) -> PlatformResult<()> {
     Err(PlatformError::Unsupported(
         "open_url not supported on this platform",
     ))
+}
+
+#[cfg(test)]
+mod trash_vocab_tests {
+    use super::*;
+
+    // #159 -- A-trash-vocab. These tests pin the per-platform string
+    // contract so a future cfg-typo (e.g. dropping the Linux arm of
+    // the any()) gets caught at test time instead of in a screenshot
+    // review. Each test is target_os-gated so it asserts the value
+    // for the platform it's actually running on.
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trash_vocab_uses_trash_words_on_macos() {
+        assert_eq!(trash_bin_noun(), "Trash");
+        assert_eq!(trash_action_verb(), "Trash");
+        assert_eq!(move_to_trash_phrase(), "Move to Trash");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trash_vocab_uses_trash_words_on_linux() {
+        // Linux follows XDG vocab -- same as macOS.
+        assert_eq!(trash_bin_noun(), "Trash");
+        assert_eq!(trash_action_verb(), "Trash");
+        assert_eq!(move_to_trash_phrase(), "Move to Trash");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trash_vocab_uses_recycle_words_on_windows() {
+        assert_eq!(trash_bin_noun(), "Recycle Bin");
+        assert_eq!(trash_action_verb(), "Recycle");
+        assert_eq!(move_to_trash_phrase(), "Move to Recycle Bin");
+    }
+
+    /// Cross-platform contract: bin-noun and action-verb must NEVER
+    /// return mismatched vocabularies (e.g. action-verb="Trash" but
+    /// bin-noun="Recycle Bin") -- they're shown together in modals
+    /// and the mismatch is jarring. This test runs everywhere.
+    #[test]
+    fn trash_vocab_is_internally_consistent_across_helpers() {
+        let noun = trash_bin_noun();
+        let verb = trash_action_verb();
+        let phrase = move_to_trash_phrase();
+        let is_trash_family = noun == "Trash" && verb == "Trash"
+            && phrase == "Move to Trash";
+        let is_recycle_family = noun == "Recycle Bin" && verb == "Recycle"
+            && phrase == "Move to Recycle Bin";
+        assert!(
+            is_trash_family || is_recycle_family,
+            "vocab helpers disagreed: noun={noun:?}, verb={verb:?}, phrase={phrase:?}"
+        );
+    }
 }

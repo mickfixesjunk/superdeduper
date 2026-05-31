@@ -110,14 +110,18 @@ impl BulkAction {
             BulkAction::SafeRenameDupes => "🛡 Safe-rename dupes",
             BulkAction::ArchiveMoveDupes => "📦 Archive (Move) dupes",
             BulkAction::ArchiveCopyDupes => "📋 Archive (Copy) dupes",
-            // #159 — macOS users expect "Trash", everyone else "Recycle".
-            // The underlying OS API (NSFileManager.trashItemAtURL: / Win
-            // SHFileOperation with FO_DELETE+FOF_ALLOWUNDO) is what it is;
-            // only the user-visible noun changes.
+            // #159 -- A-trash-vocab: macOS + Linux say "Trash";
+            // Windows says "Recycle". Underlying OS API
+            // (NSFileManager.trashItemAtURL: / SHFileOperation with
+            // FO_DELETE+FOF_ALLOWUNDO / XDG Trash) is unchanged;
+            // only the user-visible noun + verb shift.
             BulkAction::RecycleDupes => {
-                if cfg!(target_os = "macos") {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
                     "♻ Move dupes to Trash"
-                } else {
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
                     "♻ Recycle dupes"
                 }
             }
@@ -345,15 +349,19 @@ pub fn show_filtered(
                  No confirmation prompt because nothing is destroyed."
             }
             BulkAction::RecycleDupes => {
-                // #159 — per-platform noun.
-                if cfg!(target_os = "macos") {
+                // #159 -- A-trash-vocab: macOS + Linux = "Trash";
+                // Windows = "Recycle Bin".
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
                     "Send every non-keeper across every visible group to the \
-                     macOS Trash. Reference paths never touched. Recoverable \
+                     OS Trash. Reference paths never touched. Recoverable \
                      from the Trash until you empty it. Requires confirmation."
-                } else {
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
                     "Send every non-keeper across every visible group to the \
                      OS Recycle Bin. Reference paths never touched. Recoverable \
-                     from the recycle bin until you empty it. Requires \
+                     from the Recycle Bin until you empty it. Requires \
                      confirmation."
                 }
             }
@@ -675,18 +683,23 @@ pub fn show_filtered(
                                         }
                                         if ui
                                             .small_button(
-                                                RichText::new(if cfg!(target_os = "macos") {
-                                                    "♻ Trash"
-                                                } else {
-                                                    "♻ Recycle"
-                                                })
+                                                RichText::new(
+                                                    // #159 -- A-trash-vocab.
+                                                    if cfg!(any(target_os = "macos", target_os = "linux")) {
+                                                        "♻ Trash"
+                                                    } else {
+                                                        "♻ Recycle"
+                                                    },
+                                                )
                                                 .color(theme::WARN),
                                             )
-                                            .on_hover_text(if cfg!(target_os = "macos") {
-                                                "Send every dupe to the Trash. Reversible."
-                                            } else {
-                                                "Send every dupe to the Recycle Bin. Reversible."
-                                            })
+                                            .on_hover_text(
+                                                if cfg!(any(target_os = "macos", target_os = "linux")) {
+                                                    "Send every dupe to the Trash. Reversible."
+                                                } else {
+                                                    "Send every dupe to the Recycle Bin. Reversible."
+                                                },
+                                            )
                                             .clicked()
                                         {
                                             clicked = Some(GroupAction::RecycleOthers {
