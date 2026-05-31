@@ -90,6 +90,11 @@ hmac = { version = "0.12", optional = true }
 # dragging in the entire engine binary. Engine's leaderboard::hmac_signer
 # module is now a thin re-export shim around this dep.
 superdeduper-hmac-signer = { path = "crates/superdeduper-hmac-signer", optional = true }
+# Always-on log fan-out (stderr + disk). Per Mick's 2026-05-29
+# PERSIST-logs-always directive, this dep is NOT optional — the
+# closed-source telemetry-off binary path also writes the disk log.
+# See crates/superdeduper-log/Cargo.toml for rationale.
+superdeduper-log = { path = "crates/superdeduper-log" }
 uuid = { version = "1.10", optional = true, features = ["v4"] }
 # T-BENCH-ME canonical-bench (telemetry): deterministic corpus generator
 # (RFC-8439 ChaCha20 keystream w/ StreamCipherSeek for O(1) random-access
@@ -296,5 +301,5 @@ lto = "thin"
 # follow as P0-C..P0-F land.
 # ---------------------------------------------------------------------------
 [workspace]
-members = [".", "crates/superdeduper-hmac-signer"]
+members = [".", "crates/superdeduper-hmac-signer", "crates/superdeduper-log"]
 resolver = "2"

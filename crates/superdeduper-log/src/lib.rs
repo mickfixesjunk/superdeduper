@@ -1,0 +1,207 @@
+//! Persistent engine log — Mick directive 2026-05-29: "PERSIST engine logs to
+//! disk ALWAYS — observability gap that bites every retest." A thin
+//! `log_info!` / `log_warn!` / `log_err!` macro set that fans every call to
+//! BOTH stderr (the existing eprintln! channel; users running the CLI from a
+//! terminal still see it) AND a file at
+//! `<data_dir>/log/superdeduper.<unix_secs>.<pid>.log`. Keeps the last 10 log
+//! files (older are pruned on first write of a new file). Lazy-opens the file
+//! on the first call so a process that never logs costs nothing.
+//!
+//! Phase 0 (2026-05-31): extracted into a leaf crate so the future bench-real
+//! / bench-stub crates can use the macros without depending on the entire
+//! engine binary. Engine's `src/log.rs` is now a thin re-export shim around
+//! this crate so existing call-sites (`crate::log_info!(...)`, etc.) compile
+//! unchanged.
+//!
+//! Always-on: NOT gated behind any Cargo feature. The disk log must work on
+//! both `--features telemetry` and `--no-default-features` builds (the
+//! closed-source telemetry-off binary path) per the PERSIST-logs-always
+//! directive.
+
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
+
+/// Lazily-opened log file handle. `Some(f)` after first successful open;
+/// `None` if the log dir / file couldn't be created (we still flush to
+/// stderr — fail-soft, never break the caller because logging failed).
+fn slot() -> &'static Mutex<Option<std::fs::File>> {
+    static SLOT: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Whether we've attempted to open the file yet (so we only try once and
+/// don't pound on a failing fs every line).
+fn open_attempted() -> &'static Mutex<bool> {
+    static SLOT: OnceLock<Mutex<bool>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(false))
+}
+
+/// Resolve `<data_dir>` for the persistent log file. Per-platform path
+/// resolution; intentionally identical to (and independent of) the
+/// engine's `leaderboard::install::data_dir()` so this leaf crate stays
+/// dependency-free of the engine binary.
+///
+/// Windows: `%LOCALAPPDATA%\superdeduper`
+/// macOS:   `~/Library/Application Support/superdeduper`
+/// Linux:   `$XDG_DATA_HOME/superdeduper` or `~/.local/share/superdeduper`
+///
+/// Keep in sync with `leaderboard::install::data_dir()` for the lifetime of
+/// this duplication. Long-term resolution is to extract `install` (or just
+/// `data_dir`) into its own leaf crate that both engine + log can depend on;
+/// that's a separate slice.
+fn log_data_dir() -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA not set"))?;
+        let mut p = PathBuf::from(local);
+        p.push("superdeduper");
+        Ok(p)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+        let mut p = PathBuf::from(home);
+        p.push("Library");
+        p.push("Application Support");
+        p.push("superdeduper");
+        Ok(p)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            let mut p = PathBuf::from(xdg);
+            p.push("superdeduper");
+            return Ok(p);
+        }
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+        let mut p = PathBuf::from(home);
+        p.push(".local");
+        p.push("share");
+        p.push("superdeduper");
+        Ok(p)
+    }
+}
+
+fn open_log_file() -> Option<std::fs::File> {
+    // Build path: <data_dir>/log/superdeduper.<unix_secs>.<pid>.log
+    let data = log_data_dir().ok()?;
+    let log_dir = data.join("log");
+    std::fs::create_dir_all(&log_dir).ok()?;
+
+    // Rotate: keep the most-recent 9 existing files; the file we're about to
+    // create will be the 10th. We do this BEFORE creating the new file so
+    // listing doesn't include it.
+    if let Ok(entries) = std::fs::read_dir(&log_dir) {
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("superdeduper.") && n.ends_with(".log"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort(); // unix-ts-prefixed filenames sort chronologically
+        while files.len() > 9 {
+            let _ = std::fs::remove_file(files.remove(0));
+        }
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let pid = std::process::id();
+    let path = log_dir.join(format!("superdeduper.{ts:010}.{pid}.log"));
+    OpenOptions::new().create(true).append(true).open(&path).ok()
+}
+
+/// Write one log line. Fan-out: ALWAYS stderr (matches existing eprintln!
+/// behavior so terminal output is unchanged), then disk if the file can be
+/// opened. Lazy-opens the file on the first call.
+pub fn write_line(level: &str, args: std::fmt::Arguments) {
+    // 1. stderr fanout. Preserves current observable behavior for anyone
+    //    capturing stderr (PowerShell Tee-Object, 2> redirect, etc.).
+    eprintln!("[{level}] {args}");
+
+    // 2. Lazy open the disk log on first call.
+    {
+        let mut attempted = open_attempted().lock();
+        if !*attempted {
+            *attempted = true;
+            *slot().lock() = open_log_file();
+        }
+    }
+
+    // 3. Append to disk if open. Fail-soft on any IO error (we already wrote
+    //    to stderr; losing the disk copy is a degraded mode, not a fatal one).
+    let mut guard = slot().lock();
+    if let Some(f) = guard.as_mut() {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // ISO-ish: `[unix_secs] [level] message`. Cheap, sortable,
+        // tooling-friendly. Phase 2 may switch to RFC3339 via chrono.
+        let _ = writeln!(f, "{secs} [{level}] {args}");
+        let _ = f.flush();
+    }
+}
+
+/// `log_info!("foo {}", bar)` — fan an info-level line to stderr + disk.
+/// Use for routine engine state-transition messages (request submitted,
+/// PATCH succeeded, queue drained, etc.).
+///
+/// `$crate` inside the macro expands to `::superdeduper_log`, so the
+/// macro works identically whether the caller imports it via the engine
+/// binary's re-export (`crate::log_info!`) or directly from this leaf
+/// crate (`superdeduper_log::log_info!`).
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => ($crate::write_line("INFO", format_args!($($arg)*)));
+}
+
+/// `log_warn!("foo {}", bar)` — fan a warn-level line. Use for recoverable
+/// degradations: PATCH transient failure, queue grew past hint, etc.
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => ($crate::write_line("WARN", format_args!($($arg)*)));
+}
+
+/// `log_err!("foo {}", bar)` — fan an error-level line. Use for engine-bug
+/// signals: install state malformed, schema rejected, write failed.
+#[macro_export]
+macro_rules! log_err {
+    ($($arg:tt)*) => ($crate::write_line("ERR ", format_args!($($arg)*)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Smoke-tests: the macros expand + write_line doesn't panic in the
+    // common path. We can't easily assert the disk file appears here without
+    // overriding data_dir, but exercising the lazy-open path catches any
+    // expansion bugs.
+
+    #[test]
+    fn write_line_does_not_panic_on_routine_call() {
+        write_line("INFO", format_args!("test event id={}", 42));
+    }
+
+    #[test]
+    fn macros_expand_with_format_args() {
+        crate::log_info!("info msg {}", 1);
+        crate::log_warn!("warn msg {}", 2);
+        crate::log_err!("err msg {}", 3);
+    }
+}

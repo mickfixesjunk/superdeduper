@@ -1,0 +1,11 @@
+[package]
+name = "superdeduper-log"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent engine log fan-out (stderr + disk) for superdeduper. Phase 0 leaf crate extracted from src/log.rs so the future bench-real / bench-stub crates can use the log_info! / log_warn! / log_err! macros without depending on the entire engine binary. Always-on (no telemetry feature gate) per Mick's 2026-05-29 PERSIST-logs-always directive."
+license = "MIT"
+repository = "https://github.com/mickfixesjunk/superdeduper"
+publish = false
+
+[dependencies]
+parking_lot = "0.12"
