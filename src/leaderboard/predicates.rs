@@ -108,6 +108,20 @@ pub fn evaluate_all(ctx: &PredicateContext<'_>) -> Vec<String> {
     if verify_veteran(ctx).is_some() {
         hits.push("verify-veteran".to_string());
     }
+    // #161 -- A-predicates-recursive-shadercache: these two were
+    // catalog-spec'd visible:true but had no predicate, producing
+    // visible-but-unearnable badges. Web set them visible:false as
+    // interim per Mick's 2026-05-29 ruling; engine adds predicates
+    // here so the visibility flip can be re-armed once accepted.
+    // Interpretations match the achievement NAMES (catalog text not
+    // accessible from the engine repo) -- if web's description
+    // intends a different shape, flag back + adjust.
+    if recursive(ctx).is_some() {
+        hits.push("recursive".to_string());
+    }
+    if shadercache_hoarder(ctx).is_some() {
+        hits.push("shadercache-hoarder".to_string());
+    }
     hits
 }
 
@@ -340,6 +354,75 @@ fn verify_veteran(ctx: &PredicateContext<'_>) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+// =====================================================================
+// #161 -- A-predicates-recursive-shadercache. Predicates added to
+// close visible-but-unearnable. Catalog text not in engine repo;
+// behavior derived from the achievement name + standard usage of
+// the term. Flag back via the engine bilateral if web's catalog
+// description wants a different shape -- this is a starting impl.
+// =====================================================================
+
+/// recursive: a path has the SAME directory-component name repeated
+/// at least twice within itself (e.g., `/backup/foo/backup/file.bin`).
+/// Classic "user backed up the backup folder into itself" pattern --
+/// the recursive-style structure the name suggests. Lightweight:
+/// detects the structural property without needing the dup-group
+/// partition (which isn't in PredicateContext).
+fn recursive(ctx: &PredicateContext<'_>) -> Option<&'static str> {
+    // For each path, scan its components for any name that appears
+    // twice in the same chain. A HashSet per path -- inserts return
+    // false on the second hit, that's the grant.
+    use std::collections::HashSet;
+    for path in ctx.all_paths {
+        let mut seen: HashSet<String> = HashSet::new();
+        for component in path.components() {
+            let name = component.as_os_str().to_string_lossy().to_string();
+            // Skip the root/empty/relative-dot components -- they'd
+            // false-fire (every absolute path has "/" twice on
+            // posix-display layouts; we want only NAMED components).
+            if name.is_empty() || name == "/" || name == "." || name == ".." {
+                continue;
+            }
+            if !seen.insert(name) {
+                return Some("recursive");
+            }
+        }
+    }
+    None
+}
+
+/// shadercache-hoarder: scan contains a path under a known shader-
+/// cache directory. These accumulate from games + GPU drivers; users
+/// who haven't pruned them have GB of redundant pre-compiled shader
+/// data. One match grants -- the badge rewards the corpus shape,
+/// not the count.
+///
+/// Patterns (case-insensitive substring match on the path):
+/// - `__GLcache` -- NVIDIA OpenGL shader cache.
+/// - `DXShaderCache` -- DirectX shader cache.
+/// - `shadercache/` -- Steam shader cache, generic shader caches.
+/// - `DerivedDataCache/` -- Unreal Engine derived shader+asset cache.
+/// - `NvShaderCache` -- NVIDIA generic shader cache.
+/// - `D3DSCache` -- Direct3D shader cache (Windows).
+fn shadercache_hoarder(ctx: &PredicateContext<'_>) -> Option<&'static str> {
+    const NEEDLES: &[&str] = &[
+        "__glcache",
+        "dxshadercache",
+        "shadercache",
+        "derivedddatacache",  // typo-tolerant for some Unreal variants
+        "deriveddatacache",
+        "nvshadercache",
+        "d3dscache",
+    ];
+    for path in ctx.all_paths {
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        if NEEDLES.iter().any(|n| lower.contains(n)) {
+            return Some("shadercache-hoarder");
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -714,9 +797,13 @@ mod tests {
             ..ctx_empty()
         };
         let hits = evaluate_all(&ctx);
-        // 4 hits in this scenario: abyss-walker, git-repo-detected,
-        // picky-eater, verify-veteran. Returned in alphabetical
-        // dispatch-order per `evaluate_all`'s implementation.
+        // 5 hits in this scenario: abyss-walker (depth >= 15),
+        // git-repo-detected (`.git/` present), picky-eater +
+        // verify-veteran (counters >= 10), AND recursive (the
+        // deep-path fixture is `a/x/x/x/.../x` so the `x`
+        // component repeats 14 times -- a side effect of the
+        // existing fixture once #161's predicate landed). Order
+        // matches `evaluate_all`'s dispatch sequence.
         assert_eq!(
             hits,
             vec![
@@ -724,7 +811,157 @@ mod tests {
                 "git-repo-detected",
                 "picky-eater",
                 "verify-veteran",
+                "recursive",
             ]
+        );
+    }
+
+    // ============================================================
+    // #161 -- A-predicates-recursive-shadercache.
+    // ============================================================
+
+    fn ctx_with_paths<'a>(paths: &'a [&'a Path]) -> PredicateContext<'a> {
+        PredicateContext {
+            all_paths: paths,
+            mtimes_unix_secs: None,
+            install_counters: None,
+            perceptual_mode_active: false,
+        }
+    }
+
+    #[test]
+    fn recursive_grants_on_repeated_path_component() {
+        // `backup` appears twice in this path -- classic
+        // "backed up the backup" pattern.
+        let paths = [
+            PathBuf::from("/home/mick/backup/photos/backup/cat.jpg"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(recursive(&ctx), Some("recursive"));
+    }
+
+    #[test]
+    fn recursive_does_not_grant_on_distinct_components() {
+        // No component name repeats -- normal corpus shape.
+        let paths = [
+            PathBuf::from("/home/mick/photos/cat.jpg"),
+            PathBuf::from("/var/log/syslog"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(recursive(&ctx), None);
+    }
+
+    #[test]
+    fn recursive_ignores_root_and_dot_components() {
+        // The leading "/" component on POSIX paths is the root
+        // anchor; treating it as a repeating name would false-fire
+        // for every multi-segment path. Same for "."/"..".
+        let paths = [PathBuf::from("/a/b/c")];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(recursive(&ctx), None);
+    }
+
+    #[test]
+    fn recursive_grants_on_any_single_qualifying_path() {
+        // Mixed corpus -- only the second path repeats a component.
+        // Predicate grants on the first qualifying match.
+        let paths = [
+            PathBuf::from("/clean/path.bin"),
+            PathBuf::from("/usr/share/share/file.bin"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(recursive(&ctx), Some("recursive"));
+    }
+
+    #[test]
+    fn shadercache_hoarder_grants_on_nvidia_glcache() {
+        let paths = [
+            PathBuf::from("/home/mick/.cache/__GLcache/some_hash/cache.bin"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(shadercache_hoarder(&ctx), Some("shadercache-hoarder"));
+    }
+
+    #[test]
+    fn shadercache_hoarder_grants_on_steam_shadercache() {
+        let paths = [
+            PathBuf::from("/home/mick/.steam/steam/steamapps/shadercache/123/cache.bin"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(shadercache_hoarder(&ctx), Some("shadercache-hoarder"));
+    }
+
+    #[test]
+    fn shadercache_hoarder_grants_on_unreal_derived_data_cache() {
+        let paths = [
+            PathBuf::from(
+                "/Users/mick/Library/Application Support/Epic/UnrealEngine/Common/DerivedDataCache/Lod/lod.ddc",
+            ),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(shadercache_hoarder(&ctx), Some("shadercache-hoarder"));
+    }
+
+    #[test]
+    fn shadercache_hoarder_grants_on_dx_shader_cache_windows_style() {
+        let paths = [
+            PathBuf::from(
+                r"C:\Users\mick\AppData\Local\NVIDIA\DXShaderCache\some_dx.bin",
+            ),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(shadercache_hoarder(&ctx), Some("shadercache-hoarder"));
+    }
+
+    #[test]
+    fn shadercache_hoarder_is_case_insensitive() {
+        // User paths may carry any case; match must be CI to catch
+        // them all.
+        let paths = [
+            PathBuf::from("/MIXED/Case/__GLCACHE/Bin"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(shadercache_hoarder(&ctx), Some("shadercache-hoarder"));
+    }
+
+    #[test]
+    fn shadercache_hoarder_no_grant_on_unrelated_paths() {
+        // Standard user corpus with no shader caches.
+        let paths = [
+            PathBuf::from("/home/mick/documents/report.pdf"),
+            PathBuf::from("/home/mick/photos/cat.jpg"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        assert_eq!(shadercache_hoarder(&ctx), None);
+    }
+
+    #[test]
+    fn recursive_and_shadercache_hoarder_appear_in_evaluate_all() {
+        // Compound corpus that triggers BOTH new predicates. The
+        // returned hits vec MUST include both IDs, in the dispatch
+        // order they're listed in evaluate_all (after the existing
+        // 9 predicates).
+        let paths = [
+            PathBuf::from("/home/mick/.steam/shadercache/123/cache.bin"),
+            PathBuf::from("/home/mick/backup/photos/backup/cat.jpg"),
+        ];
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let ctx = ctx_with_paths(&refs);
+        let hits = evaluate_all(&ctx);
+        assert!(hits.contains(&"recursive".to_string()), "got hits: {hits:?}");
+        assert!(
+            hits.contains(&"shadercache-hoarder".to_string()),
+            "got hits: {hits:?}"
         );
     }
 }
