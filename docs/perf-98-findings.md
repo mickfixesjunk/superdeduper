@@ -1,4 +1,15 @@
-# #98 perf findings — sd `--io-threads` default is 2× slower than optimum on heterogeneous corpora
+# #98 perf findings — sd `--io-threads` default is 2× slower than optimum on heterogeneous corpora **(Linux only — see status banner)**
+
+> **STATUS (2026-05-31):** **HOLD.** No code change. Cross-platform
+> replication on NEO (Windows 11, byte-exact corpus mirror) came
+> back negative: the `--io-threads` default-multiplier cliff is
+> **Linux-specific**. Windows scheduler absorbs the
+> oversubscription cleanly. Plus sd@default beats cz@default on
+> NEO by 52%, so the "cz beats sd" premise that motivated #98
+> doesn't hold on the primary user platform. Recommendation is
+> retained for Linux power-users; no global default change. See
+> §"Recommendation" and §"Cross-platform: negative replication
+> on Windows" below.
 
 > **Author:** superdeduper-overflow, 2026-05-31
 > **Repro environment:** Linux x86_64, 32 logical CPUs, sd v0.3.0 (commit 33ea5f9, optimized release build), czkawka_cli v11.0.1 (--locked build).
@@ -19,10 +30,34 @@ a cz-got-faster problem. At sd's optimal `--io-threads` value
 on this corpus, sd is **~1.9× faster than cz** (which is itself
 near-optimal at its default `-T 0`).
 
-This finding doesn't ship a fix. The default-multiplier choice
-affects every sd user; engine-main owns that call. This commit
-lands the measurement + a recommended path forward; replication
-on Mick's NEO + actual Dropbox 198 GB corpus is the next step.
+**But this result is Linux-only.** Benchmarker's Windows
+replication on NEO with a byte-exact corpus mirror shows the
+default-cliff doesn't reproduce — the Windows scheduler handles
+the oversubscription without measurable degradation. See
+§"Cross-platform: negative replication on Windows" for the data.
+The Linux speedup is real and is documented as a power-user
+recommendation; the global default is not changing.
+
+## Recommendation
+
+**Linux, high-CPU-count hosts (≥16 logical CPUs):** consider
+setting `--io-threads ≈ CPU_COUNT / 2` (e.g. `--io-threads 16`
+on a 32-CPU box) for heterogeneous corpora. The
+default-`threads × 3` value (`io-threads ≈ 96` on a 32-CPU box)
+triggers Linux scheduler thrashing on workloads where many
+files short-circuit at Tier-0 / Tier-1, costing ~2× wallclock
+vs the tuned value on the corpus measured here.
+
+**Windows:** no change recommended. NEO replication
+(2026-05-31; appendix) shows the Windows scheduler handles the
+`threads × 3` oversubscription cleanly. The curve from
+`io-threads = 8` upward is flat to within ~7%; default is
+already near-optimal there.
+
+**macOS:** not measured. If the kernel scheduler is closer to
+Linux's (XNU is BSD-derived; threading semantics differ from
+Windows), the Linux recommendation might apply; replication
+would close it out. Not on the critical path.
 
 ## Regime
 
@@ -177,33 +212,46 @@ trial CV is **11%**; at `--io-threads 16` the CV drops to
 signal of scheduler-driven non-determinism — exactly what
 oversubscription causes on heterogeneous workloads.
 
-## Recommended fix path (engine-main's call)
+## Recommended fix path (engine-main's call) — **resolved: HOLD**
 
-Engine main owns the default; this finding is the input.
-Possible directions, roughly in order of risk:
+> **2026-05-31 update:** Mick + engine concur HOLD per the
+> Windows negative-replication data in
+> §"Cross-platform: negative replication on Windows". No global
+> default change. Linux power-user recommendation retained in
+> §"Recommendation". The options below are preserved as the
+> original engineering analysis for posterity / future
+> reconsideration if a real cold-cache regression surfaces or
+> if a non-Windows scheduler shows the Linux cliff.
+
+Engine main owns the default. Original options the
+finding presented:
 
 1. **Default to `threads` instead of `threads × 3`.** Easiest;
    gives every user the right ballpark on every workload.
    Trade-off: leaves ~10-15% perf on the table on Tier-3-pure
-   corpora where the original `threads × 3` IS optimal. But
-   "always-good" beats "sometimes-2x-better, sometimes-2x-worse."
+   corpora where the original `threads × 3` IS optimal.
+   **Status: NOT SHIPPED.** Windows replication showed the
+   default cliff doesn't reproduce there; one-platform speedup
+   isn't worth a global default change that regresses
+   Tier-3-pure across the board.
 
 2. **Auto-tune per-Tier.** Use `threads` for Tier-1/Tier-2 (per-
    file syscall-heavy), `threads × 3` for Tier-3 (sustained
    read). Requires the per-Tier worker pool to split.
+   **Status: DEFERRED.** If a cold-cache regression surfaces
+   post-ship (the warm-cache regime caveat in §"Regime"), this
+   is the path forward.
 
 3. **Make the default workload-aware** at scan-start: probe the
    inventory's size distribution + pick a multiplier. Adds
    complexity at startup; likely not worth it.
+   **Status: NOT NEEDED** under the HOLD outcome.
 
 4. **Keep the default; surface a `--io-threads auto` hint** in
-   docs + GUI Settings → Advanced. Status-quo with better UX
-   for power users. Doesn't fix the per-user default.
-
-My read: **option 1 is the right ship.** The 10-15% Tier-3-pure
-loss is bounded; the 2× heterogeneous gain is the user-facing
-win. Mick's "user-workloads must beat cz" directive points
-heterogeneous, not Tier-3-pure.
+   docs + GUI Settings → Advanced.
+   **Status: PARTIALLY ADOPTED** via this doc's §"Recommendation"
+   block. A GUI Settings hint could still be added if Linux
+   power-users surface the issue more visibly.
 
 ## Caveats + scope
 
@@ -231,6 +279,65 @@ heterogeneous, not Tier-3-pure.
    (`--threads`, Tier-2 chunking, walker buffer sizes) might
    also be sub-optimal on heterogeneous workloads. Out of
    scope for this finding.
+
+## Cross-platform: negative replication on Windows
+
+Benchmarker re-ran this methodology on NEO with a byte-exact
+corpus mirror produced by the §"Reproduction recipe" generator
+below.
+
+> **NEO config:** 32-core Ryzen 9 9950X3D + Gen 4 NVMe,
+> Windows 11, sd v0.3.0 (commit 33ea5f9), czkawka_cli 11.0.1.
+> Same warmup + measurement protocol as Linux. 3.3 GiB corpus
+> distribution byte-exact to this doc's recipe.
+
+| `--io-threads` | mean (s) | Stage 4 (ms) |
+|----------------|---------:|-------------:|
+| 1              |  0.935   |  887         |
+| 8              |  0.362   |  316         |
+| 16             |  0.377   |  327         |
+| 32             |  0.351   |  306         |
+| 64             |  0.364   |  306         |
+| **96 (default)** | **0.376** | **318**  |
+
+**The Linux 2.21× cliff at default does NOT appear on
+Windows.** The curve is flat from `io-threads = 8` onward —
+spread ~7% across 8…96. The Windows scheduler absorbs the
+`threads × 3` oversubscription without measurable degradation.
+
+cz @ default on the same NEO + corpus: **0.571 s**. So
+**sd@default is 52% faster than cz@default on Windows.** The
+"cz beats sd at default" premise that motivated #98 doesn't
+hold on the primary user platform.
+
+### Why this matters for the recommendation
+
+The Linux speedup is real but **the scheduler-thrashing penalty
+is the Linux scheduler's behavior, not a universal sd-default
+mistune.** Changing the engine default to `threads × 1` would:
+
+- Help Linux power-users on this corpus shape (the 2.2× win
+  documented above).
+- Not help Windows users at all (default is already near-
+  optimal there).
+- Risk regressing sustained-read Tier-3-pure workloads on
+  every platform (where the original `threads × 3` intent
+  was sound and benchmarker numbers show sd already leads cz).
+
+**Outcome: HOLD.** Linux power-users get the documented
+recommendation; no global default change. If a future user
+reports the Linux issue in the wild, this doc is the
+explanation; the workaround is one flag.
+
+### Methodology fairness note
+
+This negative-replication appendix is preserved verbatim so
+the cross-platform truth is documented alongside the original
+Linux finding. The post-ship doc-only history (this commit +
+commits 51bd765 + 4020e0f) is the audit trail of how the
+HOLD decision was reached: Linux measurement → warm-cache
+regime callout → Windows replication → HOLD with
+power-user recommendation retained.
 
 ## Reproduction recipe
 
