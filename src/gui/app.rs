@@ -3689,69 +3689,24 @@ impl SuperdeduperApp {
         }
         Flow::Continue
     }
-}
 
-impl eframe::App for SuperdeduperApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_events();
-        if self.is_scanning {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        }
+    // ============================================================
+    // #140 phase-3 -- A-update-layout-panel-extraction. The 6
+    // layout panels (brand, menubar, header, overall-progress,
+    // sidebar, central) extracted from update() into named render
+    // fns. Unlike the modals these are NOT conditional + don't
+    // need the Flow enum -- they always paint. The 2 panels that
+    // emit events (menubar -> MenuAction, header -> want_settings)
+    // return those events to update() for post-render dispatch.
+    // ============================================================
 
-        // #140 -- A-update-modal-extraction. Early-return modals
-        // dispatched through per-modal render fns; each returns
-        // Flow::Return if it consumed the frame. The non-blocking
-        // modals below still inline for now (follow-up commit can
-        // stack them onto the same pattern).
-        if let Flow::Return = self.render_alpha_warning_modal(ctx) {
-            return;
-        }
-
-        // Action-progress modal — overlays the GUI while a worker
-        // thread is processing a destructive action (recycle,
-        // hardlink, safe-rename, archive, unsuperdeduper). Force a
-        // 33-ms repaint while it's up so the spinner animates even
-        // when no other event is firing. Rendered AFTER the rest of
-        // the UI below so it sits on top.
-        if self.state.action_in_progress.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        }
-
-        if let Flow::Return = self.render_resume_modal(ctx) {
-            return;
-        }
-
-        // #140 phase-2 -- A-update-modal-extraction: non-blocking
-        // modal dispatch. Each fn returns Flow::Continue uniformly,
-        // so the explicit `_ = ` discard documents the convention
-        // while still letting a future modal escalate to
-        // Flow::Return without changing the call shape.
-        let _ = self.render_settings_drift_modal(ctx);
-        #[cfg(feature = "telemetry")]
-        let _ = self.render_resubmit_prompt_modal(ctx);
-        let _ = self.render_archive_restore_modal(ctx);
-        let _ = self.render_archive_summary_modal(ctx);
-        #[cfg(feature = "telemetry")]
-        let _ = self.render_badge_multiplier_detail_modal(ctx);
-        let _ = self.render_destructive_confirmation_modal(ctx);
-        let _ = self.render_settings_modal(ctx);
-        #[cfg(feature = "telemetry")]
-        let _ = self.render_bench_modal(ctx);
-        let _ = self.render_channel_banner(ctx);
-        let _ = self.render_exclusions_safe_defaults_banner(ctx);
-
-        // File menubar — owns project lifecycle (New / Open / Save /
-        // Save As / Open Archive Manifest). Rendered as a thin strip
-        // above the header so it doesn't intrude on the always-visible
-        // status bar.
-        let mut want_settings = false;
-        let mut menu_action: Option<MenuAction> = None;
-        // Brand strip: shield logo + "SuperDeDuper" name above
-        // the menubar (Mick 2026-05-25T03:45Z; resized 2026-05-27
-        // per #121 — logo bumped ~2.5× and vertical-centered beside
-        // the wordmark). Dedicated panel so the menubar stays
-        // compact; the shield's transparent PNG shows PANEL_DEEP
-        // through its negative space.
+    /// Brand strip: shield logo + "SuperDeDuper" name above the
+    /// menubar (Mick 2026-05-25T03:45Z; resized 2026-05-27 per
+    /// #121 — logo bumped ~2.5× and vertical-centered beside the
+    /// wordmark). Dedicated panel so the menubar stays compact;
+    /// the shield's transparent PNG shows PANEL_DEEP through its
+    /// negative space.
+    fn render_brand_panel(&mut self, ctx: &egui::Context) {
         TopBottomPanel::top("brand")
             .frame(
                 Frame::default()
@@ -3773,7 +3728,16 @@ impl eframe::App for SuperdeduperApp {
                     );
                 });
             });
+    }
 
+    /// File menubar — owns project lifecycle (New / Open / Save /
+    /// Save As / Open Archive Manifest / Recent / Quit). Rendered
+    /// as a thin strip above the header so it doesn't intrude on
+    /// the always-visible status bar. Returns the menu choice (or
+    /// None) so update() can dispatch after every panel has
+    /// rendered for the frame.
+    fn render_menubar_panel(&mut self, ctx: &egui::Context) -> Option<MenuAction> {
+        let mut menu_action: Option<MenuAction> = None;
         TopBottomPanel::top("menubar")
             .frame(Frame::default().fill(theme::PANEL_DEEP).inner_margin(egui::vec2(8.0, 2.0)))
             .show(ctx, |ui| {
@@ -3866,7 +3830,20 @@ impl eframe::App for SuperdeduperApp {
                     });
                 });
             });
+        menu_action
+    }
 
+    /// Header panel — header::show() returns the user's intent
+    /// (open settings, open benchmark) and a stats_rect that the
+    /// progress-bar fill used to anchor against (now discarded
+    /// since the anchor moved to progress-bar fill_rect itself).
+    /// Returns `want_settings` so update() can flip
+    /// `self.settings_open` after every panel has rendered.
+    /// `self.bench.open()` is called inline on the
+    /// `OpenBenchmark` branch (telemetry-gated) since the bench
+    /// mutation lives on `self` directly.
+    fn render_header_panel(&mut self, ctx: &egui::Context) -> bool {
+        let mut want_settings = false;
         let mut stats_rect: Option<egui::Rect> = None;
         TopBottomPanel::top("header")
             .frame(Frame::default().fill(theme::BG).inner_margin(8.0))
@@ -3886,59 +3863,16 @@ impl eframe::App for SuperdeduperApp {
                 }
                 stats_rect = out.stats_rect;
             });
-        let _ = stats_rect; // anchor moved to progress-bar fill_rect
-                            // Cache-fast-forward effect: STRICTLY resume-only. Only fires
-                            // while resume_effect_active is true, the engine is in
-                            // Hashing, and the rate exceeds the fast-forward threshold.
-                            // After catch-up (Sparkles emits `left_fast_forward`) we
-                            // clear resume_effect_active so the effect ends and the bar
-                            // returns to its normal render for the rest of the scan.
-        if self.resume_effect_active
-            && matches!(
-                self.state.overall.stage,
-                crate::gui::events::OverallStage::Hashing
-            )
-        {
-            // #99 PR13 — feed the sparkles a counter that climbs
-            // through cache hits even while `state.overall.done` is
-            // pinned by PR11's bar-floor. `Tier1Head.total` is bumped
-            // by every per-file callback (cache hits included), so
-            // its rate tracks the actual catch-up speed regardless
-            // of whether the visible bar is moving.
-            //
-            // Without this, sparkles' delta during catch-up is 0 —
-            // PR11's floor pins state.overall.done at the credit
-            // position — and the effect can't fire until the bar
-            // starts climbing past the credit, which is AFTER
-            // catch-up finishes. Mick's spec: effect should fire
-            // FROM chunk 1, during catch-up, not after.
-            let sparkle_input = self
-                .state
-                .stage_counts
-                .get(&crate::gui::events::Stage::Tier1Head)
-                .map(|c| c.total)
-                .unwrap_or(self.state.overall.done);
-            let signals = self.sparkles.tick(sparkle_input, self.last_bar_fill);
-            // Resume catch-up sounds intentionally removed — the
-            // synth attempts didn't land. Scan-finish chime in
-            // state.rs is untouched.
-            if signals.left_fast_forward {
-                self.resume_effect_active = false;
-            }
-            if self.sparkles.active() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            }
-        }
-        if want_settings {
-            self.settings_open = true;
-        }
-        if let Some(act) = menu_action {
-            self.dispatch_menu_action(act);
-        }
+        let _ = stats_rect; // anchor moved to progress-bar fill_rect.
+        want_settings
+    }
 
-        // Overall progress strip sits directly under the header and
-        // spans the full window so the user always sees "what stage,
-        // how much, how long" without hunting.
+    /// Overall progress strip — sits directly under the header
+    /// and spans the full window so the user always sees "what
+    /// stage, how much, how long" without hunting. Captures the
+    /// bar fill rect into `self.last_bar_fill` so the sparkles
+    /// overlay can clip to it later in the frame.
+    fn render_overall_progress_panel(&mut self, ctx: &egui::Context) {
         TopBottomPanel::top("overall-progress")
             .frame(
                 Frame::default()
@@ -3946,15 +3880,21 @@ impl eframe::App for SuperdeduperApp {
                     .inner_margin(egui::vec2(8.0, 4.0)),
             )
             .show(ctx, |ui| {
-                // While the resume cache-fast-forward is active the
-                // bar fills in dystopian red instead of the normal
-                // accent teal. Snaps back the very next frame after
-                // catch-up.
+                // While the resume cache-fast-forward is active
+                // the bar fills in dystopian red instead of the
+                // normal accent teal. Snaps back the very next
+                // frame after catch-up.
                 let ff = self.resume_effect_active && self.sparkles.is_fast_forwarding();
                 let bar_rects = overall_bar::show_with(ui, &self.state, ff);
                 self.last_bar_fill = bar_rects.fill;
             });
+    }
 
+    /// Left sidebar — cache banner, scan-mode picker, roots
+    /// panel, funnel diagnostic, and (telemetry-gated) the badge
+    /// wall at the bottom. Wrapped in a ScrollArea so #115's
+    /// low-res-screen "badges below the fold" case is reachable.
+    fn render_sidebar_panel(&mut self, ctx: &egui::Context) {
         SidePanel::left("sidebar")
             .resizable(true)
             .default_width(300.0)
@@ -3964,27 +3904,30 @@ impl eframe::App for SuperdeduperApp {
                 // #115 — wrap the whole sidebar in a vertical
                 // ScrollArea so the badge wall (and anything else
                 // below the fold) is reachable on lower-res screens.
-                // Before this wrap, ~1366×768 and smaller pushed the
-                // badges below the viewport with no scroll affordance.
-                // auto_shrink([false, false]) keeps the panel at full
-                // width + height even when content is short.
+                // Before this wrap, ~1366×768 and smaller pushed
+                // the badges below the viewport with no scroll
+                // affordance. auto_shrink([false, false]) keeps
+                // the panel at full width + height even when
+                // content is short.
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar-scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Render the "cached scan available" banner before
-                        // the scan controls so it's visible above the Start
-                        // button. The banner is a no-op when no cache exists
-                        // for the current roots OR when the user has
-                        // settings.always_use_cache enabled.
+                        // Render the "cached scan available"
+                        // banner before the scan controls so it's
+                        // visible above the Start button. The
+                        // banner is a no-op when no cache exists
+                        // for the current roots OR when the user
+                        // has settings.always_use_cache enabled.
                         crate::gui::widgets::cache_banner::show(
                             ui,
                             &mut self.state,
                             self.persisted.settings.always_use_cache,
                         );
-                        // #25 v2.5: scan-mode dropdown above the Roots panel
-                        // per spec §3.8 ("top of scan-config panel"). Selection
-                        // lives on `self.scan_mode` — session-sticky, NOT
+                        // #25 v2.5: scan-mode dropdown above the
+                        // Roots panel per spec §3.8 ("top of
+                        // scan-config panel"). Selection lives on
+                        // `self.scan_mode` — session-sticky, NOT
                         // persisted across launches per spec.
                         crate::gui::widgets::scan_mode_picker::show(
                             ui,
@@ -4006,10 +3949,11 @@ impl eframe::App for SuperdeduperApp {
                         ui.add_space(6.0);
                         funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
 
-                        // §10.4 badge-wall: bottom-left always-visible
-                        // achievements grid. Auto-degrades to §10.5 mini-
-                        // widget when the sidebar is narrower than ~280 px
-                        // (3 tile-columns won't fit).
+                        // §10.4 badge-wall: bottom-left always-
+                        // visible achievements grid. Auto-degrades
+                        // to §10.5 mini-widget when the sidebar is
+                        // narrower than ~280 px (3 tile-columns
+                        // won't fit).
                         #[cfg(feature = "telemetry")]
                         {
                             ui.add_space(12.0);
@@ -4027,7 +3971,14 @@ impl eframe::App for SuperdeduperApp {
                         }
                     });
             });
+    }
 
+    /// Central panel — drive scope at the top (clickable per-
+    /// drive filter), then the results-tab strip (Treemap /
+    /// Groups / Log / History / Preview), then the active tab's
+    /// content. Drive-scope clicks toggle `self.selected_drive`;
+    /// group-table clicks dispatch through `dispatch_group_action`.
+    fn render_central_panel(&mut self, ctx: &egui::Context) {
         CentralPanel::default()
             .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
             .show(ctx, |ui| {
@@ -4171,6 +4122,126 @@ impl eframe::App for SuperdeduperApp {
                     self.dispatch_group_action(a);
                 }
             });
+    }
+}
+
+impl eframe::App for SuperdeduperApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_events();
+        if self.is_scanning {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
+        // #140 -- A-update-modal-extraction. Early-return modals
+        // dispatched through per-modal render fns; each returns
+        // Flow::Return if it consumed the frame. The non-blocking
+        // modals below still inline for now (follow-up commit can
+        // stack them onto the same pattern).
+        if let Flow::Return = self.render_alpha_warning_modal(ctx) {
+            return;
+        }
+
+        // Action-progress modal — overlays the GUI while a worker
+        // thread is processing a destructive action (recycle,
+        // hardlink, safe-rename, archive, unsuperdeduper). Force a
+        // 33-ms repaint while it's up so the spinner animates even
+        // when no other event is firing. Rendered AFTER the rest of
+        // the UI below so it sits on top.
+        if self.state.action_in_progress.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
+        if let Flow::Return = self.render_resume_modal(ctx) {
+            return;
+        }
+
+        // #140 phase-2 -- A-update-modal-extraction: non-blocking
+        // modal dispatch. Each fn returns Flow::Continue uniformly,
+        // so the explicit `_ = ` discard documents the convention
+        // while still letting a future modal escalate to
+        // Flow::Return without changing the call shape.
+        let _ = self.render_settings_drift_modal(ctx);
+        #[cfg(feature = "telemetry")]
+        let _ = self.render_resubmit_prompt_modal(ctx);
+        let _ = self.render_archive_restore_modal(ctx);
+        let _ = self.render_archive_summary_modal(ctx);
+        #[cfg(feature = "telemetry")]
+        let _ = self.render_badge_multiplier_detail_modal(ctx);
+        let _ = self.render_destructive_confirmation_modal(ctx);
+        let _ = self.render_settings_modal(ctx);
+        #[cfg(feature = "telemetry")]
+        let _ = self.render_bench_modal(ctx);
+        let _ = self.render_channel_banner(ctx);
+        let _ = self.render_exclusions_safe_defaults_banner(ctx);
+
+        // File menubar — owns project lifecycle (New / Open / Save /
+        // Save As / Open Archive Manifest). Rendered as a thin strip
+        // above the header so it doesn't intrude on the always-visible
+        // status bar.
+        // #140 phase-3 -- A-update-layout-panel-extraction. The 6
+        // layout panels render through named fns; the 2 that emit
+        // events (menubar -> MenuAction, header -> want_settings)
+        // return them so the resume-effect state machine and
+        // post-render dispatch (settings-open + menu-action) can
+        // both run in the same frame, in their original sequence.
+        self.render_brand_panel(ctx);
+        let menu_action = self.render_menubar_panel(ctx);
+        let want_settings = self.render_header_panel(ctx);
+                            // Cache-fast-forward effect: STRICTLY resume-only. Only fires
+                            // while resume_effect_active is true, the engine is in
+                            // Hashing, and the rate exceeds the fast-forward threshold.
+                            // After catch-up (Sparkles emits `left_fast_forward`) we
+                            // clear resume_effect_active so the effect ends and the bar
+                            // returns to its normal render for the rest of the scan.
+        if self.resume_effect_active
+            && matches!(
+                self.state.overall.stage,
+                crate::gui::events::OverallStage::Hashing
+            )
+        {
+            // #99 PR13 — feed the sparkles a counter that climbs
+            // through cache hits even while `state.overall.done` is
+            // pinned by PR11's bar-floor. `Tier1Head.total` is bumped
+            // by every per-file callback (cache hits included), so
+            // its rate tracks the actual catch-up speed regardless
+            // of whether the visible bar is moving.
+            //
+            // Without this, sparkles' delta during catch-up is 0 —
+            // PR11's floor pins state.overall.done at the credit
+            // position — and the effect can't fire until the bar
+            // starts climbing past the credit, which is AFTER
+            // catch-up finishes. Mick's spec: effect should fire
+            // FROM chunk 1, during catch-up, not after.
+            let sparkle_input = self
+                .state
+                .stage_counts
+                .get(&crate::gui::events::Stage::Tier1Head)
+                .map(|c| c.total)
+                .unwrap_or(self.state.overall.done);
+            let signals = self.sparkles.tick(sparkle_input, self.last_bar_fill);
+            // Resume catch-up sounds intentionally removed — the
+            // synth attempts didn't land. Scan-finish chime in
+            // state.rs is untouched.
+            if signals.left_fast_forward {
+                self.resume_effect_active = false;
+            }
+            if self.sparkles.active() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+        if want_settings {
+            self.settings_open = true;
+        }
+        if let Some(act) = menu_action {
+            self.dispatch_menu_action(act);
+        }
+
+        // #140 phase-3 -- A-update-layout-panel-extraction.
+        // Bottom 3 layout panels: progress strip + sidebar +
+        // central. Pure renders; no event returns.
+        self.render_overall_progress_panel(ctx);
+        self.render_sidebar_panel(ctx);
+        self.render_central_panel(ctx);
 
         // Action-progress modal renders LAST so it overlays
         // everything else (CentralPanel, SidePanel, TopBottomPanels).
