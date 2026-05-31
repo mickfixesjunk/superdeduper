@@ -16,11 +16,67 @@
 //! directive becomes a one-grep affair.
 
 use std::fs::OpenOptions;
+use std::io;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
+
+/// Resolve `<data_dir>` for the persistent log file. Inlines the same
+/// per-platform path logic that `leaderboard::install::data_dir_public()`
+/// uses, so log writes work in both `--features telemetry` (default)
+/// builds AND `--no-default-features` builds where the leaderboard
+/// module is feature-gated out.
+///
+/// **Why duplicated**: `crate::leaderboard::install` is gated behind
+/// `#[cfg(feature = "telemetry")]` (engine binary opts in for telemetry
+/// at build time). Without this local copy, `--no-default-features`
+/// builds fail to compile at `open_log_file()` with `cannot find
+/// 'leaderboard' in the crate root`. Mick's 2026-05-29 directive
+/// ("PERSIST engine logs to disk ALWAYS") means the disk log MUST
+/// continue to work on the closed-source telemetry-off binary too;
+/// gating the call would regress observability.
+///
+/// **Lifetime**: temporary. The planned `superdeduper-log` leaf crate
+/// (P0-D prerequisite, post-launch) owns this surface; the local
+/// duplication retires when log moves out of `src/log.rs`. Until then,
+/// keep this function in sync with `leaderboard::install::data_dir()`.
+fn log_data_dir() -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA not set"))?;
+        let mut p = PathBuf::from(local);
+        p.push("superdeduper");
+        Ok(p)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+        let mut p = PathBuf::from(home);
+        p.push("Library");
+        p.push("Application Support");
+        p.push("superdeduper");
+        Ok(p)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            let mut p = PathBuf::from(xdg);
+            p.push("superdeduper");
+            return Ok(p);
+        }
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+        let mut p = PathBuf::from(home);
+        p.push(".local");
+        p.push("share");
+        p.push("superdeduper");
+        Ok(p)
+    }
+}
 
 /// Lazily-opened log file handle. `Some(f)` after first successful open;
 /// `None` if the log dir / file couldn't be created (we still flush to
@@ -39,7 +95,7 @@ fn open_attempted() -> &'static Mutex<bool> {
 
 fn open_log_file() -> Option<std::fs::File> {
     // Build path: <data_dir>/log/superdeduper.<unix_secs>.<pid>.log
-    let data = crate::leaderboard::install::data_dir_public().ok()?;
+    let data = log_data_dir().ok()?;
     let log_dir = data.join("log");
     std::fs::create_dir_all(&log_dir).ok()?;
 
