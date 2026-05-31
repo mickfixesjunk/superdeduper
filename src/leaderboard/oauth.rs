@@ -572,6 +572,13 @@ pub fn build_auth_url(
         Provider::Discord => {
             let client_id =
                 discord_client_id(channel).ok_or(OauthError::NoClientId { provider, channel })?;
+            // A-discord-email-scope (2026-05-30, web 23:10 PDT): D11a requires
+            // `verified: bool` from Discord's /users/@me, which is gated by the
+            // `email` scope. Without it, account.discord_verified=null and the
+            // server's lane=ranked + provider=discord gate 403s every Discord-
+            // linked ranked attempt. Engine drops the email VALUE at exchange-
+            // time (server-side); only the verified bool is persisted on
+            // accounts.discord_verified.
             let url = format!(
                 "{}?client_id={}\
                  &response_type=code\
@@ -580,7 +587,7 @@ pub fn build_auth_url(
                  &state={}",
                 oauth_authorize_endpoint(provider),
                 urlencode(client_id),
-                urlencode("identify"),
+                urlencode("identify email"),
                 urlencode(redirect_uri),
                 urlencode(state),
             );
