@@ -551,6 +551,14 @@ pub fn answer_challenge_from_dir_v3(
 /// carries `answers`, the V3 `result_digest`, and the `k_echo` (base64-
 /// std encoded K) so the server can confirm the client used the K it
 /// was issued on /bench/start.
+///
+/// V3.1 ADDITIVE FIELD (Phase C D1, 2026-05-30): when `rep_hashes_v3_1`
+/// is `Some`, the bench_proof gains a `rep_hashes` array (canonical
+/// group order, std-base64-encoded rep_hash_v3_1 values). The legacy V3
+/// `result_digest` field stays in place; server picks the verification
+/// path by `protocol_version`. Hard cutover to V3.1-only result_digest
+/// follows on `protocol_version="v3.1-mutate"` once web's verifier
+/// flips (coordinated separately).
 #[allow(clippy::too_many_arguments)]
 pub fn to_canonical_bench_v3(
     protocol_version: &str,
@@ -561,12 +569,26 @@ pub fn to_canonical_bench_v3(
     found_dupsets: &[Vec<u64>],
     cold_enforced: bool,
     k: &[u8; 32],
+    rep_hashes_v3_1: Option<&[[u8; 32]]>,
 ) -> super::submission::CanonicalBench {
-    let bench_proof = serde_json::json!({
+    let mut bench_proof = serde_json::json!({
         "answers": answers,
         "result_digest": result_digest_v3(found_dupsets, k),
         "k_echo": b64(k),
     });
+    if let Some(reps) = rep_hashes_v3_1 {
+        let reps_b64: Vec<String> = reps.iter().map(b64).collect();
+        bench_proof["rep_hashes"] = serde_json::Value::Array(
+            reps_b64.into_iter().map(serde_json::Value::String).collect(),
+        );
+        // Also emit the V3.1 result_digest under a distinct field for
+        // forward-compat. When protocol_version flips to "v3.1-mutate",
+        // server reads `result_digest_v3_1` instead of `result_digest`.
+        // Until then both are present + the legacy field is authoritative.
+        bench_proof["result_digest_v3_1"] = serde_json::Value::String(
+            result_digest_v3_1(found_dupsets, reps, k),
+        );
+    }
     super::submission::CanonicalBench {
         protocol_version: protocol_version.to_string(),
         corpus_version: corpus_version.to_string(),
@@ -575,6 +597,51 @@ pub fn to_canonical_bench_v3(
         bench_proof,
         cold_enforced,
     }
+}
+
+/// Compute V3.1 rep_hashes for every canonical dup-group representative.
+/// For each group, finds the lowest path_index as the rep, reads the rep
+/// file's full content from `corpus_dir`, derives the V3 per_file_key,
+/// applies the keystream to get the mutated bytes, and emits the
+/// rep_hash_v3_1.
+///
+/// Result is in the SAME ORDER as `dupsets` (NOT canonical-sorted) so
+/// callers can pass it directly to `result_digest_v3_1` which permutes
+/// in lockstep with its canonical sort.
+///
+/// Cost per rep: one full file read + one BLAKE3 (for file_hash) + one
+/// HMAC-SHA256 (per_file_key) + one ChaCha20 keystream of file_size +
+/// one XOR + one BLAKE3 over the mutated bytes. Dominated by the
+/// ChaCha20 keystream + final BLAKE3 (~150-300 MB/s combined). For
+/// v2-full's ~6 GB unique-rep content this is ~5s extra per bench;
+/// matches the spec's expected cost.
+///
+/// Filenames follow the engine's `f{:010}.bin` convention used by
+/// `answer_challenge_from_dir_v3`. Returns the first I/O error if any
+/// file is missing or unreadable; mismatched file sizes between reads
+/// and the spec are caught downstream by the verifier comparing
+/// rep_hashes against its own groundtruth.
+pub fn compute_rep_hashes_v3_1(
+    corpus_dir: &Path,
+    dupsets: &[Vec<u64>],
+    k: &[u8; 32],
+) -> std::io::Result<Vec<[u8; 32]>> {
+    let mut reps: Vec<[u8; 32]> = Vec::with_capacity(dupsets.len());
+    for group in dupsets {
+        let rep_pi = *group.iter().min().expect("dup-group must be non-empty");
+        let file_name = format!("f{rep_pi:010}.bin");
+        let file_path = corpus_dir.join(&file_name);
+        let mut f = std::fs::File::open(&file_path)?;
+        let file_size = f.metadata()?.len();
+        let mut canonical = Vec::with_capacity(file_size as usize);
+        f.read_to_end(&mut canonical)?;
+        let file_hash = *blake3::hash(&canonical).as_bytes();
+        let pf_key = per_file_key_v3(k, &file_hash);
+        let mutated = mutate_bytes_v3(&pf_key, 0, &canonical);
+        let h = rep_hash_v3_1(rep_pi, k, file_size, &mutated);
+        reps.push(h);
+    }
+    Ok(reps)
 }
 
 /// Lowercase hex of a 32-byte digest (for cross-checking against research's

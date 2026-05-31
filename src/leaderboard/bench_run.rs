@@ -331,6 +331,32 @@ pub fn run(
         (answers, bytes_read, digest)
     };
 
+    // V3.1 ADDITIVE (Phase C D1, 2026-05-30): when running V3, compute
+    // per-canonical-group rep_hash_v3_1 over the FULL MUTATED CONTENT of
+    // each rep. Closes the V3 forge where a precomputed-groundtruth
+    // attacker could emit a valid result_digest without reading any
+    // bytes. Cost: ~1 file read + 1 BLAKE3 + 1 ChaCha20 + 1 BLAKE3 per
+    // canonical group (≈5s extra on v2-full). Failure is non-fatal —
+    // logs a warn and proceeds without rep_hashes; legacy V3 path
+    // remains functional (server validates v3 result_digest from the
+    // existing bench_proof.result_digest field). Hard cutover to V3.1-only
+    // happens when protocol_version flips to "v3.1-mutate".
+    let rep_hashes_v3_1: Option<Vec<[u8; 32]>> = if use_v3 {
+        let k = k_v3.as_ref().unwrap();
+        progress("computing V3.1 rep_hashes");
+        match bench_client::compute_rep_hashes_v3_1(&corpus_dir, &dupsets, k) {
+            Ok(reps) => Some(reps),
+            Err(e) => {
+                crate::log_warn!(
+                    "bench: rep_hashes_v3_1 compute failed ({e}); proceeding without — legacy V3 result_digest still authoritative"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 5. assemble + 6. submit — bench_proof carries k_echo when V3,
     // challenge_blob_echo when V2, neither when V1.
     let bench = if use_v3 {
@@ -338,6 +364,7 @@ pub fn run(
             &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
             cold_enforced,
             k_v3.as_ref().unwrap(),
+            rep_hashes_v3_1.as_deref(),
         )
     } else {
         bench_client::to_canonical_bench_v(
