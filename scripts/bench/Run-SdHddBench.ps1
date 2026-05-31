@@ -385,7 +385,7 @@ $rammapStatus = if ($null -eq $RamMap) { 'not available' } else { $RamMap }
 [void]$md.AppendLine("- **Cold cache (RAMMap):** $DropCacheBetweenTrials  (RAMMap: $rammapStatus)")
 [void]$md.AppendLine("- **Perf counters captured:** $CaptureDiskCounters")
 [void]$md.AppendLine("- **Targets:**")
-foreach ($t in $TrialTargets) { [void]$md.AppendLine("  - `$t`") }
+foreach ($t in $TrialTargets) { [void]$md.AppendLine("  - ``$t``") }
 [void]$md.AppendLine()
 
 # Per-config aggregate (mean wall + min/max).
