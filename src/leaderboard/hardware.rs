@@ -994,6 +994,14 @@ fn normalize_cpu_brand(raw: &str) -> String {
     digits_end[..cut].trim_end().to_string()
 }
 
+/// Public hook (#138 2026-05-30): expose the raw OS-source brand string —
+/// the value BEFORE normalize_cpu_brand strips the "-Core Processor"
+/// suffix — so `superdeduper debug cpu-brand` can dump bytes for NEO
+/// root-cause analysis. Wraps the per-platform detect_cpu_model().
+pub fn debug_raw_cpu_brand() -> String {
+    detect_cpu_model()
+}
+
 #[cfg(target_os = "linux")]
 fn detect_cpu_model() -> String {
     use std::io::BufRead;
@@ -1367,9 +1375,25 @@ fn read_registry_string(subkey: &str, value: &str) -> Option<String> {
     if queried.is_err() {
         return None;
     }
-    let chars = (buf_bytes as usize) / 2;
+    // Defensive scan (#138 sdd-testwin 2026-05-30): on NEO the registry
+    // reader was producing cpu_model_string="AMD Ryzen 9 9950X3D2" with a
+    // trailing digit not present in the source string. Cap `chars` at the
+    // buffer size in case `buf_bytes` over-reports (some Windows APIs
+    // return the input size on success rather than the actual write); scan
+    // forward for the first nul OR the buffer end; then strip trailing
+    // non-printable wchars (anything < 0x20) AND whitespace from the final
+    // string so any padding/trailing garbage doesn't leak into the result.
+    let chars = ((buf_bytes as usize) / 2).min(buf.len());
     let len = buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
-    let s = String::from_utf16_lossy(&buf[..len]).trim().to_string();
+    // Trim trailing non-printable wchars at the wchar level (cheaper than
+    // round-tripping through String for the same effect, and catches
+    // sub-0x20 control codes that String::trim doesn't always treat as
+    // whitespace depending on Unicode classification).
+    let mut clean_end = len;
+    while clean_end > 0 && buf[clean_end - 1] < 0x20 {
+        clean_end -= 1;
+    }
+    let s = String::from_utf16_lossy(&buf[..clean_end]).trim().to_string();
     if s.is_empty() {
         None
     } else {

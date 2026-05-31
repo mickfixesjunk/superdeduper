@@ -556,7 +556,33 @@ fn run_debug(cmd: superdeduper::cli::DebugCommand) -> anyhow::Result<()> {
         DebugCommand::BenchDedupDiff { dir } => run_bench_dedup_diff(dir),
         #[cfg(feature = "telemetry")]
         DebugCommand::BenchClusterAudit { dir, tier } => run_bench_cluster_audit(dir, tier),
+        DebugCommand::CpuBrand => run_debug_cpu_brand(),
     }
+}
+
+/// DEBUG (#138, 2026-05-30): dump the raw bytes underlying cpu_model_string
+/// so sdd-testwin can root-cause the NEO trailing-"2" finding empirically.
+/// Prints the OS-specific source string + a hex view of the wchar/byte
+/// buffer + the normalized output that lands in submissions.
+fn run_debug_cpu_brand() -> anyhow::Result<()> {
+    use superdeduper::leaderboard::hardware;
+    let raw = hardware::debug_raw_cpu_brand();
+    let normalized = hardware::detect().cpu_model_string;
+    println!("== cpu_model_string debug ==");
+    println!();
+    println!("Raw source (as read from OS):");
+    println!("  string  : {raw:?}");
+    println!("  length  : {} chars / {} bytes (utf-8)", raw.chars().count(), raw.len());
+    println!();
+    println!("Hex view (UTF-16 wchars, byte order LE):");
+    for (i, c) in raw.encode_utf16().enumerate() {
+        let ch = char::from_u32(c as u32).filter(|c| !c.is_control()).map(|c| c.to_string()).unwrap_or_else(|| "·".to_string());
+        println!("  [{i:3}] 0x{c:04x}  {ch}");
+    }
+    println!();
+    println!("After normalize_cpu_brand (what ships in submissions):");
+    println!("  result  : {normalized:?}");
+    Ok(())
 }
 
 /// DEBUG (#116): hash every corpus file on disk, group by hash, and report

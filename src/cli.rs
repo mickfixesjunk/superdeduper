@@ -415,6 +415,16 @@ pub enum DebugCommand {
         #[arg(long, value_enum, default_value_t = BenchTier::Full)]
         tier: BenchTier,
     },
+
+    /// DEBUG (#138, 2026-05-30): dump the raw bytes underlying
+    /// `cpu_model_string` so sdd-testwin can root-cause the NEO
+    /// trailing-"2" finding. Prints (a) the OS-specific source
+    /// string verbatim (registry value on Windows, /proc/cpuinfo on
+    /// Linux, sysctl on macOS), (b) a hex view of the wchar/byte
+    /// buffer, (c) the normalized output that lands in submissions.
+    /// Windows-only-meaningful for the bug under investigation but
+    /// available on every platform for parity.
+    CpuBrand,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
