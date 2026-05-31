@@ -88,10 +88,25 @@ pub fn run(
     let install_key = state
         .install_key()
         .ok_or_else(|| anyhow::anyhow!("install_key_hex malformed; re-register"))?;
+    // A-bench-start-protocol-version (2026-05-30, testrunner 19:32 PST): the
+    // server's /bench/start defaults to "tbench-1" when the request omits
+    // `protocol_version`, which 400s on V3-only corpora ("corpus-v3-*"). The
+    // dual-protocol engine knows how to speak both V3-mutate and the V2/V1
+    // baseline; advertise the highest version we support for the corpus by
+    // matching on the corpus_version prefix. v3 corpora declare
+    // protocol_supported=['v3-mutate'] server-side; older corpora accept
+    // "tbench-1". Hardcoded pattern match keeps the fix small until a real
+    // protocol-negotiation handshake lands.
+    let req_protocol_version = if corpus_version.starts_with("corpus-v3-") {
+        "v3-mutate"
+    } else {
+        "tbench-1"
+    };
     let start_payload = serde_json::json!({
         "install_id": state.install_id,
         "corpus_version": corpus_version,
         "tier": tier,
+        "protocol_version": req_protocol_version,
     });
     let start_body = super::hmac_signer::canonical_body(&start_payload);
     let start_signature = super::hmac_signer::sign(&install_key, &start_body);
