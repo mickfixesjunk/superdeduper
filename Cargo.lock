@@ -4390,6 +4390,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "superdeduper-hmac-signer",
  "symphonia",
  "tar",
  "tempfile",
@@ -4403,6 +4404,15 @@ dependencies = [
  "uuid",
  "windows 0.58.0",
  "winresource",
+]
+
+[[package]]
+name = "superdeduper-hmac-signer"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

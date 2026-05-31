@@ -1,6 +1,6 @@
 [package]
 name = "superdeduper"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.87"
 description = "superdeduper — the fastest duplicate file finder for Windows / NTFS."
@@ -85,6 +85,11 @@ rodio = { version = "0.19", optional = true, default-features = false }
 #   install_id wants a real RFC 4122 v4 UUID per client-spec §4.3.
 ureq = { version = "2.10", optional = true, default-features = false, features = ["json", "tls"] }
 hmac = { version = "0.12", optional = true }
+# Phase 0 leaf crate (2026-05-31): hmac_signer body extracted into its own
+# crate so the future bench-real / bench-stub can depend on it without
+# dragging in the entire engine binary. Engine's leaderboard::hmac_signer
+# module is now a thin re-export shim around this dep.
+superdeduper-hmac-signer = { path = "crates/superdeduper-hmac-signer", optional = true }
 uuid = { version = "1.10", optional = true, features = ["v4"] }
 # T-BENCH-ME canonical-bench (telemetry): deterministic corpus generator
 # (RFC-8439 ChaCha20 keystream w/ StreamCipherSeek for O(1) random-access
@@ -168,7 +173,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64", "dep:tar"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64", "dep:tar", "dep:superdeduper-hmac-signer"]
 # T1.2 perceptual image similarity (#25). Pulls `image` for decode
 # + `image_hasher` for the dHash/aHash/pHash family. Off by default
 # while the feature lands incrementally — first slice is just the
@@ -282,3 +287,14 @@ strip = "symbols"
 [profile.bench]
 opt-level = 3
 lto = "thin"
+
+# ---------------------------------------------------------------------------
+# Phase 0 trait extraction (2026-05-31): root Cargo.toml is both [package]
+# AND [workspace] root. The root engine crate lives here; leaf crates that
+# the future bench-real / bench-stub can depend on without an engine
+# back-import live in crates/. Today only superdeduper-hmac-signer; more
+# follow as P0-C..P0-F land.
+# ---------------------------------------------------------------------------
+[workspace]
+members = [".", "crates/superdeduper-hmac-signer"]
+resolver = "2"

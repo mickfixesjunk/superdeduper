@@ -1,0 +1,13 @@
+[package]
+name = "superdeduper-hmac-signer"
+version = "0.1.0"
+edition = "2021"
+description = "HMAC-SHA256 canonical-body signing for superdeduper leaderboard / bench / action endpoints. Phase 0 leaf crate extracted from src/leaderboard/hmac_signer.rs so the future bench-real / bench-stub crates can depend on it without cyclic engine imports."
+license = "MIT"
+repository = "https://github.com/mickfixesjunk/superdeduper"
+publish = false
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+serde_json = "1"
