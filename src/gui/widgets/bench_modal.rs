@@ -326,20 +326,11 @@ fn run_worker(
     }
 }
 
-/// What the modal asks the app to do after this frame.
-pub enum BenchModalAction {
-    None,
-    /// Open the existing full-share-preview / privacy surface (Settings -> Privacy).
-    OpenSharePreview,
-}
-
-/// Render the modal if open. Returns an action for the app to handle (e.g.
-/// route to the existing share-preview). Call once per frame from `update`.
-pub fn show(state: &mut BenchUiState, ctx: &egui::Context) -> BenchModalAction {
+/// Render the modal if open. Call once per frame from `update`.
+pub fn show(state: &mut BenchUiState, ctx: &egui::Context) {
     if !state.open {
-        return BenchModalAction::None;
+        return;
     }
-    let mut action = BenchModalAction::None;
     let mut open = true;
     egui::Window::new("Benchmark your machine — Dedupe Hall of Fame")
         .collapsible(false)
@@ -349,7 +340,7 @@ pub fn show(state: &mut BenchUiState, ctx: &egui::Context) -> BenchModalAction {
         .show(ctx, |ui| match state.phase.clone() {
             Phase::Lane => lane_view(state, ui),
             Phase::Linking => linking_view(state, ui),
-            Phase::Consent => consent_view(state, ui, &mut action),
+            Phase::Consent => consent_view(state, ui),
             Phase::Running => running_view(state, ui, ctx),
             Phase::Done => done_view(state, ui),
         });
@@ -378,7 +369,6 @@ pub fn show(state: &mut BenchUiState, ctx: &egui::Context) -> BenchModalAction {
         state.cancel.store(true, Ordering::Relaxed);
         state.open = false;
     }
-    action
 }
 
 /// Mick bench-lane UX (2026-05-30): two-button modal — Ranked (primary) vs
@@ -616,7 +606,7 @@ fn persist_lane(lane: crate::leaderboard::install::BenchLane) {
     }
 }
 
-fn consent_view(state: &mut BenchUiState, ui: &mut egui::Ui, action: &mut BenchModalAction) {
+fn consent_view(state: &mut BenchUiState, ui: &mut egui::Ui) {
     let size = state.tier().approx_size;
     ui.label(egui::RichText::new("What happens").strong());
     ui.label(format!(
@@ -639,9 +629,13 @@ fn consent_view(state: &mut BenchUiState, ui: &mut egui::Ui, action: &mut BenchM
          machine name, or IP. The exact, complete list of every field is in \"What exactly gets \
          shared?\" below — that preview is the authoritative source of truth.",
     );
+    // Mick bug #1 fix (2026-05-30): clicking this used to fire BOTH the
+    // inline preview AND the OpenSharePreview action that routed to
+    // Settings>Privacy, so the settings modal popped over the bench modal.
+    // The inline preview below is the canonical "show me" surface; the
+    // settings detour is dropped.
     if ui.link("What exactly gets shared?").clicked() {
-        *action = BenchModalAction::OpenSharePreview;
-        state.show_share_preview = true;
+        state.show_share_preview = !state.show_share_preview;
     }
     if state.show_share_preview {
         if let Some(json) = sample_share_json() {

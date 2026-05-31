@@ -363,23 +363,225 @@ fn workdir_disk_class_platform(workdir: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Windows: derive the workdir's drive letter, open `\\.\<letter>:` as a
+/// read-only volume handle, and ask the storage driver for the bus type via
+/// IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceProperty). Maps the BusType
+/// enum to the schema's disk_class strings. Returns None if any step fails;
+/// caller falls back to the legacy system-disk-derived detection.
+///
+/// Conservative defaults match the Linux NVMe fallback: NVMe bus → "NVMe-Gen4"
+/// without the PCIe-gen probe (the protocol-specific NVMe query needs an
+/// adapter handle + ProtocolSpecificProperty wire, deferred to a follow-up).
+/// SATA bus → "SATA-SSD" without the seek-penalty refinement (assumes modern
+/// SSD; an actual rotating HDD on SATA reports back as SATA-SSD until we add
+/// the StorageDeviceSeekPenaltyProperty query). USB bus → "USB-SSD" with the
+/// same caveat.
 #[cfg(target_os = "windows")]
-fn workdir_disk_class_platform(_workdir: &std::path::Path) -> Option<String> {
-    // v0.2.58 ships the Windows slice (GetVolumePathName + QueryDosDeviceW
-    // + IOCTL_STORAGE_QUERY_PROPERTY). Until then, fall through to the
-    // existing system-disk-derived detect_disk_class() so the wire shape
-    // stays valid; the attack-surface gap stays open on Windows for one
-    // day. Tracked as task #132 v0.2.58.
-    None
+fn workdir_disk_class_platform(workdir: &std::path::Path) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Ioctl::{
+        IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
+        STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
+
+    let device_path = volume_device_path_for(workdir)?;
+    let path: Vec<u16> = device_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // Bus-type query needs access=0 (the query is metadata-only and works
+    // on a no-rights handle). FILE_SHARE_READ|WRITE so we don't lock out
+    // other readers/writers on the volume.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .ok()?;
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    // STORAGE_DEVICE_DESCRIPTOR is variable-length; the fixed header carries
+    // the BusType. Allocate a generous buffer so the OS can write the
+    // optional trailing strings without ERROR_INSUFFICIENT_BUFFER. 4 KiB is
+    // far above the practical size (~80 bytes header + a few hundred bytes
+    // of trailing UTF-16 vendor/product/serial strings).
+    let mut query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut buf = vec![0u8; 4096];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&mut query as *mut _ as *mut std::ffi::c_void),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            buf.len() as u32,
+            Some(&mut returned),
+            None,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    ok.ok()?;
+    if (returned as usize) < std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+        return None;
+    }
+    // The first sizeof(STORAGE_DEVICE_DESCRIPTOR) bytes are the fixed header.
+    // BusType is a u32 enum; cast a pointer over the header so we don't have
+    // to manually peek the byte offset (the struct layout is C-compatible).
+    let header = unsafe { &*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
+    bus_type_to_disk_class(header.BusType.0).map(str::to_string)
+}
+
+/// Map the Windows STORAGE_BUS_TYPE numeric enum to the engine's disk_class
+/// schema string. Conservative SSD defaults on SATA + USB until the
+/// seek-penalty IOCTL refinement lands; an actual rotating HDD on either bus
+/// would be misreported as SSD today. Storage Spaces (BusType=16) maps to
+/// "mixed" because the underlying pool can span heterogeneous disks.
+#[cfg(target_os = "windows")]
+fn bus_type_to_disk_class(bus_type: i32) -> Option<&'static str> {
+    // Values from windows::Win32::System::Ioctl::STORAGE_BUS_TYPE.
+    // BusTypeUnknown=0, Scsi=1, Atapi=2, Ata=3, 1394=4, Ssa=5, Fibre=6, Usb=7,
+    // RAID=8, iScsi=9, Sas=10, Sata=11, Sd=12, Mmc=13, Virtual=14,
+    // FileBackedVirtual=15, Spaces=16, Nvme=17, SCM=18, Ufs=19.
+    match bus_type {
+        17 => Some("NVMe-Gen4"),  // Nvme: conservative gen-default (matches Linux fallback)
+        11 | 3 => Some("SATA-SSD"), // Sata or legacy Ata
+        7 => Some("USB-SSD"),     // Usb: most modern USB-attached disks are SSDs
+        16 => Some("mixed"),      // Storage Spaces — heterogeneous pool
+        // Network/iSCSI shouldn't reach the local-bench path; treat as None
+        // so caller falls back to legacy detection rather than mis-tagging.
+        _ => None,
+    }
+}
+
+/// macOS: shell-out to `diskutil info -plist /dev/diskN` and parse the result
+/// for `Protocol` and `SolidState` fields. Design's 2026-05-30 15:44 PDT memo
+/// authorized the shell-out as the quicker alternative to IOKit IOServiceMatching;
+/// per the authorized-fallback-flag convention, this is the SHIPPED shape for
+/// v0.2.59 (no measured-primary regression to flag — the IOKit path was never
+/// implemented in this codebase). v0.2.60 may replace with proper IOKit FFI
+/// if shell-out turns out to be too slow or unreliable on user machines.
+#[cfg(target_os = "macos")]
+fn workdir_disk_class_platform(workdir: &std::path::Path) -> Option<String> {
+    let bsd_name = macos_bsd_device_for(workdir)?;
+    let info = macos_diskutil_info(&bsd_name)?;
+    classify_diskutil(&info)
+}
+
+/// statfs(workdir) → BSD device name like `disk2s1`. Strip the partition
+/// suffix (the trailing `s<digits>`) so the diskutil lookup targets the
+/// whole-disk node — protocol + solid-state live on the parent, not the
+/// per-partition entry.
+#[cfg(target_os = "macos")]
+fn macos_bsd_device_for(workdir: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(workdir.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(cpath.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return None;
+    }
+    // f_mntfromname is `/dev/diskNsM` (or similar); strip the /dev/ prefix.
+    let mntfrom: Vec<u8> = buf
+        .f_mntfromname
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    let s = std::str::from_utf8(&mntfrom).ok()?;
+    let dev = s.strip_prefix("/dev/")?;
+    // Strip partition suffix `s<digits>` to land on the whole-disk node.
+    let (head, _) = dev.rsplit_once('s').unwrap_or((dev, ""));
+    Some(head.to_string())
+}
+
+/// Shell-out to `diskutil info -plist <bsdname>`. Returns the raw plist text;
+/// caller parses for the fields it cares about. Timeout-bound so a hung
+/// diskutil doesn't wedge engine startup.
+#[cfg(target_os = "macos")]
+fn macos_diskutil_info(bsd_name: &str) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let output = Command::new("/usr/sbin/diskutil")
+        .args(["info", "-plist", bsd_name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Cheap plist parse: just regex-style scan for the two keys we care about
+/// (`<key>Protocol</key>` + value, `<key>SolidState</key>` + bool). Avoids a
+/// plist-parsing dependency for a few lines we can grep. Returns None when
+/// the protocol field isn't recognised so caller falls back to legacy.
+#[cfg(target_os = "macos")]
+fn classify_diskutil(plist: &str) -> Option<String> {
+    let protocol = plist_string_value(plist, "Protocol").unwrap_or_default();
+    let solid_state = plist_bool_value(plist, "SolidState").unwrap_or(false);
+    match protocol.as_str() {
+        // NVMe over PCIe on Apple silicon + Intel Macs.
+        "PCI-Express" | "PCI" | "Apple Fabric" => Some("NVMe-Gen4".to_string()),
+        // SATA — distinguish SSD vs HDD via the SolidState flag.
+        "SATA" => Some(if solid_state { "SATA-SSD" } else { "HDD" }.to_string()),
+        // USB-attached — most modern externals are SSDs but check the flag.
+        "USB" => Some(if solid_state { "USB-SSD" } else { "USB-HDD" }.to_string()),
+        // Thunderbolt is usually an NVMe enclosure; assume NVMe-class.
+        "Thunderbolt" => Some("NVMe-Gen4".to_string()),
+        // Disk Image / Network / unknown — return None so caller doesn't
+        // mis-tag the bench environment.
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn workdir_disk_class_platform(_workdir: &std::path::Path) -> Option<String> {
-    // v0.2.58 ships the macOS slice (statfs + IOServiceMatching(IOMedia)).
-    // Until then, fall through to detect_disk_class() (currently returns
-    // None on macOS so the engine reports "mixed"). Tracked as task #132
-    // v0.2.58.
-    None
+fn plist_string_value(plist: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let idx = plist.find(&needle)?;
+    let rest = &plist[idx + needle.len()..];
+    let start = rest.find("<string>")?;
+    let after_open = &rest[start + "<string>".len()..];
+    let end = after_open.find("</string>")?;
+    Some(after_open[..end].to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn plist_bool_value(plist: &str, key: &str) -> Option<bool> {
+    let needle = format!("<key>{key}</key>");
+    let idx = plist.find(&needle)?;
+    let rest = &plist[idx + needle.len()..];
+    // After the key, expect either <true/> or <false/> before any other key.
+    let next_key = rest.find("<key>").unwrap_or(rest.len());
+    let scope = &rest[..next_key];
+    if scope.contains("<true/>") {
+        Some(true)
+    } else if scope.contains("<false/>") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]

@@ -396,6 +396,128 @@ fn run_account(cmd: superdeduper::cli::AccountCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        AccountCommand::Nickname(sub) => run_account_nickname(sub),
+    }
+}
+
+/// Mick FEATURE #3 (2026-05-30) — `superdeduper account nickname [get|set]`.
+/// Set writes through web's POST /api/v1/account/display_name endpoint which
+/// BACKFILLS every existing submission row tied to the account's install_ids;
+/// the user gets an explicit are-you-sure prompt (skippable with `--yes`)
+/// because the change rewrites past leaderboard history.
+#[cfg(feature = "telemetry")]
+fn run_account_nickname(cmd: superdeduper::cli::NicknameCommand) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::{BufRead, Write};
+    use superdeduper::channel::active_channel;
+    use superdeduper::cli::{NicknameCommand, OutputFormat};
+    use superdeduper::leaderboard::{account_display_name as adn, install};
+
+    let channel = active_channel();
+    let state = install::load_for(channel)
+        .context("loading install state")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No install registered on channel `{channel}` yet. Run `superdeduper register` first."
+            )
+        })?;
+    let server_url = superdeduper::channel::server_url_for(channel);
+
+    match cmd {
+        NicknameCommand::Get { format } => match adn::fetch(&state, server_url) {
+            adn::DisplayNameOutcome::Got(info) => {
+                let source = match info.source {
+                    adn::DisplayNameSource::Manual => "manual",
+                    adn::DisplayNameSource::Auto => "auto",
+                    adn::DisplayNameSource::Unknown => "unknown",
+                };
+                match format {
+                    OutputFormat::Json => {
+                        let payload = serde_json::json!({
+                            "channel": channel.to_string(),
+                            "display_name": info.display_name,
+                            "display_name_source": source,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+                    }
+                    _ => {
+                        println!("channel:            {channel}");
+                        println!("display_name:       {}", info.display_name);
+                        println!("display_name_source: {source}");
+                        if matches!(info.source, adn::DisplayNameSource::Auto) {
+                            println!();
+                            println!("(auto-fallback shape — run `superdeduper account nickname set <name>` to pick your own)");
+                        }
+                    }
+                }
+                Ok(())
+            }
+            adn::DisplayNameOutcome::Unauthorised(msg) => {
+                Err(anyhow::anyhow!("Unauthorised: {msg}"))
+            }
+            adn::DisplayNameOutcome::Rejected(msg) => {
+                Err(anyhow::anyhow!("Rejected: {msg}"))
+            }
+            adn::DisplayNameOutcome::Transient(msg) => {
+                Err(anyhow::anyhow!("Transient (try again): {msg}"))
+            }
+            adn::DisplayNameOutcome::RateLimited(msg) => {
+                Err(anyhow::anyhow!("Rate-limited: {msg}"))
+            }
+            adn::DisplayNameOutcome::Set { .. } => {
+                Err(anyhow::anyhow!("unexpected Set outcome from a Get call"))
+            }
+        },
+        NicknameCommand::Set { name, yes } => {
+            if let Err(e) = adn::validate_nickname(&name) {
+                return Err(anyhow::anyhow!("Nickname rejected by client-side validation: {e}"));
+            }
+            if !yes {
+                eprintln!("Change your nickname to `{name}` ?");
+                eprintln!();
+                eprintln!("This will UPDATE your existing leaderboard entries — every past");
+                eprintln!("submission row tied to your linked account will show the new");
+                eprintln!("nickname after the call completes. Old rows do NOT keep the");
+                eprintln!("previous name. (5 changes per account per 24h server limit.)");
+                eprintln!();
+                eprint!("Type `yes` to confirm: ");
+                std::io::stderr().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                if line.trim() != "yes" {
+                    eprintln!("Aborted — nickname unchanged.");
+                    return Ok(());
+                }
+            }
+            match adn::set(&state, server_url, &name) {
+                adn::DisplayNameOutcome::Set { display_name, rows_updated } => {
+                    println!("Nickname set: {display_name}");
+                    if rows_updated > 0 {
+                        println!("Backfilled {rows_updated} existing leaderboard rows.");
+                    } else {
+                        println!("(No existing leaderboard rows to backfill.)");
+                    }
+                    Ok(())
+                }
+                adn::DisplayNameOutcome::Unauthorised(msg) => {
+                    Err(anyhow::anyhow!("Unauthorised: {msg}"))
+                }
+                adn::DisplayNameOutcome::Rejected(msg) => {
+                    Err(anyhow::anyhow!("Server rejected: {msg}"))
+                }
+                adn::DisplayNameOutcome::Transient(msg) => {
+                    Err(anyhow::anyhow!("Transient failure (try again): {msg}"))
+                }
+                adn::DisplayNameOutcome::RateLimited(msg) => {
+                    Err(anyhow::anyhow!(
+                        "Rate-limited (5/24h per account): {msg}"
+                    ))
+                }
+                adn::DisplayNameOutcome::Got(_) => {
+                    Err(anyhow::anyhow!("unexpected Got outcome from a Set call"))
+                }
+            }
+        }
     }
 }
 

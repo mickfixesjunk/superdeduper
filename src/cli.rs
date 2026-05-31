@@ -291,6 +291,40 @@ pub enum AccountCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+
+    /// Mick FEATURE #3 (2026-05-30) — get or set the public nickname
+    /// (display_name) attached to this install's linked account. Set
+    /// triggers a server-side BACKFILL on existing leaderboard rows
+    /// (5 changes per account per 24h rate-limit).
+    #[command(subcommand)]
+    Nickname(NicknameCommand),
+}
+
+/// `superdeduper account nickname …` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum NicknameCommand {
+    /// Print the current display_name from /api/v1/profile/me, with the
+    /// `display_name_source` annotation (manual vs auto-fallback).
+    Get {
+        /// JSON output for scripting; default text is human.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+
+    /// Update the display_name. 1-32 chars, allowed [a-zA-Z0-9 _-.'].
+    /// The change BACKFILLS every existing leaderboard row tied to your
+    /// linked account — old rows show the new nickname after the call
+    /// completes. `--yes` skips the are-you-sure prompt.
+    Set {
+        /// The new nickname.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Skip the are-you-sure confirmation prompt. Default is to
+        /// require the user to type "yes" to confirm because the change
+        /// rewrites every past leaderboard row.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 /// `sd debug …` subcommands. Currently just the snapshot helper;
