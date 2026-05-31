@@ -241,7 +241,13 @@ fn run_worker(
         Err(e) if e.downcast_ref::<bench_run::Cancelled>().is_some() => {
             finish("Cancelled — nothing was submitted.".into(), false, false)
         }
-        Err(e) => finish(format!("Benchmark failed: {e}"), true, false),
+        // A-bench-modal-error-surface (2026-05-30): use the alternate-Display
+        // form so anyhow joins the full context chain ('outer: inner: ...').
+        // Plain {e} only shows the top wrap (e.g., 'POST /bench/start failed')
+        // and swallows the actual cause (e.g., '404'). Mick's v0.2.62 bug
+        // diagnosis took an extra round-trip because the GUI showed only the
+        // top — CLI exposed the chain via anyhow's Debug formatter.
+        Err(e) => finish(format!("Benchmark failed: {e:#}"), true, false),
         Ok(o) => {
             // Human size: GB for >=1 GiB (the ranked corpora), else MB.
             let bytes = o.bytes_scanned as f64;

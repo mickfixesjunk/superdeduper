@@ -181,6 +181,15 @@ struct NicknameUi {
     /// Sticky banner from the last Set: "Nickname set, N rows backfilled"
     /// on success, or the error string on failure. Cleared on Edit-click.
     last_message: Option<Result<String, String>>,
+    /// A-nickname-fetch-loop (2026-05-30, benchmarker 20:30 PST): the render
+    /// path used to re-spawn the fetch worker every frame when
+    /// (!fetching && current.is_none()). On a fresh / unlinked install,
+    /// fetch returns Ok(None) immediately, sets fetching=false, returns —
+    /// and the next frame re-spawns. The UI gets stuck cycling through
+    /// "Loading current nickname…" without ever resolving. Guard the spawn
+    /// behind this one-shot flag so the loop runs exactly once. The Edit
+    /// button re-spawns explicitly via the user's action.
+    initial_fetch_attempted: bool,
 }
 
 #[cfg(feature = "telemetry")]
@@ -192,6 +201,7 @@ static NICKNAME_UI: parking_lot::Mutex<NicknameUi> = parking_lot::Mutex::new(Nic
     edit_buf: String::new(),
     confirming: false,
     last_message: None,
+    initial_fetch_attempted: false,
 });
 
 /// Kick off a background GET /profile/me to refresh the cached nickname.
@@ -300,10 +310,19 @@ fn render_nickname_row(ui: &mut egui::Ui) {
     use crate::leaderboard::account_display_name as adn;
 
     // First render: kick off a fetch so the row populates without the
-    // user having to click anything.
+    // user having to click anything. Guarded by initial_fetch_attempted so
+    // the spawn fires EXACTLY ONCE per process. Without this guard, when
+    // the worker returns immediately (e.g. install not registered ->
+    // Ok(None) ~instant), the next frame re-enters the (!fetching &&
+    // current.is_none()) branch and re-spawns — infinite loop benchmarker
+    // hit 20:30 PST as a persistent "Loading current nickname…".
     let needs_initial_fetch = {
-        let s = NICKNAME_UI.lock();
-        s.current.is_none() && !s.fetching
+        let mut s = NICKNAME_UI.lock();
+        let needed = !s.initial_fetch_attempted && !s.fetching;
+        if needed {
+            s.initial_fetch_attempted = true;
+        }
+        needed
     };
     if needs_initial_fetch {
         spawn_nickname_fetch();
