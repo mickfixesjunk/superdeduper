@@ -1,6 +1,6 @@
 [package]
 name = "superdeduper"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.87"
 description = "superdeduper — the fastest duplicate file finder for Windows / NTFS."
@@ -233,6 +233,12 @@ features = [
     # SHFileOperationW needs CoInitializeEx / CoUninitialize plus the
     # SHCreateItemFromParsingName/IShellItem family.
     "Win32_System_Com",
+    # SAT pass-through USB-HDD detection (v0.3.5). IOCTL_ATA_PASS_THROUGH +
+    # ATA_PASS_THROUGH_EX + ATA_FLAGS_* live under Storage::IscsiDisc; sends
+    # ATA IDENTIFY DEVICE (0xEC) through the SCSI/ATA Translation layer and
+    # reads the nominal rotation rate at word 217 to discriminate USB-SSD
+    # vs USB-HDD on USB-attached disks.
+    "Win32_Storage_IscsiDisc",
 ]
 
 # App icon embedding. `image` (build-only) decodes the SDD logo PNG

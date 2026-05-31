@@ -448,14 +448,46 @@ fn workdir_disk_class_platform(workdir: &std::path::Path) -> Option<String> {
     // BusType is a u32 enum; cast a pointer over the header so we don't have
     // to manually peek the byte offset (the struct layout is C-compatible).
     let header = unsafe { &*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
-    bus_type_to_disk_class(header.BusType.0).map(str::to_string)
+    let base = bus_type_to_disk_class(header.BusType.0)?;
+
+    // SAT pass-through refinement (v0.3.5): USB bus reports "USB-SSD" by
+    // default; query ATA IDENTIFY rotation rate to discriminate USB-HDD
+    // (5400/7200 RPM external chains) from genuine USB-SSDs. Non-passthrough
+    // bridges fail the IOCTL silently and we keep the "USB-SSD" default
+    // (documented limitation — bridge issue, not engine bug).
+    if base == "USB-SSD" {
+        if let Some(rpm) = query_sat_rotation_rate(workdir) {
+            tracing::info!(
+                "hardware: SAT pass-through IDENTIFY rotation_rate={} for {}",
+                rpm,
+                device_path
+            );
+            match rotation_rate_to_disk_class_kind(rpm) {
+                Some("HDD") => return Some("USB-HDD".to_string()),
+                // Some("SSD") OR None -> keep the USB-SSD default. The bus-type
+                // already says USB-SSD; SAT confirming (or not reporting) is fine.
+                _ => {}
+            }
+        } else {
+            tracing::debug!(
+                "hardware: SAT pass-through unavailable for {} (bridge may not support ATA pass-through); keeping USB-SSD default",
+                device_path
+            );
+        }
+    }
+
+    Some(base.to_string())
 }
 
 /// Map the Windows STORAGE_BUS_TYPE numeric enum to the engine's disk_class
-/// schema string. Conservative SSD defaults on SATA + USB until the
-/// seek-penalty IOCTL refinement lands; an actual rotating HDD on either bus
-/// would be misreported as SSD today. Storage Spaces (BusType=16) maps to
-/// "mixed" because the underlying pool can span heterogeneous disks.
+/// schema string. USB-attached disks are tentatively tagged "USB-SSD" here;
+/// callers should refine with [`refine_usb_with_sat_rotation_rate`] (issues
+/// ATA IDENTIFY DEVICE via SAT pass-through to read the rotation rate) so an
+/// actual rotating HDD reports as "USB-HDD" instead.
+///
+/// Conservative defaults on SATA: assumes SSD (the seek-penalty IOCTL
+/// refinement lives as a separate follow-up). Storage Spaces (BusType=16)
+/// maps to "mixed" because the pool can span heterogeneous disks.
 #[cfg(target_os = "windows")]
 fn bus_type_to_disk_class(bus_type: i32) -> Option<&'static str> {
     // Values from windows::Win32::System::Ioctl::STORAGE_BUS_TYPE.
@@ -465,12 +497,158 @@ fn bus_type_to_disk_class(bus_type: i32) -> Option<&'static str> {
     match bus_type {
         17 => Some("NVMe-Gen4"),  // Nvme: conservative gen-default (matches Linux fallback)
         11 | 3 => Some("SATA-SSD"), // Sata or legacy Ata
-        7 => Some("USB-SSD"),     // Usb: most modern USB-attached disks are SSDs
+        7 => Some("USB-SSD"),     // Usb: refined to USB-HDD by SAT pass-through if applicable
         16 => Some("mixed"),      // Storage Spaces — heterogeneous pool
         // Network/iSCSI shouldn't reach the local-bench path; treat as None
         // so caller falls back to legacy detection rather than mis-tagging.
         _ => None,
     }
+}
+
+/// Parse the ATA IDENTIFY DEVICE response (512 bytes) for the nominal media
+/// rotation rate at WORD 217 (byte offset 434, little-endian u16).
+///
+/// Per ATA8-ACS §7.16.7.77 the field encodes:
+/// - `0x0000` -> rotation rate not reported
+/// - `0x0001` -> non-rotating media (SSD / flash)
+/// - `0x0002..=0x0400` -> reserved
+/// - `0x0401..=0xFFFE` -> rotational speed in RPM (HDD; typically 5400/7200/10000/15000)
+/// - `0xFFFF` -> reserved
+///
+/// The classification helper layered on top of this is
+/// [`rotation_rate_to_disk_class_kind`]. Pure function — exposed for tests
+/// on every platform so the unit suite runs on the dev (Linux) host even
+/// though the IOCTL that produces the buffer is Windows-only.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn parse_ata_identify_rotation_rate(identify: &[u8]) -> Option<u16> {
+    if identify.len() < 436 {
+        return None;
+    }
+    // Word 217 = bytes 434..=435, little-endian.
+    Some(u16::from_le_bytes([identify[434], identify[435]]))
+}
+
+/// Map an ATA IDENTIFY DEVICE rotation rate (word 217) to the disk_class
+/// kind used by [`bus_type_to_disk_class`] callers: `Some("SSD")` for
+/// non-rotating media, `Some("HDD")` for any reported RPM, `None` when
+/// the field is unset / reserved (use the bus-type default).
+///
+/// Kept distinct from `bus_type_to_disk_class` so the SAT layering reads
+/// cleanly at the call site and the rotation parsing logic is unit-testable
+/// without a Windows handle.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn rotation_rate_to_disk_class_kind(rotation_rate: u16) -> Option<&'static str> {
+    match rotation_rate {
+        0x0001 => Some("SSD"),
+        0x0401..=0xFFFE => Some("HDD"),
+        _ => None, // 0x0000 not-reported, 0x0002..=0x0400 reserved, 0xFFFF reserved
+    }
+}
+
+/// Issue ATA IDENTIFY DEVICE (0xEC) via SAT pass-through against the volume
+/// underlying `workdir` and return the rotation rate from word 217 of the
+/// IDENTIFY response. `None` covers every failure mode:
+///
+/// - `workdir` doesn't resolve to a drive-letter volume.
+/// - `CreateFileW` denies access (typically: non-admin user opening the
+///   volume handle with `GENERIC_READ|GENERIC_WRITE` is allowed on
+///   removable volumes but locked on system volumes; we always try).
+/// - `DeviceIoControl(IOCTL_ATA_PASS_THROUGH, ...)` fails (this is the
+///   common case: the USB-SATA bridge doesn't implement SAT, or the
+///   ATAPI/USB stack rejects the command for the bus type).
+/// - The response buffer is shorter than 512 bytes.
+///
+/// Caller falls back to the bus-type default (typically "USB-SSD") on
+/// `None` and logs a diagnostic. SUCCESS path: caller maps the rate via
+/// [`rotation_rate_to_disk_class_kind`].
+#[cfg(target_os = "windows")]
+fn query_sat_rotation_rate(workdir: &std::path::Path) -> Option<u16> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::Storage::IscsiDisc::{
+        ATA_FLAGS_DATA_IN, ATA_FLAGS_DRDY_REQUIRED, ATA_PASS_THROUGH_EX, IOCTL_ATA_PASS_THROUGH,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
+
+    let device_path = volume_device_path_for(workdir)?;
+    let path: Vec<u16> = device_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAT requires read+write access on the device handle (read-only is
+    // sufficient on some bridges but fails on others; ask for both up
+    // front and let CreateFileW reject as needed).
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .ok()?;
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    // Buffer = ATA_PASS_THROUGH_EX header (40 B on x86_64) + 512 B IDENTIFY response.
+    // DataBufferOffset must point past the header within the SAME contiguous
+    // allocation we pass to DeviceIoControl (per MSDN ATA_PASS_THROUGH_EX docs).
+    const APT_SIZE: usize = std::mem::size_of::<ATA_PASS_THROUGH_EX>();
+    const IDENTIFY_SIZE: usize = 512;
+    const TOTAL_SIZE: usize = APT_SIZE + IDENTIFY_SIZE;
+    let mut buf = vec![0u8; TOTAL_SIZE];
+
+    {
+        // SAFETY: buf is exactly TOTAL_SIZE >= APT_SIZE bytes, properly
+        // aligned for u8; write-only via the &mut so no aliasing.
+        let header = unsafe { &mut *(buf.as_mut_ptr() as *mut ATA_PASS_THROUGH_EX) };
+        header.Length = APT_SIZE as u16;
+        header.AtaFlags = (ATA_FLAGS_DATA_IN | ATA_FLAGS_DRDY_REQUIRED) as u16;
+        header.DataTransferLength = IDENTIFY_SIZE as u32;
+        header.TimeOutValue = 5;
+        header.DataBufferOffset = APT_SIZE;
+        // CurrentTaskFile per ATA8-ACS for IDENTIFY DEVICE:
+        //  [0] Features = 0
+        //  [1] SectorCount = 1   (read 1 logical sector = 512 bytes)
+        //  [2] LBA Low = 0
+        //  [3] LBA Mid = 0
+        //  [4] LBA High = 0
+        //  [5] Device = 0
+        //  [6] Command = 0xEC    (IDENTIFY DEVICE)
+        //  [7] Reserved = 0
+        header.CurrentTaskFile = [0, 1, 0, 0, 0, 0, 0xEC, 0];
+    }
+
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_ATA_PASS_THROUGH,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            TOTAL_SIZE as u32,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            TOTAL_SIZE as u32,
+            Some(&mut returned),
+            None,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    ok.ok()?;
+
+    // IDENTIFY response sits at offset APT_SIZE in the same buffer.
+    // Use the cross-platform parser so the byte-offset arithmetic is
+    // unit-tested.
+    parse_ata_identify_rotation_rate(&buf[APT_SIZE..])
 }
 
 /// macOS: shell-out to `diskutil info -plist /dev/diskN` and parse the result
@@ -1601,5 +1779,79 @@ mod tests {
         );
         // UNC / non-drive roots aren't Dev Drives → None.
         assert!(volume_device_path_for(Path::new(r"\\server\share\x")).is_none());
+    }
+
+    /// Build a 512-byte ATA IDENTIFY DEVICE buffer with word 217 set to
+    /// `rotation_rate` (little-endian) so the rotation-rate parser sees a
+    /// realistic input. All other bytes left zero.
+    fn fake_identify_with_rotation(rotation_rate: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 512];
+        let le = rotation_rate.to_le_bytes();
+        buf[434] = le[0];
+        buf[435] = le[1];
+        buf
+    }
+
+    #[test]
+    fn ata_identify_rotation_rate_parses_word_217_le() {
+        // 0x0001 -> SSD (non-rotating media)
+        let buf = fake_identify_with_rotation(0x0001);
+        assert_eq!(parse_ata_identify_rotation_rate(&buf), Some(0x0001));
+
+        // 7200 -> typical 7200 RPM HDD (3.5" desktop)
+        let buf = fake_identify_with_rotation(7200);
+        assert_eq!(parse_ata_identify_rotation_rate(&buf), Some(7200));
+
+        // 5400 -> typical 5400 RPM HDD (2.5" laptop / external)
+        let buf = fake_identify_with_rotation(5400);
+        assert_eq!(parse_ata_identify_rotation_rate(&buf), Some(5400));
+
+        // 0x0000 -> rotation rate not reported (older devices)
+        let buf = fake_identify_with_rotation(0x0000);
+        assert_eq!(parse_ata_identify_rotation_rate(&buf), Some(0x0000));
+    }
+
+    #[test]
+    fn ata_identify_rotation_rate_rejects_short_buffer() {
+        // Must have at least 436 bytes to read word 217's two bytes.
+        let short = vec![0u8; 100];
+        assert_eq!(parse_ata_identify_rotation_rate(&short), None);
+
+        let edge = vec![0u8; 435];
+        assert_eq!(parse_ata_identify_rotation_rate(&edge), None);
+
+        // 436-byte buffer is exactly enough.
+        let mut just_enough = vec![0u8; 436];
+        just_enough[434] = 0x20; // 7200 RPM = 0x1C20
+        just_enough[435] = 0x1C;
+        assert_eq!(parse_ata_identify_rotation_rate(&just_enough), Some(7200));
+    }
+
+    #[test]
+    fn rotation_rate_to_disk_class_kind_maps_ata8_acs_buckets() {
+        // Non-rotating media -> SSD
+        assert_eq!(rotation_rate_to_disk_class_kind(0x0001), Some("SSD"));
+
+        // RPM range -> HDD (5400, 7200, 10000, 15000 are the typical values)
+        assert_eq!(rotation_rate_to_disk_class_kind(5400), Some("HDD"));
+        assert_eq!(rotation_rate_to_disk_class_kind(7200), Some("HDD"));
+        assert_eq!(rotation_rate_to_disk_class_kind(10000), Some("HDD"));
+        assert_eq!(rotation_rate_to_disk_class_kind(15000), Some("HDD"));
+
+        // Reserved / not-reported -> None (caller falls back to bus-type default)
+        assert_eq!(rotation_rate_to_disk_class_kind(0x0000), None);
+        assert_eq!(rotation_rate_to_disk_class_kind(0x0002), None);
+        assert_eq!(rotation_rate_to_disk_class_kind(0x0400), None);
+        assert_eq!(rotation_rate_to_disk_class_kind(0xFFFF), None);
+    }
+
+    /// Spec-edge: 0x0401 is the lowest RPM value that should map to HDD per
+    /// ATA8-ACS even though it's an implausible spin rate; the lower
+    /// reserved range stops at 0x0400. Pin the boundary so a future
+    /// refactor doesn't drift the lookup.
+    #[test]
+    fn rotation_rate_boundary_0x0400_vs_0x0401() {
+        assert_eq!(rotation_rate_to_disk_class_kind(0x0400), None);
+        assert_eq!(rotation_rate_to_disk_class_kind(0x0401), Some("HDD"));
     }
 }
