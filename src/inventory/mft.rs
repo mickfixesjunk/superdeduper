@@ -28,9 +28,14 @@ pub fn enumerate(
     cache: Option<&std::sync::Arc<parking_lot::Mutex<crate::cache::Cache>>>,
 ) -> Result<Vec<FileEntry>> {
     use hashbrown::HashMap;
+    use std::time::Instant;
 
     use crate::winapi_wrappers::volume_for_path;
 
+    // A-perf-stage-timing — outer-scope timing of the MFT inventory path
+    // (cold MFT + warm-path applied). Per-volume warm-vs-cold breakdowns
+    // are already in tracing::info; this is the aggregate wall.
+    let mft_started = Instant::now();
     // Group roots by volume.
     //
     // `std::fs::canonicalize` on Windows returns a verbatim path
@@ -103,6 +108,13 @@ pub fn enumerate(
         }
         out.extend(enumerate_volume(&volume, &roots, cfg, cache)?);
     }
+    let mft_ms = mft_started.elapsed().as_millis() as u64;
+    tracing::info!(
+        mft_ms,
+        files = out.len(),
+        roots = cfg.roots.len(),
+        "stage 1: mft complete"
+    );
     Ok(out)
 }
 
