@@ -108,7 +108,41 @@ pub fn find_similar_groups(
     if hashed.len() < 2 {
         return Vec::new();
     }
+    // #141 -- Steps 2 + 3 (+3b cohesion) extracted into
+    // `cluster_filter_and_build_groups` so the integration-level
+    // assertion ("find_similar_groups rejects 3+-hop chained
+    // cluster end-to-end") can drive the cohesion path with
+    // hand-constructed Hashed fingerprints, bypassing the
+    // image-decode step that would require synthesizing 4 real
+    // images with byte-exact dHash outputs.
+    let (groups, rejected_cohesion) = cluster_filter_and_build_groups(&hashed, threshold);
+    if rejected_cohesion > 0 {
+        tracing::info!(
+            rejected_cohesion,
+            "tier-4 image: rejected {rejected_cohesion} cluster(s) by E2 \
+             cohesion check (kept {} cohesive cluster(s))",
+            groups.len(),
+        );
+    }
+    groups
+}
 
+/// Steps 2-3b of [`find_similar_groups`] extracted as a private
+/// fn so the cohesion-rejection path can be driven from tests
+/// without synthesizing real images. Returns `(kept_groups,
+/// rejected_cohesion_cluster_count)`. Production `find_similar_groups`
+/// calls this after the decode step + emits the rejected-cluster
+/// tracing line based on the count.
+///
+/// #141 (P3) -- pairs with the unit-level `cluster_diameter` test by
+/// pinning the END-TO-END cluster -> diameter -> cohesion-cap ->
+/// reject decision, so a future refactor that wires the diameter
+/// check wrong (typo, flipped predicate, dropped rejection branch)
+/// surfaces here even when the helper-level test still passes.
+fn cluster_filter_and_build_groups(
+    hashed: &[Hashed<'_>],
+    threshold: u32,
+) -> (Vec<DuplicateGroup>, u64) {
     // Step 2: brute-force union-find on Hamming distance ≤ threshold.
     // O(n²); BK-tree replacement is v3. For n < ~5000 the popcount
     // inner loop is cache-warm enough that the constant factor stays
@@ -172,7 +206,7 @@ pub fn find_similar_groups(
         if indices.len() < 2 {
             continue;
         }
-        let diameter = cluster_diameter(&indices, &hashed);
+        let diameter = cluster_diameter(&indices, hashed);
         if diameter > cohesion_cap {
             tracing::debug!(
                 cluster_size = indices.len(),
@@ -228,15 +262,7 @@ pub fn find_similar_groups(
         crate::pipeline::assert_unique_paths(&g);
         groups.push(g);
     }
-    if rejected_cohesion > 0 {
-        tracing::info!(
-            rejected_cohesion,
-            "tier-4 image: rejected {rejected_cohesion} cluster(s) by E2 \
-             cohesion check (kept {} cohesive cluster(s))",
-            groups.len(),
-        );
-    }
-    groups
+    (groups, rejected_cohesion)
 }
 
 /// E2 — cluster-diameter helper. Returns the MAX pairwise Hamming
@@ -439,6 +465,117 @@ mod tests {
         assert!(d <= cap_at_5, "diameter 10 must NOT exceed cap=10 at τ=5");
         let cap_at_4 = 4u32.saturating_mul(2);
         assert!(d > cap_at_4, "diameter 10 MUST exceed cap=8 at τ=4");
+    }
+
+    /// #141 -- A-tier4-chain-cohesion-e2e. End-to-end pin: a
+    /// 4-image chain A~B~C~D where adjacent pairs are within
+    /// threshold (`τ=5`) but the diameter Δ(A,D) > 2τ (= 10) must
+    /// be REJECTED by `find_similar_groups`'s cohesion gate.
+    /// Returns 0 groups + 1 rejected-cluster count.
+    ///
+    /// Why this isn't redundant with the existing
+    /// `cluster_diameter_handles_singleton_pair_and_chain` helper
+    /// test: that test pins the diameter MATH on hand-built
+    /// indices, but doesn't exercise the union-find -> cohesion
+    /// -> reject path that's the actual production wiring. A
+    /// future regression that:
+    ///   - passes wrong args to cluster_diameter
+    ///   - flips `>` to `<` on the cohesion-cap predicate
+    ///   - drops the rejection branch in a refactor
+    /// would still produce a green helper-level test but a red
+    /// kept-group count here. Together the two tests pin the
+    /// math + the wiring.
+    ///
+    /// 2-hop chains (k=3) can't trigger this: A~B~C with each
+    /// hop = τ means diameter ≤ 2τ trivially (Hamming triangle
+    /// inequality + bit math), so they always pass. The 3+-hop
+    /// case (k=4) is the smallest cluster shape that can produce
+    /// a diameter > 2τ. Hence the 4-member chain.
+    #[test]
+    fn find_similar_groups_rejects_4_hop_chain_via_cohesion() {
+        let threshold = 5u32;
+        // Build 4 disjoint 5-bit "step" patterns so each adjacent
+        // pair has Hamming distance exactly 5 (= τ, links in
+        // union-find) but A and D's hops don't overlap:
+        //   A = 0
+        //   B = step_1 (bits 0..5 set)         -> Δ(A,B) = 5
+        //   C = step_1 | step_2 (bits 5..10)   -> Δ(B,C) = 5
+        //   D = step_1 | step_2 | step_3 (10..15) -> Δ(C,D) = 5
+        // Then Δ(A,D) = 15 (all 15 bits between them set after
+        // XOR), which exceeds 2τ = 10 -- cohesion-cap rejects.
+        let step_1: u64 = 0b_0000_0000_0001_1111;
+        let step_2: u64 = 0b_0000_0011_1110_0000;
+        let step_3: u64 = 0b_0111_1100_0000_0000;
+        let fp_a: u64 = 0;
+        let fp_b: u64 = step_1;
+        let fp_c: u64 = step_1 | step_2;
+        let fp_d: u64 = step_1 | step_2 | step_3;
+
+        // Sanity: confirm the pairwise distances match the design.
+        assert_eq!(hamming_distance(fp_a, fp_b), 5, "A-B");
+        assert_eq!(hamming_distance(fp_b, fp_c), 5, "B-C");
+        assert_eq!(hamming_distance(fp_c, fp_d), 5, "C-D");
+        assert_eq!(hamming_distance(fp_a, fp_d), 15, "A-D > 2tau");
+
+        // 4 FileEntries with synthetic paths -- no image bytes
+        // needed since `cluster_filter_and_build_groups` operates
+        // on Hashed which is the post-decode shape.
+        let entries = [
+            entry(PathBuf::from("/x/a.png"), 1024),
+            entry(PathBuf::from("/x/b.png"), 1024),
+            entry(PathBuf::from("/x/c.png"), 1024),
+            entry(PathBuf::from("/x/d.png"), 1024),
+        ];
+        let hashed = vec![
+            Hashed { file: &entries[0], fingerprint: fp_a },
+            Hashed { file: &entries[1], fingerprint: fp_b },
+            Hashed { file: &entries[2], fingerprint: fp_c },
+            Hashed { file: &entries[3], fingerprint: fp_d },
+        ];
+
+        let (groups, rejected_cohesion) =
+            cluster_filter_and_build_groups(&hashed, threshold);
+
+        assert!(
+            groups.is_empty(),
+            "4-hop chained cluster MUST be rejected by E2 cohesion check; got {} groups",
+            groups.len(),
+        );
+        assert_eq!(
+            rejected_cohesion, 1,
+            "exactly one cluster (the 4-hop chain) should be rejected by cohesion",
+        );
+    }
+
+    /// #141 -- negative control. A genuine cohesive cluster (all
+    /// 4 members within τ of each other -- diameter ≤ τ ≤ 2τ)
+    /// MUST pass the cohesion check + come back as one group of
+    /// 4. Pairs with the rejection test above; together they pin
+    /// "reject only when warranted, accept when warranted."
+    #[test]
+    fn find_similar_groups_keeps_cohesive_cluster_via_helper() {
+        let threshold = 5u32;
+        // All 4 fingerprints within 2 bits of zero -- pairwise
+        // Hamming distances are all ≤ 4, diameter ≤ 4 < cap = 10.
+        let entries = [
+            entry(PathBuf::from("/y/a.png"), 1024),
+            entry(PathBuf::from("/y/b.png"), 1024),
+            entry(PathBuf::from("/y/c.png"), 1024),
+            entry(PathBuf::from("/y/d.png"), 1024),
+        ];
+        let hashed = vec![
+            Hashed { file: &entries[0], fingerprint: 0u64 },
+            Hashed { file: &entries[1], fingerprint: 0b01u64 },
+            Hashed { file: &entries[2], fingerprint: 0b10u64 },
+            Hashed { file: &entries[3], fingerprint: 0b11u64 },
+        ];
+
+        let (groups, rejected_cohesion) =
+            cluster_filter_and_build_groups(&hashed, threshold);
+
+        assert_eq!(groups.len(), 1, "cohesive cluster should yield one group");
+        assert_eq!(groups[0].files.len(), 4, "all 4 cohesive members kept");
+        assert_eq!(rejected_cohesion, 0, "no rejection on a cohesive cluster");
     }
 
     #[test]
