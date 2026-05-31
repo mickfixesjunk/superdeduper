@@ -155,6 +155,322 @@ fn render_done_dialog(ctx: &egui::Context) {
 #[cfg(feature = "telemetry")]
 static RESET_CONFIRM: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
 
+/// Mick FEATURE #3 (2026-05-30) — nickname-editor cross-frame state for the
+/// Settings>Account tab. Single state machine because the editor is a small
+/// inline surface and a multi-state-field struct keeps the render code clean.
+#[cfg(feature = "telemetry")]
+#[derive(Default)]
+struct NicknameUi {
+    /// Current display_name from /profile/me; None until first fetch lands.
+    /// Auto-fallback shapes (`user-XXXXXXXX`) get rendered with a hint to
+    /// pick a real one.
+    current: Option<crate::leaderboard::account_display_name::DisplayNameInfo>,
+    /// True while the fetch worker is in flight (initial GET or re-fetch
+    /// after a successful Set).
+    fetching: bool,
+    /// True while the Set worker is in flight; disables the Save button +
+    /// shows a spinner.
+    saving: bool,
+    /// True while the inline editor is open. Save flips to confirming.
+    editing: bool,
+    /// Text-input buffer for the new nickname.
+    edit_buf: String,
+    /// True while the are-you-sure step is showing; user can Confirm
+    /// (-> saving) or Back (-> editing).
+    confirming: bool,
+    /// Sticky banner from the last Set: "Nickname set, N rows backfilled"
+    /// on success, or the error string on failure. Cleared on Edit-click.
+    last_message: Option<Result<String, String>>,
+}
+
+#[cfg(feature = "telemetry")]
+static NICKNAME_UI: parking_lot::Mutex<NicknameUi> = parking_lot::Mutex::new(NicknameUi {
+    current: None,
+    fetching: false,
+    saving: false,
+    editing: false,
+    edit_buf: String::new(),
+    confirming: false,
+    last_message: None,
+});
+
+/// Kick off a background GET /profile/me to refresh the cached nickname.
+/// Best-effort; failures stay quiet (the cached value just doesn't update).
+#[cfg(feature = "telemetry")]
+fn spawn_nickname_fetch() {
+    use crate::leaderboard::{account_display_name as adn, install};
+    {
+        let mut s = NICKNAME_UI.lock();
+        if s.fetching {
+            return;
+        }
+        s.fetching = true;
+    }
+    std::thread::spawn(move || {
+        let channel = crate::channel::active_channel();
+        let server_url = crate::channel::server_url_for(channel);
+        let outcome = match install::load_for(channel) {
+            Ok(Some(state)) => adn::fetch(&state, server_url),
+            _ => {
+                NICKNAME_UI.lock().fetching = false;
+                return;
+            }
+        };
+        let mut s = NICKNAME_UI.lock();
+        s.fetching = false;
+        if let adn::DisplayNameOutcome::Got(info) = outcome {
+            s.current = Some(info);
+        }
+    });
+}
+
+/// Kick off a background POST /api/v1/account/display_name with the user's
+/// new nickname. On success, refresh the cached current value + record a
+/// human "Updated N rows" banner. On failure, surface the error verbatim.
+#[cfg(feature = "telemetry")]
+fn spawn_nickname_save(new_name: String) {
+    use crate::leaderboard::{account_display_name as adn, install};
+    {
+        let mut s = NICKNAME_UI.lock();
+        if s.saving {
+            return;
+        }
+        s.saving = true;
+        s.last_message = None;
+    }
+    std::thread::spawn(move || {
+        let channel = crate::channel::active_channel();
+        let server_url = crate::channel::server_url_for(channel);
+        let state = match install::load_for(channel) {
+            Ok(Some(state)) => state,
+            _ => {
+                let mut s = NICKNAME_UI.lock();
+                s.saving = false;
+                s.last_message = Some(Err(
+                    "No install registered on this channel".to_string()
+                ));
+                return;
+            }
+        };
+        let result = adn::set(&state, server_url, &new_name);
+        let mut s = NICKNAME_UI.lock();
+        s.saving = false;
+        s.editing = false;
+        s.confirming = false;
+        match result {
+            adn::DisplayNameOutcome::Set { display_name, rows_updated } => {
+                s.current = Some(adn::DisplayNameInfo {
+                    display_name: display_name.clone(),
+                    source: adn::DisplayNameSource::Manual,
+                });
+                s.last_message = Some(Ok(if rows_updated > 0 {
+                    format!("Nickname set to `{display_name}` — backfilled {rows_updated} existing leaderboard rows.")
+                } else {
+                    format!("Nickname set to `{display_name}`.")
+                }));
+                s.edit_buf.clear();
+            }
+            adn::DisplayNameOutcome::Unauthorised(msg) => {
+                s.last_message = Some(Err(format!("Unauthorised: {msg}")));
+            }
+            adn::DisplayNameOutcome::RateLimited(_) => {
+                s.last_message = Some(Err(
+                    "Rate-limited (5 changes per account per 24h). Try again tomorrow.".to_string()
+                ));
+            }
+            adn::DisplayNameOutcome::Rejected(msg) => {
+                s.last_message = Some(Err(format!("Server rejected: {msg}")));
+            }
+            adn::DisplayNameOutcome::Transient(msg) => {
+                s.last_message = Some(Err(format!("Transient (try again): {msg}")));
+            }
+            adn::DisplayNameOutcome::Got(_) => {
+                s.last_message = Some(Err("unexpected Got response from set call".to_string()));
+            }
+        }
+    });
+}
+
+/// Render the Settings>Account nickname row + inline editor. Idle: shows
+/// current nickname + Edit button. Editing: text input + Save / Cancel.
+/// Confirming: are-you-sure with BACKFILL copy + Confirm / Back. Saving:
+/// spinner. last_message banner sticks until the next Edit-click.
+#[cfg(feature = "telemetry")]
+fn render_nickname_row(ui: &mut egui::Ui) {
+    use crate::leaderboard::account_display_name as adn;
+
+    // First render: kick off a fetch so the row populates without the
+    // user having to click anything.
+    let needs_initial_fetch = {
+        let s = NICKNAME_UI.lock();
+        s.current.is_none() && !s.fetching
+    };
+    if needs_initial_fetch {
+        spawn_nickname_fetch();
+    }
+
+    let snapshot = {
+        let s = NICKNAME_UI.lock();
+        (
+            s.current.clone(),
+            s.fetching,
+            s.saving,
+            s.editing,
+            s.confirming,
+            s.edit_buf.clone(),
+            s.last_message.clone(),
+        )
+    };
+    let (current, fetching, saving, editing, confirming, mut edit_buf, last_message) = snapshot;
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.heading("Nickname");
+    ui.label(
+        RichText::new(
+            "Your public nickname on the Dedupe Hall of Fame. \
+             Changing this will UPDATE your existing leaderboard entries — \
+             every past submission row tied to your linked account shows \
+             the new nickname after the change. (5 changes per account per 24h.)",
+        )
+        .color(theme::TEXT_LO)
+        .small(),
+    );
+    ui.add_space(6.0);
+
+    if let Some(banner) = &last_message {
+        match banner {
+            Ok(msg) => {
+                ui.label(RichText::new(format!("✓ {msg}")).color(theme::ACCENT).strong());
+            }
+            Err(msg) => {
+                ui.label(RichText::new(format!("⚠ {msg}")).color(theme::HOT).strong());
+            }
+        }
+        ui.add_space(4.0);
+    }
+
+    if confirming {
+        ui.label(
+            RichText::new(format!(
+                "Change nickname to `{}` ?",
+                edit_buf
+            ))
+            .color(theme::TEXT_HI)
+            .strong(),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "This will update your existing leaderboard entries. Old rows \
+                 do NOT keep the previous name. The change counts against your \
+                 5/24h limit.",
+            )
+            .color(theme::TEXT_LO)
+            .small(),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let confirm_clicked = ui
+                .add(
+                    egui::Button::new(RichText::new("Confirm change").color(theme::PANEL_DEEP).strong())
+                        .fill(theme::ACCENT)
+                        .min_size(egui::vec2(140.0, 28.0)),
+                )
+                .clicked();
+            let back_clicked = ui.button("Back").clicked();
+            if confirm_clicked && !saving {
+                spawn_nickname_save(edit_buf.clone());
+            } else if back_clicked {
+                let mut s = NICKNAME_UI.lock();
+                s.confirming = false;
+            }
+        });
+        return;
+    }
+
+    if editing {
+        ui.horizontal(|ui| {
+            ui.label("New nickname:");
+            ui.text_edit_singleline(&mut edit_buf);
+        });
+        {
+            let mut s = NICKNAME_UI.lock();
+            s.edit_buf = edit_buf.clone();
+        }
+        let validation = adn::validate_nickname(edit_buf.trim());
+        if let Err(e) = &validation {
+            ui.label(RichText::new(format!("⚠ {e}")).color(theme::HOT).small());
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let save_clicked = ui
+                .add_enabled(
+                    validation.is_ok(),
+                    egui::Button::new(RichText::new("Save").color(theme::PANEL_DEEP).strong())
+                        .fill(theme::ACCENT)
+                        .min_size(egui::vec2(100.0, 28.0)),
+                )
+                .clicked();
+            let cancel_clicked = ui.button("Cancel").clicked();
+            if save_clicked && validation.is_ok() {
+                let mut s = NICKNAME_UI.lock();
+                s.edit_buf = edit_buf.trim().to_string();
+                s.confirming = true;
+            } else if cancel_clicked {
+                let mut s = NICKNAME_UI.lock();
+                s.editing = false;
+                s.confirming = false;
+                s.edit_buf.clear();
+            }
+        });
+        return;
+    }
+
+    // Idle row: show current value + Edit button.
+    if saving {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Saving…");
+        });
+        return;
+    }
+    if fetching && current.is_none() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Loading current nickname…");
+        });
+        return;
+    }
+    let (current_name, is_auto) = match &current {
+        Some(info) => (
+            info.display_name.clone(),
+            matches!(info.source, adn::DisplayNameSource::Auto),
+        ),
+        None => ("(unknown)".to_string(), false),
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Current:").color(theme::TEXT_LO));
+        ui.label(RichText::new(&current_name).color(theme::TEXT_HI).strong());
+        if is_auto {
+            ui.label(
+                RichText::new("(auto-fallback)")
+                    .color(theme::TEXT_LO)
+                    .small()
+                    .italics(),
+            );
+        }
+        if ui.button("Edit").clicked() {
+            let mut s = NICKNAME_UI.lock();
+            s.editing = true;
+            s.confirming = false;
+            s.last_message = None;
+            s.edit_buf = if is_auto { String::new() } else { current_name.clone() };
+        }
+    });
+}
+
 #[cfg(feature = "telemetry")]
 fn request_reset_confirm() {
     *RESET_CONFIRM.lock() = true;
@@ -1649,6 +1965,14 @@ fn render_account(ui: &mut egui::Ui) {
     // Render the shared chooser modal — no-op unless the Link…
     // button (or the above-grid CTA) has set the flag.
     crate::gui::widgets::oauth_chooser::show(ui.ctx(), active);
+
+    // Mick FEATURE #3 (2026-05-30) — nickname row + inline editor +
+    // are-you-sure confirmation. Renders only when the install is
+    // OAuth-linked (nickname is an account-level concept; anonymous
+    // installs have nothing to change).
+    if matches!(status, Some(oauth::AccountStatus::Linked { .. })) {
+        render_nickname_row(ui);
+    }
 }
 
 #[cfg(feature = "telemetry")]

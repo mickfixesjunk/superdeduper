@@ -3575,16 +3575,14 @@ impl eframe::App for SuperdeduperApp {
 
         // T-BENCH-ME "Benchmark" modal (consent -> progress -> result).
         // Default opt-out; nothing runs until the user clicks inside it.
-        // OpenSharePreview routes to Settings -> Privacy (the canonical
-        // full-payload preview surface) rather than duplicating it.
+        // Mick bug #1 fix (2026-05-30): the modal's "What exactly gets
+        // shared?" link now toggles the inline preview directly instead of
+        // routing to Settings>Privacy, so the modal no longer pops the
+        // settings modal over the bench modal on one click.
         #[cfg(feature = "telemetry")]
         {
-            use crate::gui::widgets::bench_modal::{self, BenchModalAction};
-            if let BenchModalAction::OpenSharePreview = bench_modal::show(&mut self.bench, ctx) {
-                self.settings_open = true;
-                self.settings_modal_state.tab =
-                    crate::gui::widgets::settings_modal::SettingsTab::Leaderboard;
-            }
+            use crate::gui::widgets::bench_modal;
+            bench_modal::show(&mut self.bench, ctx);
         }
 
         // Channel banner — always-on 32px coloured strip when the
