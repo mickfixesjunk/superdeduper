@@ -18,19 +18,27 @@
 //! - [`BenchError`] — structured error type at both trait boundaries.
 //!   Stable enum; `-real` keeps `anyhow` inside the impl.
 //!
-//! ## Scaffold scope (P0-C, 2026-05-31)
+//! ## Scope progression
 //!
-//! Method signatures use opaque placeholder types (newtype-wrapped
-//! `String` / `Vec<u8>`) so the workspace builds standalone. Concrete
-//! types (`BenchContext`, `BenchOutcome`, `SubmissionInputs`,
-//! `SubmitOutcome`, `ChallengePosition`, `DebugDedupDiffReport`) are
-//! still owned by the engine `src/leaderboard/` modules and will move
-//! into this crate in P0-D when the `-real` impl pulls the leaderboard
-//! internals across the cut-line. Until then, engine call sites remain
-//! inline and this crate has no consumers.
+//! P0-C (2026-05-31): trait surface + opaque placeholder types so the
+//! workspace builds standalone with no engine consumers.
+//!
+//! P0-D Phase 1 (this commit, 2026-05-31): SIMPLE types replaced with their
+//! real engine shapes — `ChallengePosition`, `DebugDedupDiff` +
+//! `DebugDedupDiffReport`, `InstallKey`. Bench-real crate added as workspace
+//! member with a `BenchReal` stub impl + the `d7_probe` module moved across
+//! the cut-line as a proof-of-concept.
+//!
+//! P0-D Phase 2 (post-launch): COMPLEX types — `BenchContext` (lifetime
+//! decision), `BenchOutcome`, `SubmissionInputs` (depends on
+//! `HardwareFingerprint`; needs cross-module type extraction first),
+//! `SubmitOutcome` (rich enum). And the 5 remaining module moves
+//! (`bench_run`, `bench_client`, `bench`, `bench_corpus`, submission HTTP
+//! path). See `docs/phase-0-p0d-move-plan.md` for the full execution
+//! catalog.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- types
 
@@ -74,18 +82,43 @@ pub struct SubmitOutcome {
     pub server_response: String,
 }
 
-/// One challenge position descriptor. Opaque placeholder for the
-/// scaffold; P0-D moves the real `ChallengePosition` (currently in
-/// `src/leaderboard/bench_client.rs`) into this crate.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One challenge position descriptor.
+///
+/// P0-D Phase 1 (2026-05-31): canonical home. The P0-C placeholder was
+/// already byte-exact to the real shape in `bench_client.rs`; this
+/// commit promotes the placeholder to canonical so engine can drop the
+/// duplicate definition and `pub use` from here in Phase 2.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChallengePosition {
     pub path_index: u64,
     pub byte_offset: u64,
     pub byte_length: u64,
 }
 
-/// Diagnostic report from `BenchExecutor::debug_dedup_diff`. Opaque
-/// placeholder for the scaffold.
+/// One row in `DebugDedupDiffReport.diffs` — a candidate whose three
+/// content reads (parallel cold-bypass, serial cold-bypass, serial
+/// buffered) don't all agree on `blake3(content)`. P0-D Phase 1
+/// (2026-05-31): real shape moved from `src/leaderboard/bench_run.rs`.
+#[derive(Debug, Clone)]
+pub struct DebugDedupDiff {
+    pub path_index: u64,
+    pub path: PathBuf,
+    pub size: u64,
+    pub parallel_hash: [u8; 32],
+    pub parallel_cold: bool,
+    pub serial_hash: [u8; 32],
+    pub serial_cold: bool,
+    pub buffered_hash: [u8; 32],
+}
+
+/// Diagnostic report from [`BenchExecutor::debug_dedup_diff`]. Three dup-
+/// group counts should agree on a correct dedup; any divergence is the
+/// bug. P0-D Phase 1 (2026-05-31): real shape moved from
+/// `src/leaderboard/bench_run.rs`, replacing the P0-C placeholder. The
+/// scaffold dropped `diffs: Vec<DebugDedupDiff>` for simplicity; the
+/// real consumer (`sd debug dedup-diff`) prints the per-candidate
+/// divergence list, so the placeholder shape would have undercounted on
+/// move-day.
 #[derive(Debug, Clone)]
 pub struct DebugDedupDiffReport {
     pub files_enumerated: u64,
@@ -93,14 +126,18 @@ pub struct DebugDedupDiffReport {
     pub parallel_dup_groups: usize,
     pub serial_dup_groups: usize,
     pub buffered_dup_groups: usize,
-    pub diff_count: usize,
+    /// Candidates where the three reads disagree, sorted by `path_index`.
+    pub diffs: Vec<DebugDedupDiff>,
 }
 
 /// HMAC install key newtype — opaque secret material at the trait
-/// boundary. P0-D will replace with the engine's existing newtype
-/// (`leaderboard::install::InstallKey`).
+/// boundary. P0-D Phase 1 (2026-05-31): corrected from `Vec<u8>` to
+/// `[u8; 32]` to match the engine's `leaderboard::install::InstallKey`
+/// type alias (which is `[u8; 32]`, not a heap vec). Length-erased
+/// newtype keeps the iface ABI stable when the engine type's exact
+/// representation evolves.
 #[derive(Debug, Clone)]
-pub struct InstallKey(pub Vec<u8>);
+pub struct InstallKey(pub [u8; 32]);
 
 // --------------------------------------------------------------- errors
 

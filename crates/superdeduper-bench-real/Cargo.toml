@@ -1,0 +1,42 @@
+[package]
+name = "superdeduper-bench-real"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0 trait extraction default impl: superdeduper-bench-real holds the real bench-flow + submission logic moved out of the engine binary's src/leaderboard/. Implements BenchExecutor + SubmissionExecutor from superdeduper-bench-iface. Phase 1 (2026-05-31): scaffold + d7_probe module move + BenchReal stub impls. Phase 2 (post-launch): the remaining 5 modules + real trait method bodies."
+license = "MIT"
+repository = "https://github.com/mickfixesjunk/superdeduper"
+publish = false
+
+[dependencies]
+# Phase 1 deps: d7_probe + BenchReal stub + bench (chacha20 + blake3 for
+# the Merkle math) + bench_corpus (serde + bench).
+superdeduper-bench-iface = { path = "../superdeduper-bench-iface" }
+blake3 = "1"
+chacha20 = "0.9"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only deps used by the moved bench_corpus + bench tests
+# (rayon for the parallel manifest gen tests; serde_json for the
+# canonical-JSON round-trip assertions).
+rayon = "1.10"
+serde_json = "1"
+tempfile = "3"
+
+# Phase 2 deps (commented; uncomment when the 5 remaining module moves
+# land):
+# superdeduper-hmac-signer = { path = "../superdeduper-hmac-signer" }
+# superdeduper-log = { path = "../superdeduper-log" }
+# river5 = { git = "https://github.com/mickfixesjunk/river5", rev = "ae337b39908c942e0f0df8168db5be5075fbffb4" }
+# serde = { version = "1", features = ["derive"] }
+# serde_json = "1"
+# anyhow = "1"
+# ureq = { version = "2.10", default-features = false, features = ["json", "tls"] }
+# hmac = "0.12"
+# sha2 = "0.10"
+# uuid = { version = "1.10", features = ["v4"] }
+# chacha20 = "0.9"
+# base64 = "0.22"
+# tar = "0.4"
+# parking_lot = "0.12"

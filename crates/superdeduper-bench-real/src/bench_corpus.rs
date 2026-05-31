@@ -18,7 +18,12 @@
 //! dups inherit their source original's content_id (so content-identical dups
 //! exist) — but each dup still gets a DISTINCT leaf hash because the path is
 //! bound into the leaf preimage (see [`super::bench::leaf_hash`]).
-#![cfg(feature = "telemetry")]
+//!
+//! P0-D Phase 1 (2026-05-31): moved from `src/leaderboard/bench_corpus.rs`
+//! into the bench-real workspace crate. The engine binary pulls bench-real
+//! in only when the `telemetry` feature is on, so the inner
+//! `#![cfg(feature = "telemetry")]` gate that lived here became redundant
+//! and was removed during the move.
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
