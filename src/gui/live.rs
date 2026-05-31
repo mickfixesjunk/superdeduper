@@ -1572,7 +1572,8 @@ fn run(
             // — putting the best-scored file there is how we
             // make `KeepStrategy::Smart` the GUI default without
             // each downstream action having to know about it.
-            let visible_files = order_keeper_first(visible_files, settings.keep_strategy);
+            let visible_files =
+                order_keeper_first(visible_files, settings.keep_strategy, &reference_set);
             let summary = DuplicateGroupSummary {
                 size: g.size,
                 content_hash: g.content_hash,
@@ -2067,6 +2068,19 @@ fn run(
             );
             let n_groups = tier4_groups.len();
             for g in tier4_groups {
+                // A-ref-keeper — reference-drive invariant for Tier-4
+                // perceptual-image groups. Without this pair, a
+                // perceptual match where R contains the centroid would
+                // emit files[0]=non-reference and Mick would see R
+                // demoted to dupe in the GUI. Drop the group entirely
+                // if every member is under a reference root (nothing
+                // to dedupe).
+                let visible_files = filter_reference_only(g.files, &reference_set);
+                if visible_files.len() < 2 {
+                    continue;
+                }
+                let visible_files =
+                    order_keeper_first(visible_files, settings.keep_strategy, &reference_set);
                 total_dups += 1;
                 *groups_by_similarity_kind
                     .entry("perceptual-image".to_string())
@@ -2080,7 +2094,7 @@ fn run(
                 let summary = DuplicateGroupSummary {
                     size: g.size,
                     content_hash: g.content_hash,
-                    files: g.files,
+                    files: visible_files,
                     link_equivalent: g.link_equivalent,
                     unique_inodes: g.unique_inodes,
                     similarity_kind: g.similarity_kind,
@@ -2116,6 +2130,16 @@ fn run(
             let n_groups = tier4_result.groups.len();
             let short_skipped = tier4_result.short_skipped_count;
             for g in tier4_result.groups {
+                // A-ref-keeper — reference-drive invariant for Tier-4
+                // perceptual-audio groups. Mirrors the byte-identical +
+                // perceptual-image filter pair above so a star-marked
+                // root is honoured across all similarity tiers.
+                let visible_files = filter_reference_only(g.files, &reference_set);
+                if visible_files.len() < 2 {
+                    continue;
+                }
+                let visible_files =
+                    order_keeper_first(visible_files, settings.keep_strategy, &reference_set);
                 total_dups += 1;
                 *groups_by_similarity_kind
                     .entry("perceptual-audio".to_string())
@@ -2126,7 +2150,7 @@ fn run(
                 let summary = DuplicateGroupSummary {
                     size: g.size,
                     content_hash: g.content_hash,
-                    files: g.files,
+                    files: visible_files,
                     link_equivalent: g.link_equivalent,
                     unique_inodes: g.unique_inodes,
                     similarity_kind: g.similarity_kind,
@@ -2308,11 +2332,38 @@ fn truncate_tail(s: &str, n: usize) -> String {
 /// `KeepStrategy::Smart` the implicit GUI default without changing
 /// any downstream action handlers — safe-rename, recycle and
 /// hardlink all treat files[0] as canonical.
-fn order_keeper_first(files: Vec<PathBuf>, strategy: crate::cli::KeepStrategy) -> Vec<PathBuf> {
+///
+/// A-ref-keeper — reference-drive invariant (hard rule, beats every
+/// strategy): if any file is under a reference root, that file MUST
+/// be the keeper. Matches CLI `dedupe::pick_keeper` early-return
+/// (dedupe.rs:753-758) and preserves the index-0 placement that
+/// `filter_reference_only` establishes for byte-identical groups —
+/// without this short-circuit, the Smart heuristic silently demotes a
+/// reference file to a dupe when a non-reference sibling scores
+/// higher (deeper path, newer mtime, etc.), producing the
+/// "A as keeper, R as dupe" inversion Mick observed.
+fn order_keeper_first(
+    files: Vec<PathBuf>,
+    strategy: crate::cli::KeepStrategy,
+    reference_set: &hashbrown::HashSet<PathBuf>,
+) -> Vec<PathBuf> {
     if files.len() < 2 {
         return files;
     }
     use crate::cli::KeepStrategy::*;
+    // Reference-priority short-circuit — applies regardless of
+    // strategy (including First/Interactive, so a GUI default with no
+    // explicit Smart still honours the star marker).
+    if !reference_set.is_empty() {
+        if let Some(i) = files.iter().position(|p| reference_belongs(p, reference_set)) {
+            if i == 0 {
+                return files;
+            }
+            let mut reordered = files;
+            reordered.swap(0, i);
+            return reordered;
+        }
+    }
     // `First` is a no-op — the engine's natural order already wins.
     if matches!(strategy, First | Interactive) {
         return files;
@@ -2639,4 +2690,126 @@ mod tests {
         );
     }
 
+    // ============================================================
+    // A-ref-keeper — reference-drive invariant in order_keeper_first.
+    // Regression tests for the "A as keeper, R as dupe" inversion: a
+    // file under a reference root must land at files[0] regardless of
+    // any Smart heuristic that would otherwise prefer a sibling.
+    // ============================================================
+
+    use crate::cli::KeepStrategy;
+    use std::path::PathBuf;
+
+    fn ref_set(roots: &[&str]) -> hashbrown::HashSet<PathBuf> {
+        roots.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn order_keeper_first_promotes_reference_over_smart_heuristic() {
+        // R lives at a shallow path; A lives at a deeper, "more
+        // organised" path that the Smart heuristic would otherwise
+        // prefer (depth bonus). Without the reference-priority
+        // short-circuit, A wins and R gets demoted — the exact
+        // inversion Mick reported.
+        let r_file = PathBuf::from("/mnt/R/file.bin");
+        let a_file = PathBuf::from("/mnt/A/sub/sub/sub/file.bin");
+        let files = vec![a_file.clone(), r_file.clone()];
+        let refs = ref_set(&["/mnt/R"]);
+        let ordered = order_keeper_first(files, KeepStrategy::Smart, &refs);
+        assert_eq!(
+            ordered[0], r_file,
+            "reference-root file must land at index 0 regardless of heuristic"
+        );
+    }
+
+    #[test]
+    fn order_keeper_first_is_noop_when_reference_already_first() {
+        // filter_reference_only puts R at index 0 first; the heuristic
+        // must NOT swap R out for a higher-scoring sibling.
+        let r_file = PathBuf::from("/mnt/R/file.bin");
+        let a_file = PathBuf::from("/mnt/A/sub/sub/sub/file.bin");
+        let files = vec![r_file.clone(), a_file.clone()];
+        let refs = ref_set(&["/mnt/R"]);
+        let ordered = order_keeper_first(files, KeepStrategy::Smart, &refs);
+        assert_eq!(ordered[0], r_file);
+        assert_eq!(ordered[1], a_file);
+    }
+
+    #[test]
+    fn order_keeper_first_no_reference_falls_through_to_strategy() {
+        // Empty reference set → existing Smart behaviour preserved.
+        let recycle_path = PathBuf::from("/mnt/A/$Recycle.Bin/foo.txt");
+        let canonical = PathBuf::from("/mnt/A/Users/me/Documents/Projects/foo.txt");
+        let files = vec![recycle_path.clone(), canonical.clone()];
+        let refs = ref_set(&[]);
+        let ordered = order_keeper_first(files, KeepStrategy::Smart, &refs);
+        assert_eq!(
+            ordered[0], canonical,
+            "with no reference set, Smart should still beat the recycle-bin path"
+        );
+    }
+
+    #[test]
+    fn order_keeper_first_reference_priority_honoured_by_first_strategy() {
+        // Even KeepStrategy::First — which is normally a no-op — must
+        // promote a reference file. Otherwise a GUI default with no
+        // explicit Smart silently violates the star invariant.
+        let r_file = PathBuf::from("/mnt/R/file.bin");
+        let a_file = PathBuf::from("/mnt/A/file.bin");
+        let files = vec![a_file.clone(), r_file.clone()];
+        let refs = ref_set(&["/mnt/R"]);
+        let ordered = order_keeper_first(files, KeepStrategy::First, &refs);
+        assert_eq!(ordered[0], r_file);
+    }
+
+    #[test]
+    fn order_keeper_first_picks_first_reference_when_multiple_present() {
+        // Two reference roots both contain a member — the first one
+        // encountered in `files` wins, matching CLI parity
+        // (dedupe::pick_keeper returns the first index whose
+        // canonical_key is in the reference set).
+        let r1_file = PathBuf::from("/mnt/R1/file.bin");
+        let r2_file = PathBuf::from("/mnt/R2/file.bin");
+        let a_file = PathBuf::from("/mnt/A/file.bin");
+        // R2 appears first in `files` order — R2 wins.
+        let files = vec![a_file.clone(), r2_file.clone(), r1_file.clone()];
+        let refs = ref_set(&["/mnt/R1", "/mnt/R2"]);
+        let ordered = order_keeper_first(files, KeepStrategy::Smart, &refs);
+        assert_eq!(ordered[0], r2_file);
+    }
+
+    #[test]
+    fn order_keeper_first_reference_beats_newest_mtime_strategy_too() {
+        // Newest-strategy + reference set: reference still wins even
+        // if a non-reference sibling has a much newer mtime. Touches
+        // the filesystem because Newest reads mtime; build the
+        // physical files inline.
+        let dir = std::env::temp_dir().join(format!(
+            "sdd-order-keeper-newest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let r_root = dir.join("R");
+        let a_root = dir.join("A");
+        std::fs::create_dir_all(&r_root).unwrap();
+        std::fs::create_dir_all(&a_root).unwrap();
+        let r_file = r_root.join("file.bin");
+        let a_file = a_root.join("file.bin");
+        std::fs::write(&r_file, b"x").unwrap();
+        // Sleep so A's mtime is strictly later than R's.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&a_file, b"x").unwrap();
+        let files = vec![a_file.clone(), r_file.clone()];
+        let refs: hashbrown::HashSet<PathBuf> =
+            std::iter::once(r_root.clone()).collect();
+        let ordered = order_keeper_first(files, KeepStrategy::Newest, &refs);
+        assert_eq!(
+            ordered[0], r_file,
+            "reference must beat Newest even when A is strictly newer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
