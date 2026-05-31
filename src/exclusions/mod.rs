@@ -47,7 +47,15 @@ pub use self::presets::BuiltinPresets;
 /// the (forthcoming) `presets` module. For Day 1 the IDs exist so
 /// `ExclusionConfig` can serialise / deserialise them and the
 /// runtime policy can report them as the reason for an exclusion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+///
+/// #157 -- A-settings-drift-tolerant: Ord/PartialOrd added so the
+/// settings-drift comparator can canonicalize `active_packs` Vec
+/// order before comparing (the field is semantically a set). The
+/// derived enum-discriminant order is fine -- the exact order is an
+/// implementation detail of the comparator; any total order works.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum PresetPackId {
     SystemLibraries,

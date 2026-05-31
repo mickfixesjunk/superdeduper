@@ -828,7 +828,16 @@ impl SuperdeduperApp {
         // false-positive reports surface the exact diverging field via the
         // disk log instead of needing another live retest.
         let roots_match = roots_equivalent(&cp.roots, &self.persisted.roots);
-        let settings_match = cp.settings == self.persisted.settings;
+        // #157 -- A-settings-drift-tolerant. Direct
+        // `cp.settings == self.persisted.settings` is too tight: known
+        // harmless variations between the checkpoint-side and
+        // egui-persistence-side serializations were firing the modal
+        // on every macOS resume (Mick repro). `settings_equivalent`
+        // canonicalizes order-irrelevant fields (active_packs is
+        // semantically a set, not an ordered Vec) before comparing.
+        // Strict per-field comparison stays available for diagnostics
+        // below.
+        let settings_match = settings_equivalent(&cp.settings, &self.persisted.settings);
         if roots_match && settings_match {
             return None;
         }
@@ -850,11 +859,15 @@ impl SuperdeduperApp {
             );
         }
         if !settings_match {
-            crate::log_warn!(
-                "settings_drift: settings differ; cp={:?} current={:?}",
-                cp.settings,
-                self.persisted.settings
-            );
+            // #157 -- log a PER-FIELD diff so future false-positives
+            // surface exactly which field disagrees in 5 seconds of
+            // log-grep time, instead of forcing a side-by-side Debug
+            // print of the whole 20-field struct. Anyone who sees the
+            // modal can `grep 'settings_drift_field:' ~/.local/share/...`
+            // and immediately see the culprit. Stable canonical
+            // ordering is applied where the field's semantics allow
+            // (set-shaped Vecs canonicalized before comparison).
+            log_settings_field_diff(&cp.settings, &self.persisted.settings);
         }
         Some(checkpoint::CheckpointSummary {
             created_at_unix: cp.created_at_unix,
@@ -4483,6 +4496,91 @@ fn open_url_in_browser(url: &str) {
 /// /private/var/users symlink canonicalization). Compare via
 /// `fs::canonicalize` when available; fall back to raw eq if the path no
 /// longer resolves (the underlying drive ejected, the path was deleted, etc.).
+/// #157 -- A-settings-drift-tolerant. Settings comparison that
+/// canonicalizes order-irrelevant fields before structural compare,
+/// so a Vec-order shuffle on a semantically-set field doesn't trip
+/// the drift modal. Specifically `exclusion_config.active_packs` is
+/// "the set of preset packs the user enabled" -- the Vec encoding is
+/// an implementation detail; the order it was last persisted in is
+/// not part of the user's intent. Today this is the only known
+/// order-sensitive but order-irrelevant field; extend this fn (and
+/// the per-field diff logger) as future surfaces appear.
+///
+/// All other fields are byte-compared via the derived `PartialEq` on
+/// `ScanSettings`. If a tolerant comparison is needed for a NEW
+/// field, add a guard here AND a per-field log entry below so the
+/// diagnostic stays in sync.
+fn settings_equivalent(a: &crate::gui::state::ScanSettings, b: &crate::gui::state::ScanSettings) -> bool {
+    // Cheap fast path -- byte-equal settings (the steady-state case
+    // when nothing drifted) doesn't need a clone.
+    if a == b {
+        return true;
+    }
+    // Slow path -- canonicalize set-shaped fields and re-compare.
+    let mut a = a.clone();
+    let mut b = b.clone();
+    a.exclusion_config.active_packs.sort_unstable();
+    b.exclusion_config.active_packs.sort_unstable();
+    a == b
+}
+
+/// #157 -- emit one log line per ScanSettings field that disagrees.
+/// Compared to the prior single "settings differ; cp=... current=..."
+/// Debug-print of the whole struct, this lets a user reading
+/// `~/.local/share/superdeduper/diagnostics/*.log` find the
+/// disagreeing field with a simple grep. Each line prefix
+/// `settings_drift_field:` is stable for tooling.
+fn log_settings_field_diff(cp: &crate::gui::state::ScanSettings, cur: &crate::gui::state::ScanSettings) {
+    macro_rules! diff {
+        ($field:ident) => {
+            if cp.$field != cur.$field {
+                crate::log_warn!(
+                    "settings_drift_field: {} cp={:?} current={:?}",
+                    stringify!($field),
+                    cp.$field,
+                    cur.$field,
+                );
+            }
+        };
+    }
+    diff!(min_size_bytes);
+    diff!(max_size_bytes);
+    diff!(include_glob);
+    diff!(exclude_glob);
+    diff!(use_format_aware);
+    diff!(use_cache);
+    diff!(paranoid);
+    diff!(follow_links);
+    diff!(threads);
+    diff!(io_threads);
+    diff!(allow_system_paths);
+    diff!(hash_algo);
+    diff!(bypass_destructive_confirmation);
+    diff!(always_use_cache);
+    diff!(dismissed_alpha_warning);
+    diff!(skip_preflight);
+    diff!(keep_strategy);
+    diff!(history_retention_days);
+    diff!(dismissed_v0_2_7_exclusion_banner);
+    // exclusion_config compared as a sorted-set so order-only
+    // differences don't show up as a drift here either.
+    let mut cp_packs = cp.exclusion_config.active_packs.clone();
+    let mut cur_packs = cur.exclusion_config.active_packs.clone();
+    cp_packs.sort_unstable();
+    cur_packs.sort_unstable();
+    if cp.exclusion_config.enabled != cur.exclusion_config.enabled
+        || cp_packs != cur_packs
+        || cp.exclusion_config.custom_extensions != cur.exclusion_config.custom_extensions
+        || cp.exclusion_config.custom_patterns != cur.exclusion_config.custom_patterns
+    {
+        crate::log_warn!(
+            "settings_drift_field: exclusion_config cp={:?} current={:?}",
+            cp.exclusion_config,
+            cur.exclusion_config,
+        );
+    }
+}
+
 fn roots_equivalent(a: &[crate::gui::state::RootEntry], b: &[crate::gui::state::RootEntry]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -4502,6 +4600,117 @@ fn roots_equivalent(a: &[crate::gui::state::RootEntry], b: &[crate::gui::state::
         }
     }
     true
+}
+
+#[cfg(test)]
+mod settings_drift_tests {
+    use super::settings_equivalent;
+    use crate::exclusions::config::ExclusionConfig;
+    use crate::exclusions::PresetPackId;
+    use crate::gui::state::ScanSettings;
+
+    /// #157 -- A-settings-drift-tolerant. Identical settings must
+    /// compare equal (the steady-state case where nothing changed).
+    /// Pins the fast-path return.
+    #[test]
+    fn settings_equivalent_byte_identical_settings_match() {
+        let a = ScanSettings::default();
+        let b = ScanSettings::default();
+        assert!(settings_equivalent(&a, &b));
+    }
+
+    /// #157 -- A genuine user change (different min_size_bytes) MUST
+    /// still surface as a drift. Negative control to ensure the
+    /// tolerant comparator hasn't made the drift modal toothless.
+    #[test]
+    fn settings_equivalent_real_user_change_still_diffs() {
+        let a = ScanSettings::default();
+        let b = ScanSettings {
+            min_size_bytes: a.min_size_bytes + 1024,
+            ..a.clone()
+        };
+        assert!(!settings_equivalent(&a, &b));
+    }
+
+    /// #157 keystone -- the false-positive shape the issue describes:
+    /// the SAME set of active preset packs, persisted in DIFFERENT
+    /// Vec orders by two different code paths (e.g. egui's persistence
+    /// JSON serializing in toml-roundtrip order vs the checkpoint
+    /// JSON re-emitting them in user-toggle order). Before this fix,
+    /// the byte-eq comparison fired a false drift; after, the
+    /// canonicalize-as-set fast path accepts them as equal.
+    #[test]
+    fn settings_equivalent_tolerates_active_packs_order_difference() {
+        let packs_order_a = vec![
+            PresetPackId::OsSystemTrees,
+            PresetPackId::BuildArtefacts,
+            PresetPackId::PackageManagerCaches,
+        ];
+        let mut packs_order_b = packs_order_a.clone();
+        packs_order_b.reverse();
+        // Sanity: the Vecs ARE byte-different.
+        assert_ne!(packs_order_a, packs_order_b);
+
+        let exc_a = ExclusionConfig {
+            enabled: true,
+            active_packs: packs_order_a,
+            custom_extensions: Vec::new(),
+            custom_patterns: Vec::new(),
+        };
+        let exc_b = ExclusionConfig {
+            enabled: true,
+            active_packs: packs_order_b,
+            custom_extensions: Vec::new(),
+            custom_patterns: Vec::new(),
+        };
+        // Sanity: the configs differ via PartialEq.
+        assert_ne!(exc_a, exc_b);
+
+        let a = ScanSettings {
+            exclusion_config: exc_a,
+            ..ScanSettings::default()
+        };
+        let b = ScanSettings {
+            exclusion_config: exc_b,
+            ..ScanSettings::default()
+        };
+        assert!(
+            settings_equivalent(&a, &b),
+            "active_packs order shouldn't trip the drift comparator (the field is semantically a set)"
+        );
+    }
+
+    /// #157 -- a TRUE membership change in active_packs (adds /
+    /// removes a pack) MUST still surface as drift. Negative control
+    /// against the tolerant comparator becoming a no-op for that
+    /// field.
+    #[test]
+    fn settings_equivalent_detects_active_packs_membership_change() {
+        let exc_a = ExclusionConfig {
+            enabled: true,
+            active_packs: vec![PresetPackId::OsSystemTrees, PresetPackId::BuildArtefacts],
+            custom_extensions: Vec::new(),
+            custom_patterns: Vec::new(),
+        };
+        let exc_b = ExclusionConfig {
+            enabled: true,
+            active_packs: vec![PresetPackId::OsSystemTrees], // BuildArtefacts removed
+            custom_extensions: Vec::new(),
+            custom_patterns: Vec::new(),
+        };
+        let a = ScanSettings {
+            exclusion_config: exc_a,
+            ..ScanSettings::default()
+        };
+        let b = ScanSettings {
+            exclusion_config: exc_b,
+            ..ScanSettings::default()
+        };
+        assert!(
+            !settings_equivalent(&a, &b),
+            "removing a preset pack IS a real change and must drift"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2489,7 +2489,11 @@ fn macos_seek_penalty_via_diskutil(path: &std::path::Path) -> Option<bool> {
 /// (HDD), `None` if the line is absent (network volumes, sparse
 /// images, exotic mounts).
 ///
-/// Visible to all platforms so the unit tests can run on Linux.
+/// `#[cfg(any(target_os = "macos", test))]` -- compiled on macOS for
+/// production AND on every host under test so the parser contract
+/// stays pinned cross-platform without dead-code warnings on Linux
+/// production builds.
+#[cfg(any(target_os = "macos", test))]
 fn parse_diskutil_solid_state(text: &str) -> Option<bool> {
     for line in text.lines() {
         let trimmed = line.trim();
