@@ -315,37 +315,61 @@ fn record_row(ui: &mut Ui, record: &ScanRecord) -> Option<RowAction> {
         };
         let resubmit_enabled =
             resubmittable_state && has_payload && (!in_flight_elsewhere || am_in_flight);
-        let resubmit_btn_text = if am_in_flight {
-            "⏳ submitting…"
+        // #155 -- A-history-row-inflight-spinner: when THIS row is the
+        // currently-in-flight resubmit, replace the (no-op-on-click)
+        // button with an animated spinner + label so the user can
+        // visually distinguish "submitting NOW" from any disabled
+        // state. The pre-#155 path showed `⏳ submitting…` as static
+        // button text -- looks like a clickable button + the glyph
+        // doesn't move, indistinguishable from "stuck/hung" at a
+        // glance. Spinner widget animates per egui's frame loop +
+        // matches the pattern used by `action_progress` for other
+        // long-running operations.
+        if am_in_flight {
+            // Sized to match the button's min_size so the table
+            // column doesn't reflow between in-flight and not.
+            // a11y: the label text "Submitting submission for scan
+            // <id>" carries the per-row identification non-visually
+            // (egui surfaces label text through AccessKit on
+            // platforms that support it). The hover tooltip stays
+            // for mouse users.
+            let region = ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(
+                    RichText::new("Submitting…")
+                        .color(theme::TEXT_HI)
+                        .small(),
+                );
+            });
+            region
+                .response
+                .on_hover_text("Resubmit in flight…");
         } else {
-            "↻ Resubmit"
-        };
-        let resubmit_response = ui.add_enabled(
-            resubmit_enabled,
-            egui::Button::new(RichText::new(resubmit_btn_text).color(theme::TEXT_HI))
-                .min_size(egui::vec2(110.0, 22.0)),
-        );
-        let tooltip = if am_in_flight {
-            "Resubmit in flight…".to_string()
-        } else if !has_payload {
-            "This row was recorded before payload-capture (v1/v2); rescan to get a resubmittable row.".to_string()
-        } else if !resubmittable_state {
-            format!("State `{:?}` — server already has this submission.", record.submission_state)
-        } else if in_flight_elsewhere {
-            "Another resubmit is in flight; click again once it completes.".to_string()
-        } else {
-            format!(
-                "Resubmit to {} (channel: {}).",
-                record
-                    .submission_channel
-                    .as_deref()
-                    .unwrap_or(record.channel.as_str()),
-                record.channel,
-            )
-        };
-        let resubmit_response = resubmit_response.on_hover_text(tooltip);
-        if resubmit_response.clicked() && resubmit_enabled && !am_in_flight {
-            action = Some(RowAction::Resubmit(record.scan_id.clone()));
+            let resubmit_response = ui.add_enabled(
+                resubmit_enabled,
+                egui::Button::new(RichText::new("↻ Resubmit").color(theme::TEXT_HI))
+                    .min_size(egui::vec2(110.0, 22.0)),
+            );
+            let tooltip = if !has_payload {
+                "This row was recorded before payload-capture (v1/v2); rescan to get a resubmittable row.".to_string()
+            } else if !resubmittable_state {
+                format!("State `{:?}` — server already has this submission.", record.submission_state)
+            } else if in_flight_elsewhere {
+                "Another resubmit is in flight; click again once it completes.".to_string()
+            } else {
+                format!(
+                    "Resubmit to {} (channel: {}).",
+                    record
+                        .submission_channel
+                        .as_deref()
+                        .unwrap_or(record.channel.as_str()),
+                    record.channel,
+                )
+            };
+            let resubmit_response = resubmit_response.on_hover_text(tooltip);
+            if resubmit_response.clicked() && resubmit_enabled {
+                action = Some(RowAction::Resubmit(record.scan_id.clone()));
+            }
         }
 
         let delete_response = ui
