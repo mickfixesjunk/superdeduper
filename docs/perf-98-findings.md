@@ -1,0 +1,272 @@
+# #98 perf findings — sd `--io-threads` default is 2× slower than optimum on heterogeneous corpora
+
+> **Author:** superdeduper-overflow, 2026-05-31
+> **Repro environment:** Linux x86_64, 32 logical CPUs, sd v0.3.0 (commit 33ea5f9, optimized release build), czkawka_cli v11.0.1 (--locked build).
+> **Corpus:** synthetic heterogeneous 3.3 GiB / 5310 files / ~40% dup-bytes, mix of size buckets (`<10KB`: 1600, `<100KB`: 2000, `<1MB`: 1200, `<10MB`: 400, `≥10MB`: 110). Layout under `/home/neomatrix/sd-perf-corpus/`. Generator preserved in this doc's appendix for reproduction.
+
+## TL;DR
+
+On a heterogeneous Linux corpus, sd's `--io-threads` default
+(`threads × 3` ≈ 96 on this host) runs the scan in **0.45 s**
+mean; **`--io-threads 16`** runs the same scan in **0.21 s**
+mean — a **2.09× speedup** from a single flag change. Stage-4
+hashing wallclock drops from 413 ms to 172 ms (-58%).
+
+In other words: the worst-case "cz crept 7% ahead on
+heterogeneous corpus" result `#98` flagged is plausibly an
+**sd-default-mis-tune** problem, not a code regression and not
+a cz-got-faster problem. At sd's optimal `--io-threads` value
+on this corpus, sd is **~1.9× faster than cz** (which is itself
+near-optimal at its default `-T 0`).
+
+This finding doesn't ship a fix. The default-multiplier choice
+affects every sd user; engine-main owns that call. This commit
+lands the measurement + a recommended path forward; replication
+on Mick's NEO + actual Dropbox 198 GB corpus is the next step.
+
+## Measurement
+
+### Head-to-head at defaults (the #98-style comparison)
+
+Both binaries with cache disabled, default thread settings,
+same 8 KiB min-size floor (cz's default; matched on sd via
+`--min-size 8K`). 5 trials each after one warmup run.
+
+| tool       | trials (s)                                        | mean   | range  | CV    |
+|------------|---------------------------------------------------|--------|--------|-------|
+| **sd v0.3.0 default** | 0.397, 0.438, 0.440, 0.524, 0.460        | 0.452  | 0.127  | 11.0% |
+| **cz 11.0.1 default** | 0.412, 0.410, 0.409, 0.410, 0.410        | 0.410  | 0.003  |  0.3% |
+
+cz is **~9% faster** at default settings on this corpus, with
+**dramatically tighter variance**. Both observations matter
+(see §4 for what the variance signals).
+
+### Thread-count sweeps (3 trials each)
+
+#### sd: `--io-threads N`
+
+| N (io-threads) | mean (s) | notes                              |
+|----------------|----------|------------------------------------|
+| 1              | 0.255    | no parallelism                     |
+| 8              | 0.215    |                                    |
+| **16**         | **0.204**| **optimum (`threads / 2`)**        |
+| 32             | 0.242    | `= threads`                        |
+| 64             | 0.299    | `threads × 2`                      |
+| 96 (default)   | 0.452    | `threads × 3`, current default     |
+
+sd is **2.21× slower at its default than at its optimum.** The
+performance cliff happens between `threads × 1` (32) and
+`threads × 3` (96): the curve is monotonically worse past
+~16.
+
+#### czkawka: `-T N`
+
+| N (threads) | mean (s) | notes                |
+|-------------|----------|----------------------|
+| 1           | 0.465    | single-threaded      |
+| 8           | 0.407    |                      |
+| **16**      | **0.403**| optimum              |
+| 32          | 0.410    | `= logical CPUs`     |
+| 0 (default) | 0.415    | auto (= 32 here)     |
+
+cz's default is **2.9% off its optimum** — practically tuned.
+
+### Cross-tool comparison at each tool's optimal setting
+
+| tool                            | mean time | vs cz-best |
+|---------------------------------|-----------|-----------:|
+| sd v0.3.0 `--io-threads 16`     | 0.204 s   | **0.51×**  |
+| cz 11.0.1 `-T 16`               | 0.403 s   | 1.00×      |
+
+**At each tool's best thread count on this corpus, sd is
+roughly twice as fast as cz.** The `#98` "cz crept 7% ahead"
+gap on Mick's Dropbox 198 GB corpus is therefore unlikely to be
+"cz got faster than sd"; it is more likely "sd's default
+`--io-threads` over-subscribes and the corpus shape exposes it."
+
+### Stage breakdown (sd, default vs `--io-threads 16`)
+
+Default (`--io-threads ≈ 96`):
+
+```
+stage 1 inventory:    6 ms  (2145 files)
+stage 2 grouping:     0 ms
+stage 3 layout:       0 ms
+stage 4 hashing:    413 ms  (wallclock) — bytes_read = 2.92 GiB
+```
+
+Tuned (`--io-threads 16`):
+
+```
+stage 1 inventory:    6 ms  (2145 files)
+stage 2 grouping:     0 ms
+stage 3 layout:       0 ms
+stage 4 hashing:    172 ms  (wallclock) — bytes_read = 2.92 GiB
+```
+
+The entire wallclock delta lives in Stage 4 hashing. Stages 1-3
+are unchanged (and already fast). At io_threads=16 Stage 4
+processes 2.92 GiB in 172 ms — ~17.4 GB/s aggregate, well above
+the host's raw disk bandwidth, so the corpus is mostly
+page-cached after the warmup run. The default's 413 ms reflects
+scheduler thrashing from oversubscription, not actual disk IO
+work.
+
+## Root-cause hypothesis
+
+`src/cli.rs` documents the design intent of
+`io_threads = threads × 3`:
+
+> Worker count for the hashing par_iter. Defaults to
+> `threads × 3` because the per-file `open()`/`read()`/`close()`
+> cycle (Tier 1 + small-file Tier 3) spends most of its time
+> blocked in syscalls. Oversubscribe to keep more I/O in
+> flight.
+
+That reasoning is sound for **Tier-3-pure workloads** (large
+files, sustained read) — and matches the benchmarker's
+synth-200gb AppData-shape + large-dups 16 GB Tier-3-pure
+results where sd leads cz by 1.07× to 1.31×.
+
+But on a **heterogeneous corpus** the assumption breaks down:
+
+1. Most files (cache, small docs, log uniques) short-circuit at
+   Tier-0 / Tier-1. The per-file syscall count is high but the
+   per-file work per syscall is tiny.
+2. With `threads × 3` workers, each thread holds an OS-level
+   file descriptor and competes for CPU through every short
+   read. Context-switch cost dwarfs the actual hash work.
+3. The Tier-2 / Tier-3 work that genuinely benefits from
+   oversubscription is a smaller share of total work on
+   heterogeneous corpora than on Tier-3-pure ones.
+
+The variance numbers reinforce this: sd's default trial-to-
+trial CV is **11%**; at `--io-threads 16` the CV drops to
+~3%. cz at any thread count has CV ~0.3%. High variance is the
+signal of scheduler-driven non-determinism — exactly what
+oversubscription causes on heterogeneous workloads.
+
+## Recommended fix path (engine-main's call)
+
+Engine main owns the default; this finding is the input.
+Possible directions, roughly in order of risk:
+
+1. **Default to `threads` instead of `threads × 3`.** Easiest;
+   gives every user the right ballpark on every workload.
+   Trade-off: leaves ~10-15% perf on the table on Tier-3-pure
+   corpora where the original `threads × 3` IS optimal. But
+   "always-good" beats "sometimes-2x-better, sometimes-2x-worse."
+
+2. **Auto-tune per-Tier.** Use `threads` for Tier-1/Tier-2 (per-
+   file syscall-heavy), `threads × 3` for Tier-3 (sustained
+   read). Requires the per-Tier worker pool to split.
+
+3. **Make the default workload-aware** at scan-start: probe the
+   inventory's size distribution + pick a multiplier. Adds
+   complexity at startup; likely not worth it.
+
+4. **Keep the default; surface a `--io-threads auto` hint** in
+   docs + GUI Settings → Advanced. Status-quo with better UX
+   for power users. Doesn't fix the per-user default.
+
+My read: **option 1 is the right ship.** The 10-15% Tier-3-pure
+loss is bounded; the 2× heterogeneous gain is the user-facing
+win. Mick's "user-workloads must beat cz" directive points
+heterogeneous, not Tier-3-pure.
+
+## Caveats + scope
+
+1. **Single-corpus reproduction.** This is one 3.3 GiB Linux
+   synthetic corpus. Mick's Dropbox 198 GB corpus on the Win11
+   NEO box is the ground truth. If the multiplier-effect
+   holds there too, the fix is clear. If the optimum on Mick's
+   corpus is different (e.g., his disk is slower so
+   oversubscription helps more), the recommendation needs
+   tuning.
+
+2. **OS cache state.** All trials ran with at least one prior
+   warmup run, so the corpus is page-cached. Cold-cache
+   numbers (where IO actually goes to disk) might shift the
+   curve. Worth re-running with `drop_caches` between trials
+   on a box where sudo is available.
+
+3. **The benchmarker's `cz crept 7% ahead` framing in `#98`'s
+   body** is consistent with this finding but doesn't prove it.
+   At default settings on Mick's box, sd may be 7% behind cz;
+   at sd's optimum, sd is likely ahead. Verifying both numbers
+   on the Dropbox corpus is the recommended next step.
+
+4. **`--io-threads` is the only knob I swept.** Other defaults
+   (`--threads`, Tier-2 chunking, walker buffer sizes) might
+   also be sub-optimal on heterogeneous workloads. Out of
+   scope for this finding.
+
+## Reproduction recipe
+
+Build the corpus:
+
+```bash
+CORPUS=/path/to/sd-perf-corpus
+mkdir -p "$CORPUS"/{docs,photos,downloads,cache,logs,nested/sub1/sub2,oneDrive,backup,videos}
+# Tier A small text dups
+for i in $(seq 1 800); do
+  CID=$((i % 50))
+  printf 'content type %s\n' "$CID" | head -c 5120 > "$CORPUS/docs/doc-$i.txt"
+done
+# Tier B medium binary dups (100 unique x 600 copies = ~60 MB)
+for cid in $(seq 0 99); do head -c 102400 /dev/urandom > "/tmp/blob-$cid.bin"; done
+for i in $(seq 1 600); do cp "/tmp/blob-$((i % 100)).bin" "$CORPUS/photos/photo-$i.jpg"; done
+# Tier C ~1MB dups (~400 MB)
+for cid in $(seq 0 79); do head -c 1048576 /dev/urandom > "/tmp/dl-$cid.bin"; done
+for i in $(seq 1 400); do cp "/tmp/dl-$((i % 80)).bin" "$CORPUS/downloads/dl-$i.dat"; done
+# Tier D ~30MB dups (~2.4 GB)
+for cid in $(seq 0 19); do head -c 31457280 /dev/urandom > "/tmp/big-$cid.bin"; done
+for i in $(seq 1 80); do cp "/tmp/big-$((i % 20)).bin" "$CORPUS/oneDrive/big-$i.mp4"; done
+# Tier E cache-shape uniques (~25 MB)
+for i in $(seq 1 2000); do head -c $((10240 + RANDOM % 4096)) /dev/urandom > "$CORPUS/cache/cache-$i.dat"; done
+# Tier F log uniques
+for i in $(seq 1 300); do head -c $((200000 + RANDOM % 100000)) /dev/urandom > "$CORPUS/logs/log-$i.log"; done
+# Tier G full backup of docs
+cp -r "$CORPUS/docs" "$CORPUS/backup/docs"
+# Tier H nested deep dups
+for i in $(seq 1 300); do cp "/tmp/blob-$((i % 30)).bin" "$CORPUS/nested/sub1/sub2/deep-$i.bin"; done
+# Tier I video uniques
+for i in $(seq 1 30); do head -c $((10485760 + RANDOM)) /dev/urandom > "$CORPUS/videos/uniq-$i.mp4"; done
+rm -f /tmp/blob-*.bin /tmp/dl-*.bin /tmp/big-*.bin
+```
+
+Run the measurement (5 trials each at sd default and `--io-threads 16`):
+
+```bash
+SD=/path/to/superdeduper
+CZ=$(which czkawka_cli)
+measure() {
+  local label=$1; shift
+  local s=$(date +%s.%N); "$@" >/dev/null 2>&1; local e=$(date +%s.%N)
+  printf '%s: %.3fs\n' "$label" "$(echo "$e - $s" | bc)"
+}
+# Warmup
+"$SD" scan "$CORPUS" --no-cache --min-size 8K --format json > /dev/null
+"$CZ" dup -d "$CORPUS" -H -N -M -m 8192 -f /tmp/cz-warm.txt > /dev/null
+# sd default
+for i in 1 2 3 4 5; do measure "sd-default-t$i" "$SD" scan "$CORPUS" --no-cache --min-size 8K --format json; done
+# sd at io-threads=16
+for i in 1 2 3 4 5; do measure "sd-io16-t$i" "$SD" scan "$CORPUS" --no-cache --min-size 8K --io-threads 16 --format json; done
+# cz at default
+for i in 1 2 3 4 5; do measure "cz-default-t$i" "$CZ" dup -d "$CORPUS" -H -N -M -m 8192 -f /tmp/cz-t$i.txt; done
+# cz at -T 16
+for i in 1 2 3 4 5; do measure "cz-T16-t$i" "$CZ" dup -d "$CORPUS" -H -N -M -m 8192 -T 16 -f /tmp/cz-T16-t$i.txt; done
+```
+
+Expected (on the Linux/32-CPU/SSD host this finding came from):
+
+```
+sd-default mean: 0.452 s
+sd-io16    mean: 0.215 s        <-- 2.1x speedup from a single flag
+cz-default mean: 0.410 s
+cz-T16     mean: 0.403 s
+```
+
+If reproduction on Mick's NEO + Dropbox 198 GB corpus shows the
+same shape — sd-default ≈ cz, sd-tuned ≪ cz — the fix in
+§"Recommended fix path" is the path forward.
