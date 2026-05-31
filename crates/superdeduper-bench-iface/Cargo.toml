@@ -1,0 +1,12 @@
+[package]
+name = "superdeduper-bench-iface"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0 leaf crate: BenchExecutor + SubmissionExecutor traits + BenchError enum + shared types. Defines the iface boundary between engine and the future bench-real / bench-stub crates so the cut-line can be validated in code (Phase 0) before moving leaderboard internals behind it (Phase 1+)."
+license = "MIT"
+repository = "https://github.com/mickfixesjunk/superdeduper"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

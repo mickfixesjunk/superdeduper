@@ -307,5 +307,5 @@ lto = "thin"
 # follow as P0-C..P0-F land.
 # ---------------------------------------------------------------------------
 [workspace]
-members = [".", "crates/superdeduper-hmac-signer", "crates/superdeduper-log"]
+members = [".", "crates/superdeduper-hmac-signer", "crates/superdeduper-log", "crates/superdeduper-bench-iface"]
 resolver = "2"
