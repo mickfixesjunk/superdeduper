@@ -97,8 +97,16 @@ pub fn run(
     // protocol_supported=['v3-mutate'] server-side; older corpora accept
     // "tbench-1". Hardcoded pattern match keeps the fix small until a real
     // protocol-negotiation handshake lands.
+    // v0.3.0 HARD CUTOVER (2026-05-31): engine flips outgoing protocol_version
+    // string to v3.1-mutate for corpus-v3-* (was "v3-mutate"). Web /bench/start
+    // accepts both (commit 7cb251c, web dev/prod live 2026-05-31 07:54 PST);
+    // protocol_supported on corpus_versions row lists both. PATH 1 dual-emit
+    // wire shape stays unchanged -- bench_proof carries BOTH result_digest
+    // (legacy V3) and result_digest_v3_1 + rep_hashes (additive since v0.2.69).
+    // Legacy emit drop deferred to v0.3.1-cutover after async-finalize lands
+    // and V3.1 runtime enforcement is on for both v3-quick + v3-full.
     let req_protocol_version = if corpus_version.starts_with("corpus-v3-") {
-        "v3-mutate"
+        "v3.1-mutate"
     } else {
         "tbench-1"
     };
@@ -159,13 +167,18 @@ pub fn run(
             base64::engine::general_purpose::STANDARD.decode(s).ok()
         })
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
-    let use_v3 = protocol_version == "v3-mutate" && k_v3.is_some();
+    // v0.3.0 HARD CUTOVER: accept BOTH legacy "v3-mutate" and new
+    // "v3.1-mutate" as triggering the V3 engine path. Cross-stack PATH 1
+    // means the wire shape is identical (V3 binding + additive V3.1 fields);
+    // the version string is purely a label move for v0.3.0 -> v0.3.1
+    // transition tracking.
+    let use_v3 = matches!(protocol_version.as_str(), "v3-mutate" | "v3.1-mutate")
+        && k_v3.is_some();
     if use_v3 {
         use base64::Engine;
         let k_b64 = base64::engine::general_purpose::STANDARD.encode(k_v3.as_ref().unwrap());
         crate::log_info!(
-            "bench: A3 v3-mutate — k_b64={} (using tag-0x04 challenge_hash + tcorpus-result-v3 + bench_proof.k_echo)",
-            k_b64
+            "bench: A3 {protocol_version} — k_b64={k_b64} (using tag-0x04 challenge_hash + tcorpus-result-v3 + bench_proof.k_echo + V3.1 additive emit)"
         );
     } else if let Some(blob_bytes) = server_blob.as_ref() {
         use base64::Engine;
