@@ -453,62 +453,127 @@ impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
 ///
 /// Body shape `{install_id, bench_run_id}`, HMAC-signed exactly like
 /// `/bench/start` (X-Sd-Install-Id + X-Sd-Signature over the canonical
-/// body bytes). One-time use server-side: a second call on the same
-/// bench_run_id returns 409 (which we just log + ignore).
+/// body bytes).
+///
+/// ## Response shape (A-dedup-ready-retry-after-ms, Phase C item 1, 2026-05-30)
+///
+/// - `200 OK { dedup_start_ts }` — first call; server stamped this run.
+/// - `200 OK { existing_ts }` — already stamped on a prior call; safe to
+///   proceed without re-stamping.
+/// - `409 Conflict { retry_after_ms }` — wait then RETRY. This fires when
+///   the request landed inside the min-gap window the server enforces to
+///   prevent the no-anchor bypass (per web PR #11 deploy 19:14 PDT).
+///   `retry_after_ms = max(0, min_gap_ms - gap_ms)`.
+///   PRIOR BUG: every 409 was treated as 'already_stamped + continue',
+///   which let the bypass succeed because the engine never actually
+///   anchored. Now: sleep retry_after_ms (capped at MAX_SLEEP_MS) and
+///   retry up to MAX_RETRIES. If the retry budget exhausts, fall through
+///   to the back-compat path (server uses received_at - server_start_ts).
 ///
 /// Failure mode is fully back-compat: any network / status error here is
 /// non-fatal. The server falls back to the existing
 /// `received_at - server_start_ts` window, which is what every engine
-/// <= v0.2.49 used. So this is a strict improvement when it succeeds and
-/// a no-op when it doesn't.
+/// <= v0.2.49 used.
 fn signal_dedup_ready(
     base: &str,
     install_id: &str,
     install_key: &super::install::InstallKey,
     bench_run_id: &str,
 ) -> anyhow::Result<()> {
+    /// Safety cap on per-retry sleep. A server that requests a longer wait
+    /// gets ignored (we fall through to back-compat) rather than hanging
+    /// the bench thread. 5s is generous for the gap-enforcement use case
+    /// where typical waits are <1s.
+    const MAX_SLEEP_MS: u64 = 5000;
+    /// Bound the retry loop so a misbehaving server can't pin the engine.
+    /// 3 attempts at up-to-5s each = 15s worst case before back-compat.
+    const MAX_RETRIES: u32 = 3;
+
     let body = serde_json::json!({
         "install_id": install_id,
         "bench_run_id": bench_run_id,
     });
     let canonical = super::hmac_signer::canonical_body(&body);
     let signature = super::hmac_signer::sign(install_key, &canonical);
-    match ureq::post(&format!("{base}/api/v1/bench/dedup-ready"))
-        .set("Content-Type", "application/json")
-        .set("X-Sd-Install-Id", install_id)
-        .set("X-Sd-Signature", &signature)
-        .timeout(std::time::Duration::from_secs(10))
-        .send_bytes(&canonical)
-    {
-        Ok(resp) => {
-            let dedup_start_ts = resp
-                .into_json::<serde_json::Value>()
-                .ok()
-                .and_then(|v| v.get("dedup_start_ts").and_then(|s| s.as_str()).map(str::to_string))
-                .unwrap_or_else(|| "(missing dedup_start_ts in response)".to_string());
-            crate::log_info!(
-                "bench: dedup-ready stamped (bench_run_id={bench_run_id}, dedup_start_ts={dedup_start_ts})"
-            );
-            Ok(())
-        }
-        Err(ureq::Error::Status(409, _)) => {
-            crate::log_warn!(
-                "bench: dedup-ready 409 already_stamped (bench_run_id={bench_run_id}) — server keeps the first stamp; safe to continue"
-            );
-            Ok(())
-        }
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            crate::log_warn!(
-                "bench: dedup-ready HTTP {code}: {body} (back-compat fallback: server uses received_at - server_start_ts window)"
-            );
-            Ok(())
-        }
-        Err(ureq::Error::Transport(t)) => {
-            crate::log_warn!(
-                "bench: dedup-ready transport error: {t} (back-compat fallback: server uses received_at - server_start_ts window)"
-            );
-            Ok(())
+
+    let mut attempt: u32 = 0;
+    loop {
+        let response = ureq::post(&format!("{base}/api/v1/bench/dedup-ready"))
+            .set("Content-Type", "application/json")
+            .set("X-Sd-Install-Id", install_id)
+            .set("X-Sd-Signature", &signature)
+            .timeout(std::time::Duration::from_secs(10))
+            .send_bytes(&canonical);
+
+        match response {
+            Ok(resp) => {
+                let body: serde_json::Value =
+                    resp.into_json().unwrap_or_else(|_| serde_json::json!({}));
+                // Server emits either dedup_start_ts (first call) or
+                // existing_ts (already stamped). Both are 200-OK
+                // "ok-to-proceed" — log distinctly so dev-health can tell.
+                if let Some(existing_ts) =
+                    body.get("existing_ts").and_then(|s| s.as_str())
+                {
+                    crate::log_info!(
+                        "bench: dedup-ready already_stamped (bench_run_id={bench_run_id}, existing_ts={existing_ts}) — first-call ts preserved; safe to continue"
+                    );
+                    return Ok(());
+                }
+                let dedup_start_ts = body
+                    .get("dedup_start_ts")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("(missing dedup_start_ts in response)");
+                crate::log_info!(
+                    "bench: dedup-ready stamped (bench_run_id={bench_run_id}, dedup_start_ts={dedup_start_ts})"
+                );
+                return Ok(());
+            }
+            Err(ureq::Error::Status(409, resp)) => {
+                // A-dedup-ready-retry-after-ms (Phase C #1): 409 means
+                // 'wait then retry' per web PR #11. Parse retry_after_ms,
+                // sleep within the safety cap, and retry up to MAX_RETRIES.
+                let body_text = resp.into_string().unwrap_or_default();
+                let body_json: serde_json::Value =
+                    serde_json::from_str(&body_text).unwrap_or_default();
+                let retry_after_ms = body_json
+                    .get("retry_after_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if retry_after_ms > 0
+                    && retry_after_ms <= MAX_SLEEP_MS
+                    && attempt < MAX_RETRIES
+                {
+                    attempt += 1;
+                    crate::log_warn!(
+                        "bench: dedup-ready 409 retry_after_ms={retry_after_ms} attempt={attempt}/{MAX_RETRIES} (bench_run_id={bench_run_id})"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(retry_after_ms));
+                    continue;
+                }
+                // No retry_after_ms, retry budget exhausted, or wait > cap.
+                // Back-compat fallback: server uses received_at -
+                // server_start_ts. Note: this leaves the no-anchor bypass
+                // window OPEN if the engine falls through here, so the
+                // log is intentionally loud.
+                crate::log_warn!(
+                    "bench: dedup-ready 409 not retrying (retry_after_ms={retry_after_ms}, attempt={attempt}, body={body_text}) — back-compat fallback; anchor MAY be skipped"
+                );
+                return Ok(());
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                crate::log_warn!(
+                    "bench: dedup-ready HTTP {code}: {body} (back-compat fallback: server uses received_at - server_start_ts window)"
+                );
+                return Ok(());
+            }
+            Err(ureq::Error::Transport(t)) => {
+                crate::log_warn!(
+                    "bench: dedup-ready transport error: {t} (back-compat fallback: server uses received_at - server_start_ts window)"
+                );
+                return Ok(());
+            }
         }
     }
 }
