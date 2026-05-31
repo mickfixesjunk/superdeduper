@@ -48,6 +48,26 @@ pub struct ProbeTarget {
     pub byte_length: u64,
 }
 
+/// One probe result — the latency the engine measured doing a single 4 KiB
+/// cold read at the target offset. Emitted on `/bench/dedup-ready` in the
+/// `calibration_results` array (spec L3723-3738).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeResult {
+    pub probe_index: u32,
+    /// Human-readable filename for forensics (server doesn't trust this; it
+    /// re-derives `file_index` from `calibration_seed` to confirm). Just an
+    /// audit aid for "where did this probe land."
+    pub file_path: String,
+    pub byte_offset: u64,
+    pub byte_length: u64,
+    /// Monotonic-clock-measured elapsed time for the read, in nanoseconds.
+    /// Spec L3707: must come from a high-precision clock (Rust `Instant`
+    /// transparently uses `mach_absolute_time` / `QueryPerformanceCounter` /
+    /// `CLOCK_MONOTONIC` on macOS / Windows / Linux respectively, which
+    /// satisfies the Q4 verify-on-implementation item).
+    pub latency_ns: u64,
+}
+
 #[inline]
 fn parse_u64_le(bytes: &[u8]) -> u64 {
     let mut arr = [0u8; 8];
@@ -94,6 +114,80 @@ pub fn derive_probe_offsets(
             file_index,
             byte_offset,
             byte_length: PROBE_LENGTH,
+        });
+    }
+    out
+}
+
+/// Execute a sequence of probes against an actual on-disk corpus.
+///
+/// Per spec L3690-3707:
+/// - Probes are SEQUENTIAL, not parallel (parallel probes share I/O queue
+///   effects that confuse the per-probe latency signal).
+/// - Each probe MUST use the engine's cold-read path so probe latency reflects
+///   the I/O regime the bench will use (the caller provides `read_at_offset`
+///   so this function stays platform-agnostic; D7-C wires the real
+///   `read_uncached` in via the closure).
+/// - Latency is measured with the monotonic clock (`Instant`).
+///
+/// `paths` is the engine-side index from `file_index` -> filesystem path,
+/// derived from the corpus layout (typically `f00000000NN.bin` per the v3
+/// generator convention). `paths.len()` MUST equal the `file_layout` slice
+/// length that was passed to `derive_probe_offsets` — out-of-range
+/// `file_index` references panic in debug, return a zero-latency error
+/// placeholder in release.
+///
+/// `read_at_offset` reads exactly `byte_length` bytes at `byte_offset` and
+/// returns Ok on success. The actual byte content is discarded — only the
+/// elapsed wall-clock time matters for the calibration verifier. Read
+/// failures (file missing, permission denied, etc.) record `latency_ns = 0`
+/// + the failure path; the server-side verifier sees this as an anomalous
+/// signal but does not hard-reject (some real disks legitimately fail mid-
+/// scan; the verifier flags, doesn't reject, on missing probes).
+pub fn execute_probes<F>(
+    targets: &[ProbeTarget],
+    paths: &[std::path::PathBuf],
+    mut read_at_offset: F,
+) -> Vec<ProbeResult>
+where
+    F: FnMut(&std::path::Path, u64, u64) -> std::io::Result<()>,
+{
+    let mut out = Vec::with_capacity(targets.len());
+    for t in targets {
+        let path = match paths.get(t.file_index as usize) {
+            Some(p) => p.clone(),
+            None => {
+                debug_assert!(false, "execute_probes: file_index {} out of range (len={})", t.file_index, paths.len());
+                out.push(ProbeResult {
+                    probe_index: t.probe_index,
+                    file_path: format!("<out-of-range:{}>", t.file_index),
+                    byte_offset: t.byte_offset,
+                    byte_length: t.byte_length,
+                    latency_ns: 0,
+                });
+                continue;
+            }
+        };
+        let path_display = path.file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let start = std::time::Instant::now();
+        let read_ok = read_at_offset(&path, t.byte_offset, t.byte_length).is_ok();
+        let elapsed = start.elapsed();
+        let latency_ns = if read_ok {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+
+        out.push(ProbeResult {
+            probe_index: t.probe_index,
+            file_path: path_display,
+            byte_offset: t.byte_offset,
+            byte_length: t.byte_length,
+            latency_ns,
         });
     }
     out
@@ -348,4 +442,112 @@ mod tests {
         1190989141, 169168056, 1099431953, 2104346440, 212449186, 1763286286, 504783584, 1119732940,
         667324715, 547076856, 1197670165, 1053878450, 1578456011, 1852314316, 1785732448, 757938980,
     ];
+
+    // -----------------------------------------------------------------
+    // D7-B: execute_probes tests (mocked read_fn; no real I/O).
+    // -----------------------------------------------------------------
+
+    use std::path::PathBuf;
+
+    fn mock_paths(n: usize) -> Vec<PathBuf> {
+        (0..n).map(|i| PathBuf::from(format!("f{:010}.bin", i))).collect()
+    }
+
+    #[test]
+    fn execute_probes_calls_reader_once_per_target_with_correct_args() {
+        let targets = vec![
+            ProbeTarget { probe_index: 0, file_index: 0, byte_offset: 100, byte_length: 4096 },
+            ProbeTarget { probe_index: 1, file_index: 1, byte_offset: 200, byte_length: 4096 },
+            ProbeTarget { probe_index: 2, file_index: 0, byte_offset: 300, byte_length: 4096 },
+        ];
+        let paths = mock_paths(2);
+        let mut calls: Vec<(String, u64, u64)> = Vec::new();
+        let results = execute_probes(&targets, &paths, |p, off, len| {
+            calls.push((p.display().to_string(), off, len));
+            Ok(())
+        });
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], (paths[0].display().to_string(), 100, 4096));
+        assert_eq!(calls[1], (paths[1].display().to_string(), 200, 4096));
+        assert_eq!(calls[2], (paths[0].display().to_string(), 300, 4096));
+        assert_eq!(results.len(), 3);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r.probe_index, i as u32);
+            assert_eq!(r.byte_length, 4096);
+        }
+    }
+
+    #[test]
+    fn execute_probes_records_latency_for_successful_reads() {
+        let targets = vec![
+            ProbeTarget { probe_index: 0, file_index: 0, byte_offset: 0, byte_length: 4096 },
+        ];
+        let paths = mock_paths(1);
+        // Use a sleep-based mock to ensure latency_ns is > 0.
+        let results = execute_probes(&targets, &paths, |_, _, _| {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            Ok(())
+        });
+        assert_eq!(results.len(), 1);
+        // ~100us = 100_000ns; allow generous margin for scheduler jitter
+        // (test box could be slow; the spec doesn't constrain this).
+        assert!(results[0].latency_ns >= 100_000,
+                "expected at least 100us latency, got {}ns", results[0].latency_ns);
+    }
+
+    #[test]
+    fn execute_probes_records_zero_latency_on_read_failure() {
+        let targets = vec![
+            ProbeTarget { probe_index: 0, file_index: 0, byte_offset: 0, byte_length: 4096 },
+        ];
+        let paths = mock_paths(1);
+        let results = execute_probes(&targets, &paths, |_, _, _| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "mock file missing"))
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].latency_ns, 0);
+    }
+
+    #[test]
+    fn execute_probes_emits_filename_in_result() {
+        let targets = vec![
+            ProbeTarget { probe_index: 0, file_index: 7, byte_offset: 0, byte_length: 4096 },
+        ];
+        let paths = mock_paths(10);
+        let results = execute_probes(&targets, &paths, |_, _, _| Ok(()));
+        // file_path uses the file_name only (not full path) for forensics
+        // readability — spec L3729 example shows just "f0000000005.bin".
+        assert_eq!(results[0].file_path, "f0000000007.bin");
+    }
+
+    #[test]
+    fn execute_probes_returns_empty_on_empty_targets() {
+        let paths = mock_paths(5);
+        let results: Vec<ProbeResult> = execute_probes(&[], &paths, |_, _, _| Ok(()));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn execute_probes_handles_full_32_probe_run() {
+        // End-to-end shape: derive 32 probes from a small layout, execute
+        // them through a deterministic 50-microsecond mock; assert all 32
+        // results well-formed.
+        let seed = [0xab; 32];
+        let layout: Vec<FileEntry> = (0..50)
+            .map(|i| FileEntry { path_index: i, size: 10_000_000 })
+            .collect();
+        let targets = derive_probe_offsets(&seed, &layout);
+        assert_eq!(targets.len(), 32);
+        let paths = mock_paths(50);
+        let results = execute_probes(&targets, &paths, |_, _, _| {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            Ok(())
+        });
+        assert_eq!(results.len(), 32);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r.probe_index, i as u32);
+            assert_eq!(r.byte_length, 4096);
+            assert!(r.latency_ns > 0, "probe {} had zero latency", i);
+        }
+    }
 }
