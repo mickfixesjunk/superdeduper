@@ -241,6 +241,16 @@ function Parse-Timing {
 function Start-PerfSampler {
     # Returns a job handle that samples PhysicalDisk counters at 1 Hz to a CSV.
     # Caller stops the job + reads the CSV.
+    #
+    # Sampler writes the CSV INCREMENTALLY -- one row per sample, appended
+    # via ConvertTo-Csv -> Add-Content. Pre-fix the sampler buffered every
+    # sample into a List and emitted Export-Csv as the FINAL line of the
+    # scriptblock, so Stop-Job mid-loop killed the job before Export-Csv
+    # ran, producing 0 .csv files despite -CaptureDiskCounters. Caught by
+    # sdd-testwin in the first HDD-bench run (sdd-testwin->superdeduper
+    # 12:42 PST). Incremental writes are slower per-sample but Stop-Job-
+    # safe and also crash-safe (in-flight buffer lost = 1 row, not the
+    # whole capture).
     param(
         [string]$CsvPath,
         [int]$MaxSeconds = 7200  # 2-hour safety cap
@@ -254,24 +264,32 @@ function Start-PerfSampler {
             '\PhysicalDisk(*)\Avg. Disk sec/Read',
             '\PhysicalDisk(*)\Disk Read Bytes/sec'
         )
-        $samples = New-Object System.Collections.Generic.List[PSCustomObject]
+        # Write header immediately so a Stop-Job before the first sample
+        # still leaves a parseable CSV at $Csv (even if it has 0 rows).
+        '"Timestamp","Path","Value"' | Out-File -FilePath $Csv -Encoding UTF8 -Force
         $deadline = (Get-Date).AddSeconds($Max)
         while ((Get-Date) -lt $deadline) {
             try {
                 $snap = Get-Counter -Counter $counters -SampleInterval 1 -MaxSamples 1
                 foreach ($sample in $snap.CounterSamples) {
-                    [void]$samples.Add([PSCustomObject]@{
-                        Timestamp   = $sample.Timestamp.ToString('o')
-                        Path        = $sample.Path
-                        Value       = $sample.CookedValue
-                    })
+                    $row = [PSCustomObject]@{
+                        Timestamp = $sample.Timestamp.ToString('o')
+                        Path      = $sample.Path
+                        Value     = $sample.CookedValue
+                    }
+                    # ConvertTo-Csv emits a 2-line array: header + data.
+                    # Take [1] (the data row) and append; header was
+                    # written once above so we skip it on every sample.
+                    $csvLines = @($row | ConvertTo-Csv -NoTypeInformation)
+                    if ($csvLines.Length -ge 2) {
+                        $csvLines[1] | Add-Content -Path $Csv -Encoding UTF8
+                    }
                 }
             }
             catch {
                 # transient -- keep sampling
             }
         }
-        $samples | Export-Csv -Path $Csv -NoTypeInformation
     }
     Start-Job -ScriptBlock $script -ArgumentList $CsvPath, $MaxSeconds
 }
