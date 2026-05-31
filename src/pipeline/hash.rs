@@ -222,6 +222,13 @@ fn run_with_counters_inner(
         .thread_name(|i| format!("superdeduper-io-{i}"))
         .build()
         .map_err(|e| Error::other(format!("io thread pool build: {e}")))?;
+    // A-perf-stage-timing — isolate the parallel-IO scope from the pool
+    // construction + post-scope counter unwrap that share main.rs's
+    // t_hash bracket. This is the figure HDD-bench needs to decide on
+    // parallel-walk: if hash_io_ms is the dominant cost, --io-threads
+    // is the lever; if walk_ms is, parallel-walk is.
+    let hash_io_started = Instant::now();
+    let groups_in = groups.len();
     let mut confirmed: Vec<DuplicateGroup> = io_pool
         .install(|| {
             groups
@@ -232,6 +239,14 @@ fn run_with_counters_inner(
         .into_iter()
         .flatten()
         .collect();
+    let hash_io_ms = hash_io_started.elapsed().as_millis() as u64;
+    tracing::info!(
+        hash_io_ms,
+        io_threads = cfg.io_threads.max(1),
+        groups_in,
+        groups_out = confirmed.len(),
+        "stage 4: hash io_pool complete"
+    );
 
     confirmed.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.files.cmp(&b.files)));
     let counters = Arc::try_unwrap(counters).unwrap_or_else(|arc| {

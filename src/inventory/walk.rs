@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use hashbrown::HashSet;
 
@@ -90,6 +91,13 @@ pub fn enumerate_cancellable<F>(
 where
     F: FnMut(WalkEvent<'_>),
 {
+    // A-perf-stage-timing — distinct from main.rs's t_inventory wallclock,
+    // which wraps the full inventory phase (warm-path + mft + post-walk
+    // skipped[] derivation). This timing isolates the walk-only cost so
+    // HDD-bench harness can decompose "stage 1 inventory" into walk vs
+    // mft vs warm-path vs derivation, and decide whether to invest in
+    // parallel-walk.
+    let walk_started = Instant::now();
     let mut out = Vec::new();
     // T1.7: per-scan visited set for symlink cycle detection. When
     // `cfg.follow_links` is OFF, this stays empty (we never follow a
@@ -171,6 +179,13 @@ where
     // engine log that their roots overlapped (telemetry counter increments
     // via cfg.exclusion_counters automatically).
     out = dedup_by_path(out, &mut callback);
+    let walk_ms = walk_started.elapsed().as_millis() as u64;
+    tracing::info!(
+        walk_ms,
+        files = out.len(),
+        roots = cfg.roots.len(),
+        "stage 1: walk complete"
+    );
     Ok(out)
 }
 
