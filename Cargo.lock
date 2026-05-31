@@ -4391,6 +4391,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "superdeduper-hmac-signer",
+ "superdeduper-log",
  "symphonia",
  "tar",
  "tempfile",
@@ -4413,6 +4414,13 @@ dependencies = [
  "hmac",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "superdeduper-log"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]
