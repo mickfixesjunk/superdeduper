@@ -3311,6 +3311,384 @@ impl SuperdeduperApp {
         }
         Flow::Return
     }
+
+    // ============================================================
+    // #140 phase-2 -- non-blocking modal extractions. Each renders
+    // an overlay window without suppressing the rest of update();
+    // returns Flow::Continue uniformly so the dispatch in update()
+    // reads as a single sweep of `self.render_X_modal(ctx)` calls.
+    // ============================================================
+
+    /// #51 — Settings-drift modal. Rendered as a non-blocking
+    /// window over the regular UI; the user can still see their
+    /// edited Roots/Settings panel while reading the prompt,
+    /// which makes "did I really mean to change this?" easier to
+    /// answer. start_live() refuses to launch while this is Some.
+    fn render_settings_drift_modal(&mut self, ctx: &egui::Context) -> Flow {
+        let Some(summary) = self.pending_drift_modal.clone() else {
+            return Flow::Continue;
+        };
+        if let Some(choice) = settings_drift_modal::show(ctx, &summary) {
+            self.pending_drift_modal = None;
+            match choice {
+                SettingsDriftChoice::ContinueWithNew => self.accept_drift_continue(),
+                SettingsDriftChoice::RevertToPaused => self.accept_drift_revert(),
+                SettingsDriftChoice::Cancel => {}
+            }
+        }
+        Flow::Continue
+    }
+
+    /// #41 — App-start resubmit-prompt modal. Non-blocking. The
+    /// pending list was populated in `new()`; the user picks
+    /// [Resubmit all] / [Open History] / [Not now] and the modal
+    /// dismisses. Telemetry-off builds never reach this code path
+    /// (field doesn't exist + widget module is cfg-gated).
+    #[cfg(feature = "telemetry")]
+    fn render_resubmit_prompt_modal(&mut self, ctx: &egui::Context) -> Flow {
+        let Some(rows) = self.pending_resubmit_prompt.clone() else {
+            return Flow::Continue;
+        };
+        if let Some(choice) = crate::gui::widgets::resubmit_prompt_modal::show(ctx, &rows) {
+            self.pending_resubmit_prompt = None;
+            use crate::gui::widgets::resubmit_prompt_modal::ResubmitPromptChoice;
+            match choice {
+                ResubmitPromptChoice::ResubmitAll => {
+                    // #125 — queue every listed row through the
+                    // coordinator so all pending submissions drain
+                    // serially (not just the first). The History
+                    // panel surfaces per-row state as each row
+                    // finishes; the coordinator handles slot
+                    // contention + bounded per-row wait.
+                    let scan_ids: Vec<String> = rows.iter().map(|r| r.scan_id.clone()).collect();
+                    let queued = crate::gui::resubmit::request_resubmit_batch(scan_ids);
+                    if queued > 0 {
+                        self.state.push_log(
+                            crate::gui::events::LogLevel::Info,
+                            format!(
+                                "Queued {queued} pending submission(s) for resubmit. Watch the History tab for per-row outcomes."
+                            ),
+                        );
+                    }
+                    self.persisted.results_tab = ResultsTab::History;
+                }
+                ResubmitPromptChoice::OpenHistory => {
+                    self.persisted.results_tab = ResultsTab::History;
+                }
+                ResubmitPromptChoice::NotNow => {}
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Archive-restore confirmation: rendered as a non-blocking
+    /// window over the regular UI (vs the Resume modal which gates
+    /// everything). The user needs to be able to see what they're
+    /// about to undo while reading the prompt.
+    fn render_archive_restore_modal(&mut self, ctx: &egui::Context) -> Flow {
+        let Some(manifest) = self.pending_archive_restore.clone() else {
+            return Flow::Continue;
+        };
+        let mut accept = false;
+        let mut cancel = false;
+        egui::Window::new("Restore archived duplicates?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let n = manifest.entries.len();
+                let total_bytes: u64 = manifest.entries.iter().map(|e| e.size).sum();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Move {n} file(s) ({}) from",
+                        humansize::format_size(total_bytes, humansize::BINARY)
+                    ))
+                    .color(theme::TEXT_HI),
+                );
+                ui.label(
+                    egui::RichText::new(format!("  {}", manifest.destination.display()))
+                        .color(theme::TEXT_LO)
+                        .monospace(),
+                );
+                ui.label(egui::RichText::new("back to their original paths.").color(theme::TEXT_HI));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "If a file already exists at the original path we'll skip it (no overwrite). Cross-volume restores fall back to copy + remove automatically.",
+                    )
+                    .color(theme::TEXT_LO)
+                    .small()
+                    .italics(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("↩  Restore")
+                                    .color(theme::PANEL_DEEP)
+                                    .strong(),
+                            )
+                            .fill(theme::ACCENT)
+                            .min_size(egui::vec2(120.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        accept = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Cancel").color(theme::TEXT_HI),
+                            )
+                            .min_size(egui::vec2(100.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if accept {
+            self.pending_archive_restore = None;
+            self.run_archive_restore_threaded(manifest);
+        } else if cancel {
+            self.pending_archive_restore = None;
+            self.state.push_log(
+                crate::gui::events::LogLevel::Info,
+                "Archive restore cancelled by user.".into(),
+            );
+        }
+        Flow::Continue
+    }
+
+    /// #80 Bug C — post-archive summary modal. Pops the rollup
+    /// when the archive worker fires `ArchiveActionSummary`. Stays
+    /// open until the user clicks Done; Reveal opens the archive
+    /// folder in their file manager without dismissing the modal
+    /// (so they can see the contents without losing the failure
+    /// breakdown).
+    fn render_archive_summary_modal(&mut self, ctx: &egui::Context) -> Flow {
+        let Some(summary) = self.pending_archive_summary.clone() else {
+            return Flow::Continue;
+        };
+        if let Some(choice) = crate::gui::widgets::archive_summary_modal::show(ctx, &summary) {
+            use crate::gui::widgets::archive_summary_modal::ArchiveSummaryChoice;
+            match choice {
+                ArchiveSummaryChoice::Done => {
+                    self.pending_archive_summary = None;
+                }
+                ArchiveSummaryChoice::RevealDestination => {
+                    reveal_in_explorer(&summary.destination);
+                }
+            }
+        }
+        Flow::Continue
+    }
+
+    /// #77 v2 — Badge multiplier detail modal. Pops when the user
+    /// clicks a tile with the ×N overlay; reads installs each
+    /// frame out of CatalogState so a background refresh updates
+    /// rows without the user needing to reopen.
+    #[cfg(feature = "telemetry")]
+    fn render_badge_multiplier_detail_modal(&mut self, ctx: &egui::Context) -> Flow {
+        let Some(achievement_id) = self.pending_badge_multiplier_detail.clone() else {
+            return Flow::Continue;
+        };
+        let catalog_state = crate::leaderboard::catalog::peek_state();
+        let installs = catalog_state.installs_for(&achievement_id).to_vec();
+        // Resolve a human-readable name from the catalog when
+        // possible; falls back to the id verbatim if the catalog
+        // hasn't loaded yet (rare; the badge wall wouldn't have
+        // rendered without it).
+        let achievement_name = catalog_state
+            .catalog
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|c| {
+                c.achievements
+                    .iter()
+                    .find(|e| e.id == achievement_id)
+                    .map(|e| e.name.clone())
+            })
+            .unwrap_or_else(|| achievement_id.clone());
+        if let Some(_choice) = crate::gui::widgets::badge_multiplier_detail::show(
+            ctx,
+            &achievement_name,
+            &achievement_id,
+            &installs,
+        ) {
+            // Only one variant (Close) — clear the slot.
+            self.pending_badge_multiplier_detail = None;
+        }
+        Flow::Continue
+    }
+
+    /// Destructive-action confirmation modal — "type DELETE".
+    /// Gates Recycle / SafeRename / Hardlink / SafeRenameAll;
+    /// Reveal-in-Explorer and Unsuperdeduper bypass this. The
+    /// bypass-for-all setting in Settings → Safety skips the modal
+    /// entirely on dispatch (so we never reach this branch when
+    /// bypass is on).
+    fn render_destructive_confirmation_modal(&mut self, ctx: &egui::Context) -> Flow {
+        let Some(action) = self.pending_destructive.clone() else {
+            return Flow::Continue;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let description = describe_destructive_action(&action);
+        egui::Window::new(
+            egui::RichText::new("⚠ Confirm destructive action")
+                .color(theme::HOT)
+                .strong(),
+        )
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(520.0)
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(description)
+                    .color(theme::TEXT_HI)
+                    .size(14.0),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                // #159 -- A-trash-vocab: per-platform verb + noun.
+                egui::RichText::new(format!(
+                    "This cannot be auto-undone from the app. \
+                     {verb} is reversible from the {noun}; \
+                     Safe-rename is reversible via the Unsuperdeduper button; \
+                     Hardlink is NOT reversible without the original data still being elsewhere.",
+                    verb = crate::platform::trash_action_verb(),
+                    noun = crate::platform::trash_bin_noun(),
+                ))
+                .color(theme::TEXT_LO)
+                .small(),
+            );
+            ui.add_space(10.0);
+            let required_word = required_confirm_word(&action);
+            ui.label(
+                egui::RichText::new(format!("Type {required_word} to confirm:"))
+                    .color(theme::TEXT_HI)
+                    .strong(),
+            );
+            ui.text_edit_singleline(&mut self.destructive_confirm_input);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let can_confirm = self.destructive_confirm_input == required_word;
+                if ui
+                    .add_enabled(
+                        can_confirm,
+                        egui::Button::new(
+                            egui::RichText::new("Confirm")
+                                .color(if can_confirm {
+                                    theme::PANEL_DEEP
+                                } else {
+                                    theme::TEXT_LO
+                                })
+                                .strong(),
+                        )
+                        .fill(if can_confirm { theme::HOT } else { theme::PANEL }),
+                    )
+                    .clicked()
+                {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                ui.add_space(20.0);
+                ui.label(
+                    egui::RichText::new(
+                        "(Tip: Settings → Safety can bypass this prompt for future actions.)",
+                    )
+                    .color(theme::TEXT_LO)
+                    .small()
+                    .italics(),
+                );
+            });
+        });
+        if confirm {
+            crate::log_info!(
+                "destructive-modal: user confirmed via DELETE input; dispatching action"
+            );
+            self.pending_destructive = None;
+            self.destructive_confirm_input.clear();
+            self.dispatch_group_action_unchecked(action, true);
+        } else if cancel {
+            self.pending_destructive = None;
+            self.destructive_confirm_input.clear();
+        }
+        Flow::Continue
+    }
+
+    /// Settings modal — opened from the gear icon or menubar.
+    /// Doesn't claim screen real estate; renders as a Window
+    /// overlay. `settings_open` is the toggle; the inner widget
+    /// returns `true` when the user clicked Close.
+    fn render_settings_modal(&mut self, ctx: &egui::Context) -> Flow {
+        if !self.settings_open {
+            return Flow::Continue;
+        }
+        let mut open = self.settings_open;
+        if settings_modal::show(
+            ctx,
+            &mut open,
+            &mut self.persisted.settings,
+            &mut self.settings_modal_state,
+        ) {
+            self.settings_open = false;
+        } else {
+            self.settings_open = open;
+        }
+        Flow::Continue
+    }
+
+    /// T-BENCH-ME "Benchmark" modal (consent -> progress -> result).
+    /// Default opt-out; nothing runs until the user clicks inside it.
+    /// Mick bug #1 fix (2026-05-30): the modal's "What exactly gets
+    /// shared?" link now toggles the inline preview directly instead
+    /// of routing to Settings>Privacy, so the modal no longer pops the
+    /// settings modal over the bench modal on one click.
+    #[cfg(feature = "telemetry")]
+    fn render_bench_modal(&mut self, ctx: &egui::Context) -> Flow {
+        use crate::gui::widgets::bench_modal;
+        bench_modal::show(&mut self.bench, ctx);
+        Flow::Continue
+    }
+
+    /// Channel banner — always-on 32px coloured strip when the
+    /// active channel is not prod (per dev-channel-spec.md §3.4).
+    /// Rendered as the FIRST top panel so it sits at the very top
+    /// of the window, above the menubar. Reads the active channel
+    /// from the channel module's process-global cell — set once at
+    /// GUI startup via channel::set_active_channel.
+    fn render_channel_banner(&mut self, ctx: &egui::Context) -> Flow {
+        crate::gui::widgets::channel_banner::show(ctx, crate::channel::active_channel());
+        Flow::Continue
+    }
+
+    /// #81 — One-shot exclusions safe-defaults banner. Renders
+    /// above the menubar on first launch after the v0.2.7 update;
+    /// dismissed by either button. "See what's filtered" pops
+    /// Settings → Exclusions tab and also marks dismissed.
+    fn render_exclusions_safe_defaults_banner(&mut self, ctx: &egui::Context) -> Flow {
+        if self.persisted.settings.dismissed_v0_2_7_exclusion_banner {
+            return Flow::Continue;
+        }
+        if let Some(action) = crate::gui::widgets::exclusions_safe_defaults_banner::show(ctx) {
+            use crate::gui::widgets::exclusions_safe_defaults_banner::BannerAction;
+            self.persisted.settings.dismissed_v0_2_7_exclusion_banner = true;
+            if matches!(action, BannerAction::OpenSettings) {
+                self.settings_open = true;
+                self.settings_modal_state.tab =
+                    crate::gui::widgets::settings_modal::SettingsTab::Exclusions;
+            }
+        }
+        Flow::Continue
+    }
 }
 
 impl eframe::App for SuperdeduperApp {
@@ -3343,332 +3721,24 @@ impl eframe::App for SuperdeduperApp {
             return;
         }
 
-        // #51 — Settings-drift modal. Rendered as a non-blocking
-        // window over the regular UI; the user can still see their
-        // edited Roots/Settings panel while reading the prompt,
-        // which makes "did I really mean to change this?" easier to
-        // answer. start_live() refuses to launch while this is Some.
-        if let Some(summary) = self.pending_drift_modal.clone() {
-            if let Some(choice) = settings_drift_modal::show(ctx, &summary) {
-                self.pending_drift_modal = None;
-                match choice {
-                    SettingsDriftChoice::ContinueWithNew => self.accept_drift_continue(),
-                    SettingsDriftChoice::RevertToPaused => self.accept_drift_revert(),
-                    SettingsDriftChoice::Cancel => {}
-                }
-            }
-        }
-
-        // #41 — App-start resubmit-prompt modal. Non-blocking. The
-        // pending list was populated in `new()`; the user picks
-        // [Resubmit all] / [Open History] / [Not now] and the modal
-        // dismisses. Telemetry-off builds never reach this code path
-        // (field doesn't exist + widget module is cfg-gated).
+        // #140 phase-2 -- A-update-modal-extraction: non-blocking
+        // modal dispatch. Each fn returns Flow::Continue uniformly,
+        // so the explicit `_ = ` discard documents the convention
+        // while still letting a future modal escalate to
+        // Flow::Return without changing the call shape.
+        let _ = self.render_settings_drift_modal(ctx);
         #[cfg(feature = "telemetry")]
-        if let Some(rows) = self.pending_resubmit_prompt.clone() {
-            if let Some(choice) = crate::gui::widgets::resubmit_prompt_modal::show(ctx, &rows) {
-                self.pending_resubmit_prompt = None;
-                use crate::gui::widgets::resubmit_prompt_modal::ResubmitPromptChoice;
-                match choice {
-                    ResubmitPromptChoice::ResubmitAll => {
-                        // #125 — queue every listed row through the
-                        // coordinator so all pending submissions
-                        // drain serially (not just the first). The
-                        // History panel surfaces per-row state as
-                        // each row finishes; the coordinator handles
-                        // slot contention + bounded per-row wait.
-                        let scan_ids: Vec<String> =
-                            rows.iter().map(|r| r.scan_id.clone()).collect();
-                        let queued = crate::gui::resubmit::request_resubmit_batch(scan_ids);
-                        if queued > 0 {
-                            self.state.push_log(
-                                crate::gui::events::LogLevel::Info,
-                                format!(
-                                    "Queued {queued} pending submission(s) for resubmit. Watch the History tab for per-row outcomes."
-                                ),
-                            );
-                        }
-                        self.persisted.results_tab = ResultsTab::History;
-                    }
-                    ResubmitPromptChoice::OpenHistory => {
-                        self.persisted.results_tab = ResultsTab::History;
-                    }
-                    ResubmitPromptChoice::NotNow => {}
-                }
-            }
-        }
-
-        // Archive-restore confirmation: rendered as a non-blocking
-        // window over the regular UI (vs the Resume modal which
-        // gates everything). The user needs to be able to see what
-        // they're about to undo while reading the prompt.
-        if let Some(manifest) = self.pending_archive_restore.clone() {
-            let mut accept = false;
-            let mut cancel = false;
-            egui::Window::new("Restore archived duplicates?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .default_width(560.0)
-                .show(ctx, |ui| {
-                    let n = manifest.entries.len();
-                    let total_bytes: u64 = manifest.entries.iter().map(|e| e.size).sum();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Move {n} file(s) ({}) from",
-                            humansize::format_size(total_bytes, humansize::BINARY)
-                        ))
-                        .color(theme::TEXT_HI),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("  {}", manifest.destination.display()))
-                            .color(theme::TEXT_LO)
-                            .monospace(),
-                    );
-                    ui.label(egui::RichText::new("back to their original paths.").color(theme::TEXT_HI));
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "If a file already exists at the original path we'll skip it (no overwrite). Cross-volume restores fall back to copy + remove automatically.",
-                        )
-                        .color(theme::TEXT_LO)
-                        .small()
-                        .italics(),
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("↩  Restore")
-                                        .color(theme::PANEL_DEEP)
-                                        .strong(),
-                                )
-                                .fill(theme::ACCENT)
-                                .min_size(egui::vec2(120.0, 30.0)),
-                            )
-                            .clicked()
-                        {
-                            accept = true;
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Cancel").color(theme::TEXT_HI),
-                                )
-                                .min_size(egui::vec2(100.0, 30.0)),
-                            )
-                            .clicked()
-                        {
-                            cancel = true;
-                        }
-                    });
-                });
-            if accept {
-                self.pending_archive_restore = None;
-                self.run_archive_restore_threaded(manifest);
-            } else if cancel {
-                self.pending_archive_restore = None;
-                self.state.push_log(
-                    crate::gui::events::LogLevel::Info,
-                    "Archive restore cancelled by user.".into(),
-                );
-            }
-        }
-
-        // #80 Bug C — post-archive summary modal. Pops the rollup
-        // when the archive worker fires `ArchiveActionSummary`.
-        // Stays open until the user clicks Done; Reveal opens the
-        // archive folder in their file manager without dismissing
-        // the modal (so they can see the contents without losing
-        // the failure breakdown).
-        if let Some(summary) = self.pending_archive_summary.clone() {
-            if let Some(choice) = crate::gui::widgets::archive_summary_modal::show(ctx, &summary) {
-                use crate::gui::widgets::archive_summary_modal::ArchiveSummaryChoice;
-                match choice {
-                    ArchiveSummaryChoice::Done => {
-                        self.pending_archive_summary = None;
-                    }
-                    ArchiveSummaryChoice::RevealDestination => {
-                        reveal_in_explorer(&summary.destination);
-                    }
-                }
-            }
-        }
-
-        // #77 v2 — Badge multiplier detail modal. Pops when the user
-        // clicks a tile with the ×N overlay; reads installs each
-        // frame out of CatalogState so a background refresh updates
-        // rows without the user needing to reopen.
+        let _ = self.render_resubmit_prompt_modal(ctx);
+        let _ = self.render_archive_restore_modal(ctx);
+        let _ = self.render_archive_summary_modal(ctx);
         #[cfg(feature = "telemetry")]
-        if let Some(achievement_id) = self.pending_badge_multiplier_detail.clone() {
-            let catalog_state = crate::leaderboard::catalog::peek_state();
-            let installs = catalog_state.installs_for(&achievement_id).to_vec();
-            // Resolve a human-readable name from the catalog when
-            // possible; falls back to the id verbatim if the
-            // catalog hasn't loaded yet (rare; the badge wall
-            // wouldn't have rendered without it).
-            let achievement_name = catalog_state
-                .catalog
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .and_then(|c| {
-                    c.achievements
-                        .iter()
-                        .find(|e| e.id == achievement_id)
-                        .map(|e| e.name.clone())
-                })
-                .unwrap_or_else(|| achievement_id.clone());
-            if let Some(_choice) = crate::gui::widgets::badge_multiplier_detail::show(
-                ctx,
-                &achievement_name,
-                &achievement_id,
-                &installs,
-            ) {
-                // Only one variant (Close) — clear the slot.
-                self.pending_badge_multiplier_detail = None;
-            }
-        }
-
-        // Destructive-action confirmation modal — "type DELETE".
-        // Gates Recycle / SafeRename / Hardlink / SafeRenameAll;
-        // Reveal-in-Explorer and Unsuperdeduper bypass this. The
-        // bypass-for-all setting in Settings → Safety skips the
-        // modal entirely on dispatch (so we never reach this
-        // branch when bypass is on).
-        if let Some(action) = self.pending_destructive.clone() {
-            let mut confirm = false;
-            let mut cancel = false;
-            let description = describe_destructive_action(&action);
-            egui::Window::new(
-                egui::RichText::new("⚠ Confirm destructive action")
-                    .color(theme::HOT)
-                    .strong(),
-            )
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(description)
-                        .color(theme::TEXT_HI)
-                        .size(14.0),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    // #159 -- A-trash-vocab: per-platform verb + noun.
-                    egui::RichText::new(format!(
-                        "This cannot be auto-undone from the app. \
-                         {verb} is reversible from the {noun}; \
-                         Safe-rename is reversible via the Unsuperdeduper button; \
-                         Hardlink is NOT reversible without the original data still being elsewhere.",
-                        verb = crate::platform::trash_action_verb(),
-                        noun = crate::platform::trash_bin_noun(),
-                    ))
-                    .color(theme::TEXT_LO)
-                    .small(),
-                );
-                ui.add_space(10.0);
-                let required_word = required_confirm_word(&action);
-                ui.label(
-                    egui::RichText::new(format!("Type {required_word} to confirm:"))
-                        .color(theme::TEXT_HI)
-                        .strong(),
-                );
-                ui.text_edit_singleline(&mut self.destructive_confirm_input);
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let can_confirm = self.destructive_confirm_input == required_word;
-                    if ui
-                        .add_enabled(
-                            can_confirm,
-                            egui::Button::new(
-                                egui::RichText::new("Confirm")
-                                    .color(if can_confirm { theme::PANEL_DEEP } else { theme::TEXT_LO })
-                                    .strong(),
-                            )
-                            .fill(if can_confirm { theme::HOT } else { theme::PANEL }),
-                        )
-                        .clicked()
-                    {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                    ui.add_space(20.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "(Tip: Settings → Safety can bypass this prompt for future actions.)",
-                        )
-                        .color(theme::TEXT_LO)
-                        .small()
-                        .italics(),
-                    );
-                });
-            });
-            if confirm {
-                crate::log_info!("destructive-modal: user confirmed via DELETE input; dispatching action");
-                self.pending_destructive = None;
-                self.destructive_confirm_input.clear();
-                self.dispatch_group_action_unchecked(action, true);
-            } else if cancel {
-                self.pending_destructive = None;
-                self.destructive_confirm_input.clear();
-            }
-        }
-
-        // Settings modal first; it doesn't claim screen real estate.
-        if self.settings_open {
-            let mut open = self.settings_open;
-            if settings_modal::show(
-                ctx,
-                &mut open,
-                &mut self.persisted.settings,
-                &mut self.settings_modal_state,
-            ) {
-                self.settings_open = false;
-            } else {
-                self.settings_open = open;
-            }
-        }
-
-        // T-BENCH-ME "Benchmark" modal (consent -> progress -> result).
-        // Default opt-out; nothing runs until the user clicks inside it.
-        // Mick bug #1 fix (2026-05-30): the modal's "What exactly gets
-        // shared?" link now toggles the inline preview directly instead of
-        // routing to Settings>Privacy, so the modal no longer pops the
-        // settings modal over the bench modal on one click.
+        let _ = self.render_badge_multiplier_detail_modal(ctx);
+        let _ = self.render_destructive_confirmation_modal(ctx);
+        let _ = self.render_settings_modal(ctx);
         #[cfg(feature = "telemetry")]
-        {
-            use crate::gui::widgets::bench_modal;
-            bench_modal::show(&mut self.bench, ctx);
-        }
-
-        // Channel banner — always-on 32px coloured strip when the
-        // active channel is not prod (per dev-channel-spec.md §3.4).
-        // Rendered as the FIRST top panel so it sits at the very top
-        // of the window, above the menubar. Reads the active channel
-        // from the channel module's process-global cell — set once
-        // at GUI startup via channel::set_active_channel.
-        crate::gui::widgets::channel_banner::show(ctx, crate::channel::active_channel());
-
-        // #81 — One-shot exclusions safe-defaults banner. Renders
-        // above the menubar on first launch after the v0.2.7 update;
-        // dismissed by either button. "See what's filtered" pops
-        // Settings → Exclusions tab and also marks dismissed.
-        if !self.persisted.settings.dismissed_v0_2_7_exclusion_banner {
-            if let Some(action) = crate::gui::widgets::exclusions_safe_defaults_banner::show(ctx) {
-                use crate::gui::widgets::exclusions_safe_defaults_banner::BannerAction;
-                self.persisted.settings.dismissed_v0_2_7_exclusion_banner = true;
-                if matches!(action, BannerAction::OpenSettings) {
-                    self.settings_open = true;
-                    self.settings_modal_state.tab =
-                        crate::gui::widgets::settings_modal::SettingsTab::Exclusions;
-                }
-            }
-        }
+        let _ = self.render_bench_modal(ctx);
+        let _ = self.render_channel_banner(ctx);
+        let _ = self.render_exclusions_safe_defaults_banner(ctx);
 
         // File menubar — owns project lifecycle (New / Open / Save /
         // Save As / Open Archive Manifest). Rendered as a thin strip
