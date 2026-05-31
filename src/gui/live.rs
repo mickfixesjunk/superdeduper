@@ -2518,12 +2518,66 @@ fn filter_reference_only(
 }
 
 fn reference_belongs(path: &std::path::Path, reference_set: &hashbrown::HashSet<PathBuf>) -> bool {
+    // KEEPER-PRESERVATION FIX (Mick 2026-05-31 v0.3.5 4-folder run): the
+    // walker (src/inventory/walk.rs `to_verbatim`) converts root paths to
+    // their Windows verbatim form (`\\?\E:\DROPBOX\...`) before walking, and
+    // emitted file paths INTENTIONALLY keep that prefix. `reference_set`
+    // however is built from raw user-input root paths (no verbatim prefix).
+    // A naked `path.starts_with(r)` byte-compare then fails because
+    // `\\?\E:\DROPBOX\Dropbox\...` does not start with `E:\DROPBOX`, so the
+    // reference-priority short-circuit in `order_keeper_first` silently
+    // falls through to the Smart heuristic — which then picks a non-
+    // reference file as keeper when its path scores higher. That is exactly
+    // the invariant violation Mick hit (group of 3, ref path E:\DROPBOX,
+    // keeper landed on the SEAGATE non-ref file).
+    //
+    // Fix: strip the verbatim prefix from BOTH sides before the prefix
+    // compare. Cheap (no sys call), symmetric, preserves the existing
+    // semantics for the no-verbatim case. Closes task #155 (the
+    // canonicalize-vs-starts-with-parity gap dedupe.rs:1300 sidesteps via
+    // fs::canonicalize on both sides; the GUI takes this lighter route).
+    let path_normal = strip_verbatim_prefix(path);
     for r in reference_set {
-        if path.starts_with(r) {
+        let r_normal = strip_verbatim_prefix(r);
+        if path_normal.starts_with(&r_normal) {
             return true;
         }
     }
     false
+}
+
+/// Strip the Windows verbatim path prefix `\\?\` if present. No-op on
+/// every other input shape (Unix paths, drive-relative, UNC `\\server\…`).
+/// Returns a `&Path` borrowed from the input so callers don't allocate
+/// when the prefix is absent.
+fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {
+    // Match by the raw byte form (OsStr) — `Path::starts_with` is
+    // component-based and would treat `\\?\C:` as one component, which is
+    // fine but slightly less direct than a literal prefix strip.
+    let bytes = p.as_os_str();
+    // OsStr doesn't expose a portable strip_prefix; route through Path
+    // component matching which IS portable. The `\\?\` prefix shows up as
+    // a single Prefix(VerbatimDisk) / Prefix(Verbatim) / Prefix(VerbatimUNC)
+    // component on Windows; Path::components iterates past it transparently
+    // BUT changes how starts_with matches against a non-verbatim reference.
+    //
+    // The simplest cross-platform correct strip: check if the string
+    // representation starts with `\\?\` and slice. We have to go through
+    // a Cow-like lossy round-trip because OsStr isn't slicable directly;
+    // use as_encoded_bytes (stable since 1.74) for a zero-alloc slice.
+    let raw = bytes.as_encoded_bytes();
+    const VERBATIM: &[u8] = br"\\?\";
+    if raw.starts_with(VERBATIM) {
+        // SAFETY: the verbatim prefix is ASCII (4 bytes); slicing past it
+        // remains valid UTF-8/WTF-8 by construction (the encoding is
+        // backwards-compatible at ASCII boundaries). `from_encoded_bytes_unchecked`
+        // requires the slice be a valid OsStr encoding -- ASCII-prefix
+        // slicing preserves that for both Unix and Windows native encodings.
+        let stripped = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&raw[VERBATIM.len()..]) };
+        std::path::Path::new(stripped)
+    } else {
+        p
+    }
 }
 
 /// Pick chunk sizes so we get *both* enough chunks (for cross-chunk
@@ -2867,6 +2921,77 @@ File System Personality:  smbfs
         let refs = ref_set(&["/mnt/R1", "/mnt/R2"]);
         let ordered = order_keeper_first(files, KeepStrategy::Smart, &refs);
         assert_eq!(ordered[0], r2_file);
+    }
+
+    /// REGRESSION GUARD for Mick's 2026-05-31 v0.3.5 4-folder bug: when
+    /// the walker emits file paths with the Windows `\\?\` verbatim
+    /// prefix (per src/inventory/walk.rs `to_verbatim`) but the
+    /// reference set is built from raw user-input root paths (no
+    /// verbatim prefix), a naked `starts_with` byte-compare fails — so
+    /// the reference-priority short-circuit silently falls through and
+    /// the Smart heuristic picks a non-reference keeper. The fix
+    /// (strip_verbatim_prefix on both sides of the compare) is what
+    /// this test pins down.
+    ///
+    /// Windows-only because the verbatim prefix is a Windows path
+    /// concept and `Path::starts_with` component semantics differ on
+    /// Linux (treats backslash as a regular character, not a
+    /// separator) — running this test against Linux's Path parser
+    /// would test a different code path than what fires in prod.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn order_keeper_first_promotes_verbatim_prefixed_reference_files() {
+        // Mick's bug shape: 3 files with identical digest, 2 are under
+        // a reference root, walker has slapped `\\?\` on every emitted
+        // path. The reference set still carries the un-prefixed root.
+        let a_file = PathBuf::from(r"\\?\E:\SEAGATE-2TB\DropBox\Dropbox\file.mp4");
+        let b_file = PathBuf::from(r"\\?\E:\DROPBOX\Dropbox\file.mp4");
+        let c_file = PathBuf::from(r"\\?\E:\DROPBOX\Dropbox\backups\file.mp4");
+        let files = vec![a_file.clone(), b_file.clone(), c_file.clone()];
+        let refs = ref_set(&[r"E:\DROPBOX"]);
+
+        let ordered = order_keeper_first(files, KeepStrategy::Smart, &refs);
+
+        // Reference-rooted file wins regardless of Smart's path-depth
+        // heuristic preference for the SEAGATE path. Either B or C is
+        // acceptable per the tightened invariant ('keeper from the
+        // reference partition; non-reference files MUST be dupes').
+        assert!(
+            ordered[0] == b_file || ordered[0] == c_file,
+            "keeper must come from the reference partition (E:\\DROPBOX); got {:?}",
+            ordered[0]
+        );
+        // Belt-and-suspenders: the SEAGATE non-reference file MUST NOT
+        // be the keeper.
+        assert_ne!(
+            ordered[0], a_file,
+            "non-reference SEAGATE file landed as keeper — invariant violation",
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn reference_belongs_matches_across_verbatim_asymmetry() {
+        // Direct unit on the helper that did the wrong thing in v0.3.5.
+        // All four combinations of verbatim-prefix presence/absence on
+        // path vs reference must match (assuming the underlying paths
+        // refer to the same root). The walker's emission shape is the
+        // first two rows; the user-input root shape is the last two.
+        let refs_plain = ref_set(&[r"E:\DROPBOX"]);
+        let refs_verbatim = ref_set(&[r"\\?\E:\DROPBOX"]);
+
+        let plain_file = PathBuf::from(r"E:\DROPBOX\sub\file.bin");
+        let verbatim_file = PathBuf::from(r"\\?\E:\DROPBOX\sub\file.bin");
+
+        assert!(reference_belongs(&plain_file, &refs_plain), "plain+plain");
+        assert!(reference_belongs(&verbatim_file, &refs_plain), "verbatim+plain (the bug shape)");
+        assert!(reference_belongs(&plain_file, &refs_verbatim), "plain+verbatim");
+        assert!(reference_belongs(&verbatim_file, &refs_verbatim), "verbatim+verbatim");
+
+        // Non-reference paths still NOT under any reference root.
+        let unrelated = PathBuf::from(r"\\?\E:\SEAGATE-2TB\Dropbox\file.bin");
+        assert!(!reference_belongs(&unrelated, &refs_plain));
+        assert!(!reference_belongs(&unrelated, &refs_verbatim));
     }
 
     #[test]
