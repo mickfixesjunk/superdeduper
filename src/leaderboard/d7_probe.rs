@@ -396,6 +396,130 @@ mod tests {
         }
     }
 
+    /// VECTOR-6: 2-file corpus, asymmetric sizes — smallest n>1 case;
+    /// validates file_index distribution + modulus interaction across two
+    /// distinct file sizes (1MB + 10MB).
+    #[test]
+    fn golden_vector_6_two_file_asymmetric() {
+        let seed = [0x42; 32];
+        let layout = vec![
+            FileEntry { path_index: 0, size: 1_000_000 },
+            FileEntry { path_index: 1, size: 10_000_000 },
+        ];
+        let probes = derive_probe_offsets(&seed, &layout);
+        assert_eq!(probes.len(), 32);
+        for p in &probes {
+            let entry = layout[p.file_index as usize];
+            assert!(p.byte_offset + 4096 <= entry.size);
+        }
+        let expected: [(u64, u64); 32] = LOCKED_V6_FILE_INDEX_AND_OFFSET;
+        for (i, p) in probes.iter().enumerate() {
+            assert_eq!((p.file_index, p.byte_offset), expected[i],
+                       "vector-6 probe {} (file_index, byte_offset) drift", i);
+        }
+    }
+
+    /// VECTOR-7: PROBE_LENGTH+1 sized files (smallest non-collapsing). Files
+    /// of exactly 4097 bytes hit the smallest viable byte_offset modulus
+    /// (size - PROBE_LENGTH = 1), so all byte_offsets MUST be 0 just like
+    /// the collapse case but via a different code path.
+    #[test]
+    fn golden_vector_7_probe_length_plus_one() {
+        let seed = [0x99; 32];
+        let layout: Vec<FileEntry> = (0..20)
+            .map(|i| FileEntry { path_index: i, size: 4097 })
+            .collect();
+        let probes = derive_probe_offsets(&seed, &layout);
+        assert_eq!(probes.len(), 32);
+        for p in &probes {
+            assert_eq!(p.byte_offset, 0, "size=4097 must produce byte_offset=0 (modulus=1)");
+        }
+        let expected_file_indexes: [u64; 32] = LOCKED_V7_FILE_INDEXES;
+        for (i, p) in probes.iter().enumerate() {
+            assert_eq!(p.file_index, expected_file_indexes[i],
+                       "vector-7 probe {} file_index drift", i);
+        }
+    }
+
+    /// VECTOR-8: 1-byte files only — extreme modulus collapse. size = 1
+    /// triggers saturating_sub to 0, then max(0, 1) = 1, so byte_offset
+    /// modulus is 1 and all byte_offsets = 0.
+    #[test]
+    fn golden_vector_8_single_byte_files() {
+        let seed = [0xee; 32];
+        let layout: Vec<FileEntry> = (0..50)
+            .map(|i| FileEntry { path_index: i, size: 1 })
+            .collect();
+        let probes = derive_probe_offsets(&seed, &layout);
+        assert_eq!(probes.len(), 32);
+        for p in &probes {
+            assert_eq!(p.byte_offset, 0, "size=1 must produce byte_offset=0");
+            assert!(p.file_index < 50);
+        }
+        let expected_file_indexes: [u64; 32] = LOCKED_V8_FILE_INDEXES;
+        for (i, p) in probes.iter().enumerate() {
+            assert_eq!(p.file_index, expected_file_indexes[i],
+                       "vector-8 probe {} file_index drift", i);
+        }
+    }
+
+    /// VECTOR-9: large file count (5000 files of 64 KiB) — approximates
+    /// the v2-full / v3-full real-corpus shape. Sanity-checks file_index
+    /// distribution against a population large enough that u64 mod has
+    /// room to look random.
+    #[test]
+    fn golden_vector_9_v3_full_shape() {
+        let seed = [
+            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce,
+            0xca, 0xfe, 0xba, 0xbe, 0xb0, 0x0b, 0xa1, 0x10,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ];
+        let layout: Vec<FileEntry> = (0..5000)
+            .map(|i| FileEntry { path_index: i, size: 65_536 })
+            .collect();
+        let probes = derive_probe_offsets(&seed, &layout);
+        assert_eq!(probes.len(), 32);
+        for p in &probes {
+            assert!(p.file_index < 5000);
+            assert!(p.byte_offset + 4096 <= 65_536);
+        }
+        let expected: [(u64, u64); 32] = LOCKED_V9_FILE_INDEX_AND_OFFSET;
+        for (i, p) in probes.iter().enumerate() {
+            assert_eq!((p.file_index, p.byte_offset), expected[i],
+                       "vector-9 probe {} (file_index, byte_offset) drift", i);
+        }
+    }
+
+    /// VECTOR-10: BLAKE3-derived seed — verifies that a calibration_seed
+    /// itself produced by a BLAKE3 hash (the real-world shape — server-side
+    /// CSPRNG output is opaque, but verifier might supply hashed seeds for
+    /// regression tests) doesn't interact pathologically with the BLAKE3
+    /// keyed iteration inside derive_probe_offsets.
+    #[test]
+    fn golden_vector_10_blake3_derived_seed() {
+        // seed = first 32 bytes of BLAKE3("superdeduper-d7-test-seed-v1")
+        let mut h = Hasher::new();
+        h.update(b"superdeduper-d7-test-seed-v1");
+        let digest = h.finalize();
+        let seed: [u8; 32] = digest.as_bytes()[..32].try_into().unwrap();
+
+        let layout: Vec<FileEntry> = (0..200)
+            .map(|i| FileEntry { path_index: i, size: 250_000 + i * 100 })
+            .collect();
+        let probes = derive_probe_offsets(&seed, &layout);
+        assert_eq!(probes.len(), 32);
+        for p in &probes {
+            let entry = layout[p.file_index as usize];
+            assert!(p.byte_offset + 4096 <= entry.size);
+        }
+        let expected: [(u64, u64); 32] = LOCKED_V10_FILE_INDEX_AND_OFFSET;
+        for (i, p) in probes.iter().enumerate() {
+            assert_eq!((p.file_index, p.byte_offset), expected[i],
+                       "vector-10 probe {} (file_index, byte_offset) drift", i);
+        }
+    }
+
     // GOLDEN HEX TABLES — filled in via a lock-in run of the shipped impl.
     // To regenerate (only if spec changes): set RECOMPUTE_GOLDENS=1 and run
     // `cargo test -p superdeduper --lib --features telemetry golden_vector`;
@@ -441,6 +565,50 @@ mod tests {
         880407764, 1797880484, 304969829, 1565715279, 335873488, 1067458972, 869478518, 1937646267,
         1190989141, 169168056, 1099431953, 2104346440, 212449186, 1763286286, 504783584, 1119732940,
         667324715, 547076856, 1197670165, 1053878450, 1578456011, 1852314316, 1785732448, 757938980,
+    ];
+
+    const LOCKED_V6_FILE_INDEX_AND_OFFSET: [(u64, u64); 32] = [
+        (1, 2117956), (0, 317972), (0, 78017), (0, 648157), (1, 7837905),
+        (1, 1586290), (1, 5301901), (0, 614812), (0, 852362), (1, 6882494),
+        (1, 325865), (0, 874399), (1, 6056636), (1, 1410041), (0, 556904),
+        (1, 8076155), (0, 690551), (1, 1153590), (1, 7288386), (1, 5982111),
+        (0, 187331), (0, 827602), (0, 114598), (0, 995470), (0, 612453),
+        (0, 516796), (1, 2694459), (1, 4938281), (1, 6811872), (0, 116106),
+        (1, 916804), (1, 1099177),
+    ];
+
+    const LOCKED_V7_FILE_INDEXES: [u64; 32] = [
+        8, 3, 0, 14, 17, 10, 9, 9,
+        16, 13, 2, 12, 19, 16, 9, 1,
+        18, 5, 2, 4, 18, 8, 3, 0,
+        3, 1, 9, 1, 6, 3, 14, 16,
+    ];
+
+    const LOCKED_V8_FILE_INDEXES: [u64; 32] = [
+        32, 27, 13, 21, 14, 3, 23, 7,
+        46, 40, 22, 10, 18, 46, 31, 27,
+        37, 49, 36, 42, 24, 16, 3, 8,
+        10, 12, 4, 47, 21, 3, 37, 18,
+    ];
+
+    const LOCKED_V9_FILE_INDEX_AND_OFFSET: [(u64, u64); 32] = [
+        (697, 42315), (2092, 49326), (286, 36624), (354, 17681), (4232, 4941),
+        (2288, 35954), (1556, 17183), (1501, 9384), (2155, 25038), (1212, 3086),
+        (4328, 56211), (227, 59944), (1778, 19313), (2209, 12076), (2539, 53266),
+        (1419, 2334), (786, 55917), (3209, 61112), (2452, 14717), (4548, 18621),
+        (3904, 44126), (1700, 22072), (2016, 36778), (96, 26949), (528, 15254),
+        (4516, 45428), (4767, 55521), (3161, 12661), (3675, 30076), (1553, 31345),
+        (4135, 26855), (454, 47703),
+    ];
+
+    const LOCKED_V10_FILE_INDEX_AND_OFFSET: [(u64, u64); 32] = [
+        (187, 9599), (15, 56831), (17, 244001), (169, 143401), (2, 197739),
+        (74, 142573), (75, 129843), (126, 195656), (126, 208803), (25, 147776),
+        (106, 225742), (191, 167408), (116, 79766), (50, 149193), (28, 215322),
+        (151, 134193), (22, 79295), (197, 81733), (48, 85551), (15, 34103),
+        (100, 44514), (157, 121340), (146, 117427), (145, 119488), (162, 226270),
+        (167, 181627), (179, 250696), (147, 187918), (101, 45250), (153, 51072),
+        (96, 211900), (37, 213069),
     ];
 
     // -----------------------------------------------------------------
