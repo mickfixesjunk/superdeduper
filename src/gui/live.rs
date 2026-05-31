@@ -2422,8 +2422,10 @@ pub fn volume_guid_for(path: &std::path::Path) -> Option<String> {
 
 /// Best-effort detection of whether a path's underlying device has a
 /// seek penalty (HDD). Windows: IOCTL_STORAGE_QUERY_PROPERTY via
-/// winapi_wrappers; failure or non-Windows defaults to "HDD" so the
-/// scope renders in the conservative, calm pattern.
+/// winapi_wrappers. macOS (#158): parse `diskutil info <path>` for
+/// "Solid State: Yes/No"; falls back to false (SSD assumed) since
+/// every modern Mac ships with flash storage. Other Unix: defaults to
+/// "HDD" so the scope renders in the conservative pattern.
 fn detect_seek_penalty(path: &std::path::Path) -> bool {
     #[cfg(windows)]
     {
@@ -2434,11 +2436,77 @@ fn detect_seek_penalty(path: &std::path::Path) -> bool {
         }
         true
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // #158 -- A-macos-ssd. Apple Silicon internal storage is
+        // always flash + Intel Mac SSDs have been standard since ~2018;
+        // the prior non-Windows arm returned true unconditionally
+        // which mis-rendered M3 + every recent Mac as HDD. Probe
+        // diskutil first (catches external rotational disks), then
+        // fall back to SSD-assumed.
+        if let Some(has_penalty) = macos_seek_penalty_via_diskutil(path) {
+            return has_penalty;
+        }
+        false
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let _ = path;
         true
     }
+}
+
+/// #158 -- A-macos-ssd. Run `diskutil info <path>` and parse the
+/// "Solid State: Yes|No" line into a seek-penalty bool. Returns
+/// `None` when diskutil is unavailable / errors / its output doesn't
+/// include the line (network volumes, sparse images), so the caller
+/// can fall back to a sane default. Output snippet we parse:
+///
+/// ```text
+/// Device Identifier:        disk3s1s1
+/// ...
+/// Solid State:              Yes
+/// ...
+/// ```
+///
+/// Lifted out for unit testing without invoking the subprocess --
+/// `parse_diskutil_solid_state` takes the captured stdout directly.
+#[cfg(target_os = "macos")]
+fn macos_seek_penalty_via_diskutil(path: &std::path::Path) -> Option<bool> {
+    let out = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["info", &path.to_string_lossy()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&out.stdout).ok()?;
+    parse_diskutil_solid_state(text).map(|solid_state| !solid_state)
+}
+
+/// Parse `diskutil info` output: returns `Some(true)` if "Solid
+/// State: Yes" appears (SSD), `Some(false)` if "Solid State: No"
+/// (HDD), `None` if the line is absent (network volumes, sparse
+/// images, exotic mounts).
+///
+/// Visible to all platforms so the unit tests can run on Linux.
+fn parse_diskutil_solid_state(text: &str) -> Option<bool> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Solid State:") {
+            let value = rest.trim();
+            // Match case-insensitively + accept the canonical Yes/No
+            // diskutil emits. Anything else -> unknown.
+            if value.eq_ignore_ascii_case("Yes") {
+                return Some(true);
+            }
+            if value.eq_ignore_ascii_case("No") {
+                return Some(false);
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Map a path to a stable, deterministic value in a fixed range so the
@@ -2702,6 +2770,67 @@ mod tests {
 
     fn ref_set(roots: &[&str]) -> hashbrown::HashSet<PathBuf> {
         roots.iter().map(PathBuf::from).collect()
+    }
+
+    // ============================================================
+    // #158 -- A-macos-ssd. Tests for the diskutil-output parser.
+    // Cross-platform unit tests (no diskutil subprocess) so the
+    // parser contract is pinned on every host even though the
+    // production code path only runs on macOS.
+    // ============================================================
+
+    #[test]
+    fn parse_diskutil_solid_state_yes_means_ssd() {
+        let sample = "\
+Device Identifier:        disk3s1s1
+Device Node:              /dev/disk3s1s1
+Whole:                    No
+Solid State:              Yes
+SMART Status:             Verified
+";
+        // SSD -> Solid State: Yes -> Some(true).
+        assert_eq!(super::parse_diskutil_solid_state(sample), Some(true));
+    }
+
+    #[test]
+    fn parse_diskutil_solid_state_no_means_hdd() {
+        let sample = "Solid State:              No\n";
+        assert_eq!(super::parse_diskutil_solid_state(sample), Some(false));
+    }
+
+    #[test]
+    fn parse_diskutil_solid_state_absent_returns_none() {
+        // Network volume / sparse image output -- no "Solid State"
+        // line at all. Caller falls back to its platform default
+        // (SSD-assumed on macOS).
+        let sample = "\
+Device Identifier:        smb://server/share
+File System Personality:  smbfs
+";
+        assert_eq!(super::parse_diskutil_solid_state(sample), None);
+    }
+
+    #[test]
+    fn parse_diskutil_solid_state_unknown_value_returns_none() {
+        // Defensive: diskutil could in principle emit "Unknown" or
+        // some new vocabulary in a future macOS release. Don't guess.
+        let sample = "Solid State:              Unknown\n";
+        assert_eq!(super::parse_diskutil_solid_state(sample), None);
+    }
+
+    #[test]
+    fn parse_diskutil_solid_state_is_case_insensitive() {
+        let yes_lower = "Solid State: yes\n";
+        let no_upper = "Solid State: NO\n";
+        assert_eq!(super::parse_diskutil_solid_state(yes_lower), Some(true));
+        assert_eq!(super::parse_diskutil_solid_state(no_upper), Some(false));
+    }
+
+    #[test]
+    fn parse_diskutil_solid_state_tolerates_indented_lines() {
+        // Some diskutil output variants indent the value lines.
+        let sample = "    Solid State:              Yes\n";
+        assert_eq!(super::parse_diskutil_solid_state(sample), Some(true));
     }
 
     #[test]
