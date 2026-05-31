@@ -23,6 +23,46 @@
 //! aspirational and false by grep; the policy is "unsafe is justified at
 //! the call site," not "absent."
 
+/// A-home-env-serial -- process-wide serial gate for unit tests that
+/// mutate a HOME-equivalent env var (HOME, XDG_DATA_HOME, XDG_CACHE_HOME,
+/// LOCALAPPDATA, USERPROFILE). Cargo's parallel test runner schedules
+/// every unit test in this crate inside one binary, so two modules'
+/// tests both calling `env::set_var("HOME", ...)` race -- observed as
+/// #146 (`trash_root_falls_back_to_home_local_share` failed under
+/// parallel `cargo test`, passed in isolation). The per-module SERIAL
+/// gates that existed before only serialized WITHIN their own module;
+/// a test in `platform::linux::trash::tests` racing a test in
+/// `scan_history::tests` or `dedupe::tests` was still possible.
+///
+/// Every HOME-mutating unit test MUST acquire this BEFORE touching the
+/// env, AND hold the guard across both the mutation and any subsequent
+/// reads that depend on it:
+///
+/// ```ignore
+/// let _g = crate::test_serial::home_env_guard();
+/// std::env::set_var("HOME", &fake_home);
+/// // ... test body that calls into HOME-reading code ...
+/// // restore on exit; _g drops at end of scope.
+/// ```
+///
+/// `parking_lot::Mutex` is poison-tolerant: if a test panics while
+/// holding the guard, the next acquirer gets a clean lock rather than
+/// `PoisonError`. That matters because test failure shouldn't wedge the
+/// rest of the test suite.
+#[cfg(test)]
+pub(crate) mod test_serial {
+    use parking_lot::{Mutex, MutexGuard};
+
+    static HOME_ENV_SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Acquire the shared HOME-env serial gate. Hold the returned
+    /// guard for the entire duration of any test body that mutates a
+    /// HOME-equivalent env var.
+    pub fn home_env_guard() -> MutexGuard<'static, ()> {
+        HOME_ENV_SERIAL.lock()
+    }
+}
+
 pub mod action_receipt;
 pub mod cache;
 pub mod channel;

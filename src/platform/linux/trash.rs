@@ -213,23 +213,12 @@ fn iso8601_local_seconds(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Process-wide serial gate for the env-mutating tests below.
-    /// Three tests (`trash_root_uses_xdg_data_home_when_absolute`,
-    /// `trash_root_falls_back_to_home_local_share`,
-    /// `trash_file_round_trip_under_isolated_home`) all
-    /// `env::set_var("XDG_DATA_HOME", ...)` + `env::set_var("HOME", ...)`,
-    /// then restore on exit. When cargo runs them in parallel within
-    /// the same binary the env vars race — test A's `trash_root()`
-    /// can read test B's mid-flight HOME and write to the wrong
-    /// directory. Manifested as
-    /// `trash_file_round_trip_under_isolated_home` failing on faster
-    /// CI runners (locally they happen to serialise by accident).
-    ///
-    /// Tests that don't touch env (url-escape, build_trashinfo,
-    /// iso8601) don't need the gate and stay parallel.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    // A-home-env-serial (#146): HOME-mutating tests in this module
+    // now route through the crate-wide gate at
+    // `crate::test_serial::home_env_guard` so they serialize against
+    // every OTHER module's HOME-mutating tests (scan_history,
+    // dedupe), not just each other. The pre-#146 module-local
+    // `static SERIAL: Mutex<()>` only blocked within-module races.
 
     #[test]
     fn url_escape_passes_safe_chars() {
@@ -270,7 +259,7 @@ mod tests {
 
     #[test]
     fn trash_root_uses_xdg_data_home_when_absolute() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         // Save + restore so the test is hermetic.
         let prev = std::env::var_os("XDG_DATA_HOME");
         let prev_home = std::env::var_os("HOME");
@@ -291,7 +280,7 @@ mod tests {
 
     #[test]
     fn trash_root_falls_back_to_home_local_share() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let prev = std::env::var_os("XDG_DATA_HOME");
         let prev_home = std::env::var_os("HOME");
         std::env::remove_var("XDG_DATA_HOME");
@@ -310,7 +299,7 @@ mod tests {
 
     #[test]
     fn trash_file_round_trip_under_isolated_home() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         // Build a synthetic XDG home + HOME, point trash at it,
         // trash a file, then assert it's gone from src + present
         // in `<home>/.local/share/Trash/files/` with a matching

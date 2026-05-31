@@ -726,13 +726,12 @@ fn data_dir() -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Same env-mutating-test serial-gate pattern as
-    // `src/platform/linux/trash.rs::tests`. These tests set
-    // HOME / XDG_DATA_HOME to a tempdir to sandbox the history
-    // directory; running in parallel would race on the env var.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    // A-home-env-serial (#146): the HOME-mutating tests in this module
+    // now route through the crate-wide gate at
+    // `crate::test_serial::home_env_guard` so they serialize against
+    // every OTHER module's HOME-mutating tests (trash, dedupe). The
+    // pre-#146 module-local `static SERIAL` only blocked within-module
+    // races.
 
     fn isolate(label: &str) -> tempfile::TempDir {
         let dir = tempfile::Builder::new()
@@ -768,7 +767,7 @@ mod tests {
 
     #[test]
     fn record_completed_then_list_round_trips() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("round-trip");
         let id = new_scan_id();
         let record = ScanRecord::new_finished(
@@ -794,7 +793,7 @@ mod tests {
 
     #[test]
     fn list_sorts_newest_first() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("sort");
         for ts in [1700, 1500, 1900, 1100, 1800] {
             let record = ScanRecord::new_finished(
@@ -817,7 +816,7 @@ mod tests {
 
     #[test]
     fn list_skips_unparseable_files() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("skip-bad");
         // Write one good + one garbage file.
         let good = ScanRecord::new_finished(
@@ -840,7 +839,7 @@ mod tests {
 
     #[test]
     fn list_skips_forward_version_files() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("forward-version");
         let dir = history_dir().unwrap();
         fs::create_dir_all(&dir).unwrap();
@@ -857,7 +856,7 @@ mod tests {
 
     #[test]
     fn list_returns_empty_when_dir_missing() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("empty");
         // Dir doesn't exist yet; list() should return Ok([]) not error.
         let listed = list().unwrap();
@@ -866,7 +865,7 @@ mod tests {
 
     #[test]
     fn delete_is_idempotent() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("delete-idempotent");
         // Deleting a non-existent record is a no-op, not an error.
         delete("does-not-exist").unwrap();
@@ -889,7 +888,7 @@ mod tests {
 
     #[test]
     fn load_returns_none_for_missing() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("load-missing");
         assert!(load("does-not-exist").unwrap().is_none());
     }
@@ -967,7 +966,7 @@ mod tests {
     /// last_attempt_at_unix + attempt_count, then writes back.
     #[test]
     fn update_submission_state_round_trips() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("update-state");
         let id = new_scan_id();
         let r = ScanRecord::new_finished(
@@ -1010,7 +1009,7 @@ mod tests {
     /// that closes the bug class where callers might do only one half.
     #[test]
     fn mark_submitted_round_trip() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("mark-submitted");
         let scan_id = new_scan_id();
         let r = ScanRecord::new_finished(
@@ -1049,7 +1048,7 @@ mod tests {
     /// against real disk state. Pins the scan-vs-reclaim join key.
     #[test]
     fn submission_id_and_reclaim_round_trip() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("reclaim-roundtrip");
         let scan_id = new_scan_id();
         let r = ScanRecord::new_finished(
@@ -1167,7 +1166,7 @@ mod tests {
     /// who act before submitting.
     #[test]
     fn record_local_action_for_latest_scan_round_trips() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("local-action-credit");
         let scan_id = new_scan_id();
         let r = ScanRecord::new_finished(
@@ -1226,7 +1225,7 @@ mod tests {
     /// retention setting is "forever").
     #[test]
     fn prune_older_than_zero_is_noop() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("prune-zero");
         let id = new_scan_id();
         let r = ScanRecord::new_finished(
@@ -1250,7 +1249,7 @@ mod tests {
     /// older than the cutoff and leaves fresher rows alone.
     #[test]
     fn prune_older_than_removes_only_aged_rows() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("prune-aged");
         let old = ScanRecord::new_finished(
             new_scan_id(),
@@ -1288,7 +1287,7 @@ mod tests {
     /// #41 — `list_pending_older_than` filters by state AND age.
     #[test]
     fn list_pending_older_than_filters_state_and_age() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_serial::home_env_guard();
         let _td = isolate("pending-sweep");
         // Three rows: aged-pending (should match), fresh-pending
         // (should not — under threshold), aged-submitted (should

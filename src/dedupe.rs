@@ -2465,6 +2465,13 @@ mod tests {
         // to plain remove. Builds an isolated fake HOME so the
         // trashed file lands in a known location we can inspect +
         // doesn't pollute the dev's real ~/.local/share/Trash.
+        //
+        // A-home-env-serial (#146): acquire the crate-wide HOME-env
+        // gate so this test cannot race a HOME-mutating test in
+        // platform::linux::trash or scan_history (cargo runs all
+        // unit tests in one binary; without the gate, parallel
+        // schedule produced #146's intermittent failure).
+        let _guard = crate::test_serial::home_env_guard();
         let d = tmpdir();
         let fake_home = d.join("fake_home");
         fs::create_dir_all(&fake_home).unwrap();
