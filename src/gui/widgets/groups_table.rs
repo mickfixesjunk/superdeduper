@@ -789,7 +789,7 @@ pub fn show_filtered(
                             row.col(|ui| {
                                 let label = keeper
                                     .as_ref()
-                                    .map(|p| format_path(p))
+                                    .map(|p| display_path(p))
                                     .unwrap_or_default();
                                 // #156 — macOS rendered ▾/▸ (U+25BE/25B8, small
                                 // triangles in Geometric Shapes) as tofu because
@@ -885,7 +885,7 @@ pub fn show_filtered(
                                     theme::TEXT_LO
                                 };
                                 ui.label(
-                                    RichText::new(format_path(p))
+                                    RichText::new(display_path(p))
                                         .color(color)
                                         .monospace()
                                         .small(),
@@ -924,7 +924,7 @@ enum RowItem {
 /// Delegates to the crate-root `path_display::for_user_display`;
 /// per #73 the `\\?\` strip behaviour lives in exactly one place
 /// across the GUI surfaces (groups-table, Log, preview-header).
-fn format_path(p: &Path) -> String {
+fn display_path(p: &Path) -> String {
     crate::path_display::for_user_display(p)
 }
 
@@ -947,7 +947,7 @@ mod path_display_tests {
     #[test]
     fn drops_verbatim_drive_prefix() {
         let p = Path::new(r"\\?\C:\Windows\System32\notepad.exe");
-        assert_eq!(format_path(p), r"C:\Windows\System32\notepad.exe");
+        assert_eq!(display_path(p), r"C:\Windows\System32\notepad.exe");
     }
 
     #[test]
@@ -956,35 +956,35 @@ mod path_display_tests {
         // verbatim form. Stripping the prefix must not change the
         // case of what's underneath.
         let p = Path::new(r"\\?\c:\foo\bar.txt");
-        assert_eq!(format_path(p), r"c:\foo\bar.txt");
+        assert_eq!(display_path(p), r"c:\foo\bar.txt");
     }
 
     #[test]
     fn rewrites_verbatim_unc_form() {
         // \\?\UNC\server\share\file -> \\server\share\file
         let p = Path::new(r"\\?\UNC\fileserver\public\report.pdf");
-        assert_eq!(format_path(p), r"\\fileserver\public\report.pdf");
+        assert_eq!(display_path(p), r"\\fileserver\public\report.pdf");
     }
 
     #[test]
     fn passes_through_normal_windows_path() {
         let p = Path::new(r"C:\Users\Mick\Documents\thing.txt");
-        assert_eq!(format_path(p), r"C:\Users\Mick\Documents\thing.txt");
+        assert_eq!(display_path(p), r"C:\Users\Mick\Documents\thing.txt");
     }
 
     #[test]
     fn passes_through_normal_unc_path() {
         // Already-displayable UNC (no \\?\ prefix) stays put.
         let p = Path::new(r"\\fileserver\share\thing");
-        assert_eq!(format_path(p), r"\\fileserver\share\thing");
+        assert_eq!(display_path(p), r"\\fileserver\share\thing");
     }
 
     #[test]
     fn passes_through_unix_paths() {
         // Non-Windows paths trip neither branch — engine uses
-        // format_path on the Log tab for cross-platform display.
+        // display_path on the Log tab for cross-platform display.
         let p = Path::new("/home/neomatrix/file.bin");
-        assert_eq!(format_path(p), "/home/neomatrix/file.bin");
+        assert_eq!(display_path(p), "/home/neomatrix/file.bin");
     }
 
     #[test]
@@ -992,13 +992,13 @@ mod path_display_tests {
         // Edge case: just the prefix + drive root. Should produce
         // just the drive root, not crash.
         let p = Path::new(r"\\?\D:\");
-        assert_eq!(format_path(p), r"D:\");
+        assert_eq!(display_path(p), r"D:\");
     }
 
     #[test]
     fn empty_path_passes_through() {
         let p = Path::new("");
-        assert_eq!(format_path(p), "");
+        assert_eq!(display_path(p), "");
     }
 
     /// #156 -- A-bmp-glyph-fallback. Pins the no-SMP-emoji contract
