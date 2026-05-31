@@ -503,12 +503,14 @@ pub struct ScanArgs {
     pub threads: Option<usize>,
 
     /// Worker count for the hashing par_iter. Defaults to
-    /// `threads × 3` because the per-file open()/read()/close()
-    /// cycle (Tier 1 + small-file Tier 3) spends most of its time
-    /// blocked in syscalls. Oversubscribe to keep more I/O in
-    /// flight. Set explicitly to sweep — `--io-threads 1` for a
-    /// CPU-only baseline, `--io-threads 64` to find the saturation
-    /// point on a fast SSD.
+    /// `threads × 3` on SSD/NVMe-class storage (oversubscribe to
+    /// keep more I/O in flight while the per-file open/read/close
+    /// cycle blocks in syscalls). Auto-caps at 16 when the scan
+    /// root is on HDD-class storage (rotational disk; high
+    /// thread-count thrashes seeks). See `docs/perf-98-findings.md`
+    /// for the cross-storage sweep that motivates the cap. Set
+    /// explicitly to sweep — `--io-threads 1` for a CPU-only
+    /// baseline, `--io-threads 64` to find saturation on a fast SSD.
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
 
