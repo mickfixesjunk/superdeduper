@@ -1154,6 +1154,7 @@ mod tests {
             &[vec![1u64, 2, 7]],
             true,
             &k,
+            None, // no V3.1 rep_hashes for this test — keeps the legacy-only shape
         );
         // k_echo is base64-std of K (44 chars).
         let echo = cb.bench_proof.get("k_echo").and_then(|v| v.as_str())
