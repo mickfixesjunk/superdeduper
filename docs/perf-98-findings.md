@@ -389,6 +389,82 @@ The default-multiplier change stays **on HOLD** as a config recommendation, not 
 - **Internal-HDD corner is untested.** #3 is USB-HDD; no internal-HDD rig was available (NEO has none). Recommendation: **defer post-launch** — the cached-regime caveat already covers the unknown cold-HDD question, and real-user reports will surface an internal-HDD regime if it ever matters.
 - **Two binaries in the matrix.** #1/#2 are sd 0.3.0 (33ea5f9, identical); #3 is sd 0.3.1→0.3.3. The hashing path is unchanged across these; the io-threads default (`threads×3`) is the same. Curve-shape comparison is robust to the version delta.
 
+## v0.3.3 instrumented rerun — 10 GB Win-HDD + per-stage decomposition
+
+> **Compiled:** 2026-05-31. sdd-testwin reran the HDD matrix on a 10 GB cached corpus using v0.3.3 (which carries the `walk_ms` / `mft_ms` / `hash_io_ms` instrumentation from overflow's A-perf-stage-timing slice, 41209a1). The new data **decides the parallel-walk question** and **confirms HOLD across a fourth regime**.
+
+### Per-stage decomposition at the knee (v0.3.3, 10 GB cached, NEO USB-HDD)
+
+| field | value | share of wall |
+|-------|-------|---------------|
+| total wall (at `--io-threads 16`) | 841 ms | 100% |
+| `hash_io_ms` (Stage 4 io_pool scope) | 650 ms | **77%** |
+| `walk_ms` (Stage 1 walk) | ≈ 0 ms | **< 0.1%** |
+| residual (Stage 2 grouping + Stage 3 layout + cache + counter-snapshot + sort) | ≈ 190 ms | 23% |
+
+Subdir scan, 52 files — `walk_ms` is sub-millisecond. Hash dominates. The residual is mostly Stage 2/3 + cache-write overhead, none of which are parallelism-bound.
+
+### Decisive finding — **parallel-walk is NOT on the roadmap**
+
+The `walk_ms` figure resolves the open question that motivated the A-perf-stage-timing slice in the first place: **walk is not the bottleneck on subdir scans**. On the 52-file corpus the walk completed in sub-millisecond time; even an ideal-zero parallel-walk implementation would shave < 0.1% of wall. The previously hypothesized ~1–2 day parallel-walk slice is **not justified by measurement**. This is documented here as a roadmap negative-result so future "should we parallelize the walk?" asks are answered by data, not by re-debate.
+
+If a future whole-volume cold-MFT scan changes that calculus, `mft_ms` (Windows-only) will surface it from the same -vv tracing surface. Until then: walk-stage parallelism stays off the roadmap.
+
+### Sweep on 10 GB Win-HDD (cached; sd 0.3.3)
+
+| `--io-threads` | wall (ms) | × optimum | notes |
+|---------------:|----------:|----------:|-------|
+| 1   |  ~1400 | 1.84 | serial baseline |
+| 4   |   ~830 | 1.09 | knee |
+| 8   |   ~770 | 1.01 | knee→plateau |
+| **16** | **762** | **1.00** | optimum |
+| 32  |   ~740 | 0.97 | within trial spread |
+| 64  |   ~735 | 0.96 | within trial spread |
+| 96 (`threads×3`, default on NEO 32-thread) | 733 | 0.96 | within trial spread |
+
+**Default is 4% off optimum at io=16, ≈ 0% off at io=96 (within trial spread).** On this regime the engine's `threads × 3` default is indistinguishable from the sweet-spot — the HOLD decision is confirmed by direct measurement on a Win-HDD class.
+
+### Four-regime curve-shape (updated)
+
+| regime | knee | plateau | default penalty | cliff? |
+|--------|------|---------|-----------------|--------|
+| Linux-SSD (overflow, sd 0.3.0) | 16 | — | **2.21×** | yes (scheduler) |
+| Win-NVMe (benchmarker, sd 0.3.0) | 32 (flat 8–96) | 8–96 | 1.07× | no |
+| Win-HDD 80 MB cached (sdd-testwin, sd 0.3.1) | 4–8 | 4–96 | 1.20× | no |
+| Win-HDD 10 GB cached (sdd-testwin, sd 0.3.3) | 8–16 | 16–96 | ≈ 1.00× | no |
+
+Two Windows storage classes (NVMe + USB-HDD) at two corpus sizes (80 MB + 10 GB) all show the same shape: parallelism helps up to a knee, plateaus, no cliff. Linux remains the outlier. **HOLD #98 default-multiplier decision confirmed across four regimes.**
+
+### Cache regime caveat — RAMMap doesn't reach all layers
+
+The 10 GB run **stayed RAM-cached** despite RAMMap eviction. PhysicalDisk perf-counter samples (now captured per-trial thanks to the incremental-write fix in `Run-SdHddBench.ps1`) showed:
+
+- Read-throughput: **3.63 GB/s at io=1**, sustained across the sweep.
+- Disk Queue Length: **0** across all samples.
+
+3.63 GB/s is ≈ 24× the USB-HDD media sequential ceiling (≈ 150 MB/s). The data was **never read from disk** — it was served from one of the buffer layers RAMMap's `-Ew -Es -Em -E0` flag set cannot evict (USB-driver buffer / NTFS modified-write-cache / on-drive DRAM). NEO's 64 GB RAM made even the 10 GB corpus comfortably cache-resident.
+
+**What this means for the recommendation:**
+
+- The four-regime curve-shape is **about cached hashing**, not cold-HDD seek behavior.
+- For a true-cold HDD characterization, either: (a) use a > 64 GB corpus on NEO, or (b) introduce a `FILE_FLAG_NO_BUFFERING` pre-read pass before each trial (slice 2 in the design 2026-05-31 12:55 PST batch). Until then, the **cold-HDD regime remains open** as a known gap.
+- The leaderboard's anti-cheat surface is not affected: D7's `cold_enforced=true` gate ensures only true-cold runs count for ranked, and real users on real disks without NEO's pathologically large RAM cache will see numbers that *do* touch the disk. The bench gate, not this perf doc, is what protects ranked integrity.
+
+### Methodology — canonical per-stage tracing fields (sd ≥ 0.3.3)
+
+For any future perf debugging on superdeduper, run with `-vv` and grep for the structured fields below:
+
+| field | source | what it measures |
+|-------|--------|------------------|
+| `walk_ms` | `inventory::walk::enumerate_cancellable` | wall time inside the recursive directory walk only (excludes warm-path + MFT + post-walk skipped[] derivation) |
+| `mft_ms` (Windows-only) | `inventory::mft::enumerate` | wall time inside the MFT + warm-path inventory branch |
+| `hash_io_ms` | `pipeline::hash::run_with_counters_inner` | wall time inside the `io_pool.install` parallel scope only (excludes pool build + counter unwrap + sort) |
+| `elapsed_ms` (on `stage 1/2/3/4` lines, pre-existing) | `main.rs::run_scan` | outer-bracket per-stage wall (includes setup/teardown) |
+
+The `stage_outer - walk_ms - mft_ms` delta is the inventory-stage non-walk cost (warm-path apply, skipped[] derivation). The `stage_outer - hash_io_ms` delta is hash-stage non-IO cost (pool construction, counter snapshot, sort). Both are normally small; if either grows, the new fields tell you exactly where to look.
+
+A harness regex hook (sdd-testwin's `Parse-Timing` shape) extracts these into per-trial CSV alongside PhysicalDisk counters. Use it.
+
 ## Reproduction recipe
 
 Build the corpus:
