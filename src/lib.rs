@@ -76,6 +76,15 @@ pub mod exclusions;
 pub mod inventory;
 pub mod keep;
 pub mod log;
+// Re-export the leaf-crate log macros at the engine crate root so existing
+// `crate::log_info!(...)` / `crate::log_warn!(...)` / `crate::log_err!(...)`
+// call sites in engine / GUI / leaderboard continue to resolve unchanged
+// after the Phase 0 superdeduper-log extraction (2026-05-31). The macros
+// themselves live in `crates/superdeduper-log/src/lib.rs`; `$crate` inside
+// each expands to `::superdeduper_log` so the body still reaches the right
+// `write_line` regardless of how the caller imports the macro.
+pub use superdeduper_log::{log_err, log_info, log_warn};
+
 pub mod output;
 pub mod path_display;
 pub mod pipeline;
