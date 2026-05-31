@@ -8,8 +8,78 @@
 > `crates/superdeduper-bench-real/src/` crate; rewrite engine call sites to
 > reach the moved code via `BenchExecutor` / `SubmissionExecutor` trait
 > methods. Per `docs/phase-0-trait-extraction.md` §7 row P0-D.
->
-> **NOT executed yet.** No code change on this branch — this doc only.
+
+## ⓘ Execution status (2026-05-31, P0-D Phase 1 shipped on fa0dd5f)
+
+The execution split into TWO phases on contact with reality:
+
+**P0-D Phase 1 — SHIPPED** (`overflow/p0d-execute` / `fa0dd5f`, target
+v0.3.7):
+
+- ✅ Iface placeholder types **replaced with real shapes** for 3 of 7:
+  `ChallengePosition` (was byte-exact; +`Copy` + canonical doc),
+  `DebugDedupDiff` (new) + `DebugDedupDiffReport` (added `diffs` field
+  the scaffold dropped), `InstallKey` (`Vec<u8>` → `[u8; 32]` matching
+  engine's existing alias).
+- ✅ **`superdeduper-bench-real` crate scaffolded** as workspace
+  member with `iface` + `blake3` + `chacha20` + `base64` + `serde`
+  deps. `BenchReal` struct implements **both** traits with method
+  bodies returning `Err(BenchError::Unavailable)` — validates the
+  trait surface compiles against the workspace dep graph.
+- ✅ **3 of 6 module moves** via `git mv`: `d7_probe`, `bench`,
+  `bench_corpus`. All self-contained (no cross-module engine deps).
+  Inner `#![cfg(feature = "telemetry")]` gates dropped (bench-real is
+  itself telemetry-gated at the engine dep level; inner gates were
+  redundant).
+- ✅ Engine `src/leaderboard/mod.rs` `pub use` re-exports preserve all
+  existing import paths (`crate::leaderboard::{bench, bench_corpus,
+  d7_probe}` continues to resolve unchanged).
+- ✅ Engine `Cargo.toml`: bench-iface + bench-real added as **optional
+  deps gated behind `telemetry`**. `--no-default-features` builds pull
+  neither.
+- ✅ Verification: 603 tests pass across the workspace (529 engine +
+  57 bench-real + 4 iface + 13 v31 goldens). Both feature combos
+  clean.
+
+**P0-D Phase 2 — DEFERRED** (post-launch resume):
+
+- ⏳ 3 of 7 iface type-replacements: `BenchContext`, `BenchOutcome`,
+  `SubmissionInputs`, `SubmitOutcome`. Blocked on
+  `HardwareFingerprint` struct-def relocation (real `SubmissionInputs`
+  has a `hardware: HardwareFingerprint` field; the type lives in
+  `src/leaderboard/hardware.rs` which engine main is editing for SAT
+  pass-through). Cross-module dep was the gap in this plan's §4.1 the
+  dry-run missed.
+- ⏳ 3 of 6 remaining module moves: `bench_run.rs`, `bench_client.rs`,
+  `submission.rs`. The submission.rs three-way split (§4 below) and
+  the `Cancelled` → `BenchError::Cancelled` migration at
+  `bench_modal.rs:241` (§6.1) are part of this Phase 2 work.
+- ⏳ Real trait method bodies on `BenchReal` (currently all
+  `Err(Unavailable)`). Wires `run_bench` → `bench_run::run`,
+  `debug_dedup_diff` → `bench_run::debug_dedup_diff`,
+  `submit_recorded` → `submission::submit_recorded`.
+- ⏳ Engine call-site rewrites (~50+ sites; full enumeration in §3
+  below). The pub-use shims keep Phase 1 compiling without touching
+  any call site; Phase 2 either keeps the shims or rewrites the call
+  sites to executor.method() per engine's preference.
+
+**Phase 2 resume gates** (must be answered before execute restart):
+
+1. Engine main SAT pass-through on `hardware.rs` lands.
+2. Decision: `HardwareFingerprint` struct-def location.
+   Engine main 15:13 PST lean: **new types crate**
+   (e.g., `crates/superdeduper-hardware-iface/`) that both engine and
+   bench-iface depend on; engine keeps the platform-detection fn
+   bodies in `hardware.rs`, just the struct-def + serde derive moves.
+3. Decision: `BenchContext` lifetime. Engine main 15:13 PST lean:
+   **convert to owned at iface boundary** (allocations on every call;
+   the dyn-safety win is worth it for a once-per-bench-run call).
+4. Decision: `SubmitOutcome` enum shape with rank-entry variants.
+   Engine main 15:13 PST lean: **keep as enum** (iface-acceptable);
+   re-evaluate specific variant if a transitive dep surfaces.
+
+The rest of this doc is the dry-run sketch as originally written;
+read §§3, 4, 5, 6, 8 against the **Phase 2 deferred** scope above.
 
 ## 1. Modules to move
 
