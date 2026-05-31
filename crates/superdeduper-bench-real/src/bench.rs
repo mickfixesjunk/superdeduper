@@ -18,7 +18,12 @@
 //!   = the leaf hash itself.
 //! - root wire form = std-base64 (RFC4648, WITH padding).
 //! - all in-hash integers = little-endian, fixed width.
-#![cfg(feature = "telemetry")]
+//!
+//! P0-D Phase 1 (2026-05-31): moved from `src/leaderboard/bench.rs` into
+//! the bench-real workspace crate. The engine binary pulls bench-real in
+//! only when the `telemetry` feature is on, so the inner
+//! `#![cfg(feature = "telemetry")]` gate that lived here became redundant
+//! and was removed during the move.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;

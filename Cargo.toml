@@ -95,6 +95,14 @@ superdeduper-hmac-signer = { path = "crates/superdeduper-hmac-signer", optional 
 # closed-source telemetry-off binary path also writes the disk log.
 # See crates/superdeduper-log/Cargo.toml for rationale.
 superdeduper-log = { path = "crates/superdeduper-log" }
+
+# P0-D Phase 1 (2026-05-31): bench-real default impl. Holds d7_probe
+# today; the remaining 5 bench modules (bench_run, bench_client, bench,
+# bench_corpus, submission HTTP path) cross the cut-line in Phase 2.
+# Telemetry-gated because the iface bench surface only exists for the
+# telemetry build; --no-default-features doesn't pull bench-real.
+superdeduper-bench-iface = { path = "crates/superdeduper-bench-iface", optional = true }
+superdeduper-bench-real = { path = "crates/superdeduper-bench-real", optional = true }
 uuid = { version = "1.10", optional = true, features = ["v4"] }
 # T-BENCH-ME canonical-bench (telemetry): deterministic corpus generator
 # (RFC-8439 ChaCha20 keystream w/ StreamCipherSeek for O(1) random-access
@@ -178,7 +186,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64", "dep:tar", "dep:superdeduper-hmac-signer"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64", "dep:tar", "dep:superdeduper-hmac-signer", "dep:superdeduper-bench-iface", "dep:superdeduper-bench-real"]
 # T1.2 perceptual image similarity (#25). Pulls `image` for decode
 # + `image_hasher` for the dHash/aHash/pHash family. Off by default
 # while the feature lands incrementally — first slice is just the
@@ -307,5 +315,5 @@ lto = "thin"
 # follow as P0-C..P0-F land.
 # ---------------------------------------------------------------------------
 [workspace]
-members = [".", "crates/superdeduper-hmac-signer", "crates/superdeduper-log", "crates/superdeduper-bench-iface"]
+members = [".", "crates/superdeduper-hmac-signer", "crates/superdeduper-log", "crates/superdeduper-bench-iface", "crates/superdeduper-bench-real"]
 resolver = "2"

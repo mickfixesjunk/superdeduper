@@ -4390,6 +4390,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "superdeduper-bench-iface",
+ "superdeduper-bench-real",
  "superdeduper-hmac-signer",
  "superdeduper-log",
  "symphonia",
@@ -4413,6 +4415,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "superdeduper-bench-real"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "chacha20",
+ "rayon",
+ "serde",
+ "serde_json",
+ "superdeduper-bench-iface",
+ "tempfile",
 ]
 
 [[package]]

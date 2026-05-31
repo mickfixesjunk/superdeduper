@@ -46,12 +46,22 @@ pub mod vanity_slug;
 /// (per-1MiB-chunk leaves, RFC-6962 promote-last, base64-padded root) +
 /// single-round challenge derivation. (corpus generator + --bench-me flow
 /// build on these.) Telemetry-gated (the file is #![cfg(feature="telemetry")]).
-pub mod bench; // G4
+///
+/// P0-D Phase 1 (2026-05-31): module implementation moved to
+/// `crates/superdeduper-bench-real/src/bench.rs`. The `pub use` shim
+/// preserves the `leaderboard::bench::*` import path used by main.rs's
+/// `run_make_bench_corpus` CLI handler + the bench_run / bench_corpus
+/// internal callers (which now go cross-crate via the same workspace).
+pub use superdeduper_bench_real::bench;
 /// G4 / T-BENCH-ME corpus generator: the deterministic corpus-v1 layout
 /// (B.3/B.4 production contract) on top of `bench`'s frozen primitives — pure
 /// plan (file descriptors + groundtruth_dupsets + aggregates) plus
 /// materialization (leaves / on-disk corpus / signed-shape manifest).
-pub mod bench_corpus; // G4
+///
+/// P0-D Phase 1 (2026-05-31): module implementation moved to
+/// `crates/superdeduper-bench-real/src/bench_corpus.rs`. Re-exported here
+/// for the same reason as `bench`.
+pub use superdeduper_bench_real::bench_corpus;
 /// G4 / T-BENCH-ME CLIENT bench primitives (post-Merkle-drop model): the public
 /// `--bench-me` answers the server's challenge by hashing downloaded bytes at
 /// server-issued offsets + commits to its dedupe result via `result_digest`.
@@ -68,4 +78,10 @@ pub mod bench_run; // G4
 /// confirm probes hit the expected positions. Probe EXECUTION (read_uncached
 /// + Instant timing) lives in bench_run.rs; this module is the cross-stack
 /// byte-exact lock surface only.
-pub mod d7_probe;
+///
+/// P0-D Phase 1 (2026-05-31): module implementation moved to
+/// `crates/superdeduper-bench-real/src/d7_probe.rs`. This `pub use`
+/// preserves the `leaderboard::d7_probe::*` import path for any future
+/// engine consumer; today no engine code outside the bench cluster
+/// reaches d7_probe, so the re-export is forward-compatibility only.
+pub use superdeduper_bench_real::d7_probe;
