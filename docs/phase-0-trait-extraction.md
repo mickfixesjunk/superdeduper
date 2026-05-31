@@ -33,6 +33,7 @@
 | Q2 | Public error type?                      | Structured `BenchError` enum (see §4.4). `anyhow` stays inside `-real` impl; surface a stable enum at the trait boundary. |
 | Q3 | Async-compatible trait?                 | NO (design GO). Sync-only for v1. Async wrapper layered later if needed. |
 | Q4 | Non-bench code that crosses the line?   | Submission types (`SubmitOutcome` etc.) STAY in iface — used by GUI; only the wire/HTTP/crypto methods move behind the trait. `hmac_signer` STAYS in engine — used by non-bench paths (action_submission). See §5 inventory. |
+| Q5 | Single trait or two traits?             | TWO TRAITS (Mick GO 2026-05-31 10:02 PST via design). `BenchExecutor` (run_bench + debug_dedup_diff; anti-cheat-sensitive; Phase 1+ closed-source candidate) and `SubmissionExecutor` (submit_recorded; HMAC'd HTTP only; could stay public even after future closed-source split). Per quality's observation that putting both behind one trait makes the closed-source surface wider than the threat model wants. |
 
 ## 3. Workspace layout
 
@@ -72,9 +73,10 @@ selection is via mutually-exclusive features in the root `Cargo.toml`.
 
 ## 4. iface surface
 
-### 4.1 `BenchExecutor` trait (sync)
+### 4.1 Trait signatures (sync, two traits per Q5 resolution)
 
 ```rust
+/// Bench-flow executor — anti-cheat-sensitive surface; Phase 1+ closed-source candidate.
 pub trait BenchExecutor: Send + Sync {
     /// Run the canonical bench-me loop: POST /bench/start, download corpus,
     /// dedup, answer challenges, submit. Returns the outcome the CLI / GUI
@@ -86,21 +88,38 @@ pub trait BenchExecutor: Send + Sync {
         cancel: &dyn Fn() -> bool,
     ) -> Result<BenchOutcome, BenchError>;
 
-    /// Submit a recorded scan payload (non-bench submission path).
-    fn submit_recorded(
-        &self,
-        inputs: SubmissionInputs,
-        install_id: &str,
-        install_key: &InstallKey,
-    ) -> Result<SubmitOutcome, BenchError>;
-
     /// Diagnostic helper used by `sd debug dedup-diff`.
     fn debug_dedup_diff(
         &self,
         corpus_dir: &std::path::Path,
     ) -> Result<DebugDedupDiffReport, BenchError>;
 }
+
+/// Non-bench submission executor — HMAC'd HTTP scan-submit. Less sensitive
+/// than BenchExecutor; could stay public even after BenchExecutor moves to
+/// the private closed-source repo in Phase 1+.
+pub trait SubmissionExecutor: Send + Sync {
+    /// Submit a recorded scan payload to /api/v1/submit. Triggered from the
+    /// GUI scan-complete-modal + the resubmit-pending queue.
+    fn submit_recorded(
+        &self,
+        inputs: SubmissionInputs,
+        install_id: &str,
+        install_key: &InstallKey,
+    ) -> Result<SubmitOutcome, BenchError>;
+}
 ```
+
+Both traits share the `BenchError` enum at their boundary (§4.4). `-real`
+implements both. `-stub` implements both and returns `BenchError::Unavailable`
+from every method.
+
+Engine call-site shape:
+- `app.executor.run_bench(ctx, ...)` (bench-flow path; GUI bench-modal + CLI `bench-me`)
+- `app.submission_executor.submit_recorded(inputs, ...)` (scan-complete modal + resubmit-pending queue + GUI app.rs / live.rs / settings_modal.rs callers)
+- `app.executor.debug_dedup_diff(corpus_dir)` (CLI `sd debug dedup-diff`)
+
+In practice `executor` and `submission_executor` will be the SAME concrete object that implements both traits — the trait split is for architectural-boundary clarity, not for runtime polymorphism.
 
 ### 4.2 Public types that LIVE in iface (re-export from engine)
 
