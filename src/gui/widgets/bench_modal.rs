@@ -202,16 +202,9 @@ fn run_worker(
     // install_unknown -> register, don't dead-end).
     set_status("preparing (checking registration)…");
     let channel = crate::channel::active_channel();
-    // PROD-DARK belt-and-suspenders (the header button is already hidden on
-    // prod): refuse if somehow reached on the prod channel — the prod bench
-    // backend isn't live yet (launch hold).
-    if !channel.is_non_prod() {
-        return finish(
-            "Benchmark isn't available on the production leaderboard yet (launch hold).".into(),
-            true,
-            false,
-        );
-    }
+    // A-prod-undark-bench (2026-05-30 19:02 PST): prod V3 corpus live
+    // (web Mick GO override). Belt-and-suspenders refuse-on-prod gate
+    // removed; bench-me now reaches the real /bench endpoints on prod.
     let state = match install::load_for(channel) {
         Ok(Some(s)) if s.registered => s,
         Ok(Some(mut s)) => match registration::register_cli(&mut s) {

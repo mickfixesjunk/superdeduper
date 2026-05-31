@@ -873,13 +873,12 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     use superdeduper::leaderboard::install::BenchLane;
     use superdeduper::leaderboard::{bench_run, install, oauth, submission};
     let channel = superdeduper::channel::active_channel();
-    if !channel.is_non_prod() {
-        anyhow::bail!(
-            "bench-me is not yet available on the production leaderboard \
-             (launch hold). It runs on the dev/local channels: set \
-             SUPERDEDUPER_CHANNEL=dev to try it."
-        );
-    }
+    // A-prod-undark-bench (2026-05-30 19:02 PST): web shipped prod
+    // corpus-v3-quick live (Mick GO override); the engine-side
+    // belt-and-suspenders bail on `--channel prod` is no longer correct.
+    // Removed so bench-me on prod hits the real /bench endpoints. Gate
+    // would have re-blocked legitimate testrunner 9-cell A3 regression
+    // runs against prod V3.
     let mut state = install::load_for(channel)
         .context("loading install state")?
         .ok_or_else(|| anyhow::anyhow!("not registered on {channel:?} -- run `superdeduper register` first"))?;
