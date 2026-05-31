@@ -107,9 +107,16 @@ pub enum BulkAction {
 impl BulkAction {
     fn label(self) -> &'static str {
         match self {
-            BulkAction::SafeRenameDupes => "🛡 Safe-rename dupes",
-            BulkAction::ArchiveMoveDupes => "📦 Archive (Move) dupes",
-            BulkAction::ArchiveCopyDupes => "📋 Archive (Copy) dupes",
+            // #156 -- A-bmp-glyph-fallback: 🛡 (U+1F6E1) is in
+            // Supplementary Multilingual Plane; egui's bundled
+            // NotoEmoji subset doesn't include it reliably (tofus
+            // on macOS per Mick repro). Drop the emoji here; the
+            // word "Safe-rename" carries the meaning. Pattern
+            // matches #143's text-fallback approach.
+            BulkAction::SafeRenameDupes => "Safe-rename dupes",
+            // #156 -- A-bmp-glyph-fallback: 📦/📋 are SMP.
+            BulkAction::ArchiveMoveDupes => "Archive (Move) dupes",
+            BulkAction::ArchiveCopyDupes => "Archive (Copy) dupes",
             // #159 -- A-trash-vocab: macOS + Linux say "Trash";
             // Windows says "Recycle". Underlying OS API
             // (NSFileManager.trashItemAtURL: / SHFileOperation with
@@ -125,7 +132,8 @@ impl BulkAction {
                     "♻ Recycle dupes"
                 }
             }
-            BulkAction::NukeDupes => "💀 Nuke dupes (permanent)",
+            // #156 -- A-bmp-glyph-fallback: 💀 (U+1F480) SMP.
+            BulkAction::NukeDupes => "Nuke dupes (permanent)",
         }
     }
 
@@ -599,8 +607,10 @@ pub fn show_filtered(
                                         // bytes differ but the images LOOK
                                         // alike. Surface distinctly so
                                         // the user reviews carefully.
+                                        // #156 -- A-bmp-glyph-fallback: 🖼 (U+1F5BC)
+                                        // SMP -> drop emoji; word carries it.
                                         ui.label(
-                                            RichText::new("🖼 perceptual image")
+                                            RichText::new("perceptual image")
                                                 .color(theme::WARN)
                                                 .small()
                                                 .strong(),
@@ -616,8 +626,10 @@ pub fn show_filtered(
                                         // Tier-4 perceptual audio (#26 v2) — same
                                         // 'review carefully' framing but with the
                                         // music-note glyph + audio-flavoured tooltip.
+                                        // #156 -- A-bmp-glyph-fallback: 🎵 (U+1F3B5)
+                                        // SMP -> use ♪ (U+266A, BMP Misc Symbols).
                                         ui.label(
-                                            RichText::new("🎵 perceptual audio")
+                                            RichText::new("♪ perceptual audio")
                                                 .color(theme::WARN)
                                                 .small()
                                                 .strong(),
@@ -647,8 +659,12 @@ pub fn show_filtered(
                                     // reclaimable space — surface that
                                     // distinctly so the user knows
                                     // these aren't worth acting on.
+                                    // #156 -- A-bmp-glyph-fallback: 🔗 (U+1F517)
+                                    // SMP -> ⇄ (U+21C4, BMP Arrows) hints at
+                                    // the shared-bytes link without needing
+                                    // emoji rendering.
                                     ui.label(
-                                        RichText::new("🔗 already hardlinked")
+                                        RichText::new("⇄ already hardlinked")
                                             .color(theme::COOL)
                                             .small()
                                             .strong(),
@@ -667,7 +683,8 @@ pub fn show_filtered(
                                     ui.horizontal(|ui| {
                                         if ui
                                             .small_button(
-                                                RichText::new("🛡 Safe-rename").color(theme::ACCENT),
+                                                // #156 -- A-bmp-glyph-fallback: drop 🛡 (U+1F6E1, SMP).
+                                                RichText::new("Safe-rename").color(theme::ACCENT),
                                             )
                                             .on_hover_text(
                                                 "Append .superdeduper to every dupe. Reversible \
@@ -710,7 +727,8 @@ pub fn show_filtered(
                                         }
                                         if ui
                                             .small_button(
-                                                RichText::new("🔗 Hardlink").color(theme::COOL),
+                                                // #156 -- A-bmp-glyph-fallback: drop 🔗 (U+1F517, SMP).
+                                                RichText::new("Hardlink").color(theme::COOL),
                                             )
                                             .on_hover_text(
                                                 "Replace each dupe with a hardlink to the keeper. \
@@ -811,8 +829,13 @@ pub fn show_filtered(
                                 // Disabled mid-scan AND when the group is
                                 // already in the `acted` set.
                                 if j > 0 && !acted {
+                                    // #156 -- A-bmp-glyph-fallback: 👑 (U+1F451,
+                                    // SMP) tofu'd on macOS; ★ (U+2605, BMP Misc
+                                    // Symbols, same block as ♻/♪) carries the
+                                    // "make keeper / canonical" intent and
+                                    // renders in egui's default font subset.
                                     let btn = egui::Button::new(
-                                        RichText::new("👑").color(theme::WARN).small(),
+                                        RichText::new("★").color(theme::WARN).small(),
                                     )
                                     .frame(false)
                                     .min_size(egui::vec2(20.0, 16.0));
@@ -976,5 +999,34 @@ mod path_display_tests {
     fn empty_path_passes_through() {
         let p = Path::new("");
         assert_eq!(format_path(p), "");
+    }
+
+    /// #156 -- A-bmp-glyph-fallback. Pins the no-SMP-emoji contract
+    /// for every BulkAction label so a regression that re-introduces
+    /// a Supplementary-Plane glyph fails CI rather than landing as a
+    /// tofu box on Mick's macOS box. Each char must be either
+    /// printable ASCII OR in the Basic Multilingual Plane (cp <
+    /// 0x10000). NotoEmoji's bundled subset reliably covers BMP
+    /// symbols (♻/♪/⇄/★ etc.) but not SMP codepoints.
+    #[test]
+    fn bulk_action_labels_use_only_bmp_glyphs() {
+        for action in [
+            BulkAction::SafeRenameDupes,
+            BulkAction::ArchiveMoveDupes,
+            BulkAction::ArchiveCopyDupes,
+            BulkAction::RecycleDupes,
+            BulkAction::NukeDupes,
+        ] {
+            let label = action.label();
+            for ch in label.chars() {
+                assert!(
+                    (ch as u32) < 0x10000,
+                    "BulkAction::{:?} label {label:?} contains SMP char {ch:?} (U+{:05X}) -- \
+                     egui's bundled NotoEmoji doesn't reliably carry SMP glyphs; will tofu on macOS",
+                    action,
+                    ch as u32,
+                );
+            }
+        }
     }
 }
