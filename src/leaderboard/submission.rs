@@ -361,11 +361,68 @@ pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json:
     // top-level. Server treats body.lane as authoritative (design 12:29 PST
     // + web d7df4c9). When `None` (ordinary scan / pre-v0.2.54 callers),
     // server falls back to has_account_linkage gating.
-    if let Some(lane) = &inputs.lane {
-        body.as_object_mut().expect("json object")
-            .insert("lane".into(), lane.clone().into());
+    //
+    // Phase B.5 option (b) (Mick GO 2026-05-31): the lane value emitted
+    // here is the EFFECTIVE lane after applying the cold-enforce override
+    // -- a bench submission with cold_enforced=false is FORCED to casual
+    // regardless of what inputs.lane requested. See effective_lane() for
+    // the contract.
+    if let Some(lane) = effective_lane(inputs) {
+        body.as_object_mut()
+            .expect("json object")
+            .insert("lane".into(), lane.into());
     }
     body
+}
+
+/// Phase B.5 option (b) -- Mick GO 2026-05-31. Derive the effective lane
+/// for the wire body, applying the cold-enforce override: when this
+/// submission carries a bench block with `cold_enforced=false`, the lane
+/// is FORCED to `"casual"` regardless of what the caller set in
+/// `inputs.lane`. Otherwise the caller's lane (or `None`) is preserved.
+///
+/// Why this exists. Phase B.5 (workdir-disk-detect for the canonical bench)
+/// has a documented gap on container / WSL / overlayfs / tmpfs environments:
+/// `metadata(workdir).dev()` returns a virtual device number, no matching
+/// `/sys/dev/block` entry exists, so the workdir-disk probe returns `None`
+/// and `detect_with_root_hint` falls back to the system-disk probe -- which
+/// reports the HOST machine's disk_class, even though the timed reads are
+/// being served from RAM / page cache / tmpfs. The engine then submits with
+/// `cold_enforced=false` (correctly -- the reads weren't cold) but with the
+/// user's nominal `lane="ranked"` preference, leaving the server-side gate
+/// as the only enforcement layer for "this run shouldn't count for the
+/// competitive cold HoF."
+///
+/// Option (b) closes that gap on the CLIENT side by reusing the existing
+/// `cold_enforced` fail-closed semantic as the "is-this-a-real-cold-disk"
+/// signal: if cold-enforce is false, the lane MUST be casual. The engineer
+/// cost is one helper here + 6 small unit tests; the alternative (option a:
+/// thread a new `Unknown` disk_class through bench_run + submission +
+/// web verifier + per-platform detection) would have touched the web
+/// verifier surface during V3.1 / D7 work in parallel -- avoidable
+/// coordination cost.
+///
+/// Closes:
+/// - testrunner 9-cell A3 P2 cell (the cold_enforced=false runs now route
+///   to casual cleanly on the client side, matching server expectations).
+/// - cold_enforced=false UX gap (clear "this env routes to casual" signal
+///   instead of mysterious bench_verified=False post-hoc).
+/// - D7 future dependency (D7 spec Q6 already says "D7 applies only to
+///   cold_enforced=true"; this is the engine-side enforcement of that
+///   contract).
+///
+/// For NON-bench submissions (`inputs.bench.is_none()`) the override never
+/// fires; ordinary-scan submissions emit `inputs.lane` verbatim.
+fn effective_lane(inputs: &SubmissionInputs) -> Option<String> {
+    let is_warm_bench = inputs
+        .bench
+        .as_ref()
+        .map(|b| !b.cold_enforced)
+        .unwrap_or(false);
+    if is_warm_bench {
+        return Some("casual".to_string());
+    }
+    inputs.lane.clone()
 }
 
 /// #41 — re-POST a previously-recorded canonical payload. Same
@@ -1489,5 +1546,117 @@ mod tests {
         assert!(json.contains("\"hardlink_replaced_bytes\":9012"));
         let back: std::collections::BTreeMap<String, u64> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.get(ACTION_BYTES_KEY_DELETED_TO_RECYCLE), Some(&1234));
+    }
+
+    // =====================================================================
+    // Phase B.5 option (b) -- effective_lane / cold-enforce override.
+    // Mick GO 2026-05-31; design 10:35 PST.
+    // =====================================================================
+
+    /// Construct a bench-shaped SubmissionInputs for the lane tests. `bench`
+    /// + `lane` are caller-controlled so the lane-override matrix can flip
+    /// each independently.
+    fn bench_inputs(cold_enforced: Option<bool>, lane: Option<&str>) -> SubmissionInputs {
+        let mut inputs = sample_inputs();
+        inputs.run_shape.scope = "canonical-bench".into();
+        inputs.run_shape.corpus_kind = "canonical-bench".into();
+        inputs.bench = cold_enforced.map(|ce| CanonicalBench {
+            protocol_version: "tbench-1".into(),
+            corpus_version: "corpus-v1-quick".into(),
+            tier: "quick".into(),
+            bench_run_id: "run-xyz".into(),
+            bench_proof: serde_json::json!({
+                "answers": [{ "path_index": 0, "byte_offset": 0, "byte_length": 1, "challenge_hash": "" }],
+                "result_digest": "",
+            }),
+            cold_enforced: ce,
+        });
+        inputs.lane = lane.map(str::to_string);
+        inputs
+    }
+
+    /// Happy path: cold-enforced bench with explicit ranked preference --
+    /// the user's lane choice flows through unchanged.
+    #[test]
+    fn effective_lane_preserves_ranked_when_cold_enforced_true() {
+        let inputs = bench_inputs(Some(true), Some("ranked"));
+        assert_eq!(effective_lane(&inputs).as_deref(), Some("ranked"));
+        let body = build_payload(&inputs, "id");
+        assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("ranked"));
+    }
+
+    /// Phase B.5 KEYSTONE: cold-enforce false with user-requested ranked
+    /// MUST be overridden to casual. This is the bug the slice closes.
+    #[test]
+    fn effective_lane_forces_casual_when_cold_enforced_false_overrides_ranked_request() {
+        let inputs = bench_inputs(Some(false), Some("ranked"));
+        assert_eq!(effective_lane(&inputs).as_deref(), Some("casual"));
+        let body = build_payload(&inputs, "id");
+        assert_eq!(
+            body.get("lane").and_then(|v| v.as_str()),
+            Some("casual"),
+            "cold-enforced false MUST force the wire body.lane to casual; \
+             the user's ranked preference is overridden by the cold-enforce gate"
+        );
+    }
+
+    /// cold-enforce false with no lane preference still emits casual on the
+    /// wire -- the override fires regardless of whether the user asked for
+    /// a specific lane.
+    #[test]
+    fn effective_lane_forces_casual_when_cold_enforced_false_and_lane_unset() {
+        let inputs = bench_inputs(Some(false), None);
+        assert_eq!(effective_lane(&inputs).as_deref(), Some("casual"));
+        let body = build_payload(&inputs, "id");
+        assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("casual"));
+    }
+
+    /// cold-enforced true with no lane preference: no override fires; the
+    /// wire body simply omits the lane key, server falls back to its
+    /// account-linkage gating (the legacy / pre-Mick-bench-lane behavior).
+    #[test]
+    fn effective_lane_omits_lane_key_when_cold_enforced_true_and_lane_unset() {
+        let inputs = bench_inputs(Some(true), None);
+        assert_eq!(effective_lane(&inputs), None);
+        let body = build_payload(&inputs, "id");
+        assert!(
+            body.get("lane").is_none(),
+            "cold-enforced true with no lane preference must omit body.lane"
+        );
+    }
+
+    /// Casual already chosen by user + cold-enforced true: pass-through,
+    /// no override needed. Pins that the override is only ONE-DIRECTIONAL
+    /// (ranked -> casual on cold-enforce false), never the reverse.
+    #[test]
+    fn effective_lane_preserves_casual_choice_unchanged() {
+        let inputs = bench_inputs(Some(true), Some("casual"));
+        assert_eq!(effective_lane(&inputs).as_deref(), Some("casual"));
+        let body = build_payload(&inputs, "id");
+        assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("casual"));
+    }
+
+    /// Non-bench submission (ordinary scan) with a lane preference: the
+    /// override doesn't apply because there's no bench block, so no
+    /// cold_enforced gate to honour. The lane flows through verbatim --
+    /// pre-Phase-B.5 behavior preserved for ordinary scans.
+    #[test]
+    fn effective_lane_does_not_override_non_bench_submission() {
+        let mut inputs = sample_inputs();
+        inputs.bench = None;
+        inputs.lane = Some("ranked".to_string());
+        assert_eq!(effective_lane(&inputs).as_deref(), Some("ranked"));
+        let body = build_payload(&inputs, "id");
+        assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("ranked"));
+    }
+
+    /// Non-bench submission with no lane preference: the wire body simply
+    /// omits the lane key (legacy ordinary-scan shape).
+    #[test]
+    fn effective_lane_non_bench_with_no_lane_omits_lane_key() {
+        let inputs = sample_inputs();
+        assert_eq!(effective_lane(&inputs), None);
+        let body = build_payload(&inputs, "id");
+        assert!(body.get("lane").is_none());
     }
 }
