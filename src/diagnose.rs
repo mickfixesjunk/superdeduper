@@ -74,6 +74,16 @@ pub struct DriveProbeResult {
     /// Set when `tier1` / `tier3` are `None` to explain why.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// #139 (sdd-testwin 2026-05-30): per-drive disk_class derived via the
+    /// same workdir-aware probe the bench-me submission uses. Closes the
+    /// parity gap where the bench fingerprint carried a per-volume bus
+    /// type but `diagnose --format json` was silent. Schema string is the
+    /// HardwareFingerprint enum: NVMe-Gen{3,4,5}|SATA-SSD|HDD|USB-SSD|
+    /// USB-HDD|mixed|network. Omitted when the workdir-aware probe falls
+    /// back (caller can re-derive from the legacy system-disk default if
+    /// needed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_class: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -314,6 +324,15 @@ fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
         .iter()
         .map(|p| p.display().to_string())
         .collect();
+    // #139 — fingerprint the drive class for this group's representative
+    // path using the same workdir-aware probe bench-me uses. Falls back
+    // gracefully to None when the platform-specific lookup can't resolve
+    // (caller's existing behavior degrades back to the legacy default).
+    let disk_class: Option<String> = group
+        .paths
+        .first()
+        .map(|p| crate::leaderboard::hardware::detect_with_root_hint(Some(p)).disk_class)
+        .filter(|s| s != "mixed");
     let scratch = find_writable_scratch_on_drive(group);
     let scratch_path = match scratch {
         Some(p) => p,
@@ -325,6 +344,7 @@ fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
                 tier1: None,
                 tier3: None,
                 error: Some("no writable scratch location on this drive".to_string()),
+                disk_class: disk_class.clone(),
             };
         }
     };
@@ -341,6 +361,7 @@ fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
                 tier1: None,
                 tier3: None,
                 error: Some(format!("tier1 probe failed: {}", e)),
+                disk_class: disk_class.clone(),
             };
         }
     };
@@ -357,6 +378,7 @@ fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
                     tier1,
                     tier3: None,
                     error: Some(format!("tier3 probe failed: {}", e)),
+                    disk_class: disk_class.clone(),
                 };
             }
         }
@@ -368,6 +390,7 @@ fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
         tier1,
         tier3,
         error: None,
+        disk_class,
     }
 }
 
