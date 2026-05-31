@@ -115,7 +115,81 @@ pub fn count_distinct_share_roots(paths: &[PathBuf]) -> u64 {
     shares.len() as u64
 }
 
-/// #162 — the 3 esoteric run_shape dup-group metrics, computed from a SINGLE
+/// #162 -- streaming accumulator for the 3 esoteric run_shape dup-group
+/// metrics (zero_byte_group_max / max_hardlink_count_in_scan /
+/// name_collision_count). Lets the GUI emit-loop feed groups one at a time
+/// (`add_group` per emission), then `finalize()` at RunShape build time --
+/// SAME algorithm as `run_shape_esoterics` (the batch CLI path), so the
+/// two surfaces are physically guaranteed to agree (drift = test failure
+/// via `run_shape_esoterics_streaming_matches_batch`).
+///
+/// Naming: keeps the wider "run_shape esoterics" frame so a future
+/// addition (next esoteric metric) lands in one place + propagates to
+/// both surfaces.
+#[derive(Default)]
+pub struct RunShapeEsotericsAccumulator {
+    zero_byte_group_max: u64,
+    max_hardlink_count_in_scan: u64,
+    basename_to_hashes:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl RunShapeEsotericsAccumulator {
+    /// Empty accumulator -- equivalent to no groups observed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update with one group. `paths` is the iterator of the group's
+    /// member paths -- accepts anything `AsRef<Path>` so both
+    /// `Vec<PathBuf>` (CLI) and `&[PathBuf]` slices (GUI summary) work
+    /// without a clone.
+    pub fn add_group<'p, P>(
+        &mut self,
+        size: u64,
+        content_hash: &str,
+        link_equivalent: bool,
+        paths: impl IntoIterator<Item = &'p P>,
+    ) where
+        P: AsRef<std::path::Path> + 'p,
+    {
+        let mut members: u64 = 0;
+        for path in paths {
+            members += 1;
+            if let Some(name) = path.as_ref().file_name().and_then(|n| n.to_str()) {
+                self.basename_to_hashes
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(content_hash.to_string());
+            }
+        }
+        if size == 0 && members > self.zero_byte_group_max {
+            self.zero_byte_group_max = members;
+        }
+        if link_equivalent && members > self.max_hardlink_count_in_scan {
+            self.max_hardlink_count_in_scan = members;
+        }
+    }
+
+    /// Finalize into the `(zero_byte_group_max,
+    /// max_hardlink_count_in_scan, name_collision_count)` triple with
+    /// the `>0 ? Some : None` convention RunShape expects.
+    pub fn finalize(self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let name_collision_count = self
+            .basename_to_hashes
+            .values()
+            .filter(|hs| hs.len() >= 2)
+            .count() as u64;
+        let opt = |n: u64| if n > 0 { Some(n) } else { None };
+        (
+            opt(self.zero_byte_group_max),
+            opt(self.max_hardlink_count_in_scan),
+            opt(name_collision_count),
+        )
+    }
+}
+
+/// #162 -- the 3 esoteric run_shape dup-group metrics, computed from a SINGLE
 /// shared source so the CLI (`main.rs`) and the GUI emitter agree and can't
 /// drift. Previously the GUI computed these inline (gui/live.rs) while the CLI
 /// hardcoded `None`, so zero-byte-reunion / hardlink-farm / name-twins were
@@ -125,40 +199,17 @@ pub fn count_distinct_share_roots(paths: &[PathBuf]) -> u64 {
 /// - `max_hardlink_count_in_scan`: largest `link_equivalent` group by member
 ///   count (a confirmed lower bound on that inode's nlink).
 /// - `name_collision_count`: basenames resolving to ≥2 distinct content hashes.
+///
+/// Implementation just wraps the streaming accumulator above -- so the
+/// batch (CLI) and streaming (GUI) paths share one body of code.
 pub fn run_shape_esoterics(
     groups: &[crate::pipeline::DuplicateGroup],
 ) -> (Option<u64>, Option<u64>, Option<u64>) {
-    use std::collections::{HashMap, HashSet};
-    let mut zero_byte_group_max: u64 = 0;
-    let mut max_hardlink_count_in_scan: u64 = 0;
-    let mut basename_to_hashes: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut acc = RunShapeEsotericsAccumulator::new();
     for g in groups {
-        let members = g.files.len() as u64;
-        if g.size == 0 && members > zero_byte_group_max {
-            zero_byte_group_max = members;
-        }
-        if g.link_equivalent && members > max_hardlink_count_in_scan {
-            max_hardlink_count_in_scan = members;
-        }
-        for path in &g.files {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                basename_to_hashes
-                    .entry(name.to_string())
-                    .or_default()
-                    .insert(g.content_hash.clone());
-            }
-        }
+        acc.add_group(g.size, &g.content_hash, g.link_equivalent, &g.files);
     }
-    let name_collision_count = basename_to_hashes
-        .values()
-        .filter(|hs| hs.len() >= 2)
-        .count() as u64;
-    let opt = |n: u64| if n > 0 { Some(n) } else { None };
-    (
-        opt(zero_byte_group_max),
-        opt(max_hardlink_count_in_scan),
-        opt(name_collision_count),
-    )
+    acc.finalize()
 }
 
 #[cfg(test)]
@@ -249,5 +300,99 @@ mod tests {
         let plain = vec![g(50, "x", false, &["/p/only.bin", "/p/only2.bin"])];
         assert_eq!(run_shape_esoterics(&plain), (None, None, None));
         assert_eq!(run_shape_esoterics(&[]), (None, None, None));
+    }
+
+    /// #162 -- A-cross-surface-emitter-parity-guard. The CLI path
+    /// calls `run_shape_esoterics(&groups)` (batch) and the GUI path
+    /// calls `RunShapeEsotericsAccumulator::add_group(...).finalize()`
+    /// (streaming, one group at a time as emissions arrive). Both
+    /// surfaces MUST produce identical output for the same input set,
+    /// otherwise the same 3 achievements (`zero-byte-reunion`,
+    /// `hardlink-farm`, `name-twins`) are earnable on one surface but
+    /// not the other -- the exact drift class #162 was filed to
+    /// close. This test pins the streaming = batch invariant; a
+    /// future divergence (someone "optimizes" only one path) is a
+    /// compile-or-test failure rather than a silent achievement gap.
+    #[test]
+    fn run_shape_esoterics_streaming_matches_batch() {
+        use crate::pipeline::DuplicateGroup;
+        let g = |size: u64, hash: &str, link: bool, files: &[&str]| DuplicateGroup {
+            size,
+            content_hash: hash.to_string(),
+            files: files.iter().map(PathBuf::from).collect(),
+            link_equivalent: link,
+            ..Default::default()
+        };
+        // Mix of shapes that exercise every accumulator branch:
+        // zero-byte largest, hardlink-equivalent largest, multiple
+        // basename collisions across distinct hashes, plus
+        // non-contributing groups (plain dups).
+        let groups = vec![
+            g(0, "z", false, &["/a/e1", "/a/e2", "/a/e3"]),
+            g(100, "hl", true, &["/b/h1", "/b/h2", "/b/h3", "/b/h4"]),
+            g(10, "ha", false, &["/x/twin.txt", "/x/uniq_a"]),
+            g(20, "hb", false, &["/y/twin.txt", "/y/uniq_b"]),
+            g(30, "p1", false, &["/p/only.bin", "/p/only2.bin"]),
+            g(0, "z2", false, &["/c/zb1", "/c/zb2"]),
+        ];
+
+        // Batch path -- what the CLI computes.
+        let batch = run_shape_esoterics(&groups);
+
+        // Streaming path -- what the GUI emit-loop computes.
+        let mut acc = RunShapeEsotericsAccumulator::new();
+        for grp in &groups {
+            acc.add_group(grp.size, &grp.content_hash, grp.link_equivalent, &grp.files);
+        }
+        let streaming = acc.finalize();
+
+        assert_eq!(
+            batch, streaming,
+            "CLI batch run_shape_esoterics and GUI streaming RunShapeEsotericsAccumulator \
+             must agree byte-for-byte (#162 cross-surface emitter-parity guard)"
+        );
+
+        // Sanity: empty input both ways.
+        assert_eq!(
+            run_shape_esoterics(&[]),
+            RunShapeEsotericsAccumulator::new().finalize(),
+        );
+    }
+
+    /// #162 -- streaming order independence. Shuffling the order in
+    /// which groups are fed to the accumulator MUST NOT change the
+    /// final triple. The accumulator's state shape (max-so-far +
+    /// HashMap insertions) is order-independent by construction; this
+    /// test pins that property so a future change that introduces
+    /// order sensitivity (e.g. "first group wins" semantics) fails
+    /// loudly.
+    #[test]
+    fn run_shape_esoterics_streaming_is_order_independent() {
+        use crate::pipeline::DuplicateGroup;
+        let g = |size: u64, hash: &str, link: bool, files: &[&str]| DuplicateGroup {
+            size,
+            content_hash: hash.to_string(),
+            files: files.iter().map(PathBuf::from).collect(),
+            link_equivalent: link,
+            ..Default::default()
+        };
+        let groups = vec![
+            g(0, "z", false, &["/a/e1", "/a/e2", "/a/e3"]),
+            g(100, "hl", true, &["/b/h1", "/b/h2", "/b/h3", "/b/h4"]),
+            g(10, "ha", false, &["/x/twin.txt"]),
+            g(20, "hb", false, &["/y/twin.txt"]),
+        ];
+
+        let mut forward = RunShapeEsotericsAccumulator::new();
+        for grp in groups.iter() {
+            forward.add_group(grp.size, &grp.content_hash, grp.link_equivalent, &grp.files);
+        }
+
+        let mut reverse = RunShapeEsotericsAccumulator::new();
+        for grp in groups.iter().rev() {
+            reverse.add_group(grp.size, &grp.content_hash, grp.link_equivalent, &grp.files);
+        }
+
+        assert_eq!(forward.finalize(), reverse.finalize());
     }
 }

@@ -1111,31 +1111,15 @@ fn run(
     let mut groups_by_similarity_kind: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
     let mut largest_group_bytes: u64 = 0;
-    // G1.x esoteric metric: largest dup-group (by member count)
-    // whose content is empty (size == 0). Used by backend to grant
-    // "zero-byte hoarder". Updated on each group emission below.
-    let mut zero_byte_group_max: u64 = 0;
-    // G1.x esoteric metric: highest hardlink count observed in the
-    // scan. Derived from `link_equivalent` groups — every path in
-    // such a group is a confirmed alias of one inode, so the
-    // group's member count is a tight lower bound on that inode's
-    // `nlink`. Honest under-report: singletons + partial-hardlink
-    // groups don't contribute (we don't have per-file nlink at
-    // this layer; walker-side nlink capture is a future follow-up
-    // that would let us cover those too).
-    let mut max_hardlink_count_in_scan: u64 = 0;
-    // G1.x esoteric metric: count of basenames that resolved to
-    // ≥2 distinct content hashes across the scan ("name-twins").
-    // Builds basename → {content_hash} as groups stream in; the
-    // final count of entries with set size ≥ 2 is the metric.
-    // Only sees basenames that appear in ≥1 dup group (singletons
-    // bypass hashing entirely + we don't have hashes for them), so
-    // the worst missed case is "same name in one dup group + one
-    // singleton of different size" — fine for an esoteric metric.
-    let mut basename_to_hashes: std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
+    // #162 -- A-run-shape-esoterics-streaming: the 3 esoteric
+    // run_shape metrics (zero_byte_group_max, max_hardlink_count_in_scan,
+    // name_collision_count) are now accumulated through the shared
+    // streaming type in `leaderboard::payload_meta` so the GUI emitter
+    // and the CLI batch path (`payload_meta::run_shape_esoterics`)
+    // share ONE algorithm. Previously the GUI had inline state for
+    // each metric -- drift surface eliminated.
+    let mut run_shape_esoterics_accum =
+        crate::leaderboard::payload_meta::RunShapeEsotericsAccumulator::new();
     let mut tier3_done: u64 = 0;
     let mut confirmed: u64 = 0;
     let files_hashed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1524,35 +1508,20 @@ fn run(
             if group_reclaim > largest_group_bytes {
                 largest_group_bytes = group_reclaim;
             }
-            if g.size == 0 {
-                // g.files was moved into filter_reference_only
-                // above; use visible_files which carries the same
-                // (or fewer) members.
-                let members = visible_files.len() as u64;
-                if members > zero_byte_group_max {
-                    zero_byte_group_max = members;
-                }
-            }
-            if g.link_equivalent {
-                // Every visible path in a link-equivalent group
-                // refers to one inode → the member count is a
-                // confirmed lower bound on that inode's nlink.
-                let aliases = visible_files.len() as u64;
-                if aliases > max_hardlink_count_in_scan {
-                    max_hardlink_count_in_scan = aliases;
-                }
-            }
-            // Track basenames → content-hashes for the name-twins
-            // metric. A path may have a non-unicode basename — skip
-            // those (rare; just narrows what counts as a collision).
-            for path in visible_files.iter() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    basename_to_hashes
-                        .entry(name.to_string())
-                        .or_default()
-                        .insert(g.content_hash.clone());
-                }
-            }
+            // #162 -- A-run-shape-esoterics-streaming: feed the group
+            // through the shared accumulator. Same algorithm the CLI
+            // uses via `payload_meta::run_shape_esoterics` -- by
+            // construction the two paths produce identical RunShape
+            // values. `visible_files` (post `filter_reference_only`)
+            // is what the GUI displays + counts toward reclaimable; we
+            // pass the same slice to the accumulator so the
+            // reference-only members aren't double-counted.
+            run_shape_esoterics_accum.add_group(
+                g.size,
+                &g.content_hash,
+                g.link_equivalent,
+                visible_files.iter(),
+            );
             total_dups += 1;
             *groups_by_similarity_kind
                 .entry("byte-identical".to_string())
@@ -1868,6 +1837,14 @@ fn run(
             None
         };
 
+        // #162 -- A-run-shape-esoterics-streaming: finalize the
+        // shared accumulator now that the dup-group emission loop
+        // is done. Same triple shape as the CLI batch path:
+        // (zero_byte_group_max, max_hardlink_count_in_scan,
+        // name_collision_count).
+        let (zero_byte_group_max, max_hardlink_count_in_scan, name_collision_count) =
+            run_shape_esoterics_accum.finalize();
+
         let inputs = SubmissionInputs {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             run_uuid: uuid::Uuid::new_v4().to_string(),
@@ -1888,33 +1865,14 @@ fn run(
                 corpus_kind,
                 cache_hit_ratio,
                 easter_egg_hits,
-                // Computed during dup-group emission above.
-                zero_byte_group_max: if zero_byte_group_max > 0 {
-                    Some(zero_byte_group_max)
-                } else {
-                    None
-                },
-                // Computed from `link_equivalent` group sizes during
-                // dup-group emission above. Conservative lower bound
-                // — see the comment on the declaration.
-                max_hardlink_count_in_scan: if max_hardlink_count_in_scan > 0 {
-                    Some(max_hardlink_count_in_scan)
-                } else {
-                    None
-                },
-                // Tally basenames whose path-resolution disagreed on
-                // content (≥2 distinct hashes for the same name).
-                name_collision_count: {
-                    let n = basename_to_hashes
-                        .values()
-                        .filter(|hs| hs.len() >= 2)
-                        .count() as u64;
-                    if n > 0 {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                },
+                // #162 -- A-run-shape-esoterics-streaming: all 3
+                // metrics come from the shared accumulator that fed
+                // every emitted group above. Single source of truth
+                // with the CLI batch path (`run_shape_esoterics`);
+                // drift is no longer physically representable.
+                zero_byte_group_max,
+                max_hardlink_count_in_scan,
+                name_collision_count,
                 // #89 — count of distinct network-share roots in
                 // scope (UNC `\\server\share`, smb://, nfs://).
                 // Counted at the requested-root level so the value
