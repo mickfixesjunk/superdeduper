@@ -86,7 +86,7 @@ param(
     [string]$SdExe = "$(Join-Path (Get-Location) 'target\release\superdeduper.exe')",
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Matrix')]
-    [string]$MatrixSubsetFolder,
+    [string[]]$MatrixSubsetFolder,  # multi-root: pass one OR more folders; all are scanned in a SINGLE sd-scan invocation per trial (Mick's multi-folder-same-HDD use case)
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Validate')]
     [switch]$FullCorpusValidate,
@@ -164,10 +164,11 @@ if ($FullCorpusValidate) {
 }
 else {
     $Mode = 'Matrix'
-    $TrialTargets = @($MatrixSubsetFolder)
+    $TrialTargets = $MatrixSubsetFolder  # string[] - one OR more folders (all roots in a single sd scan per trial)
     $IoSweep = $IoThreadsSweep
     Write-Host "Mode: MATRIX SWEEP" -ForegroundColor Cyan
-    Write-Host "Subset folder: $MatrixSubsetFolder" -ForegroundColor DarkGray
+    Write-Host "Subset folders ($($TrialTargets.Count)):" -ForegroundColor DarkGray
+    $TrialTargets | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     Write-Host "io-threads values: $($IoSweep -join ', ')" -ForegroundColor DarkGray
 }
 Write-Host "Trials per config: $Trials" -ForegroundColor DarkGray
@@ -185,11 +186,14 @@ foreach ($t in $TrialTargets) {
 
 function Drop-Cache {
     if (-not $script:RamMap) { return }
-    # -Ew = empty working sets; -Es = empty standby list. Both required for
-    # true cold cache. Sysinternals returns 0 on success.
+    # 2026-05-31 enhancement (sdd-testwin): add -Em (modified pages) + -E0 (priority-0 standby)
+    # for deeper cache eviction. Confirmed during 10GB matrix that -Ew + -Es alone left
+    # significant OS cache; -Em + -E0 add modified-page + low-priority standby eviction.
     & $script:RamMap -Ew 2>&1 | Out-Null
     & $script:RamMap -Es 2>&1 | Out-Null
-    Start-Sleep -Milliseconds 250
+    & $script:RamMap -Em 2>&1 | Out-Null
+    & $script:RamMap -E0 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500   # extended from 250ms; give the kernel time to actually reclaim
 }
 
 function Parse-Timing {
@@ -209,6 +213,10 @@ function Parse-Timing {
         Tier1Files      = $null
         Tier2Files      = $null
         Tier3Files      = $null
+        # v0.3.3 per-stage instrumentation (INFO lines, present at -v / -vv):
+        Walk_ms         = $null   # stage 1: walk complete walk_ms=N files=M roots=K
+        Mft_ms          = $null   # only on whole-volume MFT-path scans (subdir scans skip MFT)
+        HashIo_ms       = $null   # stage 4: hash io_pool complete hash_io_ms=N io_threads=K
     }
     # stage 1 inventory:    XXX ms (NNN files)
     if ($Stderr -match 'stage 1 inventory:\s+(\d+)\s+ms\s+\((\d+)\s+files\)') {
@@ -234,6 +242,19 @@ function Parse-Timing {
         if ($Stderr -match $pat) {
             $out["Tier$($i)Files"] = [int]$matches[1]
         }
+    }
+    # v0.3.3 instrumented per-stage fields (INFO log lines).
+    # walk_ms: directory-walk wall (subdir-scan path; whole-volume roots use MFT path instead).
+    if ($Stderr -match 'walk complete\s+walk_ms=(\d+)') {
+        $out.Walk_ms = [int]$matches[1]
+    }
+    # mft_ms: only emitted on whole-volume scans (MFT path). Optional.
+    if ($Stderr -match 'mft_ms=(\d+)') {
+        $out.Mft_ms = [int]$matches[1]
+    }
+    # hash_io_ms: stage 4 io-pool wall (the io-threads-sensitive number).
+    if ($Stderr -match 'hash io_pool complete\s+hash_io_ms=(\d+)') {
+        $out.HashIo_ms = [int]$matches[1]
     }
     return $out
 }
