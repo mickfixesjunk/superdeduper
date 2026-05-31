@@ -103,7 +103,7 @@ impl ScanConfig {
             io_threads: {
                 let cpu_threads = args.threads.unwrap_or_else(num_cpus);
                 args.io_threads
-                    .unwrap_or(cpu_threads.saturating_mul(3).max(1))
+                    .unwrap_or_else(|| default_io_threads(cpu_threads, args.paths.first()))
             },
             output: args.output.clone(),
             follow_links: args.follow_links,
@@ -200,6 +200,76 @@ fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
+/// Cap applied to `--io-threads` when the scan root is on HDD-class
+/// storage (rotational disk). Past this many concurrent readers, seeks
+/// thrash instead of amortizing — see `docs/perf-98-findings.md` for
+/// the cross-storage sweep that motivates the value. The hash io_pool
+/// plateaus at io=8..16 on USB-HDD in both small-corpus (80 MB) and
+/// 10 GB cached runs (sdd-testwin 2026-05-31). 16 stays inside the
+/// plateau while preserving the parallelism-helps-from-1 curve below
+/// the knee.
+const HDD_IO_THREADS_CAP: usize = 16;
+
+/// Compute the default `--io-threads` value when the user didn't pass
+/// one explicitly. On SSD / NVMe / network / unknown classes, returns
+/// `cpu_threads × 3` (the legacy default — oversubscribe to keep more
+/// per-file I/O in flight while syscalls block). On HDD-class disks,
+/// caps at [`HDD_IO_THREADS_CAP`] so seek thrash doesn't dominate.
+///
+/// Detection routes through the existing leaderboard hardware probe
+/// (`detect_with_root_hint`) when the `telemetry` feature is on; when
+/// off, falls through to the legacy `cpu_threads × 3`. The cap kicks
+/// in only when the workdir probe returns a `disk_class` string
+/// containing `"HDD"` (matches `"HDD"` and `"USB-HDD"`); everything
+/// else — `"NVMe-Gen*"`, `"SATA-SSD"`, `"USB-SSD"`, `"network"`,
+/// `"mixed"`, missing — stays on the legacy default.
+///
+/// Emits a `tracing::info!` line at `-v` when the cap kicks in so the
+/// user sees the auto-tune in the log without needing `-vv`.
+fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize {
+    #[cfg(feature = "telemetry")]
+    let disk_class = Some(
+        crate::leaderboard::hardware::detect_with_root_hint(first_root.map(|p| p.as_path()))
+            .disk_class,
+    );
+    #[cfg(not(feature = "telemetry"))]
+    let disk_class: Option<String> = {
+        let _ = first_root;
+        None
+    };
+    compute_default_io_threads(cpu_threads, disk_class.as_deref())
+}
+
+/// Pure / testable inner of [`default_io_threads`]. Given a CPU-thread
+/// count and the optionally-detected `disk_class` string, return the
+/// default `--io-threads` value to use. HDD-class storage caps at
+/// [`HDD_IO_THREADS_CAP`]; everything else (None, NVMe/SSD-class,
+/// network, mixed) keeps the legacy `cpu_threads × 3`.
+///
+/// Splitting this from [`default_io_threads`] lets tests target the
+/// decision logic without a per-machine probe — the probe itself is
+/// machine-state and not the unit under test.
+fn compute_default_io_threads(cpu_threads: usize, disk_class: Option<&str>) -> usize {
+    let legacy_default = cpu_threads.saturating_mul(3).max(1);
+    if let Some(class) = disk_class {
+        if class.contains("HDD") {
+            let capped = legacy_default.min(HDD_IO_THREADS_CAP);
+            if capped < legacy_default {
+                tracing::info!(
+                    disk_class = %class,
+                    legacy_default,
+                    capped,
+                    cap = HDD_IO_THREADS_CAP,
+                    "io-threads default auto-capped for HDD-class storage \
+                     (pass --io-threads explicitly to override)"
+                );
+            }
+            return capped;
+        }
+    }
+    legacy_default
+}
+
 #[cfg(test)]
 mod tests {
     //! Coverage for `ScanConfig::from_args` validation rules + the
@@ -293,14 +363,56 @@ mod tests {
     }
 
     #[test]
-    fn io_threads_defaults_to_3x_threads() {
-        let mut a = args_with_paths(vec![PathBuf::from("/tmp")]);
-        a.threads = Some(8);
-        a.io_threads = None;
-        let cfg = ScanConfig::from_args(&a).unwrap();
+    fn io_threads_default_is_3x_on_nvme_class() {
+        // Pure decision-logic check; the per-machine probe is mocked
+        // out by passing the disk_class string directly.
         assert_eq!(
-            cfg.io_threads, 24,
-            "io_threads defaults to threads*3 (sd oversubscribes IO)"
+            compute_default_io_threads(8, Some("NVMe-Gen4")),
+            24,
+            "NVMe-class keeps the legacy threads*3 default"
+        );
+        assert_eq!(
+            compute_default_io_threads(8, Some("SATA-SSD")),
+            24,
+            "SATA-SSD keeps the legacy threads*3 default"
+        );
+        assert_eq!(
+            compute_default_io_threads(8, Some("network")),
+            24,
+            "network class keeps the legacy default — no measured perf data either way"
+        );
+        assert_eq!(
+            compute_default_io_threads(8, None),
+            24,
+            "no probe (None) keeps the legacy default — fail-open, not fail-cap"
+        );
+    }
+
+    #[test]
+    fn io_threads_default_auto_caps_on_hdd_class() {
+        // 2026-05-31 perf-98 cross-storage finding: hash io_pool plateau
+        // at 8..16 on USB-HDD; 16 stays inside the plateau without
+        // regressing the parallelism-helps-from-1 left of the knee.
+        assert_eq!(
+            compute_default_io_threads(8, Some("HDD")),
+            HDD_IO_THREADS_CAP,
+            "HDD must cap at 16 (legacy 24 -> capped 16)"
+        );
+        assert_eq!(
+            compute_default_io_threads(32, Some("USB-HDD")),
+            HDD_IO_THREADS_CAP,
+            "USB-HDD must cap at 16 (legacy 96 -> capped 16)"
+        );
+    }
+
+    #[test]
+    fn io_threads_hdd_cap_does_not_inflate_below_legacy() {
+        // Edge case: a low-thread machine where threads*3 < cap should
+        // NOT be lifted to the cap. The cap is a ceiling, not a target.
+        assert_eq!(
+            compute_default_io_threads(2, Some("HDD")),
+            6,
+            "threads*3=6 < cap=16; HDD branch must NOT lift to 16"
         );
     }
 
@@ -310,7 +422,10 @@ mod tests {
         a.threads = Some(4);
         a.io_threads = Some(99);
         let cfg = ScanConfig::from_args(&a).unwrap();
-        assert_eq!(cfg.io_threads, 99);
+        assert_eq!(
+            cfg.io_threads, 99,
+            "--io-threads explicit always wins, even past the HDD cap"
+        );
     }
 
     #[test]
