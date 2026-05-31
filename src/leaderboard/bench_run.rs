@@ -210,6 +210,18 @@ pub fn run(
             let _ = std::fs::remove_dir_all(&corpus_dir); // don't leave a half-extracted cache
             return Err(anyhow::Error::new(e).context("extracting corpus tar"));
         }
+        // A-corpus-tar-flatten (2026-05-30, testrunner 19:48 PST): v3 corpus
+        // tars wrap their data files under a single slug-prefix subdirectory
+        // (e.g. corpus-v3-quick/f0001.bin inside the tar). v2 corpora ship
+        // files at the tar root. full_content_dedup + answer_challenge_from_dir
+        // both use non-recursive read_dir, so the wrapped layout produces
+        // zero-files-enumerated and the bench bricks with "No such file"
+        // mid-challenge. Flatten the single-subdir shape here so downstream
+        // code sees a uniform corpus_dir/f*.bin layout regardless of tar
+        // packaging style.
+        if let Err(e) = flatten_single_subdir(&corpus_dir) {
+            crate::log_warn!("bench: corpus-tar flatten failed: {e} (continuing; downstream may enumerate 0 files)");
+        }
         std::fs::write(&complete, corpus_version.as_bytes()).context("writing cache sentinel")?;
         // #124 page-eviction (design 2026-05-30 13:33 PDT GO Path A). Evict the
         // just-written corpus pages from the OS page cache so the subsequent
@@ -499,6 +511,81 @@ fn signal_dedup_ready(
             Ok(())
         }
     }
+}
+
+/// A-corpus-tar-flatten (2026-05-30): if `corpus_dir` contains exactly one
+/// subdirectory and no top-level corpus data files, move the subdirectory's
+/// contents up to `corpus_dir` and remove the empty subdirectory. v3 corpus
+/// tars wrap their data under a slug-prefix dir (corpus-v3-quick/f*.bin); v2
+/// corpora ship files at tar root. Downstream readers (full_content_dedup,
+/// answer_challenge_from_dir, page-eviction) all use non-recursive read_dir,
+/// so this normalization keeps the post-extract layout uniform regardless of
+/// how the corpus was packaged. No-op when the layout is already flat.
+fn flatten_single_subdir(corpus_dir: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(corpus_dir)?
+        .collect::<Result<Vec<_>, _>>()?;
+    // If any entry at the top level is a corpus data file (f<index>.bin
+    // shape, per bench_corpus::parse_corpus_path_index), the tar was already
+    // flat — nothing to do.
+    let has_top_level_data = entries.iter().any(|e| {
+        e.file_name()
+            .to_str()
+            .and_then(super::bench_corpus::parse_corpus_path_index)
+            .is_some()
+    });
+    if has_top_level_data {
+        return Ok(());
+    }
+    // Drop the cache sentinel from consideration; it's written by the engine
+    // AFTER flatten so it won't be present yet at flatten time, but defensive.
+    entries.retain(|e| {
+        !e.file_name()
+            .to_string_lossy()
+            .starts_with('.')
+    });
+    // Look for exactly one directory entry that contains corpus data files.
+    let subdirs: Vec<&std::fs::DirEntry> = entries
+        .iter()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    if subdirs.len() != 1 {
+        return Ok(()); // ambiguous shape — leave alone; caller logs the 0-files outcome
+    }
+    let subdir_path = subdirs[0].path();
+    // Verify the candidate subdirectory actually has the corpus data so we
+    // don't promote a junk-dir.
+    let subdir_has_data = std::fs::read_dir(&subdir_path)?
+        .filter_map(Result::ok)
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(super::bench_corpus::parse_corpus_path_index)
+                .is_some()
+        });
+    if !subdir_has_data {
+        return Ok(());
+    }
+    // Move every child of subdir_path up to corpus_dir. Use rename so the
+    // operation is atomic per-file (same filesystem; should be cheap).
+    for child in std::fs::read_dir(&subdir_path)? {
+        let child = child?;
+        let src = child.path();
+        let name = child.file_name();
+        let dst = corpus_dir.join(&name);
+        if dst.exists() {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "flatten collision: corpus_dir already has '{}'",
+                    name.to_string_lossy()
+                ),
+            ));
+        }
+        std::fs::rename(&src, &dst)?;
+    }
+    std::fs::remove_dir(&subdir_path)?;
+    Ok(())
 }
 
 /// #124 page-eviction: walk every regular file under `corpus_dir` and hint the
