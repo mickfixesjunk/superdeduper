@@ -139,6 +139,18 @@ pub const RESULT_DIGEST_DOMAIN: &[u8] = b"tcorpus-result-v1";
 /// collide.
 pub const RESULT_DIGEST_DOMAIN_V2: &[u8] = b"tcorpus-result-v2";
 
+/// V3.1 result_digest domain — distinct from V3 so a forger replaying a V3
+/// bench_proof against the V3.1 verify path produces a different hash even
+/// before any rep_hash binding fails. Section B authoritative (design-infosec.md
+/// SERVER-SIDE COMPUTE, arbitrated by design 2026-05-30 23:19 PDT).
+pub const RESULT_DIGEST_DOMAIN_V3_1: &[u8] = b"tcorpus-result-v3.1";
+
+/// V3.1 rep_hash domain tag. Distinct from 0x00 (Merkle leaf), 0x01
+/// (Merkle node), 0x02 (V1/V2 challenge), 0x03 (V2 result_digest internals),
+/// 0x04 (V3 challenge), 0x05 reserved here for the per-rep mutated-content
+/// commitment. Matches overflow agent's spec port (commit 61b212c).
+pub const REP_HASH_TAG_V3_1: u8 = 0x05;
+
 pub fn result_digest_bytes(dupsets: &[Vec<u64>]) -> [u8; 32] {
     let mut clusters: Vec<Vec<u64>> = dupsets
         .iter()
@@ -333,6 +345,137 @@ pub fn result_digest_bytes_v3(dupsets: &[Vec<u64>], k: &[u8; 32]) -> [u8; 32] {
 
 pub fn result_digest_v3(dupsets: &[Vec<u64>], k: &[u8; 32]) -> String {
     b64(&result_digest_bytes_v3(dupsets, k))
+}
+
+// ============================================================
+// V3.1 PRIMITIVES — Phase C D1 (design 2026-05-30 21:48 PDT Mick GO).
+// Spec: design-infosec.md SERVER-SIDE COMPUTE section, arbitrated as
+// Section B by design 2026-05-30 23:19 PDT. Byte-for-byte matches the
+// overflow-agent reference impl at overflow/v31-goldens commit 61b212c
+// (tests/v31_goldens.rs); the 20 golden vectors in that file are the
+// cross-stack lock target.
+// ============================================================
+
+/// V3.1 rep_hash — commits the FULL MUTATED CONTENT of a canonical dup-group
+/// representative to the result_digest, closing the V3 forge where the
+/// attacker could compose a valid result_digest from public partition shape
+/// without reading any file bytes.
+///
+/// Formula (Section B authoritative):
+///
+/// ```text
+/// repHashV31(rep_path_index, K, file_size, mutated_bytes):
+///   BLAKE3(
+///     u8(0x05) ||              // domain tag (REP_HASH_TAG_V3_1)
+///     u64le(rep_path_index) ||
+///     u64le(file_size) ||
+///     mutated_bytes ||         // full mutated file (canonical XOR keystream)
+///     K                        // mixed in at the end (matches challenge_hash_v3 pattern)
+///   )
+/// ```
+///
+/// `mutated_bytes` MUST be the result of `mutate_bytes_v3(per_file_key, 0, canonical_bytes)`
+/// — passing raw canonical bytes produces a hash the server rejects (the
+/// mutation IS the forge defence; without K mixed in via per_file_key the
+/// attacker shortcut to a final hash from cached canonical bytes is open).
+///
+/// Cost: one BLAKE3 chunked-mode pass over `mutated_bytes.len()` bytes,
+/// ~250-500 MB/s on modern CPUs. For v2-full's ~6 GB mutated content the
+/// per-run engine cost is ~1.5-2s. Matches spec's ~5s budget incl. ChaCha20.
+pub fn rep_hash_v3_1(
+    rep_path_index: u64,
+    k: &[u8; 32],
+    file_size: u64,
+    mutated_bytes: &[u8],
+) -> [u8; 32] {
+    debug_assert_eq!(
+        mutated_bytes.len() as u64,
+        file_size,
+        "rep_hash_v3_1: mutated_bytes.len() must equal file_size"
+    );
+    let mut h = blake3::Hasher::new();
+    h.update(&[REP_HASH_TAG_V3_1]);
+    h.update(&rep_path_index.to_le_bytes());
+    h.update(&file_size.to_le_bytes());
+    h.update(mutated_bytes);
+    h.update(k);
+    *h.finalize().as_bytes()
+}
+
+/// V3.1 result_digest — binds the canonical dup-group partition AND each
+/// group's representative mutated-content hash together with K.
+///
+/// Formula (Section B authoritative):
+///
+/// ```text
+/// computeResultDigestV31(dupsets, rep_hashes_by_group, K):
+///   groups = canonicalizeDupsets(dupsets)       // members asc, groups by min member
+///   wire = concat(
+///     u32le(19) || "tcorpus-result-v3.1",       // length-prefixed domain
+///     K,                                         // 32 bytes prepended
+///     u64le(groups.length),
+///     for each (group, rep_hash) in canonical order:
+///       u64le(32) || rep_hash || u64le(group.length) || u64le(member)* (asc)
+///   )
+///   BLAKE3(wire)
+/// ```
+///
+/// `reps_in_group_canonical_order[i]` MUST correspond to the i-th group
+/// in the CANONICAL order (= same order V3 emits clusters in). Caller
+/// passes rep_hashes indexed by the ORIGINAL input order of `dupsets`;
+/// this function permutes them in lockstep with the canonical sort so
+/// the engine doesn't need to pre-sort.
+pub fn result_digest_bytes_v3_1(
+    dupsets: &[Vec<u64>],
+    reps_in_input_order: &[[u8; 32]],
+    k: &[u8; 32],
+) -> [u8; 32] {
+    assert_eq!(
+        dupsets.len(),
+        reps_in_input_order.len(),
+        "result_digest_v3_1: rep_hashes count must match dupsets count"
+    );
+    // Canonicalize: sort each group's members ascending; sort groups by
+    // min member. Maintain a permutation so rep_hashes track the same
+    // ordering. Matches V3's canonical sort exactly.
+    let groups: Vec<Vec<u64>> = dupsets
+        .iter()
+        .map(|g| {
+            let mut v = g.clone();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    let mut perm: Vec<usize> = (0..groups.len()).collect();
+    perm.sort_by_key(|&i| groups[i].first().copied().unwrap_or(0));
+    let groups_sorted: Vec<&Vec<u64>> = perm.iter().map(|&i| &groups[i]).collect();
+    let reps_sorted: Vec<&[u8; 32]> = perm.iter().map(|&i| &reps_in_input_order[i]).collect();
+
+    let mut h = blake3::Hasher::new();
+    h.update(&(RESULT_DIGEST_DOMAIN_V3_1.len() as u32).to_le_bytes());
+    h.update(RESULT_DIGEST_DOMAIN_V3_1);
+    h.update(k);
+    h.update(&(groups_sorted.len() as u64).to_le_bytes());
+    for (group, rep) in groups_sorted.iter().zip(reps_sorted.iter()) {
+        // u64le(32) length prefix on each rep_hash for forward-compat
+        // with hypothetical post-quantum 64-byte hashes (per spec note).
+        h.update(&32u64.to_le_bytes());
+        h.update(rep.as_slice());
+        h.update(&(group.len() as u64).to_le_bytes());
+        for &pi in group.iter() {
+            h.update(&pi.to_le_bytes());
+        }
+    }
+    *h.finalize().as_bytes()
+}
+
+/// V3.1 result_digest as std-base64 — the engine wire shape.
+pub fn result_digest_v3_1(
+    dupsets: &[Vec<u64>],
+    reps_in_input_order: &[[u8; 32]],
+    k: &[u8; 32],
+) -> String {
+    b64(&result_digest_bytes_v3_1(dupsets, reps_in_input_order, k))
 }
 
 /// Compute BLAKE3 over a file's entire raw content. Used to derive the

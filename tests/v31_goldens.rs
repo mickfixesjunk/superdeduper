@@ -755,6 +755,81 @@ fn v31_goldens_locked_byte_exact() {
     }
 }
 
+/// THE CROSS-STACK LOCK TEST. Runs every vector through the SHIPPED engine
+/// primitives (`bench_client::rep_hash_v3_1` + `bench_client::result_digest_bytes_v3_1`)
+/// and asserts byte-equality against the same locked hex strings the
+/// reference impl above produces. When this test passes, engine + overflow
+/// reference impl + (eventually) web TS verifier are all byte-locked to
+/// the same V3.1 wire shape. Failure = the engine has drifted from the
+/// spec; route to design + fix before shipping.
+///
+/// Authored alongside the engine V3.1 primitives in commit (this commit).
+/// Belongs in the same file as the reference impl so the lock target +
+/// the locked-against impl live together; a single regression here fails
+/// both the reference + engine paths atomically.
+#[test]
+fn v31_engine_primitives_lock_against_goldens() {
+    use superdeduper::leaderboard::bench::{content_bytes_at, corpus_keys};
+    use superdeduper::leaderboard::bench_client::{
+        mutate_bytes_v3, per_file_key_v3, rep_hash_v3_1, result_digest_bytes_v3_1,
+    };
+    for v in ALL_VECTORS {
+        // Re-derive canonical + mutated bytes via the same engine helpers
+        // the reference impl uses (corpus_keys + content_bytes_at). Then
+        // call the SHIPPED engine V3.1 primitives over them. Inputs
+        // (mutated bytes, K, rep_pi, file_size, dupsets) are identical
+        // to the reference path so the engine impl MUST emit byte-exact
+        // matches to the locked hex strings if it matches the spec.
+        let (k_content, _k_control) = corpus_keys(&v.seed);
+        let groups: Vec<Vec<u64>> = v
+            .expected_dupsets
+            .iter()
+            .map(|g| g.iter().copied().collect())
+            .collect();
+
+        let mut reps_input_order: Vec<[u8; 32]> = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let rep_pi = *group.iter().min().expect("non-empty group");
+            let f = v
+                .files
+                .iter()
+                .find(|f| f.path_index == rep_pi)
+                .expect("rep present in files table");
+            let mut canonical = vec![0u8; f.size as usize];
+            content_bytes_at(&k_content, f.content_id, 0, &mut canonical);
+            let file_hash = *blake3::hash(&canonical).as_bytes();
+            let pf_key = per_file_key_v3(&v.k, &file_hash);
+            let mutated = mutate_bytes_v3(&pf_key, 0, &canonical);
+            let h = rep_hash_v3_1(rep_pi, &v.k, f.size, &mutated);
+            reps_input_order.push(h);
+        }
+
+        let engine_digest = result_digest_bytes_v3_1(&groups, &reps_input_order, &v.k);
+        let engine_digest_hex = hex32(&engine_digest);
+        assert_eq!(
+            engine_digest_hex, v.expected_result_digest_v31_hex,
+            "{}: engine result_digest_v3.1 byte-exact mismatch (engine drifted from spec)",
+            v.name
+        );
+
+        // expected_rep_hashes_hex is indexed by canonical-group order;
+        // reps_input_order matches the order of v.expected_dupsets (which
+        // happens to coincide with canonical order for the vectors as
+        // declared, but we re-derive the permutation explicitly so the
+        // test is independent of that incidental alignment).
+        let mut perm: Vec<usize> = (0..groups.len()).collect();
+        perm.sort_by_key(|&i| groups[i].iter().min().copied().unwrap_or(0));
+        for (canon_i, &input_i) in perm.iter().enumerate() {
+            let engine_rep_hex = hex32(&reps_input_order[input_i]);
+            assert_eq!(
+                engine_rep_hex, v.expected_rep_hashes_hex[canon_i],
+                "{}: engine rep_hash[canon={canon_i}] mismatch",
+                v.name
+            );
+        }
+    }
+}
+
 // ============================================================
 // Unit-level invariants for the V3.1 reference primitives themselves.
 // These are independent of the corpus vectors above and pin properties
