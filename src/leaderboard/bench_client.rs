@@ -569,26 +569,19 @@ pub fn to_canonical_bench_v3(
     found_dupsets: &[Vec<u64>],
     cold_enforced: bool,
     k: &[u8; 32],
-    rep_hashes_v3_1: Option<&[[u8; 32]]>,
+    rep_hashes_v3_1: &[[u8; 32]],
 ) -> super::submission::CanonicalBench {
-    let mut bench_proof = serde_json::json!({
+    // V3.1-only wire (post-v0.3.1 cutover): bench_proof carries
+    // result_digest_v3_1 + rep_hashes; the legacy V3 result_digest field
+    // is no longer emitted. Server (v3-full V3.1 enforcement) reads only
+    // result_digest_v3_1.
+    let reps_b64: Vec<String> = rep_hashes_v3_1.iter().map(b64).collect();
+    let bench_proof = serde_json::json!({
         "answers": answers,
-        "result_digest": result_digest_v3(found_dupsets, k),
+        "result_digest_v3_1": result_digest_v3_1(found_dupsets, rep_hashes_v3_1, k),
+        "rep_hashes": reps_b64,
         "k_echo": b64(k),
     });
-    if let Some(reps) = rep_hashes_v3_1 {
-        let reps_b64: Vec<String> = reps.iter().map(b64).collect();
-        bench_proof["rep_hashes"] = serde_json::Value::Array(
-            reps_b64.into_iter().map(serde_json::Value::String).collect(),
-        );
-        // Also emit the V3.1 result_digest under a distinct field for
-        // forward-compat. When protocol_version flips to "v3.1-mutate",
-        // server reads `result_digest_v3_1` instead of `result_digest`.
-        // Until then both are present + the legacy field is authoritative.
-        bench_proof["result_digest_v3_1"] = serde_json::Value::String(
-            result_digest_v3_1(found_dupsets, reps, k),
-        );
-    }
     super::submission::CanonicalBench {
         protocol_version: protocol_version.to_string(),
         corpus_version: corpus_version.to_string(),
@@ -1146,28 +1139,39 @@ mod tests {
     }
 
     #[test]
-    fn v3_to_canonical_bench_emits_k_echo_and_v3_digest() {
+    fn v31_to_canonical_bench_emits_k_echo_and_v31_digest_only() {
         let k = v3_test_k();
+        // Post-v0.3.1 cutover: rep_hashes_v3_1 is mandatory. One rep_hash
+        // per canonical group; use a fixture value here since the wire
+        // shape is what's under test, not the rep_hash derivation.
+        let dupsets = &[vec![1u64, 2, 7]];
+        let reps: [[u8; 32]; 1] = [[0xCDu8; 32]];
         let cb = to_canonical_bench_v3(
-            "v3-mutate", "corpus-v3-quick", "quick", "run-V3",
+            "v3.1-mutate", "corpus-v3-quick", "quick", "run-V3",
             &[],
-            &[vec![1u64, 2, 7]],
+            dupsets,
             true,
             &k,
-            None, // no V3.1 rep_hashes for this test — keeps the legacy-only shape
+            &reps,
         );
         // k_echo is base64-std of K (44 chars).
         let echo = cb.bench_proof.get("k_echo").and_then(|v| v.as_str())
             .expect("k_echo present in V3 bench_proof");
         assert_eq!(echo, b64(&k));
-        // result_digest is V3 (distinct from V1 + V2 over same dupsets).
-        let digest = cb.bench_proof.get("result_digest").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(digest, result_digest_v3(&[vec![1u64, 2, 7]], &k));
-        assert_ne!(digest, result_digest(&[vec![1u64, 2, 7]]));
+        // result_digest_v3_1 is the only digest field on the wire now.
+        let digest = cb.bench_proof.get("result_digest_v3_1").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(digest, result_digest_v3_1(dupsets, &reps, &k));
+        // Legacy V3 result_digest must NOT be present after cutover.
+        assert!(cb.bench_proof.get("result_digest").is_none(),
+            "post-cutover V3.1 bench_proof must not carry legacy result_digest");
+        // rep_hashes present + base64-encoded.
+        let reps_wire = cb.bench_proof.get("rep_hashes").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(reps_wire.len(), 1);
+        assert_eq!(reps_wire[0].as_str().unwrap(), b64(&reps[0]));
         // No V2 fields linger.
         assert!(cb.bench_proof.get("challenge_blob_echo").is_none(),
             "V3 bench_proof must not carry V2 challenge_blob_echo");
-        assert_eq!(cb.protocol_version, "v3-mutate");
+        assert_eq!(cb.protocol_version, "v3.1-mutate");
     }
 
     /// Emits the V3 GOLDEN VECTOR for web to byte-match (run:

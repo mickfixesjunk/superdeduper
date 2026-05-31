@@ -97,14 +97,12 @@ pub fn run(
     // protocol_supported=['v3-mutate'] server-side; older corpora accept
     // "tbench-1". Hardcoded pattern match keeps the fix small until a real
     // protocol-negotiation handshake lands.
-    // v0.3.0 HARD CUTOVER (2026-05-31): engine flips outgoing protocol_version
-    // string to v3.1-mutate for corpus-v3-* (was "v3-mutate"). Web /bench/start
-    // accepts both (commit 7cb251c, web dev/prod live 2026-05-31 07:54 PST);
-    // protocol_supported on corpus_versions row lists both. PATH 1 dual-emit
-    // wire shape stays unchanged -- bench_proof carries BOTH result_digest
-    // (legacy V3) and result_digest_v3_1 + rep_hashes (additive since v0.2.69).
-    // Legacy emit drop deferred to v0.3.1-cutover after async-finalize lands
-    // and V3.1 runtime enforcement is on for both v3-quick + v3-full.
+    // v0.3.1 HARD CUTOVER: bench_proof on V3 path now emits ONLY
+    // result_digest_v3_1 + rep_hashes (legacy V3 result_digest field
+    // dropped). protocol_version stays "v3.1-mutate" for corpus-v3-*;
+    // server (v3-full V3.1 enforcement) reads only result_digest_v3_1.
+    // rep_hashes_v3_1 compute failures are now FATAL (no legacy
+    // fallback wire shape).
     let req_protocol_version = if corpus_version.starts_with("corpus-v3-") {
         "v3.1-mutate"
     } else {
@@ -344,28 +342,24 @@ pub fn run(
         (answers, bytes_read, digest)
     };
 
-    // V3.1 ADDITIVE (Phase C D1, 2026-05-30): when running V3, compute
+    // V3.1 (Phase C D1, 2026-05-30): when running V3, compute
     // per-canonical-group rep_hash_v3_1 over the FULL MUTATED CONTENT of
     // each rep. Closes the V3 forge where a precomputed-groundtruth
     // attacker could emit a valid result_digest without reading any
     // bytes. Cost: ~1 file read + 1 BLAKE3 + 1 ChaCha20 + 1 BLAKE3 per
-    // canonical group (≈5s extra on v2-full). Failure is non-fatal —
-    // logs a warn and proceeds without rep_hashes; legacy V3 path
-    // remains functional (server validates v3 result_digest from the
-    // existing bench_proof.result_digest field). Hard cutover to V3.1-only
-    // happens when protocol_version flips to "v3.1-mutate".
+    // canonical group (≈5s extra on v2-full).
+    //
+    // Post-v0.3.1 cutover: failure is FATAL. The legacy V3 result_digest
+    // is no longer emitted (server only reads result_digest_v3_1), so
+    // there is no fallback wire shape; if rep_hashes compute fails we
+    // cannot submit a valid bench_proof and must surface the error.
     let rep_hashes_v3_1: Option<Vec<[u8; 32]>> = if use_v3 {
         let k = k_v3.as_ref().unwrap();
         progress("computing V3.1 rep_hashes");
-        match bench_client::compute_rep_hashes_v3_1(&corpus_dir, &dupsets, k) {
-            Ok(reps) => Some(reps),
-            Err(e) => {
-                crate::log_warn!(
-                    "bench: rep_hashes_v3_1 compute failed ({e}); proceeding without — legacy V3 result_digest still authoritative"
-                );
-                None
-            }
-        }
+        Some(
+            bench_client::compute_rep_hashes_v3_1(&corpus_dir, &dupsets, k)
+                .context("computing V3.1 rep_hashes for bench submission")?,
+        )
     } else {
         None
     };
@@ -377,7 +371,7 @@ pub fn run(
             &protocol_version, &corpus_version, &tier, &bench_run_id, &answers, &dupsets,
             cold_enforced,
             k_v3.as_ref().unwrap(),
-            rep_hashes_v3_1.as_deref(),
+            rep_hashes_v3_1.as_deref().expect("V3 path always produces rep_hashes_v3_1"),
         )
     } else {
         bench_client::to_canonical_bench_v(
