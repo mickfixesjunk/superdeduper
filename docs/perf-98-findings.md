@@ -24,6 +24,37 @@ affects every sd user; engine-main owns that call. This commit
 lands the measurement + a recommended path forward; replication
 on Mick's NEO + actual Dropbox 198 GB corpus is the next step.
 
+## Regime
+
+**This measurement is WARM-CACHE / CPU-BOUND ONLY.** The
+17.4 GB/s aggregate throughput observed at the tuned setting
+(`--io-threads 16`, Stage 4 = 172 ms over 2.92 GiB) exceeds the
+host's raw disk bandwidth by a wide margin, confirming the
+corpus is page-cached after the warmup run. The default-cliff at
+`io-threads=96` therefore reflects **scheduler thrashing from
+worker oversubscription**, not disk-I/O behavior.
+
+**Cold-cache / disk-bound regimes were NOT measured here.** The
+default-multiplier ship decision under [Mick GO 2026-05-31
+10:55 PST] accepts the warm-cache result as a sufficient gate
+and treats cold-regime regression as a **revert-fast-follow**
+risk per the prod-zero-real-users framing. Benchmarker's NEO
+replication run on a fresh-mirror corpus matching this
+distribution is the warm-replication confirmation; that is the
+ship gate, not a separate cold-bound run.
+
+If, post-ship, a real user reports a cold-cache regression on
+heterogeneous workloads, the path forward is option 2
+(auto-tune per Tier) from §"Recommended fix path" — keep the
+oversubscription multiplier active for Tier-3 sustained reads
+(where disk-bound + sustained is exactly where the original
+`threads × 3` intent was sound) and drop it on Tier-1 /
+Tier-2 (where the warm-cache measurement here shows the cliff).
+
+> ⚠ Regime caveat added 2026-05-31 per benchmarker's prelim
+> NEO-5 GB synth run + design's regime-callout request; not in
+> the original 09:20 PST commit (51bd765).
+
 ## Measurement
 
 ### Head-to-head at defaults (the #98-style comparison)
