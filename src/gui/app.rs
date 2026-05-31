@@ -234,6 +234,25 @@ pub struct SuperdeduperApp {
     scan_complete_data: Option<crate::gui::widgets::scan_complete_modal::ScanCompleteData>,
 }
 
+/// #140 -- A-update-modal-extraction. Return type for per-modal
+/// render fns called from `eframe::App::update`. `Return` signals
+/// "the frame is done, skip the rest of `update()`" -- used by the
+/// EARLY-RETURN modals (alpha warning, resume picker) that paint
+/// only a dimmed backdrop + the modal and gate the rest of the UI
+/// off until the user picks. `Continue` is the default for
+/// non-blocking modals that overlay the regular UI without
+/// suppressing it.
+///
+/// Pattern lifted out so a future extraction of the other modals
+/// (settings-drift, resubmit-prompt, archive-*, badge-multiplier,
+/// destructive-confirmation) lands on the same shape -- one fn per
+/// modal, `Flow::Return` only where the modal genuinely blocks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Return,
+}
+
 /// Top-level File-menu actions the menubar can request. Dispatched
 /// once per frame after rendering the menu so we don't mutate
 /// `self` while drawing.
@@ -3228,6 +3247,70 @@ impl SuperdeduperApp {
             })
             .expect("spawn dedupe thread");
     }
+
+    // ============================================================
+    // #140 -- A-update-modal-extraction. Per-modal render fns
+    // pulled out of `update()` so a new modal lands in one named
+    // function instead of grafted into the 870-LOC `update()`
+    // body. Each returns `Flow::Return` if it consumed the frame
+    // (early-return modals: alpha warning, resume picker) or
+    // `Flow::Continue` otherwise.
+    // ============================================================
+
+    /// Alpha-software warning modal — shown on launch unless the
+    /// user has previously clicked "Don't show again", in which
+    /// case `persisted.settings.dismissed_alpha_warning` is true
+    /// and we skip. Once acknowledged this session,
+    /// `alpha_warning_acked_session` blocks re-render within the
+    /// same run. Rendered BEFORE any other UI so a brand new user
+    /// sees the warning even before scan controls.
+    fn render_alpha_warning_modal(&mut self, ctx: &egui::Context) -> Flow {
+        if self.persisted.settings.dismissed_alpha_warning || self.alpha_warning_acked_session {
+            return Flow::Continue;
+        }
+        CentralPanel::default()
+            .frame(Frame::default().fill(theme::BG).inner_margin(0.0))
+            .show(ctx, |_ui| { /* dimmed backdrop only */ });
+        if let Some(choice) = crate::gui::widgets::alpha_warning::show(ctx) {
+            self.alpha_warning_acked_session = true;
+            if choice == crate::gui::widgets::alpha_warning::AlphaWarningChoice::AcknowledgeForever
+            {
+                self.persisted.settings.dismissed_alpha_warning = true;
+            }
+        }
+        Flow::Return
+    }
+
+    /// Launch-time Resume / Start Fresh modal. While
+    /// `pending_resume` is Some we paint a dimmed background and
+    /// ONLY the modal. The rest of the UI is skipped entirely so
+    /// there's no way to interact with stale state before the user
+    /// has chosen — that's the contract Start Fresh relies on.
+    fn render_resume_modal(&mut self, ctx: &egui::Context) -> Flow {
+        let Some(summary) = self.pending_resume.clone() else {
+            return Flow::Continue;
+        };
+        CentralPanel::default()
+            .frame(Frame::default().fill(theme::BG).inner_margin(0.0))
+            .show(ctx, |_ui| { /* empty backdrop */ });
+        // #99 PR2 — Compute the tier BEFORE rendering the modal so
+        // the tier-specific copy + button label can surface what
+        // the resume click will actually do. The tier is a pure
+        // function of (loaded checkpoint, current session context);
+        // recomputed on every frame is cheap because there's no I/O.
+        let tier = self
+            .pending_resume_tier
+            .unwrap_or(crate::gui::resume_tier::ResumeTier::Fresh);
+        if let Some(choice) = resume_modal::show(ctx, &summary, tier) {
+            self.pending_resume = None;
+            self.pending_resume_tier = None;
+            match choice {
+                ResumeChoice::Resume => self.accept_resume(),
+                ResumeChoice::StartFresh => self.accept_start_fresh(),
+            }
+        }
+        Flow::Return
+    }
 }
 
 impl eframe::App for SuperdeduperApp {
@@ -3237,25 +3320,12 @@ impl eframe::App for SuperdeduperApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
-        // Alpha-software warning modal — shown on launch unless the
-        // user has previously clicked "Don't show again", in which
-        // case `persisted.settings.dismissed_alpha_warning` is true
-        // and we skip. Once acknowledged this session,
-        // `alpha_warning_acked_session` blocks re-render within the
-        // same run. We render this BEFORE any other UI so a brand
-        // new user sees the warning even before scan controls.
-        if !self.persisted.settings.dismissed_alpha_warning && !self.alpha_warning_acked_session {
-            CentralPanel::default()
-                .frame(Frame::default().fill(theme::BG).inner_margin(0.0))
-                .show(ctx, |_ui| { /* dimmed backdrop only */ });
-            if let Some(choice) = crate::gui::widgets::alpha_warning::show(ctx) {
-                self.alpha_warning_acked_session = true;
-                if choice
-                    == crate::gui::widgets::alpha_warning::AlphaWarningChoice::AcknowledgeForever
-                {
-                    self.persisted.settings.dismissed_alpha_warning = true;
-                }
-            }
+        // #140 -- A-update-modal-extraction. Early-return modals
+        // dispatched through per-modal render fns; each returns
+        // Flow::Return if it consumed the frame. The non-blocking
+        // modals below still inline for now (follow-up commit can
+        // stack them onto the same pattern).
+        if let Flow::Return = self.render_alpha_warning_modal(ctx) {
             return;
         }
 
@@ -3269,32 +3339,7 @@ impl eframe::App for SuperdeduperApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
-        // Launch-time Resume / Start Fresh modal. While
-        // `pending_resume` is Some we paint a dimmed background and
-        // ONLY the modal. The rest of the UI is skipped entirely so
-        // there's no way to interact with stale state before the user
-        // has chosen — that's the contract Start Fresh relies on.
-        if let Some(summary) = self.pending_resume.clone() {
-            CentralPanel::default()
-                .frame(Frame::default().fill(theme::BG).inner_margin(0.0))
-                .show(ctx, |_ui| { /* empty backdrop */ });
-            // #99 PR2 — Compute the tier BEFORE rendering the
-            // modal so the tier-specific copy + button label can
-            // surface what the resume click will actually do. The
-            // tier is a pure function of (loaded checkpoint,
-            // current session context); recomputed on every frame
-            // is cheap because there's no I/O.
-            let tier = self
-                .pending_resume_tier
-                .unwrap_or(crate::gui::resume_tier::ResumeTier::Fresh);
-            if let Some(choice) = resume_modal::show(ctx, &summary, tier) {
-                self.pending_resume = None;
-                self.pending_resume_tier = None;
-                match choice {
-                    ResumeChoice::Resume => self.accept_resume(),
-                    ResumeChoice::StartFresh => self.accept_start_fresh(),
-                }
-            }
+        if let Flow::Return = self.render_resume_modal(ctx) {
             return;
         }
 
