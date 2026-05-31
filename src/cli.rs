@@ -163,7 +163,13 @@ pub struct SubmitPendingArgs {
 #[derive(Debug, Args)]
 pub struct BenchMeArgs {
     /// Corpus version to request (default the quick tier).
-    #[arg(long, value_name = "VERSION", default_value = "corpus-v1-quick")]
+    // A-cli-default-corpus-v2 (2026-05-30, Mick + design 20:34 PDT): the
+    // legacy default "corpus-v1-quick" was retired when v2-quick launched;
+    // the server returns 404 because the corpus version is unregistered.
+    // Bare `superdeduper bench-me` now talks to the same corpus the GUI's
+    // USER_TIERS uses. The corpus-v3-quick flip is queued separately as
+    // A-default-corpus-v3 (#140); v2 here is the conservative hotfix.
+    #[arg(long, value_name = "VERSION", default_value = "corpus-v2-quick")]
     pub corpus_version: String,
     /// Tier label sent to /bench/start.
     #[arg(long, value_name = "TIER", default_value = "quick")]
