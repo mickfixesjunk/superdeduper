@@ -328,11 +328,22 @@ fn probe_drive(group: &DriveGroup, skip_io: bool) -> DriveProbeResult {
     // path using the same workdir-aware probe bench-me uses. Falls back
     // gracefully to None when the platform-specific lookup can't resolve
     // (caller's existing behavior degrades back to the legacy default).
+    //
+    // Cfg-gated on `telemetry` because the probe lives in
+    // `crate::leaderboard::hardware`, which is itself feature-gated
+    // (`#[cfg(feature = "telemetry")] pub mod leaderboard;`). On
+    // `--no-default-features` builds the disk_class field stays None
+    // and downstream `DriveProbeResult` consumers degrade exactly as
+    // they already do when the probe returns `"mixed"` -- no behavior
+    // regression on builds that DO opt into telemetry.
+    #[cfg(feature = "telemetry")]
     let disk_class: Option<String> = group
         .paths
         .first()
         .map(|p| crate::leaderboard::hardware::detect_with_root_hint(Some(p)).disk_class)
         .filter(|s| s != "mixed");
+    #[cfg(not(feature = "telemetry"))]
+    let disk_class: Option<String> = None;
     let scratch = find_writable_scratch_on_drive(group);
     let scratch_path = match scratch {
         Some(p) => p,
