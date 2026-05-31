@@ -61,3 +61,11 @@ pub mod bench_client; // G4
 /// challenge -> submit), called by BOTH the CLI and the GUI button so they
 /// can't drift. Telemetry-gated.
 pub mod bench_run; // G4
+/// D7 calibration probe (Phase C anti-cheat hardware-claim axis). Pure-function
+/// probe-offset derivation from server-issued `calibration_seed` + on-disk
+/// corpus layout. Engine + server compute byte-identical sequences; the
+/// server verifier re-derives the same `(file_index, byte_offset)` pairs to
+/// confirm probes hit the expected positions. Probe EXECUTION (read_uncached
+/// + Instant timing) lives in bench_run.rs; this module is the cross-stack
+/// byte-exact lock surface only.
+pub mod d7_probe;
