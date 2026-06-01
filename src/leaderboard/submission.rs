@@ -99,44 +99,11 @@ pub struct CanonicalBench {
 pub use superdeduper_bench_iface::RunShape;
 
 
-/// `result_summary` block per backend schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
-pub struct ResultSummary {
-    pub duplicate_groups: u64,
-    pub duplicate_bytes_reclaimable: u64,
-    pub largest_single_group_bytes: u64,
-    /// Per-action BYTES applied during dedupe, keyed by the
-    /// locked schema strings web's `lifetime-audit.ts` expects:
-    ///
-    /// - `"deleted_to_recycle_bytes"`: sum of source-file sizes
-    ///   moved to the Recycle Bin via `delete-to-recycle`.
-    /// - `"deleted_permanently_bytes"`: sum of sizes irrecoverably
-    ///   deleted via `delete-permanently`.
-    /// - `"hardlink_replaced_bytes"`: sum of source sizes replaced
-    ///   by hardlinks pointing at the keeper. On-disk reclaim
-    ///   equals these bytes (the keeper's data is now shared).
-    ///
-    /// Empty `{}` is valid + the natural state at scan-end (actions
-    /// happen post-scan). When the user has run dedupe actions
-    /// between scan + submit, this map carries the totals.
-    ///
-    /// **Key names are LOCKED** per design's
-    /// `gamification-achievement-balance.md` action-bytes formula;
-    /// web's auditor will reject submissions using different keys.
-    /// Use [`ACTION_BYTES_KEY_*`] constants instead of hardcoding.
-    pub actions_taken_summary: std::collections::BTreeMap<String, u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub placeholder_skip_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub placeholder_skip_bytes: Option<u64>,
-    /// T-BENCH-ME: the client's found duplicate sets as canonical global
-    /// `path_index` lists (sorted within + across), for the server's
-    /// client==groundtruth correctness gate. Present only on canonical-bench
-    /// submissions; omitted otherwise.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub client_found_dupsets: Option<Vec<Vec<u64>>>,
-}
+// Phase 2-B 2026-06-01: ResultSummary struct moved to bench-iface
+// (same pattern as RunShape). Engine keeps ACTION_BYTES_KEY_* constants
+// + build_payload code that constructs ResultSummary. Re-export below
+// keeps every existing call site resolving.
+pub use superdeduper_bench_iface::ResultSummary;
 
 /// Locked key for the "delete-to-recycle bytes" entry in
 /// [`ResultSummary::actions_taken_summary`]. Web's `lifetime-audit.ts`

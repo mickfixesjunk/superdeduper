@@ -301,6 +301,43 @@ pub struct RunShape {
     pub groups_reviewed_count: Option<u64>,
 }
 
+// --------------------------------------------------------------- result_summary
+
+/// `result_summary` block per backend schema. Counts + reclaim bytes
+/// describing the duplicate sets found + (optionally) the dedupe
+/// actions applied.
+///
+/// Phase 2-B 2026-06-01: moved here from `leaderboard::submission`
+/// alongside RunShape. Engine keeps the ACTION_BYTES_KEY_* constants
+/// and re-exports this struct via `pub use`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
+pub struct ResultSummary {
+    pub duplicate_groups: u64,
+    pub duplicate_bytes_reclaimable: u64,
+    pub largest_single_group_bytes: u64,
+    /// Per-action BYTES applied during dedupe, keyed by the
+    /// locked schema strings web's `lifetime-audit.ts` expects:
+    /// `"deleted_to_recycle_bytes"`, `"deleted_permanently_bytes"`,
+    /// `"hardlink_replaced_bytes"`. Empty `{}` is valid + the
+    /// natural state at scan-end (actions happen post-scan).
+    /// Key names are LOCKED per design's gamification-achievement-
+    /// balance.md action-bytes formula; web's auditor will reject
+    /// submissions using different keys. Use the `ACTION_BYTES_KEY_*`
+    /// constants in `leaderboard::submission` instead of hardcoding.
+    pub actions_taken_summary: std::collections::BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder_skip_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder_skip_bytes: Option<u64>,
+    /// T-BENCH-ME: the client's found duplicate sets as canonical
+    /// global `path_index` lists (sorted within + across), for the
+    /// server's client==groundtruth correctness gate. Present only
+    /// on canonical-bench submissions; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_found_dupsets: Option<Vec<Vec<u64>>>,
+}
+
 // --------------------------------------------------------------- errors
 
 /// Stable error surface at both trait boundaries. `anyhow` stays inside

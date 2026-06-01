@@ -80,7 +80,7 @@
       "type": "object"
     },
     "ResultSummary": {
-      "description": "`result_summary` block per backend schema.",
+      "description": "`result_summary` block per backend schema. Counts + reclaim bytes describing the duplicate sets found + (optionally) the dedupe actions applied.\n\nPhase 2-B 2026-06-01: moved here from `leaderboard::submission` alongside RunShape. Engine keeps the ACTION_BYTES_KEY_* constants and re-exports this struct via `pub use`.",
       "properties": {
         "actions_taken_summary": {
           "additionalProperties": {
@@ -88,7 +88,7 @@
             "minimum": 0.0,
             "type": "integer"
           },
-          "description": "Per-action BYTES applied during dedupe, keyed by the locked schema strings web's `lifetime-audit.ts` expects:\n\n- `\"deleted_to_recycle_bytes\"`: sum of source-file sizes moved to the Recycle Bin via `delete-to-recycle`. - `\"deleted_permanently_bytes\"`: sum of sizes irrecoverably deleted via `delete-permanently`. - `\"hardlink_replaced_bytes\"`: sum of source sizes replaced by hardlinks pointing at the keeper. On-disk reclaim equals these bytes (the keeper's data is now shared).\n\nEmpty `{}` is valid + the natural state at scan-end (actions happen post-scan). When the user has run dedupe actions between scan + submit, this map carries the totals.\n\n**Key names are LOCKED** per design's `gamification-achievement-balance.md` action-bytes formula; web's auditor will reject submissions using different keys. Use [`ACTION_BYTES_KEY_*`] constants instead of hardcoding.",
+          "description": "Per-action BYTES applied during dedupe, keyed by the locked schema strings web's `lifetime-audit.ts` expects: `\"deleted_to_recycle_bytes\"`, `\"deleted_permanently_bytes\"`, `\"hardlink_replaced_bytes\"`. Empty `{}` is valid + the natural state at scan-end (actions happen post-scan). Key names are LOCKED per design's gamification-achievement- balance.md action-bytes formula; web's auditor will reject submissions using different keys. Use the `ACTION_BYTES_KEY_*` constants in `leaderboard::submission` instead of hardcoding.",
           "type": "object"
         },
         "client_found_dupsets": {
