@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::hmac_signer;
 use super::install::InstallState;
+use superdeduper_bench_real::submission_http;
 
 // Phase 2-B 2026-06-01: SubmissionInputs struct moved to bench-iface
 // (alongside RunShape / ResultSummary / CanonicalBench / HardwareFingerprint
@@ -140,98 +141,13 @@ pub fn wire_schema_json() -> String {
 /// into `SubmissionInputs`) so the most up-to-date value from the
 /// current install state is always used — guards against a stale
 /// pending payload outliving a "Reset install" rotation.
-pub fn build_payload(inputs: &SubmissionInputs, install_id: &str) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "schema_version": "v1",
-        "client_version": inputs.client_version,
-        "install_id": install_id,
-        "timestamp": now_iso8601(),
-        "hardware": inputs.hardware,
-        "run_shape": inputs.run_shape,
-        "result_summary": inputs.result_summary,
-    });
-    // T-BENCH-ME: lift the canonical-bench work-proof + version-binding fields
-    // to the top level (only for scope=canonical-bench; ordinary scans omit
-    // them entirely, keeping the v1 schema's top-level key set unchanged).
-    if let Some(bench) = &inputs.bench {
-        let obj = body.as_object_mut().expect("json object");
-        obj.insert("protocol_version".into(), bench.protocol_version.clone().into());
-        obj.insert("corpus_version".into(), bench.corpus_version.clone().into());
-        obj.insert("tier".into(), bench.tier.clone().into());
-        obj.insert("bench_run_id".into(), bench.bench_run_id.clone().into());
-        obj.insert("bench_proof".into(), bench.bench_proof.clone());
-        // #106 — cold-enforce flag, sibling of the bench-version fields (web's
-        // field path). false (warm/unverifiable, incl. WSL fail-closed) -> the
-        // server routes the run to the casual board, not competitive cold.
-        obj.insert("cold_enforced".into(), bench.cold_enforced.into());
-    }
-    // Mick bench-lane UX (2026-05-30): user's explicit lane choice goes
-    // top-level. Server treats body.lane as authoritative (design 12:29 PST
-    // + web d7df4c9). When `None` (ordinary scan / pre-v0.2.54 callers),
-    // server falls back to has_account_linkage gating.
-    //
-    // Phase B.5 option (b) (Mick GO 2026-05-31): the lane value emitted
-    // here is the EFFECTIVE lane after applying the cold-enforce override
-    // -- a bench submission with cold_enforced=false is FORCED to casual
-    // regardless of what inputs.lane requested. See effective_lane() for
-    // the contract.
-    if let Some(lane) = effective_lane(inputs) {
-        body.as_object_mut()
-            .expect("json object")
-            .insert("lane".into(), lane.into());
-    }
-    body
-}
-
-/// Phase B.5 option (b) -- Mick GO 2026-05-31. Derive the effective lane
-/// for the wire body, applying the cold-enforce override: when this
-/// submission carries a bench block with `cold_enforced=false`, the lane
-/// is FORCED to `"casual"` regardless of what the caller set in
-/// `inputs.lane`. Otherwise the caller's lane (or `None`) is preserved.
-///
-/// Why this exists. Phase B.5 (workdir-disk-detect for the canonical bench)
-/// has a documented gap on container / WSL / overlayfs / tmpfs environments:
-/// `metadata(workdir).dev()` returns a virtual device number, no matching
-/// `/sys/dev/block` entry exists, so the workdir-disk probe returns `None`
-/// and `detect_with_root_hint` falls back to the system-disk probe -- which
-/// reports the HOST machine's disk_class, even though the timed reads are
-/// being served from RAM / page cache / tmpfs. The engine then submits with
-/// `cold_enforced=false` (correctly -- the reads weren't cold) but with the
-/// user's nominal `lane="ranked"` preference, leaving the server-side gate
-/// as the only enforcement layer for "this run shouldn't count for the
-/// competitive cold HoF."
-///
-/// Option (b) closes that gap on the CLIENT side by reusing the existing
-/// `cold_enforced` fail-closed semantic as the "is-this-a-real-cold-disk"
-/// signal: if cold-enforce is false, the lane MUST be casual. The engineer
-/// cost is one helper here + 6 small unit tests; the alternative (option a:
-/// thread a new `Unknown` disk_class through bench_run + submission +
-/// web verifier + per-platform detection) would have touched the web
-/// verifier surface during V3.1 / D7 work in parallel -- avoidable
-/// coordination cost.
-///
-/// Closes:
-/// - testrunner 9-cell A3 P2 cell (the cold_enforced=false runs now route
-///   to casual cleanly on the client side, matching server expectations).
-/// - cold_enforced=false UX gap (clear "this env routes to casual" signal
-///   instead of mysterious bench_verified=False post-hoc).
-/// - D7 future dependency (D7 spec Q6 already says "D7 applies only to
-///   cold_enforced=true"; this is the engine-side enforcement of that
-///   contract).
-///
-/// For NON-bench submissions (`inputs.bench.is_none()`) the override never
-/// fires; ordinary-scan submissions emit `inputs.lane` verbatim.
-fn effective_lane(inputs: &SubmissionInputs) -> Option<String> {
-    let is_warm_bench = inputs
-        .bench
-        .as_ref()
-        .map(|b| !b.cold_enforced)
-        .unwrap_or(false);
-    if is_warm_bench {
-        return Some("casual".to_string());
-    }
-    inputs.lane.clone()
-}
+// Phase 2-B v0.3.20 (2026-06-01): build_payload body + effective_lane helper
+// moved to bench-real submission_http. Re-exported here so every existing
+// engine call site (`leaderboard::submission::build_payload(...)`) continues
+// to resolve unchanged via the bench-real implementation. The cold-enforce
+// lane override + canonical-bench top-level lift logic now lives entirely
+// in bench-real; this engine module sees only the public function.
+pub use superdeduper_bench_real::submission_http::build_payload;
 
 /// #41 — re-POST a previously-recorded canonical payload. Same
 /// signing flow as [`submit`] but the body comes from the stored
@@ -267,19 +183,6 @@ pub fn submit_recorded_payload(
             reason: "install not registered — call `superdeduper register` first".to_string(),
         };
     }
-    if state.install_id != built_with_install_id {
-        return SubmitOutcome::Rejected {
-            status: 0,
-            reason: format!(
-                "install changed since scan: payload was built with install_id `{}` \
-                 but current install is `{}`. Reset-install rotates the HMAC key; \
-                 the recorded signature no longer matches. Delete this row from \
-                 History — re-running the scan under the current install will \
-                 produce a fresh submittable payload.",
-                built_with_install_id, state.install_id,
-            ),
-        };
-    }
     let install_key = match state.install_key() {
         Some(k) => k,
         None => {
@@ -289,48 +192,19 @@ pub fn submit_recorded_payload(
             };
         }
     };
-
-    // #150 — the submission body MUST be the FLAT payload shape:
-    // /api/v1/submit looks up the HMAC key by `install_id` at the
-    // request-body TOP LEVEL *before* verifying the signature, so
-    // install_id cannot be nested. #60's outer envelope
-    // ({outer_timestamp, replay_of_scan_id, original_payload}) nested
-    // install_id under original_payload → every resubmit 400'd
-    // install_id_missing (the universal v0.2.27 regression). The #60
-    // contract was flat all along; the envelope was wrong.
-    //
-    // Refresh the captured payload's `timestamp` in place before
-    // signing so the clock_skew sanity check still passes on
-    // resubmits (the captured inner timestamp is stale by
-    // definition). This is the v0.2.10-era approach (#41/#60 v1) —
-    // server-compatible, and the payload-not-byte-identical concern
-    // is moot vs a working submit. Re-introducing a fresh-vs-resubmit
-    // analytics signal must go INSIDE the flat payload (a future
-    // additive field), never as a wrapper.
-    let mut refreshed = payload.clone();
-    if let Some(obj) = refreshed.as_object_mut() {
-        obj.insert(
-            "timestamp".to_string(),
-            serde_json::Value::String(now_iso8601()),
-        );
-    }
-    let body = hmac_signer::canonical_body(&refreshed);
-    let signature = hmac_signer::sign(&install_key, &body);
-
-    let url = format!("{}/api/v1/submit", server_url.trim_end_matches('/'));
-    let response = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .set("X-Sd-Signature", &signature)
-        .timeout(std::time::Duration::from_secs(15))
-        .send_bytes(&body);
-
-    match response {
-        Ok(resp) => parse_ok(resp),
-        Err(ureq::Error::Status(code, resp)) => parse_error(code, resp),
-        Err(ureq::Error::Transport(t)) => SubmitOutcome::Transient {
-            reason: format!("transport: {t}"),
-        },
-    }
+    // Phase 2-B v0.3.20 (2026-06-01): HTTP body + install_id-mismatch check
+    // + timestamp-refresh + parse_ok/parse_error moved to bench-real
+    // submission_http::submit_recorded_payload_inner. Engine retains
+    // the InstallState-coupled API as this thin wrapper that unpacks the
+    // creds; zero call-site rewrites for the 6 engine consumers of
+    // submit_recorded_payload.
+    submission_http::submit_recorded_payload_inner(
+        server_url,
+        &state.install_id,
+        &install_key,
+        payload,
+        built_with_install_id,
+    )
 }
 
 /// Build + sign + POST a submission. Network errors surface as
@@ -353,107 +227,20 @@ pub fn submit(state: &InstallState, inputs: &SubmissionInputs) -> SubmitOutcome 
             };
         }
     };
-    let payload = build_payload(inputs, &state.install_id);
-    let body = hmac_signer::canonical_body(&payload);
-    let signature = hmac_signer::sign(&install_key, &body);
-
-    let url = format!("{}/api/v1/submit", state.server_url.trim_end_matches('/'));
-    let response = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .set("X-Sd-Signature", &signature)
-        .timeout(std::time::Duration::from_secs(15))
-        .send_bytes(&body);
-
-    match response {
-        Ok(resp) => parse_ok(resp),
-        Err(ureq::Error::Status(code, resp)) => parse_error(code, resp),
-        Err(ureq::Error::Transport(t)) => SubmitOutcome::Transient {
-            reason: format!("transport: {t}"),
-        },
-    }
+    // Phase 2-B v0.3.20 (2026-06-01): HMAC + POST + parse_ok/parse_error
+    // body moved to bench-real submission_http::submit_inner. Engine
+    // retains the InstallState-coupled API as this thin wrapper. Zero
+    // call-site rewrites for the 6+ engine consumers of submit().
+    submission_http::submit_inner(&state.server_url, &state.install_id, &install_key, inputs)
 }
 
-fn parse_ok(resp: ureq::Response) -> SubmitOutcome {
-    let body: serde_json::Value = match resp.into_json() {
-        Ok(v) => v,
-        Err(e) => {
-            return SubmitOutcome::Transient {
-                reason: format!("200 OK but body parse failed: {e}"),
-            };
-        }
-    };
-    let submission_id = body
-        .get("submission_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let ranks = body
-        .get("current_ranks")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| serde_json::from_value::<RankEntry>(r.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let achievements_unlocked = body
-        .get("achievements_unlocked")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|a| a.get("id").and_then(|i| i.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let profile_url = body
-        .get("profile_url")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    SubmitOutcome::Accepted {
-        submission_id,
-        ranks,
-        achievements_unlocked,
-        profile_url,
-    }
-}
-
-/// #99/v0.2.37 — extract the existing submission_id from a 409
-/// (duplicate_submission) response body. Web contract A: the field is
-/// `submission_id` (same key as the 200 path), omitted if unresolvable.
-/// Returns None on absent/non-string/unparseable. Pure for testability.
-fn duplicate_submission_id_from_409(body: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .as_ref()
-        .and_then(|v| v.get("submission_id"))
-        .and_then(|s| s.as_str())
-        .map(String::from)
-}
-
-fn parse_error(code: u16, resp: ureq::Response) -> SubmitOutcome {
-    let body_text = resp.into_string().unwrap_or_default();
-    if code == 409 {
-        // #99/v0.2.37 (web contract A): the 409 body carries the EXISTING
-        // submission_id so the post-action reclaim-credit PATCH can credit the
-        // existing row. Omitted/unparseable -> None (older server / edge).
-        return SubmitOutcome::DuplicateNoChange {
-            submission_id: duplicate_submission_id_from_409(&body_text),
-        };
-    }
-    if (500..600).contains(&code) {
-        return SubmitOutcome::Transient {
-            reason: format!("{code}: {body_text}"),
-        };
-    }
-    let reason = serde_json::from_str::<serde_json::Value>(&body_text)
-        .ok()
-        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from))
-        .unwrap_or(body_text);
-    SubmitOutcome::Rejected {
-        status: code,
-        reason,
-    }
-}
+// Phase 2-B v0.3.20 (2026-06-01): parse_ok, parse_error,
+// duplicate_submission_id_from_409 moved to bench-real submission_http
+// (private; consumed by submit_inner + submit_recorded_payload_inner).
+// Engine retains no parse helpers -- the HTTP-response parsing is fully
+// owned by bench-real. The 5 effective_lane unit tests + the
+// duplicate_submission_id_from_409 unit test moved with the helpers (see
+// crates/superdeduper-bench-real/src/submission_http.rs tests).
 
 // ============================================================
 // Offline queue: 50-submission cap, drain-on-startup per §6.5.
@@ -1179,32 +966,10 @@ mod tests {
         );
     }
 
-    // #99/v0.2.37 — the 409 (duplicate) body parse for the reclaim-credit
-    // queue-flush trigger (web contract A: field `submission_id`).
-    #[test]
-    fn duplicate_submission_id_from_409_parses_web_contract() {
-        assert_eq!(
-            duplicate_submission_id_from_409(
-                r#"{"error":"duplicate_submission","reason":"no_change_since_last_submit","submission_id":"sub-abc-123"}"#
-            ),
-            Some("sub-abc-123".to_string()),
-            "must extract the existing submission_id the 409 carries"
-        );
-        // Omitted (older server / unresolvable) -> None.
-        assert_eq!(
-            duplicate_submission_id_from_409(
-                r#"{"error":"duplicate_submission","reason":"no_change_since_last_submit"}"#
-            ),
-            None
-        );
-        // Non-string / garbage / empty -> None, never panics.
-        assert_eq!(
-            duplicate_submission_id_from_409(r#"{"submission_id":123}"#),
-            None
-        );
-        assert_eq!(duplicate_submission_id_from_409("not json"), None);
-        assert_eq!(duplicate_submission_id_from_409(""), None);
-    }
+    // Phase 2-B v0.3.20 (2026-06-01): duplicate_submission_id_from_409 test
+    // moved to crates/superdeduper-bench-real/src/submission_http.rs alongside
+    // the function it covers. See `duplicate_submission_id_from_409_extracts_id`
+    // / `_handles_absent_field` / `_handles_malformed_json` in that module.
 
     #[test]
     fn serializable_outcome_round_trips_all_variants() {
@@ -1386,19 +1151,19 @@ mod tests {
     /// Happy path: cold-enforced bench with explicit ranked preference --
     /// the user's lane choice flows through unchanged.
     #[test]
-    fn effective_lane_preserves_ranked_when_cold_enforced_true() {
+    fn build_payload_preserves_ranked_when_cold_enforced_true() {
         let inputs = bench_inputs(Some(true), Some("ranked"));
-        assert_eq!(effective_lane(&inputs).as_deref(), Some("ranked"));
         let body = build_payload(&inputs, "id");
         assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("ranked"));
     }
 
     /// Phase B.5 KEYSTONE: cold-enforce false with user-requested ranked
     /// MUST be overridden to casual. This is the bug the slice closes.
+    /// Phase 2-B v0.3.20: effective_lane helper now lives in bench-real;
+    /// the wire-output assertion is the user-visible contract.
     #[test]
-    fn effective_lane_forces_casual_when_cold_enforced_false_overrides_ranked_request() {
+    fn build_payload_forces_casual_when_cold_enforced_false_overrides_ranked_request() {
         let inputs = bench_inputs(Some(false), Some("ranked"));
-        assert_eq!(effective_lane(&inputs).as_deref(), Some("casual"));
         let body = build_payload(&inputs, "id");
         assert_eq!(
             body.get("lane").and_then(|v| v.as_str()),
@@ -1412,9 +1177,8 @@ mod tests {
     /// wire -- the override fires regardless of whether the user asked for
     /// a specific lane.
     #[test]
-    fn effective_lane_forces_casual_when_cold_enforced_false_and_lane_unset() {
+    fn build_payload_forces_casual_when_cold_enforced_false_and_lane_unset() {
         let inputs = bench_inputs(Some(false), None);
-        assert_eq!(effective_lane(&inputs).as_deref(), Some("casual"));
         let body = build_payload(&inputs, "id");
         assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("casual"));
     }
@@ -1423,9 +1187,8 @@ mod tests {
     /// wire body simply omits the lane key, server falls back to its
     /// account-linkage gating (the legacy / pre-Mick-bench-lane behavior).
     #[test]
-    fn effective_lane_omits_lane_key_when_cold_enforced_true_and_lane_unset() {
+    fn build_payload_omits_lane_key_when_cold_enforced_true_and_lane_unset() {
         let inputs = bench_inputs(Some(true), None);
-        assert_eq!(effective_lane(&inputs), None);
         let body = build_payload(&inputs, "id");
         assert!(
             body.get("lane").is_none(),
@@ -1437,9 +1200,8 @@ mod tests {
     /// no override needed. Pins that the override is only ONE-DIRECTIONAL
     /// (ranked -> casual on cold-enforce false), never the reverse.
     #[test]
-    fn effective_lane_preserves_casual_choice_unchanged() {
+    fn build_payload_preserves_casual_choice_unchanged() {
         let inputs = bench_inputs(Some(true), Some("casual"));
-        assert_eq!(effective_lane(&inputs).as_deref(), Some("casual"));
         let body = build_payload(&inputs, "id");
         assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("casual"));
     }
@@ -1449,11 +1211,10 @@ mod tests {
     /// cold_enforced gate to honour. The lane flows through verbatim --
     /// pre-Phase-B.5 behavior preserved for ordinary scans.
     #[test]
-    fn effective_lane_does_not_override_non_bench_submission() {
+    fn build_payload_does_not_override_non_bench_submission() {
         let mut inputs = sample_inputs();
         inputs.bench = None;
         inputs.lane = Some("ranked".to_string());
-        assert_eq!(effective_lane(&inputs).as_deref(), Some("ranked"));
         let body = build_payload(&inputs, "id");
         assert_eq!(body.get("lane").and_then(|v| v.as_str()), Some("ranked"));
     }
@@ -1461,9 +1222,8 @@ mod tests {
     /// Non-bench submission with no lane preference: the wire body simply
     /// omits the lane key (legacy ordinary-scan shape).
     #[test]
-    fn effective_lane_non_bench_with_no_lane_omits_lane_key() {
+    fn build_payload_non_bench_with_no_lane_omits_lane_key() {
         let inputs = sample_inputs();
-        assert_eq!(effective_lane(&inputs), None);
         let body = build_payload(&inputs, "id");
         assert!(body.get("lane").is_none());
     }
