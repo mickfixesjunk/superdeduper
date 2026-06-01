@@ -147,7 +147,7 @@
       "type": "object"
     },
     "RunShape": {
-      "description": "`run_shape` block per backend schema.",
+      "description": "`run_shape` block per backend schema. Engine-canonical describing the scan run (timing, file counts, scope enum, walker variant, feature bitmap, esoteric achievement metrics).\n\nPhase 2-B 2026-06-01: moved here from `leaderboard::submission` so the bench-real submission path can build payloads without back-importing engine internals. Engine keeps the builder / FEATURE_BIT_* / WALKER_VARIANT_* constants + re-exports this struct via `pub use`.",
       "properties": {
         "bytes_scanned": {
           "format": "uint64",
@@ -166,8 +166,8 @@
           "type": "string"
         },
         "dry_run": {
-          "description": "actions. GUI scans are always dry-run at scan-finish time (actions ship later via PATCH /actions). CLI `scan` subcommand is intrinsically dry-run; `dedupe` doesn't generate a fresh scan submission. Server's `aggregates-delta.ts` increments `lifetime_dry_run_count` by 1 when this is true, powering the `safety-first` achievement.",
-          "title": "89 — `true` when this scan submission carries no destructive",
+          "description": "actions. GUI scans are always dry-run at scan-finish time (actions ship later via PATCH /actions).",
+          "title": "89 -- `true` when this scan submission carries no destructive",
           "type": [
             "boolean",
             "null"
@@ -181,7 +181,7 @@
           "type": "array"
         },
         "features_used_bitmap": {
-          "description": "Bitmap of which engine features were active during the scan. See [`FEATURE_BIT_*`] constants.",
+          "description": "Bitmap of which engine features were active during the scan. See `FEATURE_BIT_*` constants (engine-side).",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -192,10 +192,10 @@
           "type": "integer"
         },
         "groups_reviewed_count": {
-          "description": "in the GUI since the last scan finished. Server aggregates into `lifetime_groups_reviewed`. Plumbed wire-compatibly; initially `None` (submission ships at scan-finish *before* reviews happen). Future work: PATCH-update this field as the user opens groups, or defer initial submission until first review.",
+          "description": "in the GUI since the last scan finished.",
           "format": "uint64",
           "minimum": 0.0,
-          "title": "89 — count of duplicate-group cards the user opened/reviewed",
+          "title": "89 -- count of duplicate-group cards the user opened/reviewed",
           "type": [
             "integer",
             "null"
@@ -215,7 +215,7 @@
           ]
         },
         "name_collision_count": {
-          "description": "Count of distinct (filename) values that appeared at least twice but with different content hashes — i.e. identical filenames at different paths whose CONTENT differs. Used by backend to grant \"name-collider\".",
+          "description": "Count of distinct (filename) values that appeared at least twice but with different content hashes -- i.e. identical filenames at different paths whose CONTENT differs. Used by backend to grant \"name-collider\".",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -228,7 +228,7 @@
           "type": "string"
         },
         "share_count_in_scope": {
-          "description": "Count of distinct network-share roots in this scan's scope (Windows UNC `\\\\server\\share`, `smb://...`, `nfs://...`). Backend uses this to grant the latent `multi-share-maestro` achievement. Counted at root-resolution time so the value reflects the user's *requested* scope, not whether files were actually read from those shares.",
+          "description": "Count of distinct network-share roots in this scan's scope (Windows UNC `\\\\server\\share`, `smb://...`, `nfs://...`). Backend uses this to grant the latent `multi-share-maestro` achievement.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -245,7 +245,7 @@
           "type": "number"
         },
         "zero_byte_group_max": {
-          "description": "G1.x server-side esoteric metrics. All optional / additive per the schema; older engines that don't compute these just omit the field. The backend uses them to grant catalog entries like \"zero-byte hoarder\", \"hardlink archaeologist\", \"name-collider\". Largest dup-group (by member count) whose content is zero bytes — i.e. the count of empty-file \"dups\" in the largest such group. Used by backend to grant \"zero-byte hoarder\" when this exceeds the threshold.",
+          "description": "G1.x server-side esoteric metrics. All optional / additive per the schema; older engines that don't compute these just omit the field. The backend uses them to grant catalog entries like \"zero-byte hoarder\", \"hardlink archaeologist\", \"name-collider\". Largest dup-group (by member count) whose content is zero bytes -- i.e. the count of empty-file \"dups\" in the largest such group. Used by backend to grant \"zero-byte hoarder\" when this exceeds the threshold.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [

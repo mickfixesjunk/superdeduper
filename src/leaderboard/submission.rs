@@ -90,81 +90,14 @@ pub struct CanonicalBench {
     pub cold_enforced: bool,
 }
 
-/// `run_shape` block per backend schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
-pub struct RunShape {
-    pub wall_clock_seconds: f64,
-    pub bytes_scanned: u64,
-    pub files_scanned: u64,
-    /// Enum: `"river5-aes-ni" | "river5-96" | "blake3" | "sha256"
-    /// | "other"`.
-    pub hash_algorithm: String,
-    /// Enum: `"mft" | "walker" | "hybrid"`.
-    pub walker_variant: String,
-    /// Enum: `"whole-volume" | "subdirectory" | "selection" |
-    /// "canonical-bench"`.
-    pub scope: String,
-    /// Bitmap of which engine features were active during the scan.
-    /// See [`FEATURE_BIT_*`] constants.
-    pub features_used_bitmap: u64,
-    /// Enum: `"user-data" | "system" | "canonical-bench"`.
-    pub corpus_kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_hit_ratio: Option<f64>,
-    /// G2 client-claimed achievement IDs. Backend grants these
-    /// when the predicate is `unlock_kind: client-claimed`.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub easter_egg_hits: Vec<String>,
-    /// G1.x server-side esoteric metrics. All optional / additive
-    /// per the schema; older engines that don't compute these
-    /// just omit the field. The backend uses them to grant
-    /// catalog entries like "zero-byte hoarder", "hardlink
-    /// archaeologist", "name-collider".
+// Phase 2-B 2026-06-01: RunShape struct definition moved to the
+// bench-iface crate. Engine keeps the FEATURE_BIT_* constants +
+// build_payload + every caller that constructs RunShape values;
+// only the struct definition migrated. The re-export below means
+// every existing call site that wrote `super::submission::RunShape`
+// or `leaderboard::submission::RunShape` resolves unchanged.
+pub use superdeduper_bench_iface::RunShape;
 
-    /// Largest dup-group (by member count) whose content is zero
-    /// bytes — i.e. the count of empty-file "dups" in the largest
-    /// such group. Used by backend to grant "zero-byte hoarder"
-    /// when this exceeds the threshold.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub zero_byte_group_max: Option<u64>,
-    /// Highest hardlink count observed on any inode during this
-    /// scan. Backend uses this to grant "hardlink archaeologist".
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_hardlink_count_in_scan: Option<u64>,
-    /// Count of distinct (filename) values that appeared at least
-    /// twice but with different content hashes — i.e. identical
-    /// filenames at different paths whose CONTENT differs. Used
-    /// by backend to grant "name-collider".
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub name_collision_count: Option<u64>,
-    /// Count of distinct network-share roots in this scan's scope
-    /// (Windows UNC `\\server\share`, `smb://...`, `nfs://...`).
-    /// Backend uses this to grant the latent `multi-share-maestro`
-    /// achievement. Counted at root-resolution time so the value
-    /// reflects the user's *requested* scope, not whether files were
-    /// actually read from those shares.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub share_count_in_scope: Option<u64>,
-    /// #89 — `true` when this scan submission carries no destructive
-    /// actions. GUI scans are always dry-run at scan-finish time
-    /// (actions ship later via PATCH /actions). CLI `scan` subcommand
-    /// is intrinsically dry-run; `dedupe` doesn't generate a fresh
-    /// scan submission. Server's `aggregates-delta.ts` increments
-    /// `lifetime_dry_run_count` by 1 when this is true, powering the
-    /// `safety-first` achievement.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub dry_run: Option<bool>,
-    /// #89 — count of duplicate-group cards the user opened/reviewed
-    /// in the GUI since the last scan finished. Server aggregates
-    /// into `lifetime_groups_reviewed`. Plumbed wire-compatibly;
-    /// initially `None` (submission ships at scan-finish *before*
-    /// reviews happen). Future work: PATCH-update this field as the
-    /// user opens groups, or defer initial submission until first
-    /// review.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub groups_reviewed_count: Option<u64>,
-}
 
 /// `result_summary` block per backend schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]

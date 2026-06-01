@@ -226,6 +226,81 @@ pub struct HardwareFingerprint {
     pub is_dev_drive: bool,
 }
 
+// --------------------------------------------------------------- run_shape
+
+/// `run_shape` block per backend schema. Engine-canonical describing
+/// the scan run (timing, file counts, scope enum, walker variant,
+/// feature bitmap, esoteric achievement metrics).
+///
+/// Phase 2-B 2026-06-01: moved here from `leaderboard::submission`
+/// so the bench-real submission path can build payloads without
+/// back-importing engine internals. Engine keeps the builder /
+/// FEATURE_BIT_* / WALKER_VARIANT_* constants + re-exports this struct
+/// via `pub use`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
+pub struct RunShape {
+    pub wall_clock_seconds: f64,
+    pub bytes_scanned: u64,
+    pub files_scanned: u64,
+    /// Enum: `"river5-aes-ni" | "river5-96" | "blake3" | "sha256"
+    /// | "other"`.
+    pub hash_algorithm: String,
+    /// Enum: `"mft" | "walker" | "hybrid"`.
+    pub walker_variant: String,
+    /// Enum: `"whole-volume" | "subdirectory" | "selection" |
+    /// "canonical-bench"`.
+    pub scope: String,
+    /// Bitmap of which engine features were active during the scan.
+    /// See `FEATURE_BIT_*` constants (engine-side).
+    pub features_used_bitmap: u64,
+    /// Enum: `"user-data" | "system" | "canonical-bench"`.
+    pub corpus_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_ratio: Option<f64>,
+    /// G2 client-claimed achievement IDs. Backend grants these
+    /// when the predicate is `unlock_kind: client-claimed`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub easter_egg_hits: Vec<String>,
+    /// G1.x server-side esoteric metrics. All optional / additive
+    /// per the schema; older engines that don't compute these
+    /// just omit the field. The backend uses them to grant
+    /// catalog entries like "zero-byte hoarder", "hardlink
+    /// archaeologist", "name-collider".
+
+    /// Largest dup-group (by member count) whose content is zero
+    /// bytes -- i.e. the count of empty-file "dups" in the largest
+    /// such group. Used by backend to grant "zero-byte hoarder"
+    /// when this exceeds the threshold.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub zero_byte_group_max: Option<u64>,
+    /// Highest hardlink count observed on any inode during this
+    /// scan. Backend uses this to grant "hardlink archaeologist".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_hardlink_count_in_scan: Option<u64>,
+    /// Count of distinct (filename) values that appeared at least
+    /// twice but with different content hashes -- i.e. identical
+    /// filenames at different paths whose CONTENT differs. Used
+    /// by backend to grant "name-collider".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name_collision_count: Option<u64>,
+    /// Count of distinct network-share roots in this scan's scope
+    /// (Windows UNC `\\server\share`, `smb://...`, `nfs://...`).
+    /// Backend uses this to grant the latent `multi-share-maestro`
+    /// achievement.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub share_count_in_scope: Option<u64>,
+    /// #89 -- `true` when this scan submission carries no destructive
+    /// actions. GUI scans are always dry-run at scan-finish time
+    /// (actions ship later via PATCH /actions).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dry_run: Option<bool>,
+    /// #89 -- count of duplicate-group cards the user opened/reviewed
+    /// in the GUI since the last scan finished.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub groups_reviewed_count: Option<u64>,
+}
+
 // --------------------------------------------------------------- errors
 
 /// Stable error surface at both trait boundaries. `anyhow` stays inside
