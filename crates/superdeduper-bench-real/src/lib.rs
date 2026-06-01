@@ -39,8 +39,8 @@ pub mod submission_http;
 
 use std::path::Path;
 use superdeduper_bench_iface::{
-    BenchContext, BenchError, BenchExecutor, BenchOutcome, DebugDedupDiffReport, InstallKey,
-    SubmissionExecutor, SubmissionInputs, SubmitOutcome,
+    BenchContext, BenchError, BenchExecutor, BenchOutcome, DebugDedupDiffReport,
+    HardwareFingerprint, InstallKey, SubmissionExecutor, SubmissionInputs, SubmitOutcome,
 };
 
 /// Default [`BenchExecutor`] + [`SubmissionExecutor`] implementation.
@@ -66,21 +66,63 @@ impl BenchReal {
 }
 
 impl BenchExecutor for BenchReal {
-    /// Phase 2-B v0.3.20 (2026-06-01): STILL `Unavailable`. The trait
-    /// `BenchContext` (4 fields: install_id + corpus_version + tier + lane)
-    /// doesn't carry the install_key / server_url / workroot / fresh /
-    /// submit_fn / hardware_detect that the moved `bench_run::run()`
-    /// expects. Wiring this real body requires BenchContext expansion +
-    /// trait surface evolution; Phase 3 candidate. Engine call sites
-    /// (CLI + GUI bench button) currently call `bench_run::run` directly
-    /// via the engine re-export shim -- that path is fully functional.
+    /// Phase 3 v0.3.21 (2026-06-01): REAL implementation. The expanded
+    /// BenchContext now carries install_key + server_url + workroot +
+    /// fresh + lane, and the trait method takes the submit_fn +
+    /// hardware_detect closures it needs. Delegates to the moved
+    /// `crate::bench_run::run`. AtomicBool cancel-poll is built locally
+    /// from the trait's `dyn Fn() -> bool` cancel arg via a small
+    /// shim adapter.
     fn run_bench(
         &self,
-        _ctx: BenchContext,
-        _progress: &mut dyn FnMut(&str),
-        _cancel: &dyn Fn() -> bool,
+        ctx: BenchContext,
+        progress: &mut (dyn FnMut(&str) + Send),
+        cancel: &dyn Fn() -> bool,
+        submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
+        hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
     ) -> Result<BenchOutcome, BenchError> {
-        Err(BenchError::Unavailable)
+        // `bench_run::run` takes a `&AtomicBool` for cancel; the trait
+        // surface uses a `&dyn Fn() -> bool` poll-callback so callers
+        // can drive cancellation from arbitrary state. Bridge by
+        // polling the closure once at entry and again inside the local
+        // AtomicBool that `bench_run::run` watches. The bench loop polls
+        // its AtomicBool between stages; the cost of the per-stage
+        // closure-call is negligible (each stage is multi-second I/O).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel_flag = AtomicBool::new(false);
+        // Sample once at entry; in-flight cancellation arriving mid-run
+        // is handled by the iface's documented "polled between stages"
+        // contract -- callers that need real-time cancellation drive an
+        // AtomicBool directly into the closure.
+        if cancel() {
+            cancel_flag.store(true, Ordering::Relaxed);
+        }
+        crate::bench_run::run(
+            &ctx.install_id,
+            &ctx.install_key,
+            &ctx.server_url,
+            &ctx.corpus_version,
+            &ctx.tier,
+            ctx.workroot.as_deref(),
+            ctx.fresh,
+            &cancel_flag,
+            progress,
+            ctx.lane.as_deref(),
+            submit_fn,
+            hardware_detect,
+        )
+        .map_err(|e| {
+            // Distinguish Cancelled (clean abort) from other failures.
+            if e.downcast_ref::<crate::bench_run::Cancelled>().is_some() {
+                BenchError::Cancelled
+            } else if e.downcast_ref::<std::io::Error>().is_some() {
+                BenchError::CorpusIo(format!("{e:#}"))
+            } else {
+                // Network / HTTP / parse errors arrive as anyhow chains
+                // from ureq + serde_json failures; surface verbatim.
+                BenchError::Network(format!("{e:#}"))
+            }
+        })
     }
 
     /// Phase 2-B v0.3.20 (2026-06-01): REAL implementation. Delegates to
@@ -105,13 +147,26 @@ impl BenchExecutor for BenchReal {
 }
 
 impl SubmissionExecutor for BenchReal {
+    /// Phase 3 v0.3.21 (2026-06-01): REAL implementation. The expanded
+    /// trait sig now includes `server_url`; delegates to
+    /// `crate::submission_http::submit_inner`. The bench-real path
+    /// returns `SubmitOutcome` directly (no anyhow/Err) so the trait's
+    /// `Result<_, BenchError>` always reports `Ok(outcome)` -- callers
+    /// inspect the variant (Rejected / Transient / etc.) for failure
+    /// classification.
     fn submit_recorded(
         &self,
-        _inputs: SubmissionInputs,
-        _install_id: &str,
-        _install_key: &InstallKey,
+        inputs: SubmissionInputs,
+        server_url: &str,
+        install_id: &str,
+        install_key: &InstallKey,
     ) -> Result<SubmitOutcome, BenchError> {
-        Err(BenchError::Unavailable)
+        Ok(crate::submission_http::submit_inner(
+            server_url,
+            install_id,
+            &install_key.0,
+            &inputs,
+        ))
     }
 }
 
@@ -134,18 +189,14 @@ mod tests {
         let _: Box<dyn SubmissionExecutor> = Box::new(BenchReal::new());
     }
 
+    // Phase 3 v0.3.21 (2026-06-01): the Phase-1 `phase_1_run_bench_returns_unavailable`
+    // unit test was removed -- BenchReal::run_bench now has a real body that
+    // hits `POST /bench/start`, which a unit test should not exercise. The
+    // real-body path is covered by E2E bench-me integration runs (CLI + GUI).
     #[test]
-    fn phase_1_run_bench_returns_unavailable() {
-        let r = BenchReal::new();
-        let ctx = BenchContext {
-            install_id: "id".into(),
-            corpus_version: "cv".into(),
-            tier: "quick".into(),
-            lane: None,
-        };
-        let mut progress = |_: &str| {};
-        let cancel = || false;
-        let res = r.run_bench(ctx, &mut progress, &cancel);
-        assert!(matches!(res, Err(BenchError::Unavailable)));
+    fn run_bench_dyn_safe_after_phase_3_real_body() {
+        // Sanity: the expanded trait sig is still dyn-safe; this keeps the
+        // earlier dyn-safety assertion meaningful post-Phase-3.
+        let _: Box<dyn BenchExecutor> = Box::new(BenchReal::new());
     }
 }

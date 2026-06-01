@@ -48,26 +48,65 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------- types
 
 /// Inputs the bench-flow executor needs to run `POST /bench/start` and
-/// drive the bench loop to completion. Opaque placeholder for the
-/// scaffold; P0-D fills in the real fields when the leaderboard internals
-/// cross the cut-line.
+/// drive the bench loop to completion.
+///
+/// Phase 3 v0.3.21 (2026-06-01): expanded from the P0-D Phase 1
+/// 4-field placeholder to the real shape that
+/// `superdeduper-bench-real::bench_run::run` consumes. Carries the
+/// install creds + server URL + workdir hint + freshness flag + the
+/// user's bench-lane choice; the dynamic per-call params (progress
+/// callback, cancel poll, submit closure, hardware-detect closure)
+/// stay as method-level args on the trait fn so callers don't have to
+/// re-shape closures for each invocation.
 #[derive(Debug, Clone)]
 pub struct BenchContext {
     pub install_id: String,
+    pub install_key: InstallKey,
+    /// Origin to POST /bench/start, /api/v1/submit, etc. against.
+    pub server_url: String,
     pub corpus_version: String,
     pub tier: String,
+    /// Working dir for corpus download / untar. `None` uses temp;
+    /// pass a real disk if temp is RAM-backed.
+    pub workroot: Option<PathBuf>,
+    /// `true` deletes the cached corpus before re-running. `false`
+    /// reuses (faster iteration).
+    pub fresh: bool,
+    /// User's bench-lane choice. Lifted into `/submit` body.lane;
+    /// `None` keeps the pre-v0.2.54 has_account_linkage gating.
     pub lane: Option<String>,
 }
 
-/// Result of a bench-flow run. Opaque placeholder for the scaffold; P0-D
-/// replaces this with the real `BenchOutcome` (currently in
-/// `src/leaderboard/bench_run.rs`).
+/// Result of a bench-flow run.
+///
+/// Phase 3 v0.3.21 (2026-06-01): expanded to mirror the real
+/// `superdeduper-bench-real::bench_run::BenchOutcome` so callers
+/// across the cut-line see the same fields the engine surfaces today
+/// (CLI prints; GUI status panel). The `inputs` + `submit` fields
+/// carry the assembled SubmissionInputs (so a run-locally result can
+/// be submitted later via [Submit now] without re-running) and the
+/// server outcome (when `BenchContext` requested submission via the
+/// trait-method `submit_fn` closure).
 #[derive(Debug, Clone)]
 pub struct BenchOutcome {
     pub bench_run_id: String,
-    pub result_digest_v3_1: String,
+    pub corpus_version: String,
+    pub dup_groups: usize,
+    pub bytes_scanned: u64,
+    pub files_scanned: u64,
     pub dedupe_secs: f64,
-    pub submit_response: Option<String>,
+    pub result_digest: String,
+    /// True when EVERY timed candidate read bypassed the OS cache
+    /// (cold-enforce, #106 pt2). False if any read fell back to
+    /// buffered -- the throughput then isn't a trustworthy cold number.
+    pub cold_enforced: bool,
+    /// Server outcome when submitted via the `submit_fn` callback;
+    /// `None` for a run-locally-only run.
+    pub submit: Option<SubmitOutcome>,
+    /// The assembled submission inputs, retained so a run-locally
+    /// result can be submitted later ([Submit now]) without re-running
+    /// the whole bench.
+    pub inputs: SubmissionInputs,
 }
 
 /// Inputs for the non-bench HMAC scan-submit path. Opaque placeholder
@@ -501,11 +540,24 @@ pub trait BenchExecutor: Send + Sync {
     /// the bench advances stages. `cancel` is polled between stages; the
     /// impl bails with `BenchError::Cancelled` the moment it returns
     /// true.
+    ///
+    /// Phase 3 v0.3.21 (2026-06-01): the trait method now also takes
+    /// `submit_fn` (optional /submit closure) and `hardware_detect`
+    /// (engine-side platform probe closure) so the impl can drive the
+    /// full bench flow without back-importing engine internals. The
+    /// engine retains ownership of the closures (they capture `&state`
+    /// + the engine's `leaderboard::hardware::detect_with_root_hint`);
+    /// the trait method receives them as `dyn` references.
     fn run_bench(
         &self,
         ctx: BenchContext,
-        progress: &mut dyn FnMut(&str),
+        // `Send`: the bench-real impl spawns a scoped poller thread that
+        // owns `progress` for the duration of the dedup stage. Engine
+        // callers (CLI stderr + GUI status channel) are Send.
+        progress: &mut (dyn FnMut(&str) + Send),
         cancel: &dyn Fn() -> bool,
+        submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
+        hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
     ) -> Result<BenchOutcome, BenchError>;
 
     /// Diagnostic helper used by `sd debug dedup-diff`. Dedups a corpus
@@ -525,9 +577,15 @@ pub trait SubmissionExecutor: Send + Sync {
     /// Submit a recorded scan payload to the leaderboard endpoint.
     /// Triggered from the GUI scan-complete modal and the resubmit-pending
     /// queue.
+    ///
+    /// Phase 3 v0.3.21 (2026-06-01): added `server_url` -- the trait
+    /// impl uses it as `/api/v1/submit` origin. Engine callers pass
+    /// `&state.server_url`; bench-real's impl forwards to
+    /// `submission_http::submit_inner`.
     fn submit_recorded(
         &self,
         inputs: SubmissionInputs,
+        server_url: &str,
         install_id: &str,
         install_key: &InstallKey,
     ) -> Result<SubmitOutcome, BenchError>;
@@ -548,8 +606,10 @@ mod tests {
         fn run_bench(
             &self,
             _ctx: BenchContext,
-            _progress: &mut dyn FnMut(&str),
+            _progress: &mut (dyn FnMut(&str) + Send),
             _cancel: &dyn Fn() -> bool,
+            _submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
+            _hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
         ) -> Result<BenchOutcome, BenchError> {
             Err(BenchError::Unavailable)
         }
@@ -566,6 +626,7 @@ mod tests {
         fn submit_recorded(
             &self,
             _inputs: SubmissionInputs,
+            _server_url: &str,
             _install_id: &str,
             _install_key: &InstallKey,
         ) -> Result<SubmitOutcome, BenchError> {
@@ -583,18 +644,40 @@ mod tests {
         let _: Box<dyn SubmissionExecutor> = Box::new(ScaffoldStub);
     }
 
+    fn stub_hardware() -> HardwareFingerprint {
+        HardwareFingerprint {
+            cpu_model_string: "stub".into(),
+            cpu_cores: 1,
+            cpu_threads: 1,
+            cpu_isa_flags: Vec::new(),
+            ram_total_gb_bucket: "16".into(),
+            os_version: "stub".into(),
+            os_edition: "Other".into(),
+            disk_class: "mixed".into(),
+            filesystem: "other".into(),
+            cluster_size_kb: 4,
+            volume_size_gb_bucket: "1024".into(),
+            is_dev_drive: false,
+        }
+    }
+
     #[test]
     fn stub_returns_unavailable() {
         let stub = ScaffoldStub;
         let ctx = BenchContext {
             install_id: "id".into(),
+            install_key: InstallKey([0u8; 32]),
+            server_url: "https://example.invalid".into(),
             corpus_version: "cv".into(),
             tier: "quick".into(),
+            workroot: None,
+            fresh: false,
             lane: None,
         };
         let mut progress = |_: &str| {};
         let cancel = || false;
-        let r = stub.run_bench(ctx, &mut progress, &cancel);
+        let hardware_detect = |_: Option<&Path>| stub_hardware();
+        let r = stub.run_bench(ctx, &mut progress, &cancel, None, &hardware_detect);
         assert!(matches!(r, Err(BenchError::Unavailable)));
     }
 

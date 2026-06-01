@@ -25,25 +25,11 @@ use superdeduper_bench_iface::{
 };
 use superdeduper_log::{log_info, log_warn};
 
-/// Structured result of a bench run (for the CLI to print + the GUI to render).
-pub struct BenchOutcome {
-    pub bench_run_id: String,
-    pub corpus_version: String,
-    pub dup_groups: usize,
-    pub bytes_scanned: u64,
-    pub files_scanned: u64,
-    pub dedupe_secs: f64,
-    pub result_digest: String,
-    /// True when EVERY timed candidate read bypassed the OS cache (cold-enforce,
-    /// #106 pt2). False if any read fell back to buffered (unsupported
-    /// platform/fs) — the throughput then isn't a trustworthy cold number.
-    pub cold_enforced: bool,
-    /// The server outcome when submitted; `None` for a run-locally-only run.
-    pub submit: Option<SubmitOutcome>,
-    /// The assembled submission inputs, retained so a run-locally result can be
-    /// submitted later ([Submit now]) without re-running the whole bench.
-    pub inputs: SubmissionInputs,
-}
+// Phase 3 v0.3.21 (2026-06-01): BenchOutcome promoted to iface canonical
+// home (now matches the local shape byte-for-byte). The trait method
+// `BenchExecutor::run_bench` returns the iface BenchOutcome; the engine
+// continues to see the same fields via this re-export.
+pub use superdeduper_bench_iface::BenchOutcome;
 
 /// Cancelled before completion (checked between stages). The GUI surfaces this
 /// as a clean abort with no partial submit.
