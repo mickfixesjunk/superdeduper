@@ -167,15 +167,18 @@ pub fn enumerate_with_skipped(
         match mft::enumerate(cfg, cache) {
             Ok(v) => v,
             Err(e) => {
-                // Demoted from `warn!` -> `debug!` 2026-06-01: the
-                // most common cause of MFT unavailability is the
-                // user not running as administrator (CreateFileW on
-                // \\?\Volume returns ACCESS_DENIED for non-elevated
-                // processes). That's the EXPECTED non-admin path,
-                // not a user-actionable warning. Walker fallback is
-                // correct + complete; users don't need to see this
-                // unless they passed -v / --debug.
-                tracing::debug!(error = %e, "MFT enumeration unavailable, falling back to directory walk");
+                // User-actionable hint at default verbosity: most
+                // non-admin users see this on every volume-root scan
+                // because the MFT fast path needs an elevated process
+                // token. Per Mick directive 2026-06-01: surface the
+                // 'run as admin for faster scans' tip rather than the
+                // raw CreateFileW + GUID + 0x80070005 error string.
+                // The full syscall context stays one log-level down
+                // for troubleshooting (-v / RUST_LOG=debug).
+                tracing::warn!(
+                    "Tip: run superdeduper as Administrator for faster scans on large drives (enables MFT direct-read). Falling back to directory walk."
+                );
+                tracing::debug!(error = %e, "MFT enumeration unavailable; walker fallback engaged");
                 walk::enumerate_with_progress(cfg, walker_event_callback)?
             }
         }
