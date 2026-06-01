@@ -37,6 +37,17 @@ pub struct ScanConfig {
     pub output: Option<PathBuf>,
     pub follow_links: bool,
     pub allow_system_paths: bool,
+    /// When `true`, bypass the MFT volume-root fast path and route
+    /// every root (including drive roots like `C:\`) through the
+    /// directory walker. Default `false` (use MFT for volume roots).
+    ///
+    /// Wired in for the v0.3.14 inventory matrix: benchmarker's
+    /// 2026-06-01 cell-D measurement showed the MFT-path's per-file
+    /// cost (~73 us/file on full-C: 1.24M records) is ~11x the
+    /// walker's per-file cost (~6.7 us/file on the 473K subdir
+    /// corpus). The flag lets bench validate the "route root through
+    /// walker" extrapolation empirically before any default flip.
+    pub force_walker: bool,
     /// T2.1 phase 6: when true, the hash worker tier guard accepts
     /// cloud-recall placeholders (forcing hydration on read). Default
     /// false. Flows from `--allow-recall-on-read`.
@@ -108,6 +119,7 @@ impl ScanConfig {
             output: args.output.clone(),
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
+            force_walker: args.force_walker,
             allow_recall_on_read: args.allow_recall_on_read,
             hash_algo: args.hash_algo.into(),
             // #81 — Wire the CLI's exclusion flags into the runtime
@@ -297,6 +309,7 @@ mod tests {
             output: None,
             follow_links: false,
             allow_system_paths: false,
+            force_walker: false,
             placeholders_only: false,
             force_hash: false,
             allow_recall_on_read: false,

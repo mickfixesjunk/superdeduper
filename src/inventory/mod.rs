@@ -145,7 +145,19 @@ pub fn enumerate_with_skipped(
         }
     };
 
-    let files = if !all_roots_are_volume_roots(&cfg.roots) {
+    let files = if cfg.force_walker {
+        // v0.3.14 escape hatch -- benchmarker validates the
+        // walker-on-root extrapolation before any default change.
+        // The 2026-06-01 cell-D measurement put MFT-path at
+        // ~73 us/file vs walker ~6.7 us/file on the same hardware,
+        // suggesting volume-root scans would be faster through the
+        // walker. Flag-gated so we measure before flipping.
+        tracing::info!(
+            roots = ?cfg.roots,
+            "force_walker enabled; routing every root through the directory walker (MFT path bypassed)",
+        );
+        walk::enumerate_with_progress(cfg, walker_event_callback)?
+    } else if !all_roots_are_volume_roots(&cfg.roots) {
         tracing::info!(
             roots = ?cfg.roots,
             "scan root is a subdirectory; using walker (MFT path skipped — see inventory/mod.rs doc)",
