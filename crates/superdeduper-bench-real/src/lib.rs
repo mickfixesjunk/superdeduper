@@ -66,52 +66,70 @@ impl BenchReal {
 }
 
 impl BenchExecutor for BenchReal {
-    /// Phase 3 v0.3.21 (2026-06-01): REAL implementation. The expanded
-    /// BenchContext now carries install_key + server_url + workroot +
-    /// fresh + lane, and the trait method takes the submit_fn +
-    /// hardware_detect closures it needs. Delegates to the moved
-    /// `crate::bench_run::run`. AtomicBool cancel-poll is built locally
-    /// from the trait's `dyn Fn() -> bool` cancel arg via a small
-    /// shim adapter.
+    /// Phase 3 v0.3.21 + cancellation fix v0.3.24 (2026-06-01):
+    /// REAL implementation. Delegates to `crate::bench_run::run` which
+    /// takes a `&AtomicBool` for cancel-poll; the trait surface uses a
+    /// `Fn() -> bool + Send + Sync` callback so callers can drive
+    /// cancellation from arbitrary state. The v0.3.21 implementation
+    /// sampled `cancel()` once at entry which left mid-run cancel
+    /// broken (codex-review found, design URGENT 2026-06-01 22:23Z).
+    /// This commit bridges the two by spawning a scoped propagator
+    /// thread that polls `cancel()` every ~100ms for the duration of
+    /// the bench run + forwards into the AtomicBool. Propagator exits
+    /// the moment cancel fires OR the bench run returns (done_flag).
     fn run_bench(
         &self,
         ctx: BenchContext,
         progress: &mut (dyn FnMut(&str) + Send),
-        cancel: &dyn Fn() -> bool,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
         submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
         hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
     ) -> Result<BenchOutcome, BenchError> {
-        // `bench_run::run` takes a `&AtomicBool` for cancel; the trait
-        // surface uses a `&dyn Fn() -> bool` poll-callback so callers
-        // can drive cancellation from arbitrary state. Bridge by
-        // polling the closure once at entry and again inside the local
-        // AtomicBool that `bench_run::run` watches. The bench loop polls
-        // its AtomicBool between stages; the cost of the per-stage
-        // closure-call is negligible (each stage is multi-second I/O).
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
         let cancel_flag = AtomicBool::new(false);
-        // Sample once at entry; in-flight cancellation arriving mid-run
-        // is handled by the iface's documented "polled between stages"
-        // contract -- callers that need real-time cancellation drive an
-        // AtomicBool directly into the closure.
-        if cancel() {
-            cancel_flag.store(true, Ordering::Relaxed);
-        }
-        crate::bench_run::run(
-            &ctx.install_id,
-            &ctx.install_key,
-            &ctx.server_url,
-            &ctx.corpus_version,
-            &ctx.tier,
-            ctx.workroot.as_deref(),
-            ctx.fresh,
-            &cancel_flag,
-            progress,
-            ctx.lane.as_deref(),
-            submit_fn,
-            hardware_detect,
-        )
-        .map_err(|e| {
+        let done_flag = AtomicBool::new(false);
+
+        let result = std::thread::scope(|s| {
+            // Propagator: bridge the closure-based cancel surface to
+            // the AtomicBool the moved bench_run::run path watches.
+            // Poll every 100ms; the bench loop checks its AtomicBool
+            // between stages + inside long-running streaming reads
+            // (CancelReader, dedup workers) so 100ms is fine-grained
+            // enough that a GUI cancel feels instant.
+            s.spawn(|| {
+                while !done_flag.load(Ordering::Relaxed) {
+                    if cancel() {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+
+            let r = crate::bench_run::run(
+                &ctx.install_id,
+                &ctx.install_key,
+                &ctx.server_url,
+                &ctx.corpus_version,
+                &ctx.tier,
+                ctx.workroot.as_deref(),
+                ctx.fresh,
+                &cancel_flag,
+                progress,
+                ctx.lane.as_deref(),
+                submit_fn,
+                hardware_detect,
+            );
+            // Tell the propagator to exit -- bench is done, no need
+            // to keep polling cancel(). Scope blocks here until the
+            // thread observes done_flag and exits cleanly.
+            done_flag.store(true, Ordering::Relaxed);
+            r
+        });
+
+        result.map_err(|e| {
             // Distinguish Cancelled (clean abort) from other failures.
             if e.downcast_ref::<crate::bench_run::Cancelled>().is_some() {
                 BenchError::Cancelled

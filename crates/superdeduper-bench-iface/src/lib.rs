@@ -555,7 +555,16 @@ pub trait BenchExecutor: Send + Sync {
         // owns `progress` for the duration of the dedup stage. Engine
         // callers (CLI stderr + GUI status channel) are Send.
         progress: &mut (dyn FnMut(&str) + Send),
-        cancel: &dyn Fn() -> bool,
+        // `Send + Sync`: the bench-real impl spawns a scoped propagator
+        // thread that re-evaluates `cancel()` every ~100ms and forwards
+        // into the AtomicBool the moved bench_run::run path watches.
+        // Without these bounds the closure can't cross thread boundaries
+        // and BenchReal::run_bench can only sample cancel once at entry
+        // (the v0.3.21 regression codex-review caught: mid-run cancel
+        // never reached the bench loop). Engine callers' closures
+        // `|| cancel.load(Ordering::Relaxed)` over `&AtomicBool` are
+        // already Send + Sync.
+        cancel: &(dyn Fn() -> bool + Send + Sync),
         submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
         hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
     ) -> Result<BenchOutcome, BenchError>;
@@ -607,7 +616,7 @@ mod tests {
             &self,
             _ctx: BenchContext,
             _progress: &mut (dyn FnMut(&str) + Send),
-            _cancel: &dyn Fn() -> bool,
+            _cancel: &(dyn Fn() -> bool + Send + Sync),
             _submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
             _hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
         ) -> Result<BenchOutcome, BenchError> {
