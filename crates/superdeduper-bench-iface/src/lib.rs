@@ -100,6 +100,23 @@ pub struct ChallengePosition {
     pub byte_length: u64,
 }
 
+/// One challenge answer (web's DEPLOYED wire): the descriptor echoed
+/// back + the tag-0x02 `challenge_hash` of the bytes there
+/// (std-base64). The server regenerates the same range from the
+/// private seed and direct-compares.
+///
+/// Phase 2-B 2026-06-01: moved here from `bench_client.rs` alongside
+/// the bench-client crate move. Mirror of ChallengePosition's earlier
+/// promote (the public engine's `--bench-me` paths build these
+/// structs; bench-real composes them; iface defines the shape).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChallengeAnswer {
+    pub path_index: u64,
+    pub byte_offset: u64,
+    pub byte_length: u64,
+    pub challenge_hash: String,
+}
+
 /// One row in `DebugDedupDiffReport.diffs` — a candidate whose three
 /// content reads (parallel cold-bypass, serial cold-bypass, serial
 /// buffered) don't all agree on `blake3(content)`. P0-D Phase 1
