@@ -958,6 +958,9 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     let mut submit_fn = |inputs: &superdeduper::leaderboard::submission::SubmissionInputs| {
         superdeduper::leaderboard::submission::submit(&state, inputs)
     };
+    let hardware_detect = |hint: Option<&std::path::Path>| {
+        superdeduper::leaderboard::hardware::detect_with_root_hint(hint)
+    };
     let outcome = bench_run::run(
         &state.install_id,
         &install_key,
@@ -970,6 +973,7 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
         |msg| eprintln!("bench: {msg}"),
         Some(lane.as_slug()),
         Some(&mut submit_fn), // CLI bench-me always submits
+        &hardware_detect,
     )?;
     eprintln!(
         "bench: result_digest={} ({} dup groups, {} candidate bytes, {:.2}s, cold-enforced={})",

@@ -12,8 +12,8 @@ use anyhow::Context;
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{bench_client, hardware, submission};
-use superdeduper_bench_iface::InstallKey;
+use super::{bench_client, submission};
+use superdeduper_bench_iface::{HardwareFingerprint, InstallKey};
 
 /// Structured result of a bench run (for the CLI to print + the GUI to render).
 pub struct BenchOutcome {
@@ -77,6 +77,13 @@ pub fn run(
     // only the trait-thin `SubmitOutcome`. This lets bench_run move to
     // bench-real without needing to back-import engine submission.
     submit_fn: Option<&mut dyn FnMut(&submission::SubmissionInputs) -> submission::SubmitOutcome>,
+    // Phase 2-B 2026-06-01: hardware fingerprint detect closure. Engine
+    // owns the platform-specific probe (leaderboard::hardware is 71KB of
+    // OS-conditioned code that does NOT want to live in bench-real).
+    // The closure takes the corpus root hint and returns the live wire
+    // fingerprint. Mirrors the submit_fn pattern: bench_run only sees
+    // the iface type, not the detect path.
+    hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
 ) -> anyhow::Result<BenchOutcome> {
     use std::sync::atomic::Ordering;
     let check_cancel = || -> anyhow::Result<()> {
@@ -398,7 +405,7 @@ pub fn run(
         scan_id: None,
         bench: Some(bench),
         lane: lane.map(str::to_string),
-        hardware: hardware::detect_with_root_hint(Some(&corpus_dir)),
+        hardware: hardware_detect(Some(&corpus_dir)),
         run_shape: submission::RunShape {
             wall_clock_seconds: dedupe_secs,
             bytes_scanned,

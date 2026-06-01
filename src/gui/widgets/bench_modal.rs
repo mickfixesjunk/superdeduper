@@ -249,6 +249,9 @@ fn run_worker(
     let mut submit_fn = |inputs: &crate::leaderboard::submission::SubmissionInputs| {
         crate::leaderboard::submission::submit(&state, inputs)
     };
+    let hardware_detect = |hint: Option<&std::path::Path>| {
+        crate::leaderboard::hardware::detect_with_root_hint(hint)
+    };
     let outcome = bench_run::run(
         &state.install_id,
         &install_key,
@@ -261,6 +264,7 @@ fn run_worker(
         |m| set_status(m),
         lane.map(|l| l.as_slug()),
         if submit { Some(&mut submit_fn) } else { None },
+        &hardware_detect,
     );
 
     match outcome {
