@@ -4354,7 +4354,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superdeduper"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -4423,16 +4423,24 @@ dependencies = [
 name = "superdeduper-bench-real"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "blake3",
  "chacha20",
  "hmac",
+ "libc",
  "rayon",
  "serde",
  "serde_json",
  "sha2",
  "superdeduper-bench-iface",
+ "superdeduper-hmac-signer",
+ "superdeduper-log",
+ "tar",
  "tempfile",
+ "ureq",
+ "uuid",
+ "windows 0.58.0",
 ]
 
 [[package]]
