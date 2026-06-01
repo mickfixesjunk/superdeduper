@@ -1971,19 +1971,6 @@ fn run(
             submission_payload_for_history = Some((full_payload, install_state.install_id));
         }
 
-        // #41 — build the FULL submittable payload (with the real
-        // install_id from the active install state) + stash it for
-        // the scan_history record-write site below. Resubmit replays
-        // this verbatim so the signature stays valid against the
-        // install_id captured at build time. If the install state
-        // can't load (unregistered, missing file), we just leave
-        // the History row without a payload — Resubmit stays
-        // disabled, the user has a clear "register first" surface.
-        if let Ok(Some(install_state)) = crate::leaderboard::install::load() {
-            let full_payload = submission::build_payload(&inputs, &install_state.install_id);
-            submission_payload_for_history = Some((full_payload, install_state.install_id));
-        }
-
         let _ = tx.send(EngineEvent::Log {
             level: LogLevel::Info,
             message: format!(
