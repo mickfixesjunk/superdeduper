@@ -226,6 +226,35 @@ pub struct HardwareFingerprint {
     pub is_dev_drive: bool,
 }
 
+// --------------------------------------------------------------- canonical_bench
+
+/// T-BENCH-ME canonical-bench top-level submission fields (server-
+/// direct-verify model; Merkle DROPPED). The engine's `build_payload`
+/// lifts these to the top level of the /submit body when present.
+///
+/// Phase 2-B 2026-06-01: moved here from `leaderboard::submission`
+/// alongside RunShape / ResultSummary. Engine keeps the construction
+/// path (to_canonical_bench in bench_client) + re-exports this struct
+/// via `pub use` for back-compat with existing call sites.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalBench {
+    pub protocol_version: String,
+    pub corpus_version: String,
+    pub tier: String,
+    pub bench_run_id: String,
+    /// web's DEPLOYED envelope: `{ answers: [{path_index, byte_offset,
+    /// byte_length, challenge_hash}], result_digest }`. No merkle_root,
+    /// no audit_path -- server regenerates each range from the private
+    /// seed (tag 0x02) + direct-compares; checks result_digest ==
+    /// digest(groundtruth).
+    pub bench_proof: serde_json::Value,
+    /// #106 -- whether EVERY timed candidate read bypassed the OS
+    /// cache. The server's per-run gate routes cold_enforced=false
+    /// runs to the casual (warm) board, excluded from the competitive
+    /// cold HoF.
+    pub cold_enforced: bool,
+}
+
 // --------------------------------------------------------------- run_shape
 
 /// `run_shape` block per backend schema. Engine-canonical describing

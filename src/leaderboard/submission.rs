@@ -69,26 +69,10 @@ pub struct SubmissionInputs {
     pub lane: Option<String>,
 }
 
-/// T-BENCH-ME canonical-bench top-level submission fields (server-direct-verify
-/// model — Merkle DROPPED). `build_payload` lifts these to the top level when
-/// present; `client_found_dupsets` rides in [`ResultSummary`] per web's envelope.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanonicalBench {
-    pub protocol_version: String,
-    pub corpus_version: String,
-    pub tier: String,
-    pub bench_run_id: String,
-    /// web's DEPLOYED envelope: `{ answers: [{path_index, byte_offset,
-    /// byte_length, challenge_hash}], result_digest }`. NO merkle_root, NO
-    /// audit_path — the server regenerates each range from the private seed
-    /// (tag 0x02) + direct-compares, and checks result_digest == digest(groundtruth).
-    pub bench_proof: serde_json::Value,
-    /// #106 — whether EVERY timed candidate read bypassed the OS cache. The
-    /// server's per-run gate routes cold_enforced=false runs to the casual
-    /// (warm) board, excluded from the competitive cold HoF. Emitted TOP-LEVEL
-    /// on the submit body (web's field path); omit/null = legacy/casual.
-    pub cold_enforced: bool,
-}
+// Phase 2-B 2026-06-01: CanonicalBench struct moved to bench-iface
+// (same pattern as RunShape / ResultSummary). Engine retains the
+// builder (to_canonical_bench in bench_client) + every caller.
+pub use superdeduper_bench_iface::CanonicalBench;
 
 // Phase 2-B 2026-06-01: RunShape struct definition moved to the
 // bench-iface crate. Engine keeps the FEATURE_BIT_* constants +
