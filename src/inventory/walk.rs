@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use hashbrown::HashSet;
+use rayon::prelude::*;
 
 use crate::config::ScanConfig;
 use crate::inventory::FileEntry;
@@ -230,12 +231,16 @@ where
         let root_for_walk = to_verbatim(root);
         #[cfg(not(windows))]
         let root_for_walk = root.clone();
-        walk(
+        // v0.3.13: BFS driver replaces the previous recursive walk().
+        // Layer-parallel via rayon per-layer; per-folder enumeration
+        // is pure (no shared-state mutation, no callback firing).
+        // The driver drains per-folder results on the main thread to
+        // preserve callback ordering + visited_dirs single-threaded.
+        walk_bfs(
             &root_for_walk,
             cfg,
             &mut out,
             &mut callback,
-            0,
             cancel,
             &mut visited_dirs,
         )?;
@@ -987,6 +992,127 @@ where
             volume_guid: enumeration.volume_guid.clone(),
             placeholder: crate::inventory::placeholder::classify(entry.attributes, reparse_tag),
         });
+    }
+    Ok(())
+}
+
+/// Dispatch helper for per-folder enumeration. Picks the Windows
+/// fast path when available (FileIdBothDirectoryInfo batched syscall);
+/// falls back to stdlib read_dir otherwise. Both pure: produce
+/// `FolderResult` without recursing or invoking callbacks.
+fn enumerate_one_folder_pure(
+    dir: &Path,
+    depth: u32,
+    cfg: &ScanConfig,
+    cancel: Option<&AtomicBool>,
+) -> FolderResult {
+    #[cfg(windows)]
+    {
+        if let Some(enumeration) = crate::inventory::dir_enum::enumerate_dir_full(dir) {
+            return enumerate_one_folder_fast_path(dir, depth, enumeration, cfg, cancel);
+        }
+    }
+    enumerate_one_folder_read_dir(dir, depth, cfg, cancel)
+}
+
+/// Layer-parallel BFS driver for a single root subtree.
+///
+/// Replaces the previous recursive `walk()` with an iterative
+/// breadth-first traversal whose per-layer per-folder enumeration is
+/// fanned out via rayon. Mirrors cz's `dir_traversal.rs` BFS pattern
+/// (`folders_to_check.into_par_iter().with_max_len(2)`) which is THE
+/// 2.5x walk-speed lever (cz agent source-archaeology 22:30 PST + my
+/// 22:58 PST source-grounded confirmation).
+///
+/// Order of operations per layer:
+///
+/// 1. SERIAL: cycle detection via `visited_dirs` + emit
+///    `SymlinkCycleSkipped` for any folder whose `DirIdentity`
+///    has been seen before. Survivors continue.
+/// 2. SERIAL: emit `Entered` for each survivor so the callback
+///    sees Entered BEFORE that folder's entries.
+/// 3. PARALLEL: `enumerate_one_folder_pure` per folder (no callback
+///    fired, no shared state mutated).
+/// 4. SERIAL: drain each `FolderResult` -- events to callback,
+///    entries to `out`, subdirs into the next layer's frontier.
+/// 5. Loop.
+///
+/// Cancellation: checked at the top of each layer + inside each
+/// per-folder enumeration. A per-folder cancellation flips the
+/// driver's `any_cancelled` flag and breaks the BFS loop.
+fn walk_bfs<F>(
+    root: &Path,
+    cfg: &ScanConfig,
+    out: &mut Vec<FileEntry>,
+    callback: &mut F,
+    cancel: Option<&AtomicBool>,
+    visited_dirs: &mut HashSet<DirIdentity>,
+) -> Result<()>
+where
+    F: FnMut(WalkEvent<'_>),
+{
+    let mut current_layer: Vec<(PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
+
+    while !current_layer.is_empty() {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+
+        // Step 1+2: serial cycle-detect + emit Entered.
+        let mut filtered: Vec<(PathBuf, u32)> = Vec::with_capacity(current_layer.len());
+        for (dir, depth) in current_layer.drain(..) {
+            if cfg.follow_links {
+                if let Some(identity) = dir_identity(&dir) {
+                    if !visited_dirs.insert(identity) {
+                        let target = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                        callback(WalkEvent::SymlinkCycleSkipped {
+                            from: &dir,
+                            target,
+                        });
+                        continue;
+                    }
+                }
+            }
+            callback(WalkEvent::Entered {
+                path: &dir,
+                depth,
+            });
+            filtered.push((dir, depth));
+        }
+
+        if filtered.is_empty() {
+            current_layer = Vec::new();
+            continue;
+        }
+
+        // Step 3: parallel per-folder enumeration. with_max_len(2)
+        // matches cz's lever (small chunk sizes give better load
+        // balancing on heterogeneous corpora; the per-folder cost
+        // varies widely between leaf dirs and large fan-outs).
+        let results: Vec<FolderResult> = filtered
+            .par_iter()
+            .with_max_len(2)
+            .map(|(dir, depth)| enumerate_one_folder_pure(dir.as_path(), *depth, cfg, cancel))
+            .collect();
+
+        // Step 4: serial drain. Preserve event ordering per folder.
+        let mut next_layer: Vec<(PathBuf, u32)> = Vec::new();
+        let mut any_cancelled = false;
+        for r in results {
+            for ev in &r.events {
+                callback(ev.as_borrowed());
+            }
+            out.extend(r.entries);
+            next_layer.extend(r.subdirs);
+            if r.cancelled {
+                any_cancelled = true;
+            }
+        }
+
+        if any_cancelled {
+            return Ok(());
+        }
+        current_layer = next_layer;
     }
     Ok(())
 }
