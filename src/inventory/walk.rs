@@ -67,6 +67,39 @@ pub enum WalkEvent<'a> {
     SymlinkCycleSkipped { from: &'a Path, target: PathBuf },
 }
 
+impl<'a> WalkEvent<'a> {
+    /// Promote a borrowed `WalkEvent` to an owned `OwnedWalkEvent`.
+    /// Used by the buffered-callback path (`walk_one_root_buffered`) so
+    /// per-root work can collect events for later replay on the driver
+    /// thread.
+    pub(crate) fn to_owned(&self) -> OwnedWalkEvent {
+        match self {
+            WalkEvent::Entered { path, depth } => OwnedWalkEvent::Entered {
+                path: path.to_path_buf(),
+                depth: *depth,
+            },
+            WalkEvent::FileFound { path, size } => OwnedWalkEvent::FileFound {
+                path: path.to_path_buf(),
+                size: *size,
+            },
+            WalkEvent::DirError { path, message } => OwnedWalkEvent::DirError {
+                path: path.to_path_buf(),
+                message: message.clone(),
+            },
+            WalkEvent::EntrySkipped { path, reason } => OwnedWalkEvent::EntrySkipped {
+                path: path.to_path_buf(),
+                reason: *reason,
+            },
+            WalkEvent::SymlinkCycleSkipped { from, target } => {
+                OwnedWalkEvent::SymlinkCycleSkipped {
+                    from: from.to_path_buf(),
+                    target: target.clone(),
+                }
+            }
+        }
+    }
+}
+
 /// Owned twin of [`WalkEvent`]. Used by the BFS driver so per-folder
 /// enumeration can collect events in parallel without borrowing the
 /// caller's `&mut FnMut` callback. Driver drains these on the main thread after each layer
@@ -177,72 +210,22 @@ where
     // directory reached via a followed symlink gets its identity
     // recorded so we don't recurse twice into the same physical dir.
     let mut visited_dirs: HashSet<DirIdentity> = HashSet::new();
+    // Phase 4 v0.3.23 prep (sub-step A 2026-06-01): the per-root work
+    // is extracted into `walk_one_root_buffered`, which collects per-root
+    // events into a `Vec<OwnedWalkEvent>` instead of firing the callback
+    // mid-walk. The driver replays each root's events through the
+    // caller's `FnMut` after that root finishes -- preserves the
+    // existing per-root ordering invariant + opens the door to sub-step
+    // B (par_iter over roots) without further callback-lifetime churn.
     for root in &cfg.roots {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             break;
         }
-        if !root.exists() {
-            callback(WalkEvent::DirError {
-                path: root,
-                message: "path not found".into(),
-            });
-            return Err(crate::Error::PathNotFound(root.clone()));
+        let (entries, events) = walk_one_root_buffered(root, cfg, cancel, &mut visited_dirs)?;
+        for ev in &events {
+            callback(ev.as_borrowed());
         }
-        // #32: a positional CLI arg can be a single file, not just
-        // a directory. `scan some_dir some_file.txt` should treat
-        // both as first-class inventory entries so cross-source
-        // duplicate detection can match them. Without this branch,
-        // walk() would try to read_dir(file) and return zero
-        // entries — `some_file.txt` never makes it into the
-        // inventory and the cross-source group never forms.
-        //
-        // The check is metadata-based rather than path-string-based
-        // so a symlink-to-file root with `--follow-links` does the
-        // right thing too.
-        let root_metadata = match fs::metadata(root) {
-            Ok(m) => m,
-            Err(e) => {
-                callback(WalkEvent::DirError {
-                    path: root,
-                    message: format!("metadata failed: {e}"),
-                });
-                return Err(crate::Error::PathNotFound(root.clone()));
-            }
-        };
-        if root_metadata.is_file() {
-            push_single_file_root(root, &root_metadata, cfg, &mut out, &mut callback);
-            continue;
-        }
-        // Convert the root to a verbatim (\\?\C:\...) path on
-        // Windows so child enumeration bypasses Win32's path-name
-        // normalization. Without this, filenames with trailing dots
-        // or spaces are silently stripped/dropped by FindFirstFileW
-        // (the call backing std::fs::read_dir). The verbatim prefix
-        // propagates into every DirEntry::path() that the walker
-        // emits, so downstream paths in FileEntry retain the prefix.
-        // We intentionally KEEP the prefix end-to-end — File::open
-        // also needs verbatim form to open these files, and
-        // stripping at any later stage would re-introduce the
-        // normalization bug. JSON output therefore shows
-        // \\?\C:\... paths for files under such corpora; uglier
-        // but functional.
-        #[cfg(windows)]
-        let root_for_walk = to_verbatim(root);
-        #[cfg(not(windows))]
-        let root_for_walk = root.clone();
-        // v0.3.13: BFS driver replaces the previous recursive walk().
-        // Layer-parallel via rayon per-layer; per-folder enumeration
-        // is pure (no shared-state mutation, no callback firing).
-        // The driver drains per-folder results on the main thread to
-        // preserve callback ordering + visited_dirs single-threaded.
-        walk_bfs(
-            &root_for_walk,
-            cfg,
-            &mut out,
-            &mut callback,
-            cancel,
-            &mut visited_dirs,
-        )?;
+        out.extend(entries);
     }
     // #70 (v0.2.12 P2) — defensive walker-side path dedup. assert_unique_paths
     // in src/pipeline/mod.rs:86 is a debug_assert against the same-path-twice
@@ -297,47 +280,48 @@ where
 /// Reparse + placeholder classification matches walk()'s path so a
 /// recall-on-open file passed as a positional arg gets the same
 /// "skipped" treatment it would have got inside a dir.
-fn push_single_file_root<F>(
+fn push_single_file_root_buffered(
     path: &Path,
     metadata: &std::fs::Metadata,
     cfg: &ScanConfig,
     out: &mut Vec<FileEntry>,
-    callback: &mut F,
-) where
-    F: FnMut(WalkEvent<'_>),
-{
+    events: &mut Vec<OwnedWalkEvent>,
+) {
     let size = metadata.len();
     if size < cfg.min_size {
-        callback(WalkEvent::EntrySkipped {
-            path,
+        events.push(OwnedWalkEvent::EntrySkipped {
+            path: path.to_path_buf(),
             reason: "below min-size",
         });
         return;
     }
     if let Some(max) = cfg.max_size {
         if size > max {
-            callback(WalkEvent::EntrySkipped {
-                path,
+            events.push(OwnedWalkEvent::EntrySkipped {
+                path: path.to_path_buf(),
                 reason: "above max-size",
             });
             return;
         }
     }
     if dropped_by_exclusions(path, size, cfg) {
-        callback(WalkEvent::EntrySkipped {
-            path,
+        events.push(OwnedWalkEvent::EntrySkipped {
+            path: path.to_path_buf(),
             reason: "Settings → Exclusions",
         });
         return;
     }
     if !path_passes_globs(path, cfg) {
-        callback(WalkEvent::EntrySkipped {
-            path,
+        events.push(OwnedWalkEvent::EntrySkipped {
+            path: path.to_path_buf(),
             reason: "filtered by include/exclude",
         });
         return;
     }
-    callback(WalkEvent::FileFound { path, size });
+    events.push(OwnedWalkEvent::FileFound {
+        path: path.to_path_buf(),
+        size,
+    });
 
     // Reparse-tag for cloud-placeholder classification matches the
     // dir-walker path's late-stage handling. On Linux + macOS the
@@ -1038,6 +1022,80 @@ fn enumerate_one_folder_pure(
 ///    output vector, and queue its sub-directories into the
 ///    next-depth frontier.
 ///
+/// Per-root buffered enumeration. Encapsulates everything the
+/// `enumerate_cancellable` for-loop body does for one root: existence
+/// check, single-file branch, Windows verbatim conversion, BFS walk.
+/// Events accumulate in a `Vec<OwnedWalkEvent>` for the driver to
+/// replay through the caller's `FnMut` callback after the per-root
+/// work completes.
+///
+/// Phase 4 v0.3.23 prep (sub-step A 2026-06-01): pulled out so a
+/// future sub-step B can wrap `cfg.roots.par_iter()` around this and
+/// realize roots-level parallelism without further callback-lifetime
+/// churn. Today the driver still calls it sequentially, so behavior is
+/// byte-identical to the v0.3.22 walker.
+fn walk_one_root_buffered(
+    root: &Path,
+    cfg: &ScanConfig,
+    cancel: Option<&AtomicBool>,
+    visited_dirs: &mut HashSet<DirIdentity>,
+) -> Result<(Vec<FileEntry>, Vec<OwnedWalkEvent>)> {
+    let mut entries: Vec<FileEntry> = Vec::new();
+    let mut events: Vec<OwnedWalkEvent> = Vec::new();
+
+    if !root.exists() {
+        events.push(OwnedWalkEvent::DirError {
+            path: root.to_path_buf(),
+            message: "path not found".into(),
+        });
+        return Err(crate::Error::PathNotFound(root.to_path_buf()));
+    }
+    // #32: a positional CLI arg can be a single file, not just
+    // a directory. `scan some_dir some_file.txt` should treat
+    // both as first-class inventory entries so cross-source
+    // duplicate detection can match them.
+    let root_metadata = match fs::metadata(root) {
+        Ok(m) => m,
+        Err(e) => {
+            events.push(OwnedWalkEvent::DirError {
+                path: root.to_path_buf(),
+                message: format!("metadata failed: {e}"),
+            });
+            return Err(crate::Error::PathNotFound(root.to_path_buf()));
+        }
+    };
+    if root_metadata.is_file() {
+        push_single_file_root_buffered(root, &root_metadata, cfg, &mut entries, &mut events);
+        return Ok((entries, events));
+    }
+    // Convert the root to a verbatim (\\?\C:\...) path on Windows so
+    // child enumeration bypasses Win32's path-name normalization.
+    // Without this, filenames with trailing dots or spaces are
+    // silently stripped/dropped by FindFirstFileW. The verbatim
+    // prefix propagates into every DirEntry::path() the walker emits.
+    #[cfg(windows)]
+    let root_for_walk = to_verbatim(root);
+    #[cfg(not(windows))]
+    let root_for_walk = root.to_path_buf();
+
+    // Buffering callback: walk_bfs invokes this for every Entered /
+    // FileFound / EntrySkipped / DirError / SymlinkCycleSkipped event;
+    // we promote to OwnedWalkEvent and push onto the per-root event
+    // list. Driver replays them after this root completes.
+    let mut buffered_callback = |ev: WalkEvent<'_>| {
+        events.push(ev.to_owned());
+    };
+    walk_bfs(
+        &root_for_walk,
+        cfg,
+        &mut entries,
+        &mut buffered_callback,
+        cancel,
+        visited_dirs,
+    )?;
+    Ok((entries, events))
+}
+
 /// Cancellation: the per-folder routine checks the cancel flag
 /// itself and flags `cancelled` in its return value. The driver
 /// drains the cancelled batch's partial results, then exits.
