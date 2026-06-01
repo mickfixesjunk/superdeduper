@@ -2,9 +2,10 @@
   "$schema": "https://json-schema.org/draft/2019-09/schema",
   "definitions": {
     "HardwareFingerprint": {
+      "description": "Hardware-detect submission wire struct. Field shape is dictated by the backend's Zod schema at `api.superdeduper.io/api/v1/submit/schema.json` — emit exactly the keys it lists in `hardware.required` (`additionalProperties: false`). Fields the client can't reliably detect fall back to documented defaults rather than failing.\n\nPhase 2-A 2026-06-01: moved here from the engine binary's `leaderboard::hardware` module so bench-real's submission path can build payloads without back-importing engine internals. The engine keeps the `detect()` / `detect_with_root_hint()` probe functions in `leaderboard::hardware` and re-exports this struct via `pub use`.",
       "properties": {
         "cluster_size_kb": {
-          "description": "NTFS cluster size in KB. Defaults to 4 (the NTFS default for volumes ≤ 16 TB).",
+          "description": "NTFS cluster size in KB. Defaults to 4 (the NTFS default for volumes <= 16 TB).",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -33,7 +34,7 @@
           "type": "integer"
         },
         "disk_class": {
-          "description": "Enum: `\"NVMe-Gen5\" | \"NVMe-Gen4\" | \"NVMe-Gen3\" | \"SATA-SSD\" | \"HDD\" | \"network\" | \"mixed\"`. Defaults to \"mixed\" — proper detection is a future enhancement.",
+          "description": "Enum: `\"NVMe-Gen5\" | \"NVMe-Gen4\" | \"NVMe-Gen3\" | \"SATA-SSD\" | \"HDD\" | \"USB-SSD\" | \"USB-HDD\" | \"network\" | \"mixed\"`. Defaults to \"mixed\" when detection fails.",
           "type": "string"
         },
         "filesystem": {
@@ -55,11 +56,11 @@
           "type": "string"
         },
         "ram_total_gb_bucket": {
-          "description": "Snapped enum: `\"4\" | \"8\" | \"16\" | \"32\" | \"64\" | \"128\" | \"256\" | \"512\" | \"1024\"`. Round-down to the nearest enum value (so 30 GB → \"16\"). Defaults to \"16\" if detection fails (sensible mid-range guess).",
+          "description": "Snapped enum: `\"4\" | \"8\" | \"16\" | \"32\" | \"64\" | \"128\" | \"256\" | \"512\" | \"1024\"`. Round-down to the nearest enum value (so 30 GB -> \"16\"). Defaults to \"16\" if detection fails (sensible mid-range guess).",
           "type": "string"
         },
         "volume_size_gb_bucket": {
-          "description": "Snapped enum power-of-two from \"1\" to \"32768\" (GB). Defaults to \"1024\" (1 TB — common modern drive) when volume probe isn't wired.",
+          "description": "Snapped enum power-of-two from \"1\" to \"32768\" (GB). Defaults to \"1024\" (1 TB - common modern drive) when volume probe isn't wired.",
           "type": "string"
         }
       },

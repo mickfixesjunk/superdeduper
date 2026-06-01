@@ -6,59 +6,13 @@
 //! `additionalProperties: false`). Fields we can't reliably detect
 //! today fall back to documented defaults rather than failing.
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "telemetry", derive(schemars::JsonSchema))]
-pub struct HardwareFingerprint {
-    /// Vendor + model as reported by the OS, e.g.
-    /// `"AMD Ryzen 9 9950X3D 16-Core Processor"`.
-    pub cpu_model_string: String,
-    /// Physical cores. Distinct from `cpu_threads` on
-    /// hyperthreaded CPUs (cores < threads).
-    pub cpu_cores: u32,
-    /// `std::thread::available_parallelism()` — total logical
-    /// threads visible to the scheduler.
-    pub cpu_threads: u32,
-    /// CPUID ISA flag names, lowercase + dash-or-digit-only per
-    /// the backend pattern `^[a-z0-9-]{1,20}$`. Sorted.
-    pub cpu_isa_flags: Vec<String>,
-    /// Snapped enum: `"4" | "8" | "16" | "32" | "64" | "128" |
-    /// "256" | "512" | "1024"`. Round-down to the nearest enum
-    /// value (so 30 GB → "16"). Defaults to "16" if detection
-    /// fails (sensible mid-range guess).
-    pub ram_total_gb_bucket: String,
-    /// OS-specific version label, e.g. `"Windows 11 25H2"`,
-    /// `"macOS 14.5"`, `"Ubuntu 22.04"`. Free-form string.
-    pub os_version: String,
-    /// Enum: `"Home" | "Pro" | "Enterprise" | "Education" |
-    /// "Server" | "Other"`. Parsed out of the full Windows
-    /// edition string when possible; "Other" on macOS / Linux.
-    pub os_edition: String,
-    /// Enum: `"NVMe-Gen5" | "NVMe-Gen4" | "NVMe-Gen3" |
-    /// "SATA-SSD" | "HDD" | "network" | "mixed"`. Defaults to
-    /// "mixed" — proper detection is a future enhancement.
-    pub disk_class: String,
-    /// Enum: `"NTFS" | "ReFS" | "exFAT" | "FAT32" |
-    /// "network-SMB" | "other"`. Defaults to "NTFS" on Windows,
-    /// "other" elsewhere.
-    pub filesystem: String,
-    /// NTFS cluster size in KB. Defaults to 4 (the NTFS default
-    /// for volumes ≤ 16 TB).
-    pub cluster_size_kb: u32,
-    /// Snapped enum power-of-two from "1" to "32768" (GB).
-    /// Defaults to "1024" (1 TB — common modern drive) when
-    /// volume probe isn't wired.
-    pub volume_size_gb_bucket: String,
-    /// #130 Pathfinder Phase 3 — `true` when ANY local volume on
-    /// this machine is a Windows Dev Drive (ReFS + developer-
-    /// workload flag set, Windows 11 24H2+). Defaults to false
-    /// on non-Windows and when no Dev Drive is detected.
-    /// `#[serde(default)]` keeps old engine submissions readable
-    /// (web sees them as false).
-    #[serde(default)]
-    pub is_dev_drive: bool,
-}
+// Phase 2-A 2026-06-01: HardwareFingerprint struct definition moved to
+// the bench-iface crate so bench-real's submission path can build
+// payloads without back-importing engine internals. Engine keeps the
+// detect probe functions below + re-exports the struct via pub use so
+// existing call sites that wrote `super::hardware::HardwareFingerprint`
+// continue to resolve unchanged.
+pub use superdeduper_bench_iface::HardwareFingerprint;
 
 pub fn detect() -> HardwareFingerprint {
     detect_with_root_hint(None)

@@ -186,7 +186,7 @@ audio = ["dep:rodio"]
 # G-track leaderboards + achievements. Pulls the HMAC + ureq stack
 # so the engine can register + sign + submit. Off by default until
 # G1 lands and the release matrix turns it on.
-telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64", "dep:tar", "dep:superdeduper-hmac-signer", "dep:superdeduper-bench-iface", "dep:superdeduper-bench-real"]
+telemetry = ["dep:ureq", "dep:hmac", "dep:uuid", "dep:unicode-script", "dep:schemars", "dep:chacha20", "dep:base64", "dep:tar", "dep:superdeduper-hmac-signer", "dep:superdeduper-bench-iface", "superdeduper-bench-iface/telemetry", "dep:superdeduper-bench-real"]
 # T1.2 perceptual image similarity (#25). Pulls `image` for decode
 # + `image_hasher` for the dHash/aHash/pHash family. Off by default
 # while the feature lands incrementally — first slice is just the

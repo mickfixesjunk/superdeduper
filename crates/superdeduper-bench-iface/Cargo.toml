@@ -10,3 +10,15 @@ publish = false
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+# schemars derives JSON Schema for wire types (HardwareFingerprint;
+# RunShape + ResultSummary follow in Phase 2-B). Optional + gated
+# behind `telemetry` so closed-source / minimal-deps build paths
+# don't pull it in. Engine forwards its own `telemetry` feature.
+schemars = { version = "0.8", optional = true }
+
+[features]
+default = []
+# Activates JsonSchema derives on the wire types. Engine forwards
+# `telemetry` here so the schema-derivation CI test (the
+# schema/submit.schema.json regen guard) keeps working post-move.
+telemetry = ["dep:schemars"]
