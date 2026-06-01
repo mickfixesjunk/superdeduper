@@ -225,16 +225,42 @@ fn run_worker(
         Err(e) => return finish(format!("Install state error: {e}"), true, false),
     };
 
+    // Phase 2-B 2026-06-01: bench_run::run takes install creds + a
+    // submit-callback closure instead of &InstallState. Build the
+    // params here; closure captures &state for the submission HTTP.
+    if !state.registered {
+        return finish(
+            "Install not registered; run `superdeduper register` first.".into(),
+            true,
+            false,
+        );
+    }
+    let install_key_arr = match state.install_key() {
+        Some(k) => k,
+        None => {
+            return finish(
+                "Install key malformed; re-register.".into(),
+                true,
+                false,
+            );
+        }
+    };
+    let install_key = superdeduper_bench_iface::InstallKey(install_key_arr);
+    let mut submit_fn = |inputs: &crate::leaderboard::submission::SubmissionInputs| {
+        crate::leaderboard::submission::submit(&state, inputs)
+    };
     let outcome = bench_run::run(
-        &state,
+        &state.install_id,
+        &install_key,
+        &state.server_url,
         tier.corpus_version,
         tier.tier,
         None,
         fresh,
-        submit,
         cancel,
         |m| set_status(m),
         lane.map(|l| l.as_slug()),
+        if submit { Some(&mut submit_fn) } else { None },
     );
 
     match outcome {

@@ -944,16 +944,32 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     }
 
     let cancel = std::sync::atomic::AtomicBool::new(false);
+    // Phase 2-B 2026-06-01: bench_run::run now takes install creds +
+    // a submit-callback closure instead of &InstallState. Engine builds
+    // the params here; the closure captures &state for the submission.
+    anyhow::ensure!(
+        state.registered,
+        "install not registered; run `superdeduper register`"
+    );
+    let install_key_arr = state
+        .install_key()
+        .ok_or_else(|| anyhow::anyhow!("install_key_hex malformed; re-register"))?;
+    let install_key = superdeduper_bench_iface::InstallKey(install_key_arr);
+    let mut submit_fn = |inputs: &superdeduper::leaderboard::submission::SubmissionInputs| {
+        superdeduper::leaderboard::submission::submit(&state, inputs)
+    };
     let outcome = bench_run::run(
-        &state,
+        &state.install_id,
+        &install_key,
+        &state.server_url,
         &args.corpus_version,
         &args.tier,
         args.workdir.as_deref(),
         args.fresh,
-        true, // CLI bench-me always submits
         &cancel,
         |msg| eprintln!("bench: {msg}"),
         Some(lane.as_slug()),
+        Some(&mut submit_fn), // CLI bench-me always submits
     )?;
     eprintln!(
         "bench: result_digest={} ({} dup groups, {} candidate bytes, {:.2}s, cold-enforced={})",

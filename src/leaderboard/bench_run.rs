@@ -12,7 +12,8 @@ use anyhow::Context;
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{bench_client, hardware, install, submission};
+use super::{bench_client, hardware, submission};
+use superdeduper_bench_iface::InstallKey;
 
 /// Structured result of a bench run (for the CLI to print + the GUI to render).
 pub struct BenchOutcome {
@@ -51,12 +52,13 @@ impl std::error::Error for Cancelled {}
 /// RAM-backed). The corpus dir is removed unless `keep`.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    state: &install::InstallState,
+    install_id: &str,
+    install_key: &InstallKey,
+    server_url: &str,
     corpus_version: &str,
     tier: &str,
     workroot: Option<&Path>,
     fresh: bool,
-    submit: bool,
     cancel: &std::sync::atomic::AtomicBool,
     // `Send`: the live-progress poller runs on a scoped thread that owns
     // `progress` for the duration of the dedup. Both callers (CLI -> stderr,
@@ -67,6 +69,14 @@ pub fn run(
     // truth). `None` keeps the pre-v0.2.54 behavior (server falls back to
     // has_account_linkage gating).
     lane: Option<&str>,
+    // Phase 2-B pre-refactor 2026-06-01: callers (CLI main.rs + GUI
+    // bench_modal.rs) pass a closure that submits the assembled inputs.
+    // `None` keeps the bench result local (no submission). `Some(fn)` is
+    // typically `|inputs| submission::submit(&install_state, inputs)`.
+    // The closure captures the engine-side InstallState; bench_run sees
+    // only the trait-thin `SubmitOutcome`. This lets bench_run move to
+    // bench-real without needing to back-import engine submission.
+    submit_fn: Option<&mut dyn FnMut(&submission::SubmissionInputs) -> submission::SubmitOutcome>,
 ) -> anyhow::Result<BenchOutcome> {
     use std::sync::atomic::Ordering;
     let check_cancel = || -> anyhow::Result<()> {
@@ -75,8 +85,8 @@ pub fn run(
         }
         Ok(())
     };
-    anyhow::ensure!(state.registered, "install not registered; run `superdeduper register`");
-    let base = state.server_url.trim_end_matches('/').to_string();
+    let install_key_bytes: [u8; 32] = install_key.0;
+    let base = server_url.trim_end_matches('/').to_string();
 
     // 1. POST /bench/start — HMAC-authed per the G fix coupled with #4(a)
     // (web dev rev 584089d + the cap-table swap). Pre-G the endpoint was
@@ -85,9 +95,10 @@ pub fn run(
     // Sign with install_key over the canonical body; matches every other
     // authed endpoint (submission, action_submission, etc.).
     progress(&format!("requesting bench run ({corpus_version}, {tier})"));
-    let install_key = state
-        .install_key()
-        .ok_or_else(|| anyhow::anyhow!("install_key_hex malformed; re-register"))?;
+    // Phase 2-B 2026-06-01: install_key arrives pre-decoded as
+    // [u8; 32] via the InstallKey newtype; the engine caller does
+    // the hex decode + validation BEFORE invoking run_bench.
+    let install_key = install_key_bytes;
     // A-bench-start-protocol-version (2026-05-30, testrunner 19:32 PST): the
     // server's /bench/start defaults to "tbench-1" when the request omits
     // `protocol_version`, which 400s on V3-only corpora ("corpus-v3-*"). The
@@ -109,7 +120,7 @@ pub fn run(
         "tbench-1"
     };
     let start_payload = serde_json::json!({
-        "install_id": state.install_id,
+        "install_id": install_id,
         "corpus_version": corpus_version,
         "tier": tier,
         "protocol_version": req_protocol_version,
@@ -118,7 +129,7 @@ pub fn run(
     let start_signature = super::hmac_signer::sign(&install_key, &start_body);
     let start: serde_json::Value = ureq::post(&format!("{base}/api/v1/bench/start"))
         .set("Content-Type", "application/json")
-        .set("X-Sd-Install-Id", &state.install_id)
+        .set("X-Sd-Install-Id", &install_id)
         .set("X-Sd-Signature", &start_signature)
         .timeout(std::time::Duration::from_secs(15))
         .send_bytes(&start_body)
@@ -281,7 +292,7 @@ pub fn run(
     // / 503 / etc.) we log + continue, server falls back to the existing
     // (received_at - server_start_ts) window. The endpoint is one-time-use
     // server-side (409 on second call) which we just absorb via log_warn.
-    let _ = signal_dedup_ready(&base, &state.install_id, &install_key, &bench_run_id);
+    let _ = signal_dedup_ready(&base, &install_id, &install_key, &bench_run_id);
 
     // 3. real size-grouped exact dedupe (the ranked wall + I/O signal). The
     // timed window covers enumerate + size-group + hash-candidates;
@@ -416,11 +427,14 @@ pub fn run(
             client_found_dupsets: Some(dupsets.clone()),
         },
     };
-    // 6. submit (only on Run & submit; Run-locally returns inputs for later).
-    let submit_outcome = if submit {
+    // 6. submit (only when caller passed a submit_fn closure;
+    // Run-locally returns inputs for later). Phase 2-B 2026-06-01:
+    // submit_fn is the caller's bridge to submission::submit (which
+    // still lives engine-side until submission.rs moves to bench-real).
+    let submit_outcome = if let Some(submit_fn) = submit_fn {
         check_cancel()?;
         progress("submitting");
-        Some(submission::submit(state, &inputs))
+        Some(submit_fn(&inputs))
     } else {
         progress("done (local only -- not submitted)");
         None
