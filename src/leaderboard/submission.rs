@@ -20,54 +20,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::hardware::HardwareFingerprint;
 use super::hmac_signer;
 use super::install::InstallState;
 
-/// Inputs to the submission builder. Caller provides everything the
-/// engine knows about this scan; this module wraps it into the wire
-/// payload + signs + posts.
-///
-/// Mirrors the backend schema's required top-level keys (less
-/// `install_id` + `timestamp` which `build_payload` synthesises from
-/// freshest sources): `client_version`, `hardware`, `run_shape`,
-/// `result_summary`.
-#[derive(Debug, Clone)]
-pub struct SubmissionInputs {
-    pub client_version: String,
-    pub hardware: HardwareFingerprint,
-    pub run_shape: RunShape,
-    pub result_summary: ResultSummary,
-    /// Local copy of the run UUID — useful for engine-side
-    /// diagnostic logging (e.g. "payload built for run X"). NOT on
-    /// the wire; backend assigns its own submission_id.
-    pub run_uuid: String,
-    /// #82 — `scan_history::ScanRecord::scan_id` of the row this
-    /// submission belongs to. Threaded through so the submit
-    /// worker can stamp the server-issued `submission_id` back
-    /// onto the right history row at POST-success time. `None`
-    /// when telemetry is off OR the submission path is not the
-    /// freshly-finished scan (e.g. resubmit from history, which
-    /// already has the scan_id from a different path).
-    pub scan_id: Option<String>,
-    /// T-BENCH-ME: present only for `scope = "canonical-bench"` submissions.
-    /// Carries the work-proof + version-binding fields web's
-    /// `verifyHardenedBench` requires; `None` for every ordinary scan
-    /// submission (then `build_payload` emits no bench keys). Not serialized
-    /// directly — `build_payload` lifts it into the wire body.
-    pub bench: Option<CanonicalBench>,
-    /// Mick bench-lane UX (2026-05-30): the user's explicit lane choice
-    /// for this submission. Server treats this as authoritative per design
-    /// 12:29 PST / web d7df4c9 — when present, body.lane overrides the
-    /// server-derived has_account_linkage gating so an OAuth-linked user
-    /// who picks Casual genuinely lands on the casual board. `None` for
-    /// non-bench submissions (server falls back to existing gating).
-    /// Wire form: `"lane": "ranked"` or `"lane": "casual"` at the top
-    /// level of the /submit body. (No `#[serde(default)]` needed — the
-    /// struct isn't serde-derived; `build_payload` lifts the value into
-    /// the JSON body manually.)
-    pub lane: Option<String>,
-}
+// Phase 2-B 2026-06-01: SubmissionInputs struct moved to bench-iface
+// (alongside RunShape / ResultSummary / CanonicalBench / HardwareFingerprint
+// migrated earlier in this phase). Engine keeps the builder code that
+// constructs SubmissionInputs values + every consumer; the struct
+// definition now lives in iface so bench-real can take SubmissionInputs
+// across the trait boundary without back-importing engine internals.
+// See [[project_v032_modularization_overflow_queue]] / Phase 2-B plan.
+pub use superdeduper_bench_iface::SubmissionInputs;
 
 // Phase 2-B 2026-06-01: CanonicalBench struct moved to bench-iface
 // (same pattern as RunShape / ResultSummary). Engine retains the
@@ -114,51 +77,12 @@ pub const FEATURE_BIT_REFERENCE_ROOTS: u64 = 1 << 6;
 pub const FEATURE_BIT_INCLUDE_GLOB: u64 = 1 << 7;
 pub const FEATURE_BIT_EXCLUDE_GLOB: u64 = 1 << 8;
 
-#[derive(Debug, Clone)]
-pub enum SubmitOutcome {
-    /// 200 OK — backend accepted and ranked.
-    Accepted {
-        submission_id: String,
-        ranks: Vec<RankEntry>,
-        achievements_unlocked: Vec<String>,
-        profile_url: Option<String>,
-    },
-    /// 409 — same payload hash already on file. Neutral status.
-    /// #99/v0.2.37: the 409 body now carries the EXISTING submission_id
-    /// (web contract A, live), so the post-action reclaim-credit PATCH can
-    /// credit the existing row (fixes the re-submit-same-corpus flat-lifetime
-    /// case). `None` if the server omitted it (older server / unresolvable).
-    DuplicateNoChange { submission_id: Option<String> },
-    /// 4xx (other than 409). Caller should surface the reason; don't
-    /// retry (the payload is wrong, not the network).
-    Rejected { status: u16, reason: String },
-    /// 5xx / network. Caller should enqueue to disk for next launch.
-    /// (Persisting is done by `submit_with_queue` — see below.)
-    Transient { reason: String },
-    /// User clicked "Submit for review" on a Rejected outcome. We
-    /// saved a copy to the local review queue and (best-effort)
-    /// uploaded to /api/v1/submit/review. `review_id` is the
-    /// server-assigned id on success; `None` if the upload didn't
-    /// land but the local save did. `original_status` /
-    /// `original_reason` carry the rejection that triggered this
-    /// review — surfaced in the GUI confirmation card so the user
-    /// sees both "we sent it" + "here's what was wrong" in the
-    /// same view. Rendered with a green ✓.
-    FlaggedForReview {
-        review_id: Option<String>,
-        local_path: String,
-        original_status: u16,
-        original_reason: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RankEntry {
-    pub category: String,
-    pub bracket: String,
-    pub rank: u64,
-    pub bucket_size: u64,
-}
+// Phase 2-B 2026-06-01: SubmitOutcome enum + RankEntry struct moved to
+// bench-iface alongside SubmissionInputs. The trait surface
+// (SubmissionExecutor::submit_recorded) returns SubmitOutcome across
+// the cut-line, so the enum must live in iface. Engine keeps every
+// consumer; only the type definitions migrated.
+pub use superdeduper_bench_iface::{RankEntry, SubmitOutcome};
 
 /// #144 — Derive the canonical JSON Schema for the submission wire
 /// structs (`RunShape`, `ResultSummary`, `HardwareFingerprint`) +

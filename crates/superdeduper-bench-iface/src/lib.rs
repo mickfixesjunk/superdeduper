@@ -73,18 +73,89 @@ pub struct BenchOutcome {
 /// Inputs for the non-bench HMAC scan-submit path. Opaque placeholder
 /// for the scaffold; P0-D replaces this with the real `SubmissionInputs`
 /// (currently in `src/leaderboard/submission.rs`).
+/// Engine-canonical submission inputs.
+///
+/// Mirrors the backend schema's required top-level keys (less
+/// `install_id` + `timestamp` which `build_payload` synthesises from
+/// freshest sources): `client_version`, `hardware`, `run_shape`,
+/// `result_summary`.
+///
+/// Phase 2-B 2026-06-01: real shape replacing the P0-D Phase 1
+/// placeholder. The placeholder had 3 fields (client_version + run_uuid
+/// + payload_json); this is the real wire-shape that engine
+/// submission.rs + bench_run.rs use.
 #[derive(Debug, Clone)]
 pub struct SubmissionInputs {
     pub client_version: String,
+    pub hardware: HardwareFingerprint,
+    pub run_shape: RunShape,
+    pub result_summary: ResultSummary,
+    /// Local copy of the run UUID -- useful for engine-side
+    /// diagnostic logging. NOT on the wire; backend assigns its own
+    /// submission_id.
     pub run_uuid: String,
-    pub payload_json: String,
+    /// #82 -- `scan_history::ScanRecord::scan_id` of the row this
+    /// submission belongs to. Threaded through so the submit worker
+    /// can stamp the server-issued `submission_id` back onto the
+    /// right history row at POST-success time.
+    pub scan_id: Option<String>,
+    /// T-BENCH-ME: present only for `scope = "canonical-bench"`
+    /// submissions. Carries the work-proof + version-binding fields.
+    /// `None` for every ordinary scan submission.
+    pub bench: Option<CanonicalBench>,
+    /// Mick bench-lane UX: the user's explicit lane choice for this
+    /// submission. Server treats this as authoritative; when present,
+    /// body.lane overrides the server-derived has_account_linkage
+    /// gating. Wire form: `"lane": "ranked"` or `"lane": "casual"`.
+    pub lane: Option<String>,
 }
 
-/// Outcome of a non-bench submit. Opaque placeholder for the scaffold.
+/// One leaderboard rank-entry the server returns in `SubmitOutcome::Accepted.ranks`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RankEntry {
+    pub category: String,
+    pub bracket: String,
+    pub rank: u64,
+    pub bucket_size: u64,
+}
+
+/// Outcome of a non-bench submit.
+///
+/// Phase 2-B 2026-06-01: real enum replacing the P0-D Phase 1
+/// placeholder struct. The placeholder had submission_id +
+/// server_response; this is the real shape with Accepted /
+/// DuplicateNoChange / Rejected / Transient / FlaggedForReview
+/// variants matching engine submission::SubmitOutcome.
 #[derive(Debug, Clone)]
-pub struct SubmitOutcome {
-    pub submission_id: String,
-    pub server_response: String,
+pub enum SubmitOutcome {
+    /// 200 OK -- backend accepted and ranked.
+    Accepted {
+        submission_id: String,
+        ranks: Vec<RankEntry>,
+        achievements_unlocked: Vec<String>,
+        profile_url: Option<String>,
+    },
+    /// 409 -- same payload hash already on file. Neutral status.
+    /// `submission_id` carries the EXISTING submission_id when the
+    /// server supplies it (post-#99 contract A); `None` if the server
+    /// omitted it (older server / unresolvable).
+    DuplicateNoChange { submission_id: Option<String> },
+    /// 4xx (other than 409). Caller should surface the reason; don't
+    /// retry (the payload is wrong, not the network).
+    Rejected { status: u16, reason: String },
+    /// 5xx / network. Caller should enqueue to disk for next launch.
+    Transient { reason: String },
+    /// User clicked "Submit for review" on a Rejected outcome. We
+    /// saved a copy to the local review queue and (best-effort)
+    /// uploaded to /api/v1/submit/review. `review_id` is the
+    /// server-assigned id on success; `None` if the upload didn't
+    /// land but the local save did.
+    FlaggedForReview {
+        review_id: Option<String>,
+        local_path: String,
+        original_status: u16,
+        original_reason: String,
+    },
 }
 
 /// One challenge position descriptor.
