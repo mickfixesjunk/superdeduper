@@ -538,6 +538,17 @@ pub struct ScanArgs {
     #[arg(long)]
     pub force_mft: bool,
 
+    /// v0.3.23 (2026-06-01) — walk multi-root scans concurrently via
+    /// rayon `par_iter` rather than serially. Each parallel root gets
+    /// its own symlink-cycle `visited_dirs` HashSet (cross-root
+    /// duplicate aliases caught by the post-walk dedup pass). Default
+    /// off; opt-in for the multi-root case (e.g. 4 folders on the same
+    /// HDD scanned together for multi-folder-same-HDD seek-thrashing
+    /// measurement, or N folders across N volumes for cross-disk
+    /// parallelism). No-op on single-root scans.
+    #[arg(long)]
+    pub parallel_roots: bool,
+
     /// #81 — Master toggle for the safe-defaults exclusion filter
     /// (the preset packs that skip system DLLs, .git internals,
     /// OS-protected paths, and AV signature databases). Default ON

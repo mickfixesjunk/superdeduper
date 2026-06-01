@@ -59,6 +59,15 @@ pub struct ScanConfig {
     ///   `FSCTL_ENUM_USN_DATA` syscall when the volume happens to be
     ///   shaped right for the MFT path's full-volume scan.
     pub force_mft: bool,
+    /// v0.3.23 (2026-06-01): when true, multi-root scans walk all
+    /// roots concurrently via rayon `par_iter` rather than serially.
+    /// Each parallel root gets its own symlink-cycle `visited_dirs`
+    /// HashSet (cross-root duplicate aliases caught by the post-walk
+    /// `dedup_by_path` pass). Default false; opt-in via
+    /// `--parallel-roots` for the multi-root use case (Mick: 4 folders
+    /// on the same HDD scanned together). On a single-root scan the
+    /// flag is a no-op.
+    pub parallel_roots: bool,
     /// T2.1 phase 6: when true, the hash worker tier guard accepts
     /// cloud-recall placeholders (forcing hydration on read). Default
     /// false. Flows from `--allow-recall-on-read`.
@@ -131,6 +140,7 @@ impl ScanConfig {
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
             force_mft: args.force_mft,
+            parallel_roots: args.parallel_roots,
             allow_recall_on_read: args.allow_recall_on_read,
             hash_algo: args.hash_algo.into(),
             // #81 — Wire the CLI's exclusion flags into the runtime
@@ -321,6 +331,7 @@ mod tests {
             follow_links: false,
             allow_system_paths: false,
             force_mft: false,
+            parallel_roots: false,
             placeholders_only: false,
             force_hash: false,
             allow_recall_on_read: false,

@@ -210,22 +210,53 @@ where
     // directory reached via a followed symlink gets its identity
     // recorded so we don't recurse twice into the same physical dir.
     let mut visited_dirs: HashSet<DirIdentity> = HashSet::new();
-    // Phase 4 v0.3.23 prep (sub-step A 2026-06-01): the per-root work
-    // is extracted into `walk_one_root_buffered`, which collects per-root
-    // events into a `Vec<OwnedWalkEvent>` instead of firing the callback
-    // mid-walk. The driver replays each root's events through the
-    // caller's `FnMut` after that root finishes -- preserves the
-    // existing per-root ordering invariant + opens the door to sub-step
-    // B (par_iter over roots) without further callback-lifetime churn.
-    for root in &cfg.roots {
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            break;
+    // Phase 4 v0.3.23 (sub-step A+B 2026-06-01): per-root work runs
+    // through `walk_one_root_buffered`, which collects per-root events
+    // into a `Vec<OwnedWalkEvent>` for replay through the caller's
+    // `FnMut`. When `cfg.parallel_roots` is set, `cfg.roots.par_iter()`
+    // walks all roots concurrently via rayon (each parallel root has
+    // its own `visited_dirs`; cross-root duplicate aliases caught by
+    // the post-walk `dedup_by_path` pass). When `parallel_roots` is
+    // false (default), the loop runs serially with a single shared
+    // `visited_dirs` to preserve the v0.3.22 behavior byte-exactly.
+    if cfg.parallel_roots && cfg.roots.len() > 1 {
+        // Each parallel root needs its own visited_dirs. follow_links is
+        // off by default so this almost always stays empty anyway; when
+        // on, the cost is N-fold redundant cycle-detection inserts +
+        // duplicate-walks caught by dedup_by_path post-pass.
+        let results: Vec<Result<(Vec<FileEntry>, Vec<OwnedWalkEvent>)>> = cfg
+            .roots
+            .par_iter()
+            .map(|root| {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+                let mut per_root_visited: HashSet<DirIdentity> = HashSet::new();
+                walk_one_root_buffered(root, cfg, cancel, &mut per_root_visited)
+            })
+            .collect();
+        // Replay events + extend out in cfg.roots order (collect()
+        // preserves source order); first error wins via try-collect-
+        // equivalent below.
+        for r in results {
+            let (entries, events) = r?;
+            for ev in &events {
+                callback(ev.as_borrowed());
+            }
+            out.extend(entries);
         }
-        let (entries, events) = walk_one_root_buffered(root, cfg, cancel, &mut visited_dirs)?;
-        for ev in &events {
-            callback(ev.as_borrowed());
+    } else {
+        for root in &cfg.roots {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break;
+            }
+            let (entries, events) =
+                walk_one_root_buffered(root, cfg, cancel, &mut visited_dirs)?;
+            for ev in &events {
+                callback(ev.as_borrowed());
+            }
+            out.extend(entries);
         }
-        out.extend(entries);
     }
     // #70 (v0.2.12 P2) — defensive walker-side path dedup. assert_unique_paths
     // in src/pipeline/mod.rs:86 is a debug_assert against the same-path-twice

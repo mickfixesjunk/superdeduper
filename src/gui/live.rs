@@ -2689,6 +2689,7 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         // GUI never sets force_mft; it's an A/B knob exposed via
         // the CLI for the v0.3.14 inventory matrix only.
         force_mft: false,
+        parallel_roots: false,
         // GUI settings don't surface the placeholder-policy knob yet;
         // tier guard defaults to conservative (refuse cloud recalls).
         // Phase 7 GUI counter exposes the bucket; a future iteration

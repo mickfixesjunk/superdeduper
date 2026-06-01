@@ -1302,6 +1302,7 @@ mod tests {
             follow_links: false,
             allow_system_paths: false,
             force_mft: false,
+            parallel_roots: false,
             allow_recall_on_read: false,
             io_threads: 4,
             hash_algo: HashAlgo::Blake3,
