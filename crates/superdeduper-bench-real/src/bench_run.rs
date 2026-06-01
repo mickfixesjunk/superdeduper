@@ -1030,31 +1030,13 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((std::fs::read(path)?, false))
 }
 
-/// Per-candidate diff report for `debug_dedup_diff`. One entry per
-/// candidate whose three reads (parallel cold-bypass, serial cold-bypass,
-/// serial buffered) don't all agree on `blake3(content)`.
-pub struct DebugDedupDiff {
-    pub path_index: u64,
-    pub path: std::path::PathBuf,
-    pub size: u64,
-    pub parallel_hash: [u8; 32],
-    pub parallel_cold: bool,
-    pub serial_hash: [u8; 32],
-    pub serial_cold: bool,
-    pub buffered_hash: [u8; 32],
-}
-
-/// Aggregate report from `debug_dedup_diff`. The three dup-group counts
-/// should agree on a correct dedup; any divergence is the bug.
-pub struct DebugDedupDiffReport {
-    pub files_enumerated: u64,
-    pub candidate_count: u64,
-    pub parallel_dup_groups: usize,
-    pub serial_dup_groups: usize,
-    pub buffered_dup_groups: usize,
-    /// candidates where the three reads disagree, sorted by path_index.
-    pub diffs: Vec<DebugDedupDiff>,
-}
+// Phase 2-B v0.3.20 (2026-06-01): DebugDedupDiff + DebugDedupDiffReport
+// promoted to canonical iface types. The local copies that came along
+// in 16d13b9 (the bench_run.rs body move) collided with the iface
+// versions; the iface ones are canonical (used by the BenchExecutor
+// trait return type), so this module pub-uses them rather than
+// defining its own.
+pub use superdeduper_bench_iface::{DebugDedupDiff, DebugDedupDiffReport};
 
 /// DEBUG helper for the cert digest mismatch (#116): dedup a corpus dir
 /// THREE WAYS — production parallel cold-bypass, serial cold-bypass, and

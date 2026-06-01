@@ -66,6 +66,14 @@ impl BenchReal {
 }
 
 impl BenchExecutor for BenchReal {
+    /// Phase 2-B v0.3.20 (2026-06-01): STILL `Unavailable`. The trait
+    /// `BenchContext` (4 fields: install_id + corpus_version + tier + lane)
+    /// doesn't carry the install_key / server_url / workroot / fresh /
+    /// submit_fn / hardware_detect that the moved `bench_run::run()`
+    /// expects. Wiring this real body requires BenchContext expansion +
+    /// trait surface evolution; Phase 3 candidate. Engine call sites
+    /// (CLI + GUI bench button) currently call `bench_run::run` directly
+    /// via the engine re-export shim -- that path is fully functional.
     fn run_bench(
         &self,
         _ctx: BenchContext,
@@ -75,11 +83,24 @@ impl BenchExecutor for BenchReal {
         Err(BenchError::Unavailable)
     }
 
+    /// Phase 2-B v0.3.20 (2026-06-01): REAL implementation. Delegates to
+    /// `bench_run::debug_dedup_diff` (moved here in 16d13b9). The
+    /// `anyhow::Result` -> `Result<_, BenchError>` mapping classifies IO
+    /// errors as `CorpusIo` and everything else as `Internal` (the
+    /// callers `sd debug dedup-diff` + the GUI diagnostic surface render
+    /// the message verbatim either way; the variant just steers the
+    /// telemetry channel).
     fn debug_dedup_diff(
         &self,
-        _corpus_dir: &Path,
+        corpus_dir: &Path,
     ) -> Result<DebugDedupDiffReport, BenchError> {
-        Err(BenchError::Unavailable)
+        crate::bench_run::debug_dedup_diff(corpus_dir).map_err(|e| {
+            if e.downcast_ref::<std::io::Error>().is_some() {
+                BenchError::CorpusIo(format!("{e:#}"))
+            } else {
+                BenchError::Internal(format!("{e:#}"))
+            }
+        })
     }
 }
 
