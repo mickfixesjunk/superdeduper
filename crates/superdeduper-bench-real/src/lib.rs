@@ -33,6 +33,7 @@
 pub mod bench;
 pub mod bench_client;
 pub mod bench_corpus;
+pub mod bench_run;
 pub mod d7_probe;
 
 use std::path::Path;
