@@ -160,7 +160,23 @@ pub fn show(
         )
         .fill(theme::ACCENT)
         .min_size(vec2(150.0, 28.0));
-        if ui.add_enabled(can_scan || is_scanning, primary).clicked() {
+        let primary_response = ui.add_enabled(can_scan || is_scanning, primary);
+        // #189 — accessibility tooltip surfaces the keyboard shortcut.
+        // Screen readers read tooltip text; the hint also helps
+        // power-users + UIA SendKeys harnesses that drive sd via
+        // assistive-tech APIs. See gui::accessibility for the catalog.
+        let primary_response = if is_scanning {
+            primary_response.on_hover_text(format!(
+                "Pause the in-flight scan ({}).",
+                crate::gui::accessibility::shortcut_label_cancel_scan()
+            ))
+        } else {
+            primary_response.on_hover_text(format!(
+                "Run a duplicate scan over the listed roots ({}).",
+                crate::gui::accessibility::shortcut_label_start_scan()
+            ))
+        };
+        if primary_response.clicked() {
             action = Some(if is_scanning {
                 RootsAction::Pause
             } else {

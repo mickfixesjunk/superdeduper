@@ -10,6 +10,7 @@
 //! read trace, an animated pipeline funnel, per-drive throughput scopes,
 //! and a squarified treemap of reclaimable space.
 
+pub mod accessibility;
 pub mod app;
 pub mod archive;
 pub mod checkpoint;

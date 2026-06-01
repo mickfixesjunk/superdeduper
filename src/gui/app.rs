@@ -4132,6 +4132,39 @@ impl eframe::App for SuperdeduperApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
+        // Accessibility-action dispatch (#189, 2026-05-31). Keyboard
+        // shortcuts route to the same internal handlers as the
+        // corresponding action buttons; this gives screen-readers,
+        // assistive-tech automation, and UIA SendKeys harnesses a
+        // secondary input path that doesn't depend on accesskit
+        // invoke-vs-winit-pointer-event divergence. See
+        // src/gui/accessibility.rs for the catalog + rationale.
+        for action in crate::gui::accessibility::consume_pressed_shortcuts(ctx) {
+            use crate::gui::accessibility::AccessibilityAction;
+            match action {
+                AccessibilityAction::StartScan => {
+                    // Mirror the "▶  Start scan" button: gated by
+                    // can_scan (roots non-empty + not already
+                    // scanning). Preflight modal still applies —
+                    // keyboard shortcuts don't bypass user-consent
+                    // gates, they just provide an alternative way
+                    // to fire the same initial dispatch.
+                    if !self.is_scanning && !self.persisted.roots.is_empty() {
+                        self.start_live();
+                    }
+                }
+                AccessibilityAction::CancelScan => {
+                    // Only meaningful while a scan is in flight;
+                    // request_pause is the same handler the
+                    // "Cancel" / "Pause" button calls. No-op
+                    // otherwise.
+                    if self.is_scanning {
+                        self.request_pause();
+                    }
+                }
+            }
+        }
+
         // #140 -- A-update-modal-extraction. Early-return modals
         // dispatched through per-modal render fns; each returns
         // Flow::Return if it consumed the frame. The non-blocking
