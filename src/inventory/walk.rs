@@ -991,6 +991,202 @@ where
     Ok(())
 }
 
+/// Per-folder pure enumeration for the Windows MFT fast path (via
+/// `FileIdBothDirectoryInfo`). Used by the layer-parallel BFS driver
+/// (#194). Mirrors `walk_fast_path()` body exactly:
+///
+/// * Reparse-point tag fetch + symlink follow_links handling
+/// * is_superdeduper_self_path skip
+/// * size/min-size/max-size/exclusions/globs filter ladder
+///
+/// Subdirs go into `result.subdirs` (NOT recursed). Events go into
+/// `result.events` (NOT emitted via callback). Cancellation flips
+/// `result.cancelled`.
+///
+/// `Entered` event emission lives in the driver per the read_dir
+/// pure helper's convention.
+#[cfg(windows)]
+fn enumerate_one_folder_fast_path(
+    dir: &Path,
+    depth: u32,
+    enumeration: crate::inventory::dir_enum::DirFullEnumeration,
+    cfg: &ScanConfig,
+    cancel: Option<&AtomicBool>,
+) -> FolderResult {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+    let mut result = FolderResult::default();
+
+    for entry in enumeration.entries {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            result.cancelled = true;
+            return result;
+        }
+        let path = dir.join(&entry.name);
+
+        if is_superdeduper_self_path(&path) {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "superdeduper self-footprint",
+            });
+            continue;
+        }
+
+        let reparse_tag = if (entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            crate::winapi_wrappers::fetch_reparse_tag(&path)
+        } else {
+            None
+        };
+        let is_symlink = reparse_tag == Some(IO_REPARSE_TAG_SYMLINK);
+
+        if is_symlink {
+            if !cfg.follow_links {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path,
+                    reason: "symlink (use --follow-links to include)",
+                });
+                continue;
+            }
+            // --follow-links: re-stat through the symlink.
+            let target_meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => {
+                    result.events.push(OwnedWalkEvent::EntrySkipped {
+                        path,
+                        reason: "symlink target unreadable",
+                    });
+                    continue;
+                }
+            };
+            if target_meta.is_dir() {
+                // Driver's visited_dirs check catches cycles.
+                result.subdirs.push((path, depth + 1));
+                continue;
+            }
+            if !target_meta.is_file() {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path,
+                    reason: "not a regular file",
+                });
+                continue;
+            }
+            let target_size = target_meta.len();
+            if target_size < cfg.min_size {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path,
+                    reason: "below min-size",
+                });
+                continue;
+            }
+            if let Some(max) = cfg.max_size {
+                if target_size > max {
+                    result.events.push(OwnedWalkEvent::EntrySkipped {
+                        path,
+                        reason: "above max-size",
+                    });
+                    continue;
+                }
+            }
+            if dropped_by_exclusions(&path, target_size, cfg) {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path,
+                    reason: "Settings \u{2192} Exclusions",
+                });
+                continue;
+            }
+            if !path_passes_globs(&path, cfg) {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path,
+                    reason: "filtered by include/exclude",
+                });
+                continue;
+            }
+            result.events.push(OwnedWalkEvent::FileFound {
+                path: path.clone(),
+                size: target_size,
+            });
+            let target_attrs = win_file_attributes(&target_meta);
+            let target_reparse_tag = if (target_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                crate::winapi_wrappers::fetch_reparse_tag(&path)
+            } else {
+                None
+            };
+            result.entries.push(FileEntry {
+                path,
+                size: target_size,
+                mtime: filetime_ticks(&target_meta),
+                file_ref: 0,
+                parent_ref: 0,
+                usn: 0,
+                attributes: target_attrs,
+                volume_guid: None,
+                placeholder: crate::inventory::placeholder::classify(
+                    target_attrs,
+                    target_reparse_tag,
+                ),
+            });
+            continue;
+        }
+
+        if entry.is_dir {
+            result.subdirs.push((path, depth + 1));
+            continue;
+        }
+
+        // Regular file branch.
+        let size = entry.size;
+        if size < cfg.min_size {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "below min-size",
+            });
+            continue;
+        }
+        if let Some(max) = cfg.max_size {
+            if size > max {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path,
+                    reason: "above max-size",
+                });
+                continue;
+            }
+        }
+        if dropped_by_exclusions(&path, size, cfg) {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "Settings \u{2192} Exclusions",
+            });
+            continue;
+        }
+        if !path_passes_globs(&path, cfg) {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "filtered by include/exclude",
+            });
+            continue;
+        }
+
+        result.events.push(OwnedWalkEvent::FileFound {
+            path: path.clone(),
+            size,
+        });
+
+        result.entries.push(FileEntry {
+            path,
+            size,
+            mtime: entry.mtime_filetime,
+            file_ref: entry.file_id,
+            parent_ref: 0,
+            usn: 0,
+            attributes: entry.attributes,
+            volume_guid: enumeration.volume_guid.clone(),
+            placeholder: crate::inventory::placeholder::classify(entry.attributes, reparse_tag),
+        });
+    }
+    result
+}
+
 /// Per-folder pure enumeration for the stdlib `read_dir` fallback
 /// path. Used by the layer-parallel BFS driver (#194). Mirrors the
 /// inner loop semantics of `walk()`'s read_dir block exactly:
