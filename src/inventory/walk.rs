@@ -991,6 +991,190 @@ where
     Ok(())
 }
 
+/// Per-folder pure enumeration for the stdlib `read_dir` fallback
+/// path. Used by the layer-parallel BFS driver (#194). Mirrors the
+/// inner loop semantics of `walk()`'s read_dir block exactly:
+///
+/// * Reparse-point classification + symlink follow_links handling
+/// * is_superdeduper_self_path skip
+/// * size/min-size/max-size/exclusions/globs filter ladder
+/// * Cancellation check at start of each entry
+///
+/// Key differences from `walk()`:
+///
+/// * Does NOT recurse into subdirs -- they're collected into
+///   `result.subdirs` as `(path, depth+1)` tuples for the BFS driver
+///   to feed into the next layer.
+/// * Does NOT call any `FnMut` callback -- events are pushed into
+///   `result.events` for the driver to drain on the main thread.
+/// * Does NOT touch `visited_dirs` -- symlink-cycle detection lives
+///   in the driver as a serial pre-filter before each parallel batch.
+///
+/// `Entered` event is NOT emitted here (it's the driver's responsibility
+/// to emit it before launching the per-folder worker, so the order is
+/// "Entered first, then entries").
+fn enumerate_one_folder_read_dir(
+    dir: &Path,
+    depth: u32,
+    cfg: &ScanConfig,
+    cancel: Option<&AtomicBool>,
+) -> FolderResult {
+    let mut result = FolderResult::default();
+
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            result.events.push(OwnedWalkEvent::DirError {
+                path: dir.to_path_buf(),
+                message: "permission denied".into(),
+            });
+            return result;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return result;
+        }
+        Err(e) => {
+            result.events.push(OwnedWalkEvent::DirError {
+                path: dir.to_path_buf(),
+                message: e.to_string(),
+            });
+            return result;
+        }
+    };
+
+    for entry in read {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            result.cancelled = true;
+            return result;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                result.events.push(OwnedWalkEvent::DirError {
+                    path: dir.to_path_buf(),
+                    message: format!("entry error: {e}"),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path: path.clone(),
+                    reason: "metadata failed",
+                });
+                continue;
+            }
+        };
+
+        let entry_was_symlink = metadata.file_type().is_symlink();
+        let metadata = if entry_was_symlink {
+            if !cfg.follow_links {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path: path.clone(),
+                    reason: "symlink (use --follow-links to include)",
+                });
+                continue;
+            }
+            // --follow-links: re-stat through the symlink so downstream
+            // checks see the TARGET's attributes, not the link's.
+            match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => {
+                    result.events.push(OwnedWalkEvent::EntrySkipped {
+                        path: path.clone(),
+                        reason: "symlink target unreadable",
+                    });
+                    continue;
+                }
+            }
+        } else {
+            metadata
+        };
+        let _ = entry_was_symlink;
+
+        if is_superdeduper_self_path(&path) {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path: path.clone(),
+                reason: "superdeduper self-footprint",
+            });
+            continue;
+        }
+
+        if metadata.is_dir() {
+            result.subdirs.push((path, depth + 1));
+            continue;
+        }
+        if !metadata.is_file() {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "not a regular file",
+            });
+            continue;
+        }
+
+        let size = metadata.len();
+        if size < cfg.min_size {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "below min-size",
+            });
+            continue;
+        }
+        if let Some(max) = cfg.max_size {
+            if size > max {
+                result.events.push(OwnedWalkEvent::EntrySkipped {
+                    path,
+                    reason: "above max-size",
+                });
+                continue;
+            }
+        }
+        if dropped_by_exclusions(&path, size, cfg) {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "Settings \u{2192} Exclusions",
+            });
+            continue;
+        }
+        if !path_passes_globs(&path, cfg) {
+            result.events.push(OwnedWalkEvent::EntrySkipped {
+                path,
+                reason: "filtered by include/exclude",
+            });
+            continue;
+        }
+
+        result.events.push(OwnedWalkEvent::FileFound {
+            path: path.clone(),
+            size,
+        });
+
+        let attributes = win_file_attributes(&metadata);
+        let reparse_tag = if (attributes & 0x400) != 0 {
+            crate::winapi_wrappers::fetch_reparse_tag(&path)
+        } else {
+            None
+        };
+        let (file_ref, volume_guid) = inode_identity(&metadata);
+        result.entries.push(FileEntry {
+            path,
+            size,
+            mtime: filetime_ticks(&metadata),
+            file_ref,
+            parent_ref: 0,
+            usn: 0,
+            attributes,
+            volume_guid,
+            placeholder: crate::inventory::placeholder::classify(attributes, reparse_tag),
+        });
+    }
+    result
+}
+
 fn path_passes_globs(path: &Path, cfg: &ScanConfig) -> bool {
     if let Some(inc) = &cfg.include {
         if !inc.is_match(path) {
