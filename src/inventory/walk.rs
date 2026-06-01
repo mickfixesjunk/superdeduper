@@ -66,6 +66,78 @@ pub enum WalkEvent<'a> {
     SymlinkCycleSkipped { from: &'a Path, target: PathBuf },
 }
 
+/// Owned twin of [`WalkEvent`]. Used by the layer-parallel BFS path
+/// (#194 walker conversion) so per-folder enumeration can collect
+/// events in parallel without borrowing the caller's `&mut FnMut`
+/// callback. Driver drains these on the main thread after each layer
+/// completes and synthesises borrowed `WalkEvent<'_>`s for the
+/// caller's FnMut.
+///
+/// The borrowed `WalkEvent::SymlinkCycleSkipped` carries a `&Path` for
+/// `from` and an owned `PathBuf` for `target`; the Owned variant just
+/// promotes both to owned, since the parallel path doesn't have the
+/// caller's lifetime to borrow against.
+#[derive(Debug, Clone)]
+pub(crate) enum OwnedWalkEvent {
+    Entered { path: PathBuf, depth: u32 },
+    FileFound { path: PathBuf, size: u64 },
+    DirError { path: PathBuf, message: String },
+    EntrySkipped { path: PathBuf, reason: &'static str },
+    SymlinkCycleSkipped { from: PathBuf, target: PathBuf },
+}
+
+impl OwnedWalkEvent {
+    /// Synthesise a borrowed [`WalkEvent`] for the caller's `FnMut`
+    /// callback. The returned event borrows from `self`; lifetime is
+    /// the borrow of `&self`.
+    pub(crate) fn as_borrowed(&self) -> WalkEvent<'_> {
+        match self {
+            OwnedWalkEvent::Entered { path, depth } => WalkEvent::Entered {
+                path,
+                depth: *depth,
+            },
+            OwnedWalkEvent::FileFound { path, size } => WalkEvent::FileFound {
+                path,
+                size: *size,
+            },
+            OwnedWalkEvent::DirError { path, message } => WalkEvent::DirError {
+                path,
+                message: message.clone(),
+            },
+            OwnedWalkEvent::EntrySkipped { path, reason } => WalkEvent::EntrySkipped {
+                path,
+                reason: *reason,
+            },
+            OwnedWalkEvent::SymlinkCycleSkipped { from, target } => {
+                WalkEvent::SymlinkCycleSkipped {
+                    from,
+                    target: target.clone(),
+                }
+            }
+        }
+    }
+}
+
+/// Result of enumerating ONE folder serially (no recursion). Produced
+/// by the layer-parallel BFS path's per-folder workers; drained on the
+/// main thread.
+///
+/// * `entries`: file rows ready to flow into the inventory `Vec<FileEntry>`.
+/// * `subdirs`: child directories discovered in this folder, with the
+///   depth they should be visited at (parent_depth + 1). The BFS
+///   driver merges these into the next layer's frontier.
+/// * `events`: deferred WalkEvent emissions. Drained in order on the
+///   main thread to preserve the existing FnMut callback contract.
+/// * `cancelled`: true if the cancel flag flipped mid-enumeration; the
+///   driver stops the BFS in that case.
+#[derive(Debug, Default)]
+pub(crate) struct FolderResult {
+    pub(crate) entries: Vec<FileEntry>,
+    pub(crate) subdirs: Vec<(PathBuf, u32)>,
+    pub(crate) events: Vec<OwnedWalkEvent>,
+    pub(crate) cancelled: bool,
+}
+
 pub fn enumerate(cfg: &ScanConfig) -> Result<Vec<FileEntry>> {
     enumerate_with_progress(cfg, |_| {})
 }
