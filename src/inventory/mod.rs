@@ -56,29 +56,45 @@ pub struct FileEntry {
 
 /// Enumerate every eligible file under the scan roots.
 ///
-/// Strategy:
-/// * If every scan root is a volume root (e.g. `C:\`, `D:\`, `/`), try the
-///   MFT fast path first; on failure (or non-NTFS), fall back to walking.
-/// * If any scan root is a strict subdirectory (e.g. `C:\Windows`), skip
-///   MFT entirely and go straight to walker.
+/// Strategy (v0.3.16 Path B; Mick GO 2026-06-01 07:53 PDT):
+/// * **Default**: route every root through the directory walker.
+///   Layer-parallel BFS (per `walk_bfs`) handles volume roots and
+///   subdirectories alike; correctness is uniform.
+/// * **Opt-in**: `--force-mft` + every root is a volume root +
+///   admin-elevated process → use the MFT fast path. Falls back to
+///   the walker on EACCES (non-admin) or any other MFT enum failure.
 ///
-/// Why the subdir carve-out:
-/// MFT enum reads the **full volume's** records, then `under_any_root`
-/// filters them. For a subdir scan that's wasted work — the headline finding
-/// from sys32-r2-broader-scope was 95% of wall-clock spent in Stage 1 because
-/// of this. The walker is bounded to the target subtree.
+/// Why walker as the default (the Path B decision):
 ///
-/// Worse, MFT reconstructs ONE canonical path per inode via the primary
-/// `parent_ref` chain. For hardlinked files whose primary path lies outside
-/// the scan root (e.g. a System32 file whose MFT-primary alias is in
-/// WinSxS), `under_any_root` rejects the reconstructed path and the file
-/// is silently dropped from the inventory — measured at 738 inodes when the
-/// walker fallback saw 11,299 paths on the same corpus. That's data-loss
-/// territory, not just a perf issue.
+/// 1. MFT path silently elides hardlink aliases. It reconstructs ONE
+///    canonical path per inode via the primary `parent_ref` chain.
+///    For hardlinked files whose primary path lies outside the scan
+///    root (e.g. a System32 file whose MFT-primary alias is in
+///    WinSxS), `under_any_root` rejects the reconstructed path and
+///    the file is silently dropped from the inventory — measured at
+///    738 inodes when the walker fallback saw 11,299 paths on the
+///    same corpus, and 685k MFT entries vs 793k walker entries on a
+///    full C:\ scan (benchmarker D'' 2026-06-01 07:45 PDT). The
+///    walker sees every alias as a FileEntry.
 ///
-/// The walker sees hardlink aliases natively (one FileEntry per directory
-/// entry) and doesn't pay the whole-volume MFT cost. MFT remains the
-/// fast-path for whole-volume scans where it's genuinely faster.
+/// 2. MFT path historically skipped the engine's exclusion filters
+///    (`is_superdeduper_self_path`, `dropped_by_exclusions`) that the
+///    walker applies. Net effect on cell-D was ~41k system-DLL /
+///    OS-protected paths surfaced as dedup candidates that the user
+///    explicitly excluded by policy.
+///
+/// 3. Per-file enumeration cost. MFT path reads the **full volume's**
+///    USN records via `FSCTL_ENUM_USN_DATA` then does a separate
+///    `fs::metadata()` syscall per surviving record (to fetch size,
+///    which the USN record doesn't carry). Walker uses
+///    `FileIdBothDirectoryInfo` per-folder — name + size + attrs +
+///    mtime + inode in one batched call. Benchmarker D' measured
+///    walker walk_us/file ~17 us on full C:\ vs MFT walk_us/file
+///    ~143 us = 8.3x faster per-file even at volume scale.
+///
+/// MFT is retained as an opt-in escape hatch for admin power-users
+/// who want raw walk-stage speed on a volume where they understand
+/// the hardlink-elision + exclusion-skip tradeoffs.
 ///
 /// Filtering against `min_size` / `max_size` / include / exclude globs
 /// happens here so downstream stages never see ineligible files.
@@ -145,38 +161,46 @@ pub fn enumerate_with_skipped(
         }
     };
 
-    let files = if cfg.force_walker {
-        // v0.3.14 escape hatch -- benchmarker validates the
-        // walker-on-root extrapolation before any default change.
-        // The 2026-06-01 cell-D measurement put MFT-path at
-        // ~73 us/file vs walker ~6.7 us/file on the same hardware,
-        // suggesting volume-root scans would be faster through the
-        // walker. Flag-gated so we measure before flipping.
-        tracing::info!(
-            roots = ?cfg.roots,
-            "force_walker enabled; routing every root through the directory walker (MFT path bypassed)",
-        );
-        walk::enumerate_with_progress(cfg, walker_event_callback)?
-    } else if !all_roots_are_volume_roots(&cfg.roots) {
-        tracing::info!(
-            roots = ?cfg.roots,
-            "scan root is a subdirectory; using walker (MFT path skipped — see inventory/mod.rs doc)",
-        );
+    let files = if !cfg.force_mft || !all_roots_are_volume_roots(&cfg.roots) {
+        // v0.3.16 Path B (Mick GO 2026-06-01 07:53 PDT): walker is the
+        // default for every root, including volume roots like C:\.
+        // Benchmarker D'/D'' (07:36-07:45 PDT) validated the walker
+        // is BOTH faster (8.8x walk on full C:\) AND more correct (sees
+        // all hardlink aliases; applies exclusion filters the MFT path
+        // skipped). The MFT path's lower bytes-read isn't a perf win --
+        // it's missing data (data-loss territory per the docstring
+        // below). Path B chooses correctness as default.
+        //
+        // MFT path stays available via --force-mft for admin power-users
+        // who accept the hardlink-canonical-path elision + missing
+        // exclusion-filter coverage tradeoffs for raw speed on volumes
+        // where they understand both costs. Non-admin processes can't
+        // open \\?\Volume anyway -- MFT enum returns ACCESS_DENIED and
+        // falls through to the walker.
+        if cfg.force_mft && !all_roots_are_volume_roots(&cfg.roots) {
+            tracing::info!(
+                roots = ?cfg.roots,
+                "force_mft requested but at least one root is a subdir; using walker (MFT only applies to volume roots)",
+            );
+        }
         walk::enumerate_with_progress(cfg, walker_event_callback)?
     } else {
+        // --force-mft + every root is a volume root: opt into the MFT
+        // fast path. Falls back to the walker on ACCESS_DENIED (non-
+        // admin) or any other MFT enumeration failure.
         match mft::enumerate(cfg, cache) {
             Ok(v) => v,
             Err(e) => {
-                // User-actionable hint at default verbosity: most
-                // non-admin users see this on every volume-root scan
-                // because the MFT fast path needs an elevated process
-                // token. Per Mick directive 2026-06-01: surface the
-                // 'run as admin for faster scans' tip rather than the
-                // raw CreateFileW + GUID + 0x80070005 error string.
-                // The full syscall context stays one log-level down
-                // for troubleshooting (-v / RUST_LOG=debug).
+                // Path B (v0.3.16+): MFT is opt-in, so this fallback
+                // fires only when the user explicitly requested
+                // --force-mft AND the enum failed at runtime. Most
+                // common cause is non-admin process token: MFT path
+                // opens \\?\Volume via CreateFileW which requires
+                // elevation. The walker fallback is correct + complete;
+                // the user gets a hint about the prerequisite for the
+                // MFT path they tried to opt into.
                 tracing::warn!(
-                    "Tip: run superdeduper as Administrator for faster scans on large drives (enables MFT direct-read). Falling back to directory walk."
+                    "--force-mft requested but MFT enumeration failed (typically requires running as Administrator). Falling back to directory walk."
                 );
                 tracing::debug!(error = %e, "MFT enumeration unavailable; walker fallback engaged");
                 walk::enumerate_with_progress(cfg, walker_event_callback)?
@@ -246,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_roots_force_walker() {
+    fn mixed_roots_force_mft() {
         // If any root is a subdir, the whole scan must use walker —
         // splitting per-volume would add architectural complexity for
         // a rarely-used multi-root case.

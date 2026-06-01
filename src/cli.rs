@@ -526,17 +526,17 @@ pub struct ScanArgs {
     #[arg(long)]
     pub allow_system_paths: bool,
 
-    /// Bypass the MFT volume-root fast path and route every root
-    /// (including drive roots like `C:\`) through the directory
-    /// walker. Useful for the v0.3.14 inventory matrix: benchmarker
-    /// found the MFT path is ~11x slower per file than the walker on
-    /// full-volume scans, likely because FSCTL_ENUM_USN_DATA reads
-    /// the entire volume's MFT records (including orphans/system
-    /// files) and then issues a per-file `metadata()` to fetch size.
-    /// Defaults to off (preserve v0.3.x routing). Flip to validate
-    /// the walker-on-root hypothesis before any default change.
+    /// Opt into the MFT direct-enum fast path for volume-root scans.
+    /// Requires running as Administrator. Power-user only: accepts
+    /// hardlink-alias collapse (canonical path per inode; aliases
+    /// silently dropped) and bypasses the engine's exclusion filters
+    /// (system DLLs / OS-protected paths surface as candidates).
+    /// Defaults off: every root goes through the directory walker,
+    /// which is correctness-first and benchmarks faster overall on
+    /// the wall-clock even at higher hash load (see release notes
+    /// for v0.3.16). Subdir scans always use the walker.
     #[arg(long)]
-    pub force_walker: bool,
+    pub force_mft: bool,
 
     /// #81 — Master toggle for the safe-defaults exclusion filter
     /// (the preset packs that skip system DLLs, .git internals,

@@ -2686,9 +2686,9 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         output: None,
         follow_links: settings.follow_links,
         allow_system_paths: settings.allow_system_paths,
-        // GUI never sets force_walker; it's an A/B knob exposed via
+        // GUI never sets force_mft; it's an A/B knob exposed via
         // the CLI for the v0.3.14 inventory matrix only.
-        force_walker: false,
+        force_mft: false,
         // GUI settings don't surface the placeholder-policy knob yet;
         // tier guard defaults to conservative (refuse cloud recalls).
         // Phase 7 GUI counter exposes the bucket; a future iteration

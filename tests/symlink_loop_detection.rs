@@ -46,7 +46,7 @@ fn cfg_with(roots: Vec<PathBuf>, follow_links: bool) -> ScanConfig {
         output: None,
         follow_links,
         allow_system_paths: false,
-            force_walker: false,
+            force_mft: false,
         allow_recall_on_read: false,
         hash_algo: superdeduper::pipeline::hash::HashAlgo::Blake3,
         exclusion_policy: superdeduper::exclusions::ExclusionPolicy::disabled(),
