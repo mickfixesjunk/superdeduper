@@ -871,7 +871,7 @@ fn parse_bench_seed(seed: Option<String>) -> anyhow::Result<[u8; 32]> {
 #[cfg(feature = "telemetry")]
 fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     use superdeduper::leaderboard::install::BenchLane;
-    use superdeduper::leaderboard::{bench_run, install, oauth, submission};
+    use superdeduper::leaderboard::{install, oauth, submission};
     let channel = superdeduper::channel::active_channel();
     // A-prod-undark-bench (2026-05-30 19:02 PST): web shipped prod
     // corpus-v3-quick live (Mick GO override); the engine-side
@@ -944,9 +944,10 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     }
 
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    // Phase 2-B 2026-06-01: bench_run::run now takes install creds +
-    // a submit-callback closure instead of &InstallState. Engine builds
-    // the params here; the closure captures &state for the submission.
+    // Phase 3 v0.3.21 (2026-06-01): route bench-flow through the
+    // BenchExecutor trait. CLI / GUI both pick `BenchReal` today; a
+    // future bench-stub crate slots in here for audit / hermetic
+    // builds without engine code changes.
     anyhow::ensure!(
         state.registered,
         "install not registered; run `superdeduper register`"
@@ -961,20 +962,30 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
     let hardware_detect = |hint: Option<&std::path::Path>| {
         superdeduper::leaderboard::hardware::detect_with_root_hint(hint)
     };
-    let outcome = bench_run::run(
-        &state.install_id,
-        &install_key,
-        &state.server_url,
-        &args.corpus_version,
-        &args.tier,
-        args.workdir.as_deref(),
-        args.fresh,
-        &cancel,
-        |msg| eprintln!("bench: {msg}"),
-        Some(lane.as_slug()),
-        Some(&mut submit_fn), // CLI bench-me always submits
-        &hardware_detect,
-    )?;
+    let ctx = superdeduper_bench_iface::BenchContext {
+        install_id: state.install_id.clone(),
+        install_key,
+        server_url: state.server_url.clone(),
+        corpus_version: args.corpus_version.clone(),
+        tier: args.tier.clone(),
+        workroot: args.workdir.clone(),
+        fresh: args.fresh,
+        lane: Some(lane.as_slug().to_string()),
+    };
+    use superdeduper_bench_iface::BenchExecutor;
+    let executor: Box<dyn BenchExecutor> =
+        Box::new(superdeduper_bench_real::BenchReal::new());
+    let mut progress = |msg: &str| eprintln!("bench: {msg}");
+    let cancel_poll = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let outcome = executor
+        .run_bench(
+            ctx,
+            &mut progress,
+            &cancel_poll,
+            Some(&mut submit_fn), // CLI bench-me always submits
+            &hardware_detect,
+        )
+        .map_err(|e| anyhow::anyhow!("bench: {e}"))?;
     eprintln!(
         "bench: result_digest={} ({} dup groups, {} candidate bytes, {:.2}s, cold-enforced={})",
         outcome.result_digest,

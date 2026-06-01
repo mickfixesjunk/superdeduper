@@ -185,7 +185,7 @@ fn run_worker(
     tier: BenchTierChoice,
     lane: Option<crate::leaderboard::install::BenchLane>,
 ) {
-    use crate::leaderboard::{bench_run, install, registration, submission};
+    use crate::leaderboard::{install, registration, submission};
 
     let set_status = |msg: &str| {
         shared.lock().unwrap().status = msg.to_string();
@@ -252,32 +252,41 @@ fn run_worker(
     let hardware_detect = |hint: Option<&std::path::Path>| {
         crate::leaderboard::hardware::detect_with_root_hint(hint)
     };
-    let outcome = bench_run::run(
-        &state.install_id,
-        &install_key,
-        &state.server_url,
-        tier.corpus_version,
-        tier.tier,
-        None,
+    // Phase 3 v0.3.21 (2026-06-01): route through BenchExecutor trait.
+    let ctx = superdeduper_bench_iface::BenchContext {
+        install_id: state.install_id.clone(),
+        install_key,
+        server_url: state.server_url.clone(),
+        corpus_version: tier.corpus_version.to_string(),
+        tier: tier.tier.to_string(),
+        workroot: None,
         fresh,
-        cancel,
-        |m| set_status(m),
-        lane.map(|l| l.as_slug()),
+        lane: lane.map(|l| l.as_slug().to_string()),
+    };
+    use superdeduper_bench_iface::{BenchError, BenchExecutor};
+    let executor: Box<dyn BenchExecutor> =
+        Box::new(superdeduper_bench_real::BenchReal::new());
+    let mut progress = |m: &str| set_status(m);
+    let cancel_poll = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let outcome = executor.run_bench(
+        ctx,
+        &mut progress,
+        &cancel_poll,
         if submit { Some(&mut submit_fn) } else { None },
         &hardware_detect,
     );
 
     match outcome {
-        Err(e) if e.downcast_ref::<bench_run::Cancelled>().is_some() => {
+        Err(BenchError::Cancelled) => {
             finish("Cancelled — nothing was submitted.".into(), false, false)
         }
-        // A-bench-modal-error-surface (2026-05-30): use the alternate-Display
-        // form so anyhow joins the full context chain ('outer: inner: ...').
-        // Plain {e} only shows the top wrap (e.g., 'POST /bench/start failed')
-        // and swallows the actual cause (e.g., '404'). Mick's v0.2.62 bug
-        // diagnosis took an extra round-trip because the GUI showed only the
-        // top — CLI exposed the chain via anyhow's Debug formatter.
-        Err(e) => finish(format!("Benchmark failed: {e:#}"), true, false),
+        // A-bench-modal-error-surface (2026-05-30): the BenchError Display
+        // surfaces the inner chain (e.g. 'network: <anyhow chain>') so
+        // the GUI shows the actual cause rather than the top-of-stack
+        // wrapper alone. Phase 3 v0.3.21: anyhow chain joining is the
+        // bench-real adapter's responsibility (BenchExecutor impl maps
+        // anyhow context onto the BenchError variant message).
+        Err(e) => finish(format!("Benchmark failed: {e}"), true, false),
         Ok(o) => {
             // Human size: GB for >=1 GiB (the ranked corpora), else MB.
             let bytes = o.bytes_scanned as f64;
