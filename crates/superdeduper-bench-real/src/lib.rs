@@ -31,6 +31,7 @@
 //! See `docs/phase-0-p0d-move-plan.md` for the full move catalog.
 
 pub mod bench;
+pub mod bench_client;
 pub mod bench_corpus;
 pub mod d7_probe;
 

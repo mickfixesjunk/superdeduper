@@ -4426,9 +4426,11 @@ dependencies = [
  "base64",
  "blake3",
  "chacha20",
+ "hmac",
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "superdeduper-bench-iface",
  "tempfile",
 ]

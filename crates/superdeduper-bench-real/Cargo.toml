@@ -10,11 +10,17 @@ publish = false
 [dependencies]
 # Phase 1 deps: d7_probe + BenchReal stub + bench (chacha20 + blake3 for
 # the Merkle math) + bench_corpus (serde + bench).
+# Phase 2-B 2026-06-01: bench_client.rs move pulls in serde_json (the
+# canonical-bench bench_proof field is a Value; to_canonical_bench
+# uses json!() macro).
 superdeduper-bench-iface = { path = "../superdeduper-bench-iface" }
 blake3 = "1"
 chacha20 = "0.9"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
 
 [dev-dependencies]
 # Test-only deps used by the moved bench_corpus + bench tests
