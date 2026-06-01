@@ -498,3 +498,26 @@ jobs:
           generate_release_notes: false
           files: |
             release-files/SHA256SUMS
+
+      - name: Publish release + flip Latest pointer
+        # Phase 3 v0.3.22 (2026-06-01): finalize step. All per-platform
+        # build legs + the SHA256SUMS upload have landed on the draft;
+        # this step flips draft -> published + moves the GitHub "Latest"
+        # pin to the new tag. Replaces the manual `gh release edit
+        # <tag> --draft=false --latest` step that the engine agent had
+        # to remember after every tag push.
+        #
+        # See [[feedback_github_release_hold_by_default]] revoked-rule
+        # context: engine releases auto-promote per Mick directive; this
+        # final step is what actually realizes that auto-promote at the
+        # workflow level (the prior workflow shape left every release in
+        # Draft until an out-of-band manual publish, which I missed
+        # across v0.3.16-v0.3.20 before catching it at v0.3.21).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release edit "$VERSION_TAG" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --latest
