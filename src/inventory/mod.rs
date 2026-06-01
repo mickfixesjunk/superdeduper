@@ -167,7 +167,15 @@ pub fn enumerate_with_skipped(
         match mft::enumerate(cfg, cache) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "MFT enumeration unavailable, falling back to directory walk");
+                // Demoted from `warn!` -> `debug!` 2026-06-01: the
+                // most common cause of MFT unavailability is the
+                // user not running as administrator (CreateFileW on
+                // \\?\Volume returns ACCESS_DENIED for non-elevated
+                // processes). That's the EXPECTED non-admin path,
+                // not a user-actionable warning. Walker fallback is
+                // correct + complete; users don't need to see this
+                // unless they passed -v / --debug.
+                tracing::debug!(error = %e, "MFT enumeration unavailable, falling back to directory walk");
                 walk::enumerate_with_progress(cfg, walker_event_callback)?
             }
         }
