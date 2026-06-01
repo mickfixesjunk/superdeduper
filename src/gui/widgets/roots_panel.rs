@@ -165,16 +165,21 @@ pub fn show(
         // Screen readers read tooltip text; the hint also helps
         // power-users + UIA SendKeys harnesses that drive sd via
         // assistive-tech APIs. See gui::accessibility for the catalog.
+        //
+        // PERF (#191 overnight push, 2026-05-31): tooltip strings are now
+        // platform-cfg const &str so we do NOT format!() / allocate a
+        // String every frame the button is rendered. The Ctrl+R-vs-Cmd+R
+        // distinction is the only thing the runtime tooltip needs to
+        // express, and that's a compile-time platform fact.
+        #[cfg(target_os = "macos")]
+        const TOOLTIP_RUN: &str = "Run a duplicate scan over the listed roots (⌘R or F5).";
+        #[cfg(not(target_os = "macos"))]
+        const TOOLTIP_RUN: &str = "Run a duplicate scan over the listed roots (Ctrl+R or F5).";
+        const TOOLTIP_PAUSE: &str = "Pause the in-flight scan (Esc).";
         let primary_response = if is_scanning {
-            primary_response.on_hover_text(format!(
-                "Pause the in-flight scan ({}).",
-                crate::gui::accessibility::shortcut_label_cancel_scan()
-            ))
+            primary_response.on_hover_text(TOOLTIP_PAUSE)
         } else {
-            primary_response.on_hover_text(format!(
-                "Run a duplicate scan over the listed roots ({}).",
-                crate::gui::accessibility::shortcut_label_start_scan()
-            ))
+            primary_response.on_hover_text(TOOLTIP_RUN)
         };
         if primary_response.clicked() {
             action = Some(if is_scanning {

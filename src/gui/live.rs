@@ -177,10 +177,17 @@ fn run(
     }
 
     let cfg = build_config(&roots, &settings)?;
+    // PERF (#191 overnight push, 2026-05-31): pre-normalize reference roots
+    // to their non-verbatim form ONCE at scan start. reference_belongs is
+    // called on every GUI repaint frame × every group × every file; doing
+    // strip_verbatim_prefix() on each reference root per-call was burning
+    // CPU at 30fps. With pre-normalized entries here, reference_belongs
+    // only normalizes the candidate path (one strip per call) + does a
+    // straight starts_with against already-normalized references.
     let reference_set: hashbrown::HashSet<PathBuf> = roots
         .iter()
         .filter(|r| r.is_reference)
-        .map(|r| r.path.clone())
+        .map(|r| strip_verbatim_prefix(&r.path).to_path_buf())
         .collect();
     let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
     let checkpoint_path = checkpoint::default_checkpoint_path().ok();
@@ -2527,23 +2534,17 @@ fn reference_belongs(path: &std::path::Path, reference_set: &hashbrown::HashSet<
     // `\\?\E:\DROPBOX\Dropbox\...` does not start with `E:\DROPBOX`, so the
     // reference-priority short-circuit in `order_keeper_first` silently
     // falls through to the Smart heuristic — which then picks a non-
-    // reference file as keeper when its path scores higher. That is exactly
-    // the invariant violation Mick hit (group of 3, ref path E:\DROPBOX,
-    // keeper landed on the SEAGATE non-ref file).
+    // reference file as keeper when its path scores higher.
     //
-    // Fix: strip the verbatim prefix from BOTH sides before the prefix
-    // compare. Cheap (no sys call), symmetric, preserves the existing
-    // semantics for the no-verbatim case. Closes task #155 (the
-    // canonicalize-vs-starts-with-parity gap dedupe.rs:1300 sidesteps via
-    // fs::canonicalize on both sides; the GUI takes this lighter route).
+    // PERF (#191 overnight push, 2026-05-31): `reference_set` entries are
+    // now pre-normalized at scan-start (see L180) so this hot-path only
+    // normalizes the candidate path. Earlier symmetric `strip_verbatim_prefix(r)`
+    // call per iteration was burning CPU at 30fps × N groups × M files;
+    // pre-normalization moves it to once-per-scan-start.
     let path_normal = strip_verbatim_prefix(path);
-    for r in reference_set {
-        let r_normal = strip_verbatim_prefix(r);
-        if path_normal.starts_with(&r_normal) {
-            return true;
-        }
-    }
-    false
+    reference_set
+        .iter()
+        .any(|r_normalized| path_normal.starts_with(r_normalized))
 }
 
 /// Strip the Windows verbatim path prefix `\\?\` if present. No-op on
@@ -2785,7 +2786,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn ref_set(roots: &[&str]) -> hashbrown::HashSet<PathBuf> {
-        roots.iter().map(PathBuf::from).collect()
+        // Mirror production construction (live.rs:180) which pre-normalizes
+        // via strip_verbatim_prefix so reference_belongs's hot path only
+        // strips the candidate side. Production code is the truth; tests
+        // should construct the set the same way.
+        roots
+            .iter()
+            .map(|s| strip_verbatim_prefix(std::path::Path::new(s)).to_path_buf())
+            .collect()
     }
 
     // ============================================================
