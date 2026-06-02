@@ -2648,14 +2648,33 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
             // entirely. On a real NVMe with 312K-file corpus that
             // produced 60x slower wall-time than the CLI (CLI's
             // ScanConfig::from_args hits the probe; GUI didn't).
+            //
+            // 2026-06-02 v0.3.34 diagnostic (design 23:38Z): v0.3.33
+            // ship reduced the gap from 5min to 3min, not all the way
+            // to CLI's ~5s. Emit a tracing::info! that pins which path
+            // ran -- user override vs default-via-probe vs default-via-
+            // (α)-fallback. Mick can read this from the engine log to
+            // confirm the new code path is engaging.
             let cpu = settings.threads.unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
             });
-            settings.io_threads.unwrap_or_else(|| {
-                crate::config::default_io_threads(cpu, roots.first().map(|r| &r.path))
-            })
+            let (chosen, source) = match settings.io_threads {
+                Some(n) => (n, "user-explicit"),
+                None => {
+                    let first_root = roots.first().map(|r| &r.path);
+                    let n = crate::config::default_io_threads(cpu, first_root);
+                    (n, "default-via-default_io_threads")
+                }
+            };
+            tracing::info!(
+                io_threads = chosen,
+                source = source,
+                cpu_threads = cpu,
+                "GUI scan: io-threads selected"
+            );
+            chosen
         },
         output: None,
         follow_links: settings.follow_links,
