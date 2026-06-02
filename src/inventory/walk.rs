@@ -39,6 +39,15 @@ pub struct DirIdentity {
 /// Streaming progress emitted by [`enumerate_with_progress`]. Consumers
 /// translate these into [`EngineEvent`]s for the GUI; the CLI uses a
 /// no-op consumer.
+///
+/// Ordering contract: events are emitted in BFS layer order — every
+/// directory at depth N is `Entered` before any directory at depth
+/// N+1. Within a single layer, the relative order of events across
+/// sibling folders is undefined (the BFS driver harvests siblings in
+/// parallel via rayon and replays each folder's events in collection
+/// order, which is rayon-implementation-dependent). Code that needs
+/// stable per-directory ordering must key on the `Entered.path`
+/// itself, not on event arrival sequence.
 pub enum WalkEvent<'a> {
     /// About to enumerate this directory.
     Entered { path: &'a Path, depth: u32 },
@@ -1130,6 +1139,15 @@ fn walk_one_root_buffered(
 /// Cancellation: the per-folder routine checks the cancel flag
 /// itself and flags `cancelled` in its return value. The driver
 /// drains the cancelled batch's partial results, then exits.
+///
+/// Memory: `frontier` holds one `(PathBuf, u32)` per pending directory
+/// at the current BFS layer. Peak size is the maximum fan-out across
+/// any single layer of the tree (NOT the total directory count) — for
+/// pathological wide-but-shallow shapes (e.g. a single folder with
+/// 100k subdirs) this is ~16 MB at the layer boundary; for typical
+/// trees it stays well under 1 MB. No explicit cap is enforced;
+/// catastrophic shapes surface as `OutOfMemory` rather than silent
+/// truncation.
 fn walk_bfs<F>(
     root: &Path,
     cfg: &ScanConfig,
@@ -1181,6 +1199,17 @@ where
         // worker is pure -- no callback fires, no shared mutable
         // state -- so rayon's default fork/join with work-stealing
         // is enough; no explicit chunk tuning needed.
+        //
+        // Lever (deferred): rayon defaults aim for ~`num_threads`
+        // splits and bias toward larger chunks. If HDD small-folder
+        // workloads regress (mechanical heads thrash on tiny chunks
+        // dispatched to too many threads), attaching `.with_max_len(2)`
+        // here would force rayon to keep each work-item to <=2 folders
+        // before stealing. Currently NOT applied: SSD/NVMe benchmarks
+        // showed the default tuning already saturates the device, and
+        // the HDD slowdown class observed so far is dominated by seek
+        // ordering inside `enumerate_one_folder_pure`, not by chunk
+        // granularity here.
         let harvest: Vec<FolderResult> = announced
             .into_par_iter()
             .map(|(dir, depth)| enumerate_one_folder_pure(&dir, depth, cfg, cancel))
