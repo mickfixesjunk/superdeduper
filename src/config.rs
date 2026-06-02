@@ -286,6 +286,37 @@ const IO_THREADS_WSL: usize = 1;
 /// "wrong" thread count only costs per-thread CPU efficiency, not
 /// wall.
 fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize {
+    // PRIMARY mechanism (β): startup throughput probe on the first
+    // scan root. Per Mick GO 2026-06-02 09:42 PDT, transparent to
+    // disk_class misclassification (notably v0.3.5 SAT pass-through
+    // limit USB-HDD-as-USB-SSD case) + per-instance accurate.
+    //
+    // Skip the probe when:
+    // - SUPERDEDUPER_IOTHREADS_PARKED env set (manual override)
+    // - explicit --io-threads is already handled upstream in
+    //   ScanConfig::from_args (this function is only called when no
+    //   explicit value was passed)
+    //
+    // Fall back to (α) per-disk-class table when:
+    // - probe errors (no eligible files, IO failure, panic)
+    // - first_root is None (no workdir to probe against)
+    if std::env::var("SUPERDEDUPER_IOTHREADS_PARKED").is_ok() {
+        tracing::info!("io-threads probe skipped: SUPERDEDUPER_IOTHREADS_PARKED env set");
+        return 1;
+    }
+    if let Some(root) = first_root {
+        match crate::pipeline::io_threads_probe::probe_optimal_io_threads(root) {
+            Ok(n) => return n,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "io-threads probe failed; falling back to (a) per-disk-class table"
+            ),
+        }
+    }
+
+    // (α) FALLBACK: per-disk-class table (per testdesign 09:33 PDT).
+    // Engages when probe failed OR no first_root available. Repurposed
+    // from the prior 716d479 PARKED commit per design 09:52 PDT lean.
     #[cfg(feature = "telemetry")]
     let disk_class = Some(
         crate::leaderboard::hardware::detect_with_root_hint(first_root.map(|p| p.as_path()))
