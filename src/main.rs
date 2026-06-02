@@ -2440,7 +2440,7 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
             use superdeduper::leaderboard::hardware;
             use superdeduper::leaderboard::payload_meta;
             use superdeduper::leaderboard::submission::{
-                self, ResultSummary, RunShape, SubmissionInputs, FEATURE_BIT_ALLOW_RECALL_ON_READ,
+                self, FEATURE_BIT_ALLOW_RECALL_ON_READ,
                 FEATURE_BIT_ALLOW_SYSTEM_PATHS, FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB,
                 FEATURE_BIT_FOLLOW_LINKS, FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB,
                 FEATURE_BIT_REFERENCE_ROOTS,
@@ -2491,19 +2491,20 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
             // zero-byte-reunion / hardlink-farm / name-twins never granted on CLI.
             let (zero_byte_group_max, max_hardlink_count_in_scan, name_collision_count) =
                 payload_meta::run_shape_esoterics(&duplicates);
-            let inputs = SubmissionInputs {
-                client_version: env!("CARGO_PKG_VERSION").to_string(),
-                run_uuid: uuid::Uuid::new_v4().to_string(),
-                scan_id: Some(scan_id.clone()),
-                hardware: hardware::detect_with_root_hint(
-                    cfg.roots.first().map(|p| p.as_path()),
-                ),
-                run_shape: RunShape {
+            // Codex-review item 2 (v0.3.25): the field-name boilerplate
+            // is consolidated in payload_meta::build_scan_submission_inputs.
+            // Callers pass only the variant-value fields; constants live
+            // in one place to prevent future drift between CLI + GUI.
+            let inputs = payload_meta::build_scan_submission_inputs(
+                payload_meta::ScanSubmissionArgs {
+                    scan_id: scan_id.clone(),
+                    hardware: hardware::detect_with_root_hint(
+                        cfg.roots.first().map(|p| p.as_path()),
+                    ),
                     wall_clock_seconds,
                     bytes_scanned: history_total_bytes_read,
                     files_scanned: history_total_files,
                     hash_algorithm,
-                    walker_variant: "hybrid".to_string(),
                     scope,
                     features_used_bitmap: features_bits,
                     corpus_kind,
@@ -2512,8 +2513,8 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
                     // consumed (was hardcoded empty → CLI never granted
                     // any client-claimed achievement).
                     easter_egg_hits,
-                    // #162 — from the shared run_shape_esoterics (above); the
-                    // helper already applies the >0 ? Some : None convention.
+                    // #162 — from the shared run_shape_esoterics; helper
+                    // already applies the >0 ? Some : None convention.
                     zero_byte_group_max,
                     max_hardlink_count_in_scan,
                     name_collision_count,
@@ -2522,27 +2523,18 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
                     } else {
                         None
                     },
-                    dry_run: None,
-                    groups_reviewed_count: None,
-                },
-                result_summary: ResultSummary {
                     duplicate_groups: total_dups,
                     duplicate_bytes_reclaimable: reclaimable_bytes
                         .min(history_total_bytes_read),
                     largest_single_group_bytes: largest_group_bytes
                         .min(history_total_bytes_read),
-                    actions_taken_summary: std::collections::BTreeMap::new(),
                     placeholder_skip_count: if skipped.is_empty() {
                         None
                     } else {
                         Some(skipped.len() as u64)
                     },
-                    placeholder_skip_bytes: None,
-                    client_found_dupsets: None,
                 },
-                bench: None,
-                lane: None,
-            };
+            );
             let payload = submission::build_payload(&inputs, &install_state.install_id);
             record = record.with_submission_payload(payload, install_state.install_id);
         }

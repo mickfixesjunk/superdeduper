@@ -1775,7 +1775,7 @@ fn run(
         use crate::leaderboard::hardware;
         use crate::leaderboard::hmac_signer;
         use crate::leaderboard::submission::{
-            self, ResultSummary, RunShape, SubmissionInputs, FEATURE_BIT_ALLOW_RECALL_ON_READ,
+            self, FEATURE_BIT_ALLOW_RECALL_ON_READ,
             FEATURE_BIT_ALLOW_SYSTEM_PATHS, FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB,
             FEATURE_BIT_FOLLOW_LINKS, FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB,
             FEATURE_BIT_REFERENCE_ROOTS,
@@ -1852,21 +1852,24 @@ fn run(
         let (zero_byte_group_max, max_hardlink_count_in_scan, name_collision_count) =
             run_shape_esoterics_accum.finalize();
 
-        let inputs = SubmissionInputs {
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            run_uuid: uuid::Uuid::new_v4().to_string(),
-            scan_id: Some(scan_id_for_this_run.clone()),
-            // #88 Phase 1 — pass the first scan root so filesystem
-            // detection has a real path to probe instead of falling
-            // back to the platform default. Unlocks pathfinder-refs
-            // + network-pioneer signal classes.
-            hardware: hardware::detect_with_root_hint(roots.first().map(|r| r.path.as_path())),
-            run_shape: RunShape {
+        // Codex-review item 2 (v0.3.25): the field-name boilerplate
+        // is consolidated in payload_meta::build_scan_submission_inputs.
+        // The GUI passes the streaming-accumulator outputs + the
+        // count_distinct_share_roots reading via root_paths; constant
+        // fields (walker_variant, dry_run, bench, lane, etc.) come from
+        // the helper.
+        let inputs = crate::leaderboard::payload_meta::build_scan_submission_inputs(
+            crate::leaderboard::payload_meta::ScanSubmissionArgs {
+                scan_id: scan_id_for_this_run.clone(),
+                // #88 Phase 1 — pass the first scan root so filesystem
+                // detection has a real path to probe instead of falling
+                // back to the platform default. Unlocks pathfinder-refs
+                // + network-pioneer signal classes.
+                hardware: hardware::detect_with_root_hint(roots.first().map(|r| r.path.as_path())),
                 wall_clock_seconds,
                 bytes_scanned: total_bytes_read,
                 files_scanned: total_files,
                 hash_algorithm,
-                walker_variant: "hybrid".to_string(),
                 scope,
                 features_used_bitmap: features_bits,
                 corpus_kind,
@@ -1896,37 +1899,15 @@ fn run(
                         None
                     }
                 },
-                // #89 — kept `None` per design's catalog-semantic
-                // flag (rollback from initial `Some(true)`). The
-                // `safety-first` achievement (catalog:932) describes
-                // "Used --dry-run 25+ times before commit" and sits
-                // on the skill/curation axis — it rewards deliberate
-                // dry-run *intent*, not every-submission protocol
-                // shape. Setting Some(true) per scan-finish would
-                // collapse the metric into "scanned 25+ times" and
-                // strip the curation semantic. Reactivate the field
-                // when a real dry-run UX ships: a future GUI
-                // "Preview without action" toggle, or CLI
-                // `superdeduper scan --dry-run`.
-                dry_run: None,
-                // #89 — group-reviews happen AFTER scan-finish, so
-                // the count is always 0 at initial submission time.
-                // Plumbed as `None` (omitted from payload) until a
-                // PATCH path updates it. See submission.rs comment
-                // on the field for the deferred future-work note.
-                groups_reviewed_count: None,
-            },
-            result_summary: ResultSummary {
-                duplicate_groups: total_dups,
                 // Use inode-aware reclaim (collapses hardlink
                 // aliases) for the leaderboard payload. Clamp to
                 // bytes_scanned just in case some weird edge case
                 // still produces reclaim > scanned (e.g. a file
                 // counted as both alias and unique somehow); backend
                 // sanity-rejects on that.
+                duplicate_groups: total_dups,
                 duplicate_bytes_reclaimable: reclaimable_inode.min(total_bytes_read),
                 largest_single_group_bytes: largest_group_bytes.min(total_bytes_read),
-                actions_taken_summary: std::collections::BTreeMap::new(),
                 // #142 follow-up — populate placeholder_skip_count
                 // from the running counters so the GUI submission
                 // matches the CLI's. Pre-fix the field always
@@ -1943,12 +1924,8 @@ fn run(
                         None
                     }
                 },
-                placeholder_skip_bytes: None,
-                client_found_dupsets: None,
             },
-            bench: None,
-            lane: None,
-        };
+        );
         // Diagnostic-only payload preview. install_id is empty string
         // here because the engine doesn't load the install state at
         // scan-end — the real submission flow re-loads it just-in-time
