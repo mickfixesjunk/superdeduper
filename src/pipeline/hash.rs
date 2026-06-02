@@ -1303,6 +1303,7 @@ mod tests {
             allow_system_paths: false,
             force_mft: false,
             parallel_roots: false,
+            work_stealing: false,
             allow_recall_on_read: false,
             io_threads: 4,
             hash_algo: HashAlgo::Blake3,

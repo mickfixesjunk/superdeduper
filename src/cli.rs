@@ -549,6 +549,15 @@ pub struct ScanArgs {
     #[arg(long)]
     pub parallel_roots: bool,
 
+    /// v0.3.28 (2026-06-02) -- run the experimental work-stealing
+    /// pipeline (channel-based walker -> hash handoff; no walk-then-hash
+    /// layer barrier). Default off; production users see the
+    /// v0.3.27 pipeline unchanged. Mirrors `Settings -> Performance ->
+    /// Work-stealing pipeline` GUI toggle and the
+    /// `SUPERDEDUPER_WORK_STEALING=1` env var (testdesign automation).
+    #[arg(long)]
+    pub work_stealing: bool,
+
     /// #81 — Master toggle for the safe-defaults exclusion filter
     /// (the preset packs that skip system DLLs, .git internals,
     /// OS-protected paths, and AV signature databases). Default ON

@@ -68,6 +68,15 @@ pub struct ScanConfig {
     /// on the same HDD scanned together). On a single-root scan the
     /// flag is a no-op.
     pub parallel_roots: bool,
+    /// v0.3.28 (2026-06-02): when true, the engine runs the
+    /// experimental work-stealing pipeline (channel-based walker ->
+    /// hash handoff; no walk-then-hash layer barrier). Default false;
+    /// opt-in via `--work-stealing` CLI flag OR the new GUI
+    /// `Settings → Performance` tab toggle OR
+    /// `SUPERDEDUPER_WORK_STEALING=1` env var (testdesign automation).
+    /// Implementation is feature-flag-isolated; production users see
+    /// the v0.3.27 pipeline unchanged.
+    pub work_stealing: bool,
     /// T2.1 phase 6: when true, the hash worker tier guard accepts
     /// cloud-recall placeholders (forcing hydration on read). Default
     /// false. Flows from `--allow-recall-on-read`.
@@ -141,6 +150,12 @@ impl ScanConfig {
             allow_system_paths: args.allow_system_paths,
             force_mft: args.force_mft,
             parallel_roots: args.parallel_roots,
+            // v0.3.28: env var override (testdesign automation hook); CLI
+            // flag is the user-facing path. Either OR; default off.
+            work_stealing: args.work_stealing
+                || std::env::var("SUPERDEDUPER_WORK_STEALING")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             allow_recall_on_read: args.allow_recall_on_read,
             hash_algo: args.hash_algo.into(),
             // #81 — Wire the CLI's exclusion flags into the runtime
@@ -332,6 +347,7 @@ mod tests {
             allow_system_paths: false,
             force_mft: false,
             parallel_roots: false,
+            work_stealing: false,
             placeholders_only: false,
             force_hash: false,
             allow_recall_on_read: false,
