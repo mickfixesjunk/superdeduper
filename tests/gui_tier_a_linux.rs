@@ -515,6 +515,7 @@ fn tier_a_g_reference_protection_preserves_reference_file() {
 /// confirm with "HARDLINK", and assert the dupes are replaced with hardlinks to
 /// the keeper: all member paths still exist (no path touched) + they collapse to
 /// a SINGLE shared inode (the real on-disk effect), content byte-identical.
+#[cfg(unix)]
 #[test]
 fn tier_a_g_hardlink_collapses_dupes_to_one_inode() {
     let _env = env_lock();
@@ -768,6 +769,7 @@ fn tier_a_action_patches_scan_history_actually_reclaimed_bytes() {
 /// EXACTLY ONE plain copy survives (the keeper) ⟺ the guard refused the alias as
 /// a LOSER (anti-vacuous: if the alias were merely the keeper, both plains would
 /// be actioned -> 0 plains survive -> this FAILS, catching the vacuous case).
+#[cfg(unix)]
 #[test]
 fn tier_a_g_system_path_alias_refused_preserves_target() {
     let _env = env_lock();
