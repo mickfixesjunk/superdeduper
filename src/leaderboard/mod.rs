@@ -23,6 +23,7 @@
 
 pub mod account_badge_summary;
 pub mod account_display_name;
+pub mod gui_submission_state;
 pub mod account_privacy;
 pub mod action_submission;
 pub mod captcha;
