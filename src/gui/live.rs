@@ -2638,14 +2638,24 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
                 .unwrap_or(1)
         }),
         io_threads: {
-            // Explicit setting wins; otherwise oversubscribe to
-            // CPU × 3 like the CLI default.
+            // 2026-06-02 P1 fix (design URGENT 22:05Z, Mick C:\sdd-tests
+            // 60x GUI-vs-CLI gap): explicit setting wins; otherwise
+            // delegate to crate::config::default_io_threads which runs
+            // the v0.3.31 startup probe + (α) per-disk-class fallback.
+            //
+            // Pre-fix the GUI hardcoded cpu × 3 here (= 96 threads on a
+            // 9950X3D2) which bypassed the workload-aware default
+            // entirely. On a real NVMe with 312K-file corpus that
+            // produced 60x slower wall-time than the CLI (CLI's
+            // ScanConfig::from_args hits the probe; GUI didn't).
             let cpu = settings.threads.unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
             });
-            settings.io_threads.unwrap_or(cpu.saturating_mul(3).max(1))
+            settings.io_threads.unwrap_or_else(|| {
+                crate::config::default_io_threads(cpu, roots.first().map(|r| &r.path))
+            })
         },
         output: None,
         follow_links: settings.follow_links,

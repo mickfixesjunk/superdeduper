@@ -285,7 +285,7 @@ const IO_THREADS_WSL: usize = 1;
 /// regardless of thread count (1.4% wall span per sdd-testwin); the
 /// "wrong" thread count only costs per-thread CPU efficiency, not
 /// wall.
-fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize {
+pub(crate) fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize {
     // PRIMARY mechanism (β): startup throughput probe on the first
     // scan root. Per Mick GO 2026-06-02 09:42 PDT, transparent to
     // disk_class misclassification (notably v0.3.5 SAT pass-through
