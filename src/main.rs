@@ -2256,6 +2256,22 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
         scan_started.elapsed().as_millis()
     );
 
+    // 2026-06-02 Option C (Mick GO): tier 2 cull telemetry. Drives the
+    // v0.3.33+ decision on whether tier 2 is load-bearing (KEEP) or
+    // over-engineered (DROP for cz-style 2-pass). Line format chosen
+    // for grep-ability: "tier2 cull: input=N survivors=M culled=N-M (X%)".
+    let tier2_in = counters.tier2_input_files.load(Ordering::Relaxed);
+    let tier2_out = counters.tier2_survivors.load(Ordering::Relaxed);
+    if tier2_in > 0 {
+        let culled = tier2_in.saturating_sub(tier2_out);
+        let cull_pct = (culled as f64 / tier2_in as f64) * 100.0;
+        let _ = writeln!(
+            stderr,
+            "tier2 cull: input={tier2_in} survivors={tier2_out} \
+             culled={culled} ({cull_pct:.1}% of tier2-input)"
+        );
+    }
+
     // T2.1 phase 7: surface placeholder skip counts so a smaller-
     // than-expected dup-group count has a visible explanation.
     let placeholders_recall = counters.placeholders_blocked_recall.load(Ordering::Relaxed);

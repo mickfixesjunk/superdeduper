@@ -116,6 +116,17 @@ pub struct HashCounters {
     /// changing wire format.
     pub placeholders_blocked_recall: AtomicU64,
     pub placeholders_blocked_other_reparse: AtomicU64,
+    /// 2026-06-02 Option C (Mick GO: "C"): "files tier 2 cull'd that
+    /// would have gone to tier 3". Drives the v0.3.33+ decision on
+    /// whether tier 2 is load-bearing (KEEP) or over-engineered (DROP
+    /// to match cz's 2-pass shape).
+    ///
+    /// Mechanically: files that ENTER tier 2 (i.e. survived tier 1
+    /// with a 2+ collision group) MINUS files that LEAVE tier 2 (i.e.
+    /// still in a 2+ collision group after tier 2 hashing). The
+    /// difference is what tier 2 culled.
+    pub tier2_input_files: AtomicU64,
+    pub tier2_survivors: AtomicU64,
 }
 
 /// Outcome reported by the per-file [`FileProgress`] callback.
@@ -267,6 +278,8 @@ fn run_with_counters_inner(
             tier_micros: snap_arr(&arc.tier_micros),
             tier_bytes: snap_arr(&arc.tier_bytes),
             tier_count: snap_arr(&arc.tier_count),
+            tier2_input_files: AtomicU64::new(arc.tier2_input_files.load(Ordering::Relaxed)),
+            tier2_survivors: AtomicU64::new(arc.tier2_survivors.load(Ordering::Relaxed)),
             placeholders_blocked_recall: AtomicU64::new(
                 arc.placeholders_blocked_recall.load(Ordering::Relaxed),
             ),
@@ -609,11 +622,23 @@ fn run_group(
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Ok(out);
         }
+        // 2026-06-02 Option C: instrument tier 2 cull. INPUT = files
+        // entering tier 2 (survivors from tier 1). OUTPUT = files
+        // leaving tier 2 (survivors going to tier 3). The diff is
+        // what tier 2 culled; drives v0.3.33+ decision on whether to
+        // keep or drop tier 2.
+        let tier2_input = survivors.len() as u64;
+        counters
+            .tier2_input_files
+            .fetch_add(tier2_input, Ordering::Relaxed);
         survivors = split_by(&survivors, |f| {
             tiered(f, Tier::Two, algo, cache, counters, on_file, || {
                 tier2_hash(f, size, algo, cfg.cold_enforced)
             })
         })?;
+        counters
+            .tier2_survivors
+            .fetch_add(survivors.len() as u64, Ordering::Relaxed);
         if survivors.len() < 2 {
             return Ok(out);
         }
