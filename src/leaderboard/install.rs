@@ -232,8 +232,28 @@ pub fn data_dir_public() -> io::Result<PathBuf> {
     data_dir()
 }
 
-#[cfg(windows)]
+/// Resolve the engine's persistent data dir. Order of precedence:
+///
+/// 1. `SUPERDEDUPER_TEST_DATA_DIR` env var if set -- used by tests
+///    (notably sdd-testwin's egui_kittest cells, design 2026-06-02
+///    17:00 PDT) for hermetic isolation. Cross-platform: works the
+///    same on Linux / macOS / Windows so tests don't have to set
+///    per-OS env vars (XDG_DATA_HOME on Unix vs LOCALAPPDATA on
+///    Windows). When set, the override path is used VERBATIM (no
+///    "superdeduper" subdirectory appended) so tests can point at a
+///    tempdir directly.
+/// 2. Platform-specific default (LOCALAPPDATA on Windows,
+///    XDG_DATA_HOME or ~/.local/share on Linux, ~/Library/Application
+///    Support on macOS). All append a `superdeduper/` subdirectory.
 fn data_dir() -> io::Result<PathBuf> {
+    if let Some(test_dir) = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR") {
+        return Ok(PathBuf::from(test_dir));
+    }
+    data_dir_platform()
+}
+
+#[cfg(windows)]
+fn data_dir_platform() -> io::Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA not set"))?;
     let mut p = PathBuf::from(local);
@@ -242,7 +262,7 @@ fn data_dir() -> io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn data_dir() -> io::Result<PathBuf> {
+fn data_dir_platform() -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
     let mut p = PathBuf::from(home);
@@ -253,7 +273,7 @@ fn data_dir() -> io::Result<PathBuf> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn data_dir() -> io::Result<PathBuf> {
+fn data_dir_platform() -> io::Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         let mut p = PathBuf::from(xdg);
         p.push("superdeduper");
@@ -547,6 +567,53 @@ fn hex_encode(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_dir_honors_test_data_dir_override() {
+        // SUPERDEDUPER_TEST_DATA_DIR env-var override per design ask
+        // 2026-06-02 17:00 PDT. Lets sdd-testwin's egui_kittest cells
+        // redirect data_dir to a tempdir for hermetic isolation
+        // without per-platform XDG/LOCALAPPDATA conditionals.
+        let _g = crate::test_serial::home_env_guard();
+        let prev = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR");
+        let tmp = std::env::temp_dir().join(format!(
+            "superdeduper-test-data-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", &tmp);
+        let got = data_dir().expect("data_dir succeeds when override set");
+        assert_eq!(got, tmp, "override path must be used verbatim");
+        // Cleanup.
+        match prev {
+            Some(v) => std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", v),
+            None => std::env::remove_var("SUPERDEDUPER_TEST_DATA_DIR"),
+        }
+    }
+
+    #[test]
+    fn data_dir_falls_back_to_platform_when_override_unset() {
+        // When SUPERDEDUPER_TEST_DATA_DIR is unset, data_dir falls
+        // through to platform-specific resolution. We can't assert
+        // the exact path here (depends on the test host) but we can
+        // assert the path ENDS with the "superdeduper" subdirectory
+        // that platform helpers append.
+        let _g = crate::test_serial::home_env_guard();
+        let prev = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR");
+        std::env::remove_var("SUPERDEDUPER_TEST_DATA_DIR");
+        let got = data_dir().expect("platform data_dir resolves");
+        assert!(
+            got.ends_with("superdeduper"),
+            "platform data_dir must append 'superdeduper' subdirectory; got {got:?}"
+        );
+        // Restore.
+        if let Some(v) = prev {
+            std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", v);
+        }
+    }
 
     #[test]
     fn new_unregistered_has_v4_uuid_and_64_hex_key() {
