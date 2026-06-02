@@ -39,8 +39,8 @@ pub mod submission_http;
 
 use std::path::Path;
 use superdeduper_bench_iface::{
-    BenchContext, BenchError, BenchExecutor, BenchOutcome, DebugDedupDiffReport,
-    HardwareFingerprint, InstallKey, SubmissionExecutor, SubmissionInputs, SubmitOutcome,
+    BenchContext, BenchError, BenchExecutor, BenchOutcome, BenchServices, DebugDedupDiffReport,
+    InstallKey, SubmissionExecutor, SubmissionInputs, SubmitOutcome,
 };
 
 /// Default [`BenchExecutor`] + [`SubmissionExecutor`] implementation.
@@ -80,13 +80,17 @@ impl BenchExecutor for BenchReal {
     fn run_bench(
         &self,
         ctx: BenchContext,
-        progress: &mut (dyn FnMut(&str) + Send),
-        cancel: &(dyn Fn() -> bool + Send + Sync),
-        submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
-        hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
+        services: BenchServices<'_>,
     ) -> Result<BenchOutcome, BenchError> {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
+
+        let BenchServices {
+            progress,
+            cancel,
+            submit_fn,
+            hardware_detect,
+        } = services;
 
         let cancel_flag = AtomicBool::new(false);
         let done_flag = AtomicBool::new(false);

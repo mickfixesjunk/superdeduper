@@ -972,19 +972,19 @@ fn run_bench_me(args: superdeduper::cli::BenchMeArgs) -> anyhow::Result<()> {
         fresh: args.fresh,
         lane: Some(lane.as_slug().to_string()),
     };
-    use superdeduper_bench_iface::BenchExecutor;
+    use superdeduper_bench_iface::{BenchExecutor, BenchServices};
     let executor: Box<dyn BenchExecutor> =
         Box::new(superdeduper_bench_real::BenchReal::new());
     let mut progress = |msg: &str| eprintln!("bench: {msg}");
     let cancel_poll = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let services = BenchServices {
+        progress: &mut progress,
+        cancel: &cancel_poll,
+        submit_fn: Some(&mut submit_fn), // CLI bench-me always submits
+        hardware_detect: &hardware_detect,
+    };
     let outcome = executor
-        .run_bench(
-            ctx,
-            &mut progress,
-            &cancel_poll,
-            Some(&mut submit_fn), // CLI bench-me always submits
-            &hardware_detect,
-        )
+        .run_bench(ctx, services)
         .map_err(|e| anyhow::anyhow!("bench: {e}"))?;
     eprintln!(
         "bench: result_digest={} ({} dup groups, {} candidate bytes, {:.2}s, cold-enforced={})",
