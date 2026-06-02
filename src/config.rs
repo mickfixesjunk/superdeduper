@@ -283,6 +283,15 @@ fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize
 /// decision logic without a per-machine probe — the probe itself is
 /// machine-state and not the unit under test.
 fn compute_default_io_threads(cpu_threads: usize, disk_class: Option<&str>) -> usize {
+    // PARKED 2026-06-02 — workdirs/design/profile-data.md warm-cache WSL
+    // ext4 measurements show iothreads=1 is 2.7-3.5x FASTER than the
+    // current default. HDD-cold-cache + large-file validation pending
+    // before this becomes the released default. Until then, the env
+    // var below lets Mick (or benchmarker) take it for testing without
+    // a rebuild. Do NOT release until Mick GO.
+    if std::env::var("SUPERDEDUPER_IOTHREADS_PARKED").is_ok() {
+        return 1;
+    }
     let legacy_default = cpu_threads.saturating_mul(3).max(1);
     if let Some(class) = disk_class {
         if class.contains("HDD") {
