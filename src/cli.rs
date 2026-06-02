@@ -599,6 +599,33 @@ pub struct ScanArgs {
     #[arg(long)]
     pub force_hash: bool,
 
+    /// MEASUREMENT mode: bypass the OS page cache for every file read
+    /// in the scan, so per-tier IO timing reflects cold-cache behaviour
+    /// regardless of how big the corpus is vs available RAM.
+    ///
+    /// On Windows uses `FILE_FLAG_NO_BUFFERING`; on Linux uses `O_DIRECT`
+    /// (with a WSL safety check that falls back to buffered — WSL accepts
+    /// O_DIRECT but serves warm, which would lie); on macOS uses
+    /// `F_NOCACHE`. Other platforms fall back to buffered + a warning.
+    ///
+    /// Use only when measuring cold-cache scaling (e.g. the v0.3.30
+    /// io-thread sweep on real Windows hardware). Regular scans should
+    /// leave this OFF — bypassing the cache is much slower per-file
+    /// and defeats the page-cache optimization the kernel does for
+    /// repeated reads on the same corpus.
+    ///
+    /// Per-tier behaviour:
+    /// - Tier 1 (head, 4 KiB sector-aligned): cold-bypass enabled.
+    /// - Tier 2 (head + mid + tail): falls back to buffered; the
+    ///   mid/tail seeks aren't sector-aligned for arbitrary file sizes,
+    ///   so a clean cold-bypass would need per-call alignment logic;
+    ///   tier 2 is the smallest tier so the cache pollution from it
+    ///   is negligible vs tier 1 + tier 3.
+    /// - Tier 3 (full content): cold-bypass enabled via the same
+    ///   `read_uncached` helper bench-me uses.
+    #[arg(long)]
+    pub cold_enforced: bool,
+
     /// Allow the hash worker to read cloud-placeholder files
     /// (`RecallOnOpen` / `RecallOnDataAccess`) even though opening them
     /// triggers cloud hydration. Default OFF — the conservative default

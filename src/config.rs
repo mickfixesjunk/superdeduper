@@ -72,6 +72,15 @@ pub struct ScanConfig {
     /// cloud-recall placeholders (forcing hydration on read). Default
     /// false. Flows from `--allow-recall-on-read`.
     pub allow_recall_on_read: bool,
+    /// 2026-06-02 R2 engine-ask: when true, every file read in the
+    /// scan path opens with FILE_FLAG_NO_BUFFERING (Windows) /
+    /// O_DIRECT (Linux non-WSL) / F_NOCACHE (macOS) so the OS page
+    /// cache is bypassed. Lets sdd-testwin's io-thread scaling sweep
+    /// measure cold-cache behaviour regardless of corpus size vs RAM.
+    /// Flows from `--cold-enforced`. Per-tier impact: tier 1 + tier 3
+    /// cold-bypass; tier 2 falls back to buffered (mid/tail seeks not
+    /// sector-aligned for arbitrary file sizes). MEASUREMENT mode only.
+    pub cold_enforced: bool,
     /// Which content-hash algorithm to use for Tier 1/2/3 + format
     /// fingerprints. BLAKE3 is the default; DDH-128 is the
     /// in-development alternative (currently an xxhash3-128 stub).
@@ -142,6 +151,7 @@ impl ScanConfig {
             force_mft: args.force_mft,
             parallel_roots: args.parallel_roots,
             allow_recall_on_read: args.allow_recall_on_read,
+            cold_enforced: args.cold_enforced,
             hash_algo: args.hash_algo.into(),
             // #81 — Wire the CLI's exclusion flags into the runtime
             // policy. Defaults to safe-defaults ON (the new v0.2.7+
@@ -343,6 +353,7 @@ mod tests {
             parallel_roots: false,
             placeholders_only: false,
             force_hash: false,
+            cold_enforced: false,
             allow_recall_on_read: false,
             hash_algo: HashAlgoArg::River5,
             mode: crate::cli::ScanMode::Exact,

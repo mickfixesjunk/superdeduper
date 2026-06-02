@@ -833,7 +833,7 @@ fn evict_file_pages(_path: &Path) -> std::io::Result<()> {
 /// Real Linux, where O_DIRECT is honoured, stays reliable. tmpfs/overlay
 /// already fail honestly via the `open` rejection -> buffered -> cold=false.
 #[cfg(target_os = "linux")]
-fn cold_bypass_reliable() -> bool {
+pub fn cold_bypass_reliable() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| match std::fs::read_to_string("/proc/version") {
@@ -848,7 +848,7 @@ fn cold_bypass_reliable() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::FromRawFd;
@@ -909,7 +909,7 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
     let mut file = std::fs::File::open(path)?;
@@ -924,7 +924,7 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
 }
 
 #[cfg(windows)]
-fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -1011,7 +1011,7 @@ fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     // No portable cache-bypass on this platform -> buffered (not cold).
     Ok((std::fs::read(path)?, false))
 }

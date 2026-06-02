@@ -2659,6 +2659,9 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         // Phase 7 GUI counter exposes the bucket; a future iteration
         // can add the toggle if user feedback shows it's wanted.
         allow_recall_on_read: false,
+        // 2026-06-02 R2 engine-ask: cold-enforced is a CLI-only
+        // measurement flag; GUI scans use the OS page cache as normal.
+        cold_enforced: false,
         hash_algo: settings.hash_algo,
         // #81 — Compile the user's ExclusionConfig (master toggle +
         // active preset packs + custom rules) into the runtime

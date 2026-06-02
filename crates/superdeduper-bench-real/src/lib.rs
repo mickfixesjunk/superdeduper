@@ -37,6 +37,13 @@ pub mod bench_run;
 pub mod d7_probe;
 pub mod submission_http;
 
+// 2026-06-02: re-export cold-cache-bypass read helper so the engine's
+// scan path (src/pipeline/hash.rs) can use the same FILE_FLAG_NO_BUFFERING
+// / O_DIRECT primitives that bench-me uses. Lets `--cold-enforced` on
+// `sd scan` deliver clean cold-read scaling measurements per design
+// directive 2026-06-02 07:25 PDT (R2 engine-ask).
+pub use bench_run::read_uncached;
+
 use std::path::Path;
 use superdeduper_bench_iface::{
     BenchContext, BenchError, BenchExecutor, BenchOutcome, BenchServices, DebugDedupDiffReport,
