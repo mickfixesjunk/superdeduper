@@ -2654,11 +2654,14 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         // the CLI for the v0.3.14 inventory matrix only.
         force_mft: false,
         parallel_roots: false,
-        // v0.3.28: env var path only for the GUI in this slice. Sub-step 2
-        // adds the Settings -> Performance toggle that surfaces this field.
-        work_stealing: std::env::var("SUPERDEDUPER_WORK_STEALING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false),
+        // v0.3.28: Settings → Performance → "Work-stealing pipeline"
+        // toggle is the user-facing path. SUPERDEDUPER_WORK_STEALING=1
+        // env var override is the testdesign-automation hook (forces ON
+        // regardless of persisted setting).
+        work_stealing: settings.work_stealing
+            || std::env::var("SUPERDEDUPER_WORK_STEALING")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         // GUI settings don't surface the placeholder-policy knob yet;
         // tier guard defaults to conservative (refuse cloud recalls).
         // Phase 7 GUI counter exposes the bucket; a future iteration

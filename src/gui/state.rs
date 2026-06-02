@@ -126,6 +126,15 @@ pub struct ScanSettings {
     /// after dismissal the value persists across launches.
     #[serde(default)]
     pub dismissed_v0_2_7_exclusion_banner: bool,
+    /// v0.3.28 (2026-06-02): Settings → Performance → "Work-stealing
+    /// pipeline" toggle. Default OFF; when ON the next scan runs via
+    /// the experimental channel-based walker → hasher pipeline (no
+    /// walk-then-hash layer barrier). Implementation lands in v0.3.29;
+    /// this field surfaces the persistence + toggle UI in v0.3.28 so
+    /// testdesign harnesses + Mick's manual A/B flip wire up
+    /// independently of the engine-side rewrite.
+    #[serde(default)]
+    pub work_stealing: bool,
 }
 
 impl Default for ScanSettings {
@@ -151,6 +160,7 @@ impl Default for ScanSettings {
             history_retention_days: 0,
             exclusion_config: crate::exclusions::ExclusionConfig::default(),
             dismissed_v0_2_7_exclusion_banner: false,
+            work_stealing: false,
         }
     }
 }

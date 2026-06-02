@@ -29,6 +29,12 @@ pub enum SettingsTab {
     /// 8 pack-row checkboxes, custom-extension / pattern textareas.
     Exclusions,
     Network,
+    /// v0.3.28 (2026-06-02) — Experimental perf toggles. Currently
+    /// hosts the "Work-stealing pipeline" opt-in (default OFF).
+    /// Future load-bearing perf settings (io-threads tuning, walker
+    /// strategy hints, prehash tier overrides) migrate here per
+    /// design 2026-06-02 02:39Z spec UPDATE.
+    Performance,
     #[cfg(feature = "telemetry")]
     Account,
     #[cfg(feature = "telemetry")]
@@ -45,6 +51,7 @@ impl SettingsTab {
             SettingsTab::Preflight => "Pre-flight",
             SettingsTab::Exclusions => "Exclusions",
             SettingsTab::Network => "Network",
+            SettingsTab::Performance => "Performance",
             #[cfg(feature = "telemetry")]
             SettingsTab::Account => "Account",
             #[cfg(feature = "telemetry")]
@@ -61,6 +68,7 @@ impl SettingsTab {
             SettingsTab::Preflight,
             SettingsTab::Exclusions,
             SettingsTab::Network,
+            SettingsTab::Performance,
         ];
         #[cfg(feature = "telemetry")]
         {
@@ -812,6 +820,7 @@ fn render_modal_body(
                                 SettingsTab::Preflight => render_preflight(ui, settings),
                                 SettingsTab::Exclusions => render_exclusions(ui, settings),
                                 SettingsTab::Network => render_network(ui, state),
+                                SettingsTab::Performance => render_performance(ui, settings),
                                 #[cfg(feature = "telemetry")]
                                 SettingsTab::Account => render_account(ui),
                                 #[cfg(feature = "telemetry")]
@@ -1637,6 +1646,52 @@ fn render_network(ui: &mut egui::Ui, state: &mut SettingsModalState) {
                 .italics(),
         );
     }
+}
+
+/// Settings → Performance tab — experimental perf opt-ins.
+///
+/// v0.3.28 (2026-06-02): currently hosts the "Work-stealing pipeline"
+/// toggle. Future load-bearing perf settings (io-threads tuning,
+/// walker strategy hints, prehash tier overrides) migrate here per
+/// design 2026-06-02 02:39Z spec UPDATE.
+///
+/// All toggles default OFF -- production behavior preserved unless the
+/// user explicitly flips a switch. The work-stealing toggle's actual
+/// engine implementation lands in v0.3.29; v0.3.28 surfaces the
+/// persistence + UI so testdesign harnesses + Mick's manual A/B flip
+/// can wire up independently of the engine-side rewrite.
+fn render_performance(ui: &mut egui::Ui, settings: &mut ScanSettings) {
+    ui.label(
+        RichText::new("Performance")
+            .heading()
+            .color(theme::TEXT_HI),
+    );
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "Experimental engine paths. Default OFF; flipping a switch \
+             re-routes the next scan through the alternate path."
+        )
+        .small()
+        .color(theme::TEXT_LO),
+    );
+    ui.add_space(16.0);
+
+    ui.checkbox(
+        &mut settings.work_stealing,
+        "Work-stealing pipeline (experimental)",
+    );
+    ui.label(
+        RichText::new(
+            "Walker streams files directly to hash workers (no walk-then-hash \
+             barrier). May improve throughput on heterogeneous corpora; can \
+             regress on unique-size-heavy corpora. v0.3.28 ships the toggle; \
+             engine implementation lands in v0.3.29. Override at runtime via \
+             SUPERDEDUPER_WORK_STEALING=1 environment variable."
+        )
+        .small()
+        .color(theme::TEXT_LO),
+    );
 }
 
 /// Settings → Account tab — G3 OAuth surface.
