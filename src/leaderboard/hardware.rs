@@ -240,8 +240,28 @@ fn detect_workdir_disk_class(workdir: &std::path::Path) -> Option<String> {
 /// then check /queue/rotational + (for NVMe) the parent controller's
 /// /device/current_link_speed to derive the PCIe-gen suffix. Falls back
 /// through SATA-SSD / HDD / None per the rotational signal.
+/// True when running under WSL2. WSL exposes a virtual block device
+/// (typically `/dev/sd*`) whose `queue/rotational` flag reports `1`
+/// regardless of the host's actual hardware — so the rotational
+/// signal misclassifies WSL ext4 (backed by an NVMe / SSD on the host)
+/// as `HDD`. Detection via the standard `/proc/sys/kernel/osrelease`
+/// `microsoft` marker, which both WSL1 and WSL2 set.
+#[cfg(target_os = "linux")]
+fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.to_lowercase().contains("microsoft"))
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "linux")]
 fn workdir_disk_class_platform(workdir: &std::path::Path) -> Option<String> {
+    // WSL early-return: the virtual block device's rotational flag is
+    // unreliable. Report `WSL2` so the io-thread cap (which fires on
+    // `disk_class.contains("HDD")`) doesn't engage on what is almost
+    // always a fast host-side SSD/NVMe behind the .vhdx.
+    if is_wsl() {
+        return Some("WSL2".to_string());
+    }
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(workdir).ok()?;
     // Linux `dev_t`: 8-bit major | 8-bit minor (legacy) or 12-bit major | 20-bit
@@ -741,6 +761,11 @@ fn detect_disk_class() -> String {
 
 #[cfg(target_os = "linux")]
 fn platform_detect_disk_class() -> Option<String> {
+    // WSL early-return: same rotational-flag-unreliable rationale as
+    // workdir_disk_class_platform — see is_wsl() doc.
+    if is_wsl() {
+        return Some("WSL2".to_string());
+    }
     // Walk /sys/class/nvme/. Each child is an NVMe controller
     // (nvme0, nvme1, …). Its `device/current_link_speed` reports
     // the PCIe link speed in GT/s — e.g. "32.0 GT/s PCIe" for
