@@ -247,7 +247,7 @@ fn detect_workdir_disk_class(workdir: &std::path::Path) -> Option<String> {
 /// as `HDD`. Detection via the standard `/proc/sys/kernel/osrelease`
 /// `microsoft` marker, which both WSL1 and WSL2 set.
 #[cfg(target_os = "linux")]
-fn is_wsl() -> bool {
+pub(crate) fn is_wsl() -> bool {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.to_lowercase().contains("microsoft"))
         .unwrap_or(false)
