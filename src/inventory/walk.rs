@@ -497,6 +497,274 @@ fn to_verbatim(p: &Path) -> std::path::PathBuf {
     }
 }
 
+fn walk<F>(
+    dir: &Path,
+    cfg: &ScanConfig,
+    out: &mut Vec<FileEntry>,
+    callback: &mut F,
+    depth: u32,
+    cancel: Option<&AtomicBool>,
+    visited_dirs: &mut HashSet<DirIdentity>,
+) -> Result<()>
+where
+    F: FnMut(WalkEvent<'_>),
+{
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Ok(());
+    }
+    // T1.7: when follow_links is ON, every descend goes through this
+    // identity check. If we've already enumerated this physical dir
+    // (via any path — symlink or regular subdir), return silently.
+    // The named `SymlinkCycleSkipped` event lives at the symlink site
+    // below; this gate catches the case where the regular descent
+    // happens AFTER a symlink-followed descent already populated the
+    // set, which would otherwise enumerate the dir twice.
+    if cfg.follow_links {
+        if let Some(identity) = dir_identity(dir) {
+            if !visited_dirs.insert(identity) {
+                // Already enumerated this physical directory. Emit
+                // the named cycle event so the GUI / log can show
+                // "we detected an alias" rather than silently skip.
+                let target = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                callback(WalkEvent::SymlinkCycleSkipped { from: dir, target });
+                return Ok(());
+            }
+        }
+    }
+    callback(WalkEvent::Entered { path: dir, depth });
+
+    // Block N: Windows fast path via FileIdBothDirectoryInfo. Returns
+    // every entry's name + size + attrs + inode + mtime in a single
+    // batched call, eliminating the per-entry `metadata()` cost AND
+    // populating `file_ref` so Stage 2b's resolve_file_ids skips us
+    // entirely (it short-circuits per-file when file_ref != 0).
+    //
+    // On non-NTFS volumes or any API failure, falls through to the
+    // existing `read_dir` path. The fall-through preserves the
+    // original semantics exactly — fast path is opportunistic.
+    #[cfg(windows)]
+    {
+        if let Some(enumeration) = crate::inventory::dir_enum::enumerate_dir_full(dir) {
+            return walk_fast_path(
+                dir,
+                enumeration,
+                cfg,
+                out,
+                callback,
+                depth,
+                cancel,
+                visited_dirs,
+            );
+        }
+        // Fall through to read_dir (logged at trace level — common on
+        // network shares / non-NTFS where the API doesn't apply).
+        tracing::trace!(
+            path = %dir.display(),
+            "FileIdBothDirectoryInfo unavailable; falling back to read_dir"
+        );
+    }
+
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            callback(WalkEvent::DirError {
+                path: dir,
+                message: "permission denied".into(),
+            });
+            tracing::warn!(path = %dir.display(), "permission denied; skipping");
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(e) => {
+            callback(WalkEvent::DirError {
+                path: dir,
+                message: e.to_string(),
+            });
+            tracing::warn!(path = %dir.display(), error = %e, "open dir failed; skipping");
+            return Ok(());
+        }
+    };
+
+    for entry in read {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                callback(WalkEvent::DirError {
+                    path: dir,
+                    message: format!("entry error: {e}"),
+                });
+                tracing::warn!(error = %e, dir = %dir.display(), "skipping entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "metadata failed",
+                });
+                tracing::debug!(path = %path.display(), error = %e, "metadata failed; skipping");
+                continue;
+            }
+        };
+
+        let entry_was_symlink = metadata.file_type().is_symlink();
+        let metadata = if entry_was_symlink {
+            if !cfg.follow_links {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "symlink (use --follow-links to include)",
+                });
+                continue;
+            }
+            // --follow-links: re-stat through the symlink so downstream
+            // checks (is_file / is_dir / classify) see the TARGET's
+            // attributes, not the link's. `entry.metadata()` returns
+            // symlink_metadata on every platform, so a file-symlink
+            // would otherwise be dropped by the `!is_file` branch below.
+            // Per testdesign criterion #5: default.json and follow.json
+            // had been byte-identical because of this — --follow-links
+            // had zero observable effect.
+            match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    callback(WalkEvent::EntrySkipped {
+                        path: &path,
+                        reason: "symlink target unreadable",
+                    });
+                    tracing::debug!(
+                        path = %path.display(),
+                        error = %e,
+                        "symlink target stat failed; skipping",
+                    );
+                    continue;
+                }
+            }
+        } else {
+            metadata
+        };
+
+        // #116 — superdeduper's own footprint should never appear in
+        // dedup results, regardless of user exclusion settings. Skip
+        // diagnose-scratch dirs, safe-rename'd dups, and reflink
+        // atomic-temp files unconditionally.
+        if is_superdeduper_self_path(&path) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "superdeduper self-footprint",
+            });
+            continue;
+        }
+
+        if metadata.is_dir() {
+            // T1.7: cycle detection is centralised at walk-top
+            // (visited-set insert + named event emission). We just
+            // recurse; walk handles dedup.
+            let _ = entry_was_symlink; // explicitly accept: used implicitly via metadata re-stat above
+            walk(&path, cfg, out, callback, depth + 1, cancel, visited_dirs)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "not a regular file",
+            });
+            continue;
+        }
+
+        let size = metadata.len();
+        if size < cfg.min_size {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "below min-size",
+            });
+            continue;
+        }
+        if let Some(max) = cfg.max_size {
+            if size > max {
+                callback(WalkEvent::EntrySkipped {
+                    path: &path,
+                    reason: "above max-size",
+                });
+                continue;
+            }
+        }
+
+        if dropped_by_exclusions(&path, size, cfg) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "Settings → Exclusions",
+            });
+            continue;
+        }
+        if !path_passes_globs(&path, cfg) {
+            callback(WalkEvent::EntrySkipped {
+                path: &path,
+                reason: "filtered by include/exclude",
+            });
+            continue;
+        }
+
+        callback(WalkEvent::FileFound { path: &path, size });
+
+        // Walker emits FileEntry with file_ref=0 / volume_guid=None.
+        // Inode-id resolution happens later — see
+        // `pipeline::grouping::resolve_file_ids`, called between the
+        // size-grouping and layout stages. Files that don't survive
+        // size grouping (i.e. have unique sizes) never need an inode
+        // id, so resolving here would mean opening every file on the
+        // walk to get information that almost all of them won't
+        // need.
+        // Extract Win32 file attributes on Windows so cloud-placeholder
+        // classification works on the fallback path too. On other
+        // platforms attributes stays 0 and placeholder.rs's
+        // cross-platform stub returns NotPlaceholder.
+        let attributes = win_file_attributes(&metadata);
+        // When the file carries a reparse point, fetch its tag via
+        // FSCTL_GET_REPARSE_POINT so classify() can distinguish
+        // IO_REPARSE_TAG_DEDUP (ReparseDedup → hashable) from cloud
+        // tags (RecallOnOpen etc. via tag-first detection) from
+        // arbitrary unknowns. Without this, every reparse file
+        // classifies as `OtherReparse(0)` — conservative-blocked,
+        // but loses information the user needs.
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x400.
+        let reparse_tag = if (attributes & 0x400) != 0 {
+            crate::winapi_wrappers::fetch_reparse_tag(&path)
+        } else {
+            None
+        };
+        // L0: on Linux/Unix, populate file_ref + volume_guid from
+        // st_ino + st_dev so the engine's T0.5 partition_by_inode
+        // sees real hardlink relationships. Without this, every
+        // path got a synthetic per-file key, hardlinks were never
+        // collapsed, and reclaimable_inode_bytes inflated on
+        // hardlink-heavy corpora (e.g. /usr/lib's uutils multi-
+        // call binary that ships 114 hardlinks to one inode).
+        // Cheap: `metadata` was already fetched for the size +
+        // filetime/win-attributes lines above; no extra syscall.
+        let (file_ref, volume_guid) = inode_identity(&metadata);
+        out.push(FileEntry {
+            path,
+            size,
+            mtime: filetime_ticks(&metadata),
+            file_ref,
+            parent_ref: 0,
+            usn: 0,
+            attributes,
+            volume_guid,
+            placeholder: crate::inventory::placeholder::classify(attributes, reparse_tag),
+        });
+    }
+    Ok(())
+}
 
 /// Extract (file_ref, volume_guid) from a Metadata.
 ///
