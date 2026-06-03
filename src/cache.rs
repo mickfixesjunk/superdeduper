@@ -968,14 +968,32 @@ impl SchemaState {
     }
 }
 
-#[cfg(windows)]
+/// Cache DB path. Honors `SUPERDEDUPER_TEST_DATA_DIR` first (so
+/// egui_kittest cells get a hermetic cache cross-platform); falls
+/// back to the per-platform default when the override isn't set.
+///
+/// Same env-var that `leaderboard::install::data_dir` reads. Before
+/// this override existed, Windows egui_kittest cells with
+/// `SUPERDEDUPER_TEST_DATA_DIR` set still saw cache reads land at the
+/// real `%LOCALAPPDATA%\superdeduper\cache.db` (test pollution), which
+/// is part of why sdd-testwin's first-launch cells failed 8/9 on
+/// Windows even after the v0.3.35 install-side override shipped. Linux
+/// already worked via the XDG_CACHE_HOME / HOME branch + `isolated_env`.
 pub fn default_cache_path() -> Result<PathBuf> {
+    if let Some(test_dir) = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR") {
+        return Ok(PathBuf::from(test_dir).join("cache.db"));
+    }
+    default_cache_path_platform()
+}
+
+#[cfg(windows)]
+fn default_cache_path_platform() -> Result<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").map_err(|_| Error::EnvVarMissing("LOCALAPPDATA"))?;
     Ok(PathBuf::from(local).join("superdeduper").join("cache.db"))
 }
 
 #[cfg(not(windows))]
-pub fn default_cache_path() -> Result<PathBuf> {
+fn default_cache_path_platform() -> Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(xdg).join("superdeduper").join("cache.db"));
     }
@@ -1012,6 +1030,47 @@ mod tests {
             mtime,
             usn,
             hash_algo: HashAlgo::Blake3,
+        }
+    }
+
+    #[test]
+    fn default_cache_path_honors_test_data_dir_override() {
+        // Mirrors leaderboard::install::data_dir_honors_test_data_dir_override.
+        // The 2026-06-03 sweep extended SUPERDEDUPER_TEST_DATA_DIR coverage to
+        // include cache + scan_history; before that, Windows egui_kittest cells
+        // got hermetic install state but the cache still landed at the real
+        // %LOCALAPPDATA%\superdeduper\cache.db.
+        let _g = crate::test_serial::home_env_guard();
+        let prev = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR");
+        let tmp = std::env::temp_dir().join(format!(
+            "superdeduper-cache-test-data-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", &tmp);
+        let got = default_cache_path().expect("default_cache_path succeeds when override set");
+        assert_eq!(got, tmp.join("cache.db"), "override path + cache.db must be used");
+        match prev {
+            Some(v) => std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", v),
+            None => std::env::remove_var("SUPERDEDUPER_TEST_DATA_DIR"),
+        }
+    }
+
+    #[test]
+    fn default_cache_path_falls_back_to_platform_when_override_unset() {
+        let _g = crate::test_serial::home_env_guard();
+        let prev = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR");
+        std::env::remove_var("SUPERDEDUPER_TEST_DATA_DIR");
+        let got = default_cache_path().expect("platform default_cache_path resolves");
+        assert!(
+            got.ends_with("cache.db"),
+            "platform default_cache_path must end with 'cache.db'; got {got:?}"
+        );
+        if let Some(v) = prev {
+            std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", v);
         }
     }
 
