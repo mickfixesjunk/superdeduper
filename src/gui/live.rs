@@ -1312,14 +1312,24 @@ fn run(
             // Drive-scope dot positioning. On SSDs we use a stable
             // path-hash for Y (scattered "TV snow"); on HDDs we
             // use the cumulative-bytes climb (clean diagonal).
-            let lcn_bytes = if progress_drive_is_hdd {
-                total_bytes
-            } else {
-                hash_path_to_lcn(path)
-            };
-
+            //
+            // 2026-06-02 perf cleanup (design iterate-freely 17:15
+            // PDT; pre-empting hypothesis 2/3/5 investigation):
+            // hash_path_to_lcn(path) is a BLAKE3 hash on the path
+            // string -- ~1-2us per call. Pre-fix it was computed on
+            // EVERY callback (per-file-per-tier) but only USED inside
+            // the modulus-gated try_send (every 10th call on SSD;
+            // every 50th on HDD). 90-98% of the BLAKE3 work was
+            // discarded. Moved inside the modulus-gated branch.
+            // Per-file cost change for the dominant SSD case on a
+            // 312K-file scan: ~280K wasted BLAKE3 calls -> 0.
             let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
             if n.is_multiple_of(read_modulus) {
+                let lcn_bytes = if progress_drive_is_hdd {
+                    total_bytes
+                } else {
+                    hash_path_to_lcn(path)
+                };
                 let _ = progress_tx.try_send(EngineEvent::Read(ReadSample {
                     drive: progress_drive,
                     lcn_bytes,
