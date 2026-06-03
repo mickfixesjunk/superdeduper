@@ -48,7 +48,15 @@ use std::time::{Duration, Instant};
 /// the three regimes characterized in workdirs/design/profile-data.md:
 /// 1 (HDD-bottlenecked / WSL warm), 4-8 (NVMe knee), 16 (NVMe
 /// plateau).
-const PROBE_CANDIDATES: &[usize] = &[1, 4, 16];
+///
+/// 2026-06-03: added 8 explicitly. Prior session perf data showed Win
+/// NVMe cold optima at io=8 for some corpora -- with only {1,4,16}
+/// probed, the bracket could pick 16 even when 8 would have been
+/// faster (16 wins the {1,4,16} contest by being closest to 8 from
+/// above on machines where 16 over-saturates). Adding 8 lets the
+/// probe pick it directly. Total probe budget unchanged (still
+/// PROBE_TOTAL_TIME_CAP gated); per-candidate slot just trims.
+const PROBE_CANDIDATES: &[usize] = &[1, 4, 8, 16];
 
 /// Cap how many files the probe walks before bailing. Each file is
 /// read once per config so total = N × candidates.len() reads. 16
