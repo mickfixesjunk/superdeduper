@@ -68,9 +68,17 @@ fn make_dup_corpus(tag: &str) -> (PathBuf, [PathBuf; 4]) {
     (dir, [keeper, loser_a, loser_b, distinct])
 }
 
-/// Isolate XDG_* + HOME to a fresh tempdir so app::new() sees no checkpoint
-/// (no Resume modal), a hermetic cache, and a clean scan-history. Returns the
-/// root so the caller can inspect/clean it.
+/// Isolate XDG_* + HOME + SUPERDEDUPER_TEST_DATA_DIR to a fresh tempdir so
+/// app::new() sees no checkpoint (no Resume modal), a hermetic cache, and a
+/// clean scan-history. Returns the root so the caller can inspect/clean it.
+///
+/// XDG_* covers Linux; SUPERDEDUPER_TEST_DATA_DIR covers cross-platform via
+/// install.rs::data_dir + cache.rs::default_cache_path + scan_history.rs::data_dir
+/// (gui/checkpoint.rs::default_checkpoint_path inherits transitively). Without
+/// the env-var, sdd-testwin's Windows runs hit real %LOCALAPPDATA%\\superdeduper
+/// state from prior real runs (stale settings shadow test roots, dismissed
+/// alpha modal hides the Continue button, leftover checkpoint races with the
+/// boot path) — that's the 8/9-cells-fail-on-Windows finding's likely root.
 fn isolated_env(tag: &str) -> PathBuf {
     let mut root = std::env::temp_dir();
     root.push(format!(
@@ -88,6 +96,9 @@ fn isolated_env(tag: &str) -> PathBuf {
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
     std::env::set_var("HOME", &root);
+    // Cross-platform engine-side hermetic redirect; the engine's
+    // install/cache/scan_history/checkpoint resolvers all honor this first.
+    std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", root.join("data"));
     root
 }
 
