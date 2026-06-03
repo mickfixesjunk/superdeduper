@@ -2678,11 +2678,18 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
                     (n, "default-via-default_io_threads")
                 }
             };
-            tracing::info!(
-                io_threads = chosen,
-                source = source,
-                cpu_threads = cpu,
-                "GUI scan: io-threads selected"
+            // 2026-06-02: GUI binary does NOT install a tracing
+            // subscriber (per src/bin/superdeduper_gui.rs); tracing::info!
+            // would be a no-op + never reach Mick's engine log file. Use
+            // the superdeduper-log macro instead -- writes to both stderr
+            // AND the persistent engine log at
+            // <data_dir>/log/superdeduper.<unix>.<pid>.log per
+            // [[feedback_persist_engine_log]] (Mick directive 2026-05-29).
+            crate::log_info!(
+                "GUI scan: io-threads selected io_threads={} source={} cpu_threads={}",
+                chosen,
+                source,
+                cpu,
             );
             chosen
         },
