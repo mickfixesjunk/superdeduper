@@ -687,8 +687,20 @@ fn io_err(e: impl std::error::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-#[cfg(windows)]
+/// scan-history data dir. Honors `SUPERDEDUPER_TEST_DATA_DIR` first
+/// (so egui_kittest cells get a hermetic scan-history cross-platform);
+/// falls back to the per-platform default when the override isn't set.
+/// Same env-var pattern as `leaderboard::install::data_dir` and
+/// `cache::default_cache_path` — see those for the why.
 fn data_dir() -> io::Result<PathBuf> {
+    if let Some(test_dir) = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR") {
+        return Ok(PathBuf::from(test_dir));
+    }
+    data_dir_platform()
+}
+
+#[cfg(windows)]
+fn data_dir_platform() -> io::Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA not set"))?;
     let mut p = PathBuf::from(local);
@@ -697,7 +709,7 @@ fn data_dir() -> io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn data_dir() -> io::Result<PathBuf> {
+fn data_dir_platform() -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
     let mut p = PathBuf::from(home);
@@ -708,7 +720,7 @@ fn data_dir() -> io::Result<PathBuf> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn data_dir() -> io::Result<PathBuf> {
+fn data_dir_platform() -> io::Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         let mut p = PathBuf::from(xdg);
         p.push("superdeduper");
@@ -752,6 +764,56 @@ mod tests {
         let id = new_scan_id();
         assert_eq!(id.len(), 32, "got {id}");
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "got {id}");
+    }
+
+    #[test]
+    fn data_dir_honors_test_data_dir_override() {
+        // Mirrors leaderboard::install::data_dir_honors_test_data_dir_override.
+        // 2026-06-03 sweep: SUPERDEDUPER_TEST_DATA_DIR now also redirects the
+        // scan_history dir so egui_kittest cells get hermetic history state
+        // cross-platform (Windows pre-fix read real %LOCALAPPDATA% bypassing
+        // the env-var even though Linux already honored XDG_DATA_HOME).
+        let _g = crate::test_serial::home_env_guard();
+        let prev = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR");
+        let tmp = std::env::temp_dir().join(format!(
+            "superdeduper-history-test-data-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        unsafe {
+            std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", &tmp);
+        }
+        let got = data_dir().expect("data_dir succeeds when override set");
+        assert_eq!(got, tmp, "override path must be used verbatim");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", v),
+                None => std::env::remove_var("SUPERDEDUPER_TEST_DATA_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn data_dir_falls_back_to_platform_when_override_unset() {
+        let _g = crate::test_serial::home_env_guard();
+        let prev = std::env::var_os("SUPERDEDUPER_TEST_DATA_DIR");
+        unsafe {
+            std::env::remove_var("SUPERDEDUPER_TEST_DATA_DIR");
+        }
+        let _td = isolate("data-dir-fallback");
+        let got = data_dir().expect("platform data_dir resolves");
+        assert!(
+            got.ends_with("superdeduper"),
+            "platform data_dir must end with 'superdeduper'; got {got:?}"
+        );
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", v);
+            }
+        }
     }
 
     #[test]
