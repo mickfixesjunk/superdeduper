@@ -179,7 +179,7 @@ pub fn run_with_counters(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, None, None)
+    run_with_counters_inner(groups, cfg, cache, None, None, None)
 }
 
 /// Same as [`run_with_counters`] but with a per-file progress
@@ -192,7 +192,7 @@ pub fn run_with_progress(
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: FileProgress,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, Some(on_file), None)
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), None, None)
 }
 
 /// Like [`run_with_progress`] but also takes a cancellation flag. The
@@ -207,7 +207,44 @@ pub fn run_cancellable(
     on_file: FileProgress,
     cancel: Arc<AtomicBool>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, Some(on_file), Some(cancel))
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), Some(cancel), None)
+}
+
+/// Variant of [`run_cancellable`] that reuses a caller-built `io_pool`.
+///
+/// The GUI invokes the hash pipeline once per chunk (so confirmed dup
+/// groups surface mid-scan). Pre-#195 each chunk rebuilt the rayon
+/// io-pool — 8 thread creates + 8 joins per chunk, ~1000 chunks per
+/// real scan on Mick's C:\sdd-tests corpus — which dwarfed the actual
+/// IO work on small chunks. Letting the caller pre-build a single pool
+/// and pass it through hoists that cost out of the inner loop entirely.
+pub fn run_cancellable_with_pool(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+    on_file: FileProgress,
+    cancel: Arc<AtomicBool>,
+    io_pool: &rayon::ThreadPool,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    run_with_counters_inner(
+        groups,
+        cfg,
+        cache,
+        Some(on_file),
+        Some(cancel),
+        Some(io_pool),
+    )
+}
+
+/// Build a rayon thread pool sized to `cfg.io_threads` for stage-4
+/// hashing. Exposed so the GUI can build the pool once and share it
+/// across all hash chunks via [`run_cancellable_with_pool`].
+pub fn build_io_pool(cfg: &ScanConfig) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.io_threads.max(1))
+        .thread_name(|i| format!("superdeduper-io-{i}"))
+        .build()
+        .map_err(|e| Error::other(format!("io thread pool build: {e}")))
 }
 
 fn run_with_counters_inner(
@@ -216,6 +253,7 @@ fn run_with_counters_inner(
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: Option<FileProgress>,
     cancel: Option<Arc<AtomicBool>>,
+    shared_pool: Option<&rayon::ThreadPool>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
     let counters = Arc::new(HashCounters::default());
     let on_file_ref = on_file.as_ref();
@@ -228,11 +266,16 @@ fn run_with_counters_inner(
     // Keeping a separate pool from the global rayon means
     // non-hash rayon usage (layout resolver, perceptual Tier-4)
     // keeps its CPU-sized parallelism.
-    let io_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(cfg.io_threads.max(1))
-        .thread_name(|i| format!("superdeduper-io-{i}"))
-        .build()
-        .map_err(|e| Error::other(format!("io thread pool build: {e}")))?;
+    //
+    // When the GUI runs chunked it pre-builds the pool ONCE and
+    // passes it via `shared_pool` so we don't rebuild 8 threads
+    // (~1000 chunks × CreateThread + join on Windows = real time).
+    let owned_pool: Option<rayon::ThreadPool> = if shared_pool.is_some() {
+        None
+    } else {
+        Some(build_io_pool(cfg)?)
+    };
+    let io_pool: &rayon::ThreadPool = shared_pool.unwrap_or_else(|| owned_pool.as_ref().unwrap());
     // A-perf-stage-timing — isolate the parallel-IO scope from the pool
     // construction + post-scope counter unwrap that share main.rs's
     // t_hash bracket. This is the figure HDD-bench needs to decide on

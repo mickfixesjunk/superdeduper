@@ -1054,6 +1054,25 @@ fn run(
     // animates *within* a chunk, not just between them.
     let chunks = chunk_groups(laid, 32, 50);
     let total_chunks = chunks.len();
+
+    // #195 perf — build the stage-4 io thread pool ONCE here and
+    // share it across every chunk via run_cancellable_with_pool.
+    // Pre-fix, each chunk built its own pool (CreateThread x
+    // cfg.io_threads + join on scope-exit). On Windows that's tens
+    // of ms per chunk; with ~1000 chunks on Mick's C:\sdd-tests
+    // corpus the per-chunk pool churn was eating a chunk of the
+    // GUI-vs-CLI gap (CLI builds the pool once for the whole run).
+    // Fall back to fresh-per-chunk if build fails so a broken pool
+    // setup doesn't strand the scan.
+    let shared_io_pool = match pipeline::hash::build_io_pool(&cfg) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            crate::log_warn!(
+                "GUI scan: shared io_pool build failed ({e}); falling back to per-chunk pools"
+            );
+            None
+        }
+    };
     let total_to_hash = laid_count;
     let hashing_started = Instant::now();
     let _ = tx.send(EngineEvent::Status(format!(
@@ -1396,13 +1415,25 @@ fn run(
             }
         });
 
-        let (dups, counters) = match pipeline::hash::run_cancellable(
-            chunk,
-            &cfg,
-            cache.clone(),
-            on_file,
-            Arc::clone(&cancel),
-        ) {
+        let chunk_result = if let Some(pool) = shared_io_pool.as_ref() {
+            pipeline::hash::run_cancellable_with_pool(
+                chunk,
+                &cfg,
+                cache.clone(),
+                on_file,
+                Arc::clone(&cancel),
+                pool,
+            )
+        } else {
+            pipeline::hash::run_cancellable(
+                chunk,
+                &cfg,
+                cache.clone(),
+                on_file,
+                Arc::clone(&cancel),
+            )
+        };
+        let (dups, counters) = match chunk_result {
             Ok(v) => v,
             Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
                 // Cancellation came from the per-file Tier 3 streaming
