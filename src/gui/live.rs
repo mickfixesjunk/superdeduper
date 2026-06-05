@@ -1342,7 +1342,10 @@ fn run(
             // discarded. Moved inside the modulus-gated branch.
             // Per-file cost change for the dominant SSD case on a
             // 312K-file scan: ~280K wasted BLAKE3 calls -> 0.
-            let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
+            // SUPERDEDUPER_THROTTLE_STATE_EMIT_DURING_SCAN (Cand 1
+            // experiment, see state_emit_throttle_mult fn): multiplies
+            // modulus 10x when env var is set so events drop 10x.
+            let read_modulus = (if progress_drive_is_hdd { 50 } else { 10 }) * state_emit_throttle_mult();
             if n.is_multiple_of(read_modulus) {
                 let lcn_bytes = if progress_drive_is_hdd {
                     total_bytes
@@ -1360,7 +1363,8 @@ fn run(
             // Per-tier funnel tick — uses the tier-local counter
             // and the matching Stage enum so the funnel rows
             // narrow as you'd expect: T0 ≥ T1 ≥ T2 ≥ T3.
-            if n_tier.is_multiple_of(100) {
+            let stage_modulus = 100 * state_emit_throttle_mult();
+            if n_tier.is_multiple_of(stage_modulus) {
                 let stage = match tier {
                     0 => Stage::Tier0Format,
                     1 => Stage::Tier1Head,
@@ -1369,13 +1373,14 @@ fn run(
                 };
                 let _ = progress_tx.try_send(EngineEvent::StageTick {
                     stage,
-                    delta: 100,
+                    delta: stage_modulus,
                     total: n_tier,
                 });
             }
 
             // Headline OverallProgress + ETA: only Tier 1 advances.
-            if counts_for_progress && n.is_multiple_of(100) {
+            let progress_modulus = 100 * state_emit_throttle_mult();
+            if counts_for_progress && n.is_multiple_of(progress_modulus) {
                 let elapsed = hashing_started_inner.elapsed().as_secs_f32();
                 // #99 PR6+PR8 — bar math:
                 //   done = restored_skipped + n
@@ -2488,6 +2493,33 @@ fn parse_diskutil_solid_state(text: &str) -> Option<bool> {
 /// Uses BLAKE3 truncated to 8 bytes — fast, no allocation beyond a
 /// short slice, and stable across runs so the same file lands in the
 /// same place on repeated scans.
+/// EXPERIMENTAL GATE -- SUPERDEDUPER_THROTTLE_STATE_EMIT_DURING_SCAN
+/// (Mick GO state-emit-throttling experiment via design 2026-06-05 00:00 PDT).
+/// Tests Cand 1 hypothesis: per-file scan-progress event volume drives GUI
+/// per-step cost (drain_events processing + downstream state mutation +
+/// render churn).
+///
+/// When the env var is SET (any value, matches the SUPERDEDUPER_IOTHREADS_PARKED
+/// + SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN pattern), the on_file callback's
+/// existing modulus gates are MULTIPLIED 10x:
+///   - Read events:           every 10/50 -> every 100/500
+///   - StageTick funnel:      every 100   -> every 1000
+///   - OverallProgress + ETA: every 100   -> every 1000
+///
+/// Diagnostic-only. Default behavior (env var unset) is UNCHANGED. Cached
+/// via OnceLock so env::var_os fires ONCE per process.
+fn state_emit_throttle_mult() -> u64 {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<u64> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        if std::env::var_os("SUPERDEDUPER_THROTTLE_STATE_EMIT_DURING_SCAN").is_some() {
+            10
+        } else {
+            1
+        }
+    })
+}
+
 fn hash_path_to_lcn(path: &std::path::Path) -> u64 {
     let bytes = path.as_os_str().to_string_lossy();
     let h = blake3::hash(bytes.as_bytes());
