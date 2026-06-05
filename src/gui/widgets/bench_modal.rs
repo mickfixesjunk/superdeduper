@@ -263,18 +263,18 @@ fn run_worker(
         fresh,
         lane: lane.map(|l| l.as_slug().to_string()),
     };
-    use superdeduper_bench_iface::{BenchError, BenchExecutor};
+    use superdeduper_bench_iface::{BenchError, BenchExecutor, BenchServices};
     let executor: Box<dyn BenchExecutor> =
         Box::new(superdeduper_bench_real::BenchReal::new());
     let mut progress = |m: &str| set_status(m);
     let cancel_poll = || cancel.load(std::sync::atomic::Ordering::Relaxed);
-    let outcome = executor.run_bench(
-        ctx,
-        &mut progress,
-        &cancel_poll,
-        if submit { Some(&mut submit_fn) } else { None },
-        &hardware_detect,
-    );
+    let services = BenchServices {
+        progress: &mut progress,
+        cancel: &cancel_poll,
+        submit_fn: if submit { Some(&mut submit_fn) } else { None },
+        hardware_detect: &hardware_detect,
+    };
+    let outcome = executor.run_bench(ctx, services);
 
     match outcome {
         Err(BenchError::Cancelled) => {

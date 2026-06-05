@@ -37,10 +37,17 @@ pub mod bench_run;
 pub mod d7_probe;
 pub mod submission_http;
 
+// 2026-06-02: re-export cold-cache-bypass read helper so the engine's
+// scan path (src/pipeline/hash.rs) can use the same FILE_FLAG_NO_BUFFERING
+// / O_DIRECT primitives that bench-me uses. Lets `--cold-enforced` on
+// `sd scan` deliver clean cold-read scaling measurements per design
+// directive 2026-06-02 07:25 PDT (R2 engine-ask).
+pub use bench_run::read_uncached;
+
 use std::path::Path;
 use superdeduper_bench_iface::{
-    BenchContext, BenchError, BenchExecutor, BenchOutcome, DebugDedupDiffReport,
-    HardwareFingerprint, InstallKey, SubmissionExecutor, SubmissionInputs, SubmitOutcome,
+    BenchContext, BenchError, BenchExecutor, BenchOutcome, BenchServices, DebugDedupDiffReport,
+    InstallKey, SubmissionExecutor, SubmissionInputs, SubmitOutcome,
 };
 
 /// Default [`BenchExecutor`] + [`SubmissionExecutor`] implementation.
@@ -66,52 +73,60 @@ impl BenchReal {
 }
 
 impl BenchExecutor for BenchReal {
-    /// Phase 3 v0.3.21 (2026-06-01): REAL implementation. The expanded
-    /// BenchContext now carries install_key + server_url + workroot +
-    /// fresh + lane, and the trait method takes the submit_fn +
-    /// hardware_detect closures it needs. Delegates to the moved
-    /// `crate::bench_run::run`. AtomicBool cancel-poll is built locally
-    /// from the trait's `dyn Fn() -> bool` cancel arg via a small
-    /// shim adapter.
+    /// Phase 3 v0.3.21 + cancellation fix v0.3.24 (2026-06-01):
+    /// REAL implementation. Delegates to `crate::bench_run::run` which
+    /// takes a `&AtomicBool` for cancel-poll; the trait surface uses a
+    /// `Fn() -> bool + Send + Sync` callback so callers can drive
+    /// cancellation from arbitrary state. The v0.3.21 implementation
+    /// sampled `cancel()` once at entry which left mid-run cancel
+    /// broken (codex-review found, design URGENT 2026-06-01 22:23Z).
+    /// This commit bridges the two by spawning a scoped propagator
+    /// thread that polls `cancel()` every ~100ms for the duration of
+    /// the bench run + forwards into the AtomicBool. Propagator exits
+    /// the moment cancel fires OR the bench run returns (done_flag).
     fn run_bench(
         &self,
         ctx: BenchContext,
-        progress: &mut (dyn FnMut(&str) + Send),
-        cancel: &dyn Fn() -> bool,
-        submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
-        hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
+        services: BenchServices<'_>,
     ) -> Result<BenchOutcome, BenchError> {
-        // `bench_run::run` takes a `&AtomicBool` for cancel; the trait
-        // surface uses a `&dyn Fn() -> bool` poll-callback so callers
-        // can drive cancellation from arbitrary state. Bridge by
-        // polling the closure once at entry and again inside the local
-        // AtomicBool that `bench_run::run` watches. The bench loop polls
-        // its AtomicBool between stages; the cost of the per-stage
-        // closure-call is negligible (each stage is multi-second I/O).
         use std::sync::atomic::{AtomicBool, Ordering};
-        let cancel_flag = AtomicBool::new(false);
-        // Sample once at entry; in-flight cancellation arriving mid-run
-        // is handled by the iface's documented "polled between stages"
-        // contract -- callers that need real-time cancellation drive an
-        // AtomicBool directly into the closure.
-        if cancel() {
-            cancel_flag.store(true, Ordering::Relaxed);
-        }
-        crate::bench_run::run(
-            &ctx.install_id,
-            &ctx.install_key,
-            &ctx.server_url,
-            &ctx.corpus_version,
-            &ctx.tier,
-            ctx.workroot.as_deref(),
-            ctx.fresh,
-            &cancel_flag,
+        use std::time::Duration;
+
+        let BenchServices {
             progress,
-            ctx.lane.as_deref(),
+            cancel,
             submit_fn,
             hardware_detect,
-        )
-        .map_err(|e| {
+        } = services;
+
+        let cancel_flag = AtomicBool::new(false);
+        let done_flag = AtomicBool::new(false);
+
+        let result = std::thread::scope(|s| {
+            spawn_cancel_propagator(s, cancel, &cancel_flag, &done_flag);
+
+            let r = crate::bench_run::run(
+                &ctx.install_id,
+                &ctx.install_key,
+                &ctx.server_url,
+                &ctx.corpus_version,
+                &ctx.tier,
+                ctx.workroot.as_deref(),
+                ctx.fresh,
+                &cancel_flag,
+                progress,
+                ctx.lane.as_deref(),
+                submit_fn,
+                hardware_detect,
+            );
+            // Tell the propagator to exit -- bench is done, no need
+            // to keep polling cancel(). Scope blocks here until the
+            // thread observes done_flag and exits cleanly.
+            done_flag.store(true, Ordering::Relaxed);
+            r
+        });
+
+        result.map_err(|e| {
             // Distinguish Cancelled (clean abort) from other failures.
             if e.downcast_ref::<crate::bench_run::Cancelled>().is_some() {
                 BenchError::Cancelled
@@ -144,6 +159,44 @@ impl BenchExecutor for BenchReal {
             }
         })
     }
+}
+
+/// Bridge the closure-based cancel surface (the `Fn() -> bool + Send + Sync`
+/// the trait surface accepts) to the `AtomicBool` that the moved
+/// `bench_run::run` path watches.
+///
+/// Spawns a scoped thread that polls `cancel()` every 100ms and writes
+/// `true` into `cancel_flag` the first time `cancel()` returns true; the
+/// thread exits when `done_flag` flips (the caller signals this on bench
+/// completion so the propagator doesn't outlive the bench run).
+///
+/// 100ms polling is fine-grained enough that a GUI cancel feels instant,
+/// while infrequent enough that the propagator's CPU cost is negligible
+/// next to the bench's IO + hash work.
+///
+/// Extracted from `BenchReal::run_bench` (2026-06-02) so the regression
+/// test [`cancel_propagator_bridges_callback_to_flag`] can exercise the
+/// same code path the production bench uses, not a reimplementation.
+/// The codex-review report 2026-06-02T19:47:43Z surfaced this concern --
+/// the v0.3.24 fix shipped without a unit test pinning the bridge
+/// behaviour; this commit closes that gap.
+fn spawn_cancel_propagator<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    cancel: &'scope (dyn Fn() -> bool + Send + Sync),
+    cancel_flag: &'scope std::sync::atomic::AtomicBool,
+    done_flag: &'scope std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    scope.spawn(move || {
+        while !done_flag.load(Ordering::Relaxed) {
+            if cancel() {
+                cancel_flag.store(true, Ordering::Relaxed);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
 }
 
 impl SubmissionExecutor for BenchReal {
@@ -198,5 +251,96 @@ mod tests {
         // Sanity: the expanded trait sig is still dyn-safe; this keeps the
         // earlier dyn-safety assertion meaningful post-Phase-3.
         let _: Box<dyn BenchExecutor> = Box::new(BenchReal::new());
+    }
+
+    /// Regression test for the v0.3.24 cancel-bridge fix (codex-review
+    /// 2026-06-02T19:47:43Z). Before the fix, `BenchReal::run_bench`
+    /// sampled the trait surface's `cancel()` callback ONCE at entry
+    /// and passed the resulting bool into a local AtomicBool that
+    /// `bench_run::run` watched; mid-run flips of the original
+    /// `Arc<AtomicBool>` (driven by GUI Cancel / window-close) never
+    /// reached the bench worker.
+    ///
+    /// The fix spawns a scoped propagator thread that polls `cancel()`
+    /// every 100ms + writes into the local flag. This test exercises
+    /// the [`spawn_cancel_propagator`] helper directly (the same code
+    /// path `run_bench` uses since the 2026-06-02 refactor); a future
+    /// regression that re-introduces "sample once at entry" semantics
+    /// would have to remove this test to ship.
+    #[test]
+    fn cancel_propagator_bridges_callback_to_flag() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let cancel_flag = AtomicBool::new(false);
+        let done_flag = AtomicBool::new(false);
+        // Cancel returns false for the first 3 polls, then true on
+        // the 4th. With 100ms polling that's ~300-400ms before the
+        // bridge flips cancel_flag; well under the 2s safety bound.
+        let poll_count = AtomicUsize::new(0);
+        let cancel_fn = |poll_count: &AtomicUsize| -> bool {
+            let n = poll_count.fetch_add(1, Ordering::Relaxed);
+            n >= 3
+        };
+        let cancel: Box<dyn Fn() -> bool + Send + Sync> =
+            Box::new(move || cancel_fn(&poll_count));
+
+        std::thread::scope(|s| {
+            spawn_cancel_propagator(s, cancel.as_ref(), &cancel_flag, &done_flag);
+            let start = Instant::now();
+            loop {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    done_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "propagator never flipped cancel_flag within 2s; \
+                     the cancel-bridge regression has re-emerged"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "cancel_flag must be set after the propagator observed cancel()==true"
+        );
+    }
+
+    /// Companion test: if the cancel callback NEVER returns true,
+    /// the propagator should exit cleanly when `done_flag` flips
+    /// (the bench finished naturally; no stuck-thread leak).
+    #[test]
+    fn cancel_propagator_exits_when_bench_completes_without_cancel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let cancel_flag = AtomicBool::new(false);
+        let done_flag = AtomicBool::new(false);
+        let cancel: Box<dyn Fn() -> bool + Send + Sync> = Box::new(|| false);
+
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            spawn_cancel_propagator(s, cancel.as_ref(), &cancel_flag, &done_flag);
+            // Simulate the bench loop completing without cancel:
+            // wait 200ms (2 polling intervals), then signal done.
+            // Propagator must observe done_flag + exit.
+            std::thread::sleep(Duration::from_millis(200));
+            done_flag.store(true, Ordering::Relaxed);
+        });
+
+        assert!(
+            !cancel_flag.load(Ordering::Relaxed),
+            "cancel_flag must stay false when the callback never returned true"
+        );
+        // Scope::exit blocks until all spawned threads return; if the
+        // propagator hadn't observed done_flag this would hang. The
+        // assertion below is a defensive sanity check on the time
+        // budget -- 100ms poll + 200ms wait + thread join < 2s.
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "propagator failed to exit promptly after done_flag flipped"
+        );
     }
 }

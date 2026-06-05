@@ -531,33 +531,65 @@ pub enum BenchError {
 ///   `--no-default-features`). Every method returns
 ///   `Err(BenchError::Unavailable)`. Used for binary slices that ship
 ///   without bench/anti-cheat code (audit builds, hermetic dev images).
+/// Dynamic per-call services for a bench run. Bundles the 4 closures
+/// the bench loop needs (progress emit, cancel poll, optional submit
+/// callback, hardware-fingerprint probe) into a single parameter so the
+/// trait surface stays tight as the bench-loop's dependency surface
+/// grows over time.
+///
+/// Phase 4 v0.3.25 (2026-06-02): consolidates the 4 closure parameters
+/// codex-review item 4 flagged. Engine callers (CLI + GUI) bundle once
+/// at the call site; `BenchExecutor::run_bench` unpacks via field
+/// access. Refactor is signature-only -- no behavior change.
+///
+/// Lifetime: all fields share `'a` because engine callers construct
+/// the closures in the same lexical scope as the call site (closure
+/// captures + AtomicBool live across the entire bench run). The
+/// unified lifetime avoids 4-way lifetime variance + matches engine
+/// usage exactly.
+pub struct BenchServices<'a> {
+    /// `Send`: the bench-real impl spawns a scoped poller thread that
+    /// owns `progress` for the duration of the dedup stage. Engine
+    /// callers (CLI stderr + GUI status channel) are Send.
+    pub progress: &'a mut (dyn FnMut(&str) + Send),
+    /// `Send + Sync`: the bench-real impl spawns a scoped propagator
+    /// thread that re-evaluates `cancel()` every ~100ms and forwards
+    /// into the AtomicBool the moved bench_run::run path watches.
+    /// Without these bounds the closure can't cross thread boundaries
+    /// and BenchReal::run_bench can only sample cancel once at entry
+    /// (the v0.3.21 regression codex-review caught: mid-run cancel
+    /// never reached the bench loop). Engine callers' closures
+    /// `|| cancel.load(Ordering::Relaxed)` over `&AtomicBool` are
+    /// already Send + Sync.
+    pub cancel: &'a (dyn Fn() -> bool + Send + Sync),
+    /// Optional /submit callback. `None` keeps the bench result local
+    /// (no submission). `Some(fn)` is typically a closure that captures
+    /// the engine-side InstallState + calls the engine submission path.
+    pub submit_fn: Option<&'a mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
+    /// Engine-side hardware fingerprint probe. Lifted out of the
+    /// bench-real crate so bench-real doesn't depend on the engine's
+    /// 71KB `leaderboard::hardware` module (see v0.3.19 4fbd676).
+    pub hardware_detect: &'a dyn Fn(Option<&Path>) -> HardwareFingerprint,
+}
+
 pub trait BenchExecutor: Send + Sync {
     /// Run the canonical bench-me loop: `POST /bench/start`, download
     /// corpus, dedup, answer challenges, submit. Returns the outcome the
     /// CLI / GUI surfaces to the user.
     ///
-    /// `progress` is invoked with short, human-facing status strings as
-    /// the bench advances stages. `cancel` is polled between stages; the
-    /// impl bails with `BenchError::Cancelled` the moment it returns
-    /// true.
+    /// `services.progress` is invoked with short, human-facing status
+    /// strings as the bench advances stages. `services.cancel` is polled
+    /// between stages; the impl bails with `BenchError::Cancelled` the
+    /// moment it returns true.
     ///
-    /// Phase 3 v0.3.21 (2026-06-01): the trait method now also takes
-    /// `submit_fn` (optional /submit closure) and `hardware_detect`
-    /// (engine-side platform probe closure) so the impl can drive the
-    /// full bench flow without back-importing engine internals. The
-    /// engine retains ownership of the closures (they capture `&state`
-    /// + the engine's `leaderboard::hardware::detect_with_root_hint`);
-    /// the trait method receives them as `dyn` references.
+    /// Phase 4 v0.3.25 (2026-06-02): the 4 closure params from v0.3.21
+    /// are bundled into a single `BenchServices` struct (codex-review
+    /// item 4). Caller-side ergonomics improve substantially; trait
+    /// surface stays evolvable without per-param sig churn.
     fn run_bench(
         &self,
         ctx: BenchContext,
-        // `Send`: the bench-real impl spawns a scoped poller thread that
-        // owns `progress` for the duration of the dedup stage. Engine
-        // callers (CLI stderr + GUI status channel) are Send.
-        progress: &mut (dyn FnMut(&str) + Send),
-        cancel: &dyn Fn() -> bool,
-        submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
-        hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
+        services: BenchServices<'_>,
     ) -> Result<BenchOutcome, BenchError>;
 
     /// Diagnostic helper used by `sd debug dedup-diff`. Dedups a corpus
@@ -606,10 +638,7 @@ mod tests {
         fn run_bench(
             &self,
             _ctx: BenchContext,
-            _progress: &mut (dyn FnMut(&str) + Send),
-            _cancel: &dyn Fn() -> bool,
-            _submit_fn: Option<&mut dyn FnMut(&SubmissionInputs) -> SubmitOutcome>,
-            _hardware_detect: &dyn Fn(Option<&Path>) -> HardwareFingerprint,
+            _services: BenchServices<'_>,
         ) -> Result<BenchOutcome, BenchError> {
             Err(BenchError::Unavailable)
         }
@@ -677,7 +706,13 @@ mod tests {
         let mut progress = |_: &str| {};
         let cancel = || false;
         let hardware_detect = |_: Option<&Path>| stub_hardware();
-        let r = stub.run_bench(ctx, &mut progress, &cancel, None, &hardware_detect);
+        let services = BenchServices {
+            progress: &mut progress,
+            cancel: &cancel,
+            submit_fn: None,
+            hardware_detect: &hardware_detect,
+        };
+        let r = stub.run_bench(ctx, services);
         assert!(matches!(r, Err(BenchError::Unavailable)));
     }
 

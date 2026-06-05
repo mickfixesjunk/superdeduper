@@ -59,10 +59,28 @@ pub struct ScanConfig {
     ///   `FSCTL_ENUM_USN_DATA` syscall when the volume happens to be
     ///   shaped right for the MFT path's full-volume scan.
     pub force_mft: bool,
+    /// v0.3.23 (2026-06-01): when true, multi-root scans walk all
+    /// roots concurrently via rayon `par_iter` rather than serially.
+    /// Each parallel root gets its own symlink-cycle `visited_dirs`
+    /// HashSet (cross-root duplicate aliases caught by the post-walk
+    /// `dedup_by_path` pass). Default false; opt-in via
+    /// `--parallel-roots` for the multi-root use case (Mick: 4 folders
+    /// on the same HDD scanned together). On a single-root scan the
+    /// flag is a no-op.
+    pub parallel_roots: bool,
     /// T2.1 phase 6: when true, the hash worker tier guard accepts
     /// cloud-recall placeholders (forcing hydration on read). Default
     /// false. Flows from `--allow-recall-on-read`.
     pub allow_recall_on_read: bool,
+    /// 2026-06-02 R2 engine-ask: when true, every file read in the
+    /// scan path opens with FILE_FLAG_NO_BUFFERING (Windows) /
+    /// O_DIRECT (Linux non-WSL) / F_NOCACHE (macOS) so the OS page
+    /// cache is bypassed. Lets sdd-testwin's io-thread scaling sweep
+    /// measure cold-cache behaviour regardless of corpus size vs RAM.
+    /// Flows from `--cold-enforced`. Per-tier impact: tier 1 + tier 3
+    /// cold-bypass; tier 2 falls back to buffered (mid/tail seeks not
+    /// sector-aligned for arbitrary file sizes). MEASUREMENT mode only.
+    pub cold_enforced: bool,
     /// Which content-hash algorithm to use for Tier 1/2/3 + format
     /// fingerprints. BLAKE3 is the default; DDH-128 is the
     /// in-development alternative (currently an xxhash3-128 stub).
@@ -131,7 +149,9 @@ impl ScanConfig {
             follow_links: args.follow_links,
             allow_system_paths: args.allow_system_paths,
             force_mft: args.force_mft,
+            parallel_roots: args.parallel_roots,
             allow_recall_on_read: args.allow_recall_on_read,
+            cold_enforced: args.cold_enforced,
             hash_algo: args.hash_algo.into(),
             // #81 — Wire the CLI's exclusion flags into the runtime
             // policy. Defaults to safe-defaults ON (the new v0.2.7+
@@ -223,33 +243,80 @@ fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
-/// Cap applied to `--io-threads` when the scan root is on HDD-class
-/// storage (rotational disk). Past this many concurrent readers, seeks
-/// thrash instead of amortizing — see `docs/perf-98-findings.md` for
-/// the cross-storage sweep that motivates the value. The hash io_pool
-/// plateaus at io=8..16 on USB-HDD in both small-corpus (80 MB) and
-/// 10 GB cached runs (sdd-testwin 2026-05-31). 16 stays inside the
-/// plateau while preserving the parallelism-helps-from-1 curve below
-/// the knee.
-const HDD_IO_THREADS_CAP: usize = 16;
+/// Per-disk-class default io-threads, derived from sdd-testwin's
+/// cross-platform probes (iothreads-windows-probe-1 + 2; 2026-06-02).
+///
+/// Knee values are FIXED, not multiples of `cpu_threads`, because the
+/// device queue-depth that wins parallelism is per-DEVICE, not
+/// per-CPU.
+const IO_THREADS_HDD: usize = 1;
+const IO_THREADS_NVME: usize = 8;
+const IO_THREADS_SSD: usize = 8;
+const IO_THREADS_UNKNOWN_DEFAULT: usize = 8;
+const IO_THREADS_WSL: usize = 1;
 
 /// Compute the default `--io-threads` value when the user didn't pass
-/// one explicitly. On SSD / NVMe / network / unknown classes, returns
-/// `cpu_threads × 3` (the legacy default — oversubscribe to keep more
-/// per-file I/O in flight while syscalls block). On HDD-class disks,
-/// caps at [`HDD_IO_THREADS_CAP`] so seek thrash doesn't dominate.
+/// one explicitly.
+///
+/// PARKED 2026-06-02 (option (c) workload-aware default; awaiting Mick
+/// GO per testdesign 09:33 PDT routing + design 09:33 PDT LGTM):
+///
+/// | Regime | Default | Source data |
+/// |--------|---------|-------------|
+/// | SUPERDEDUPER_IOTHREADS_PARKED env set | 1 | manual override (kept for symmetry) |
+/// | WSL (`/proc/version` matches `microsoft`) | 1 | overnight WSL ext4 warm: io=1 wins 2.7-3.5x |
+/// | `disk_class.contains("HDD")` | 1 | sdd-testwin probe-2: 1.4% span across io=1..64 on USB-HDD cold; io=1 marginally fastest + zero pool overhead |
+/// | `disk_class.contains("NVMe")` | 8 | sdd-testwin probe-1: knee at io=4..16; 8 is the midpoint |
+/// | `disk_class.contains("SSD")` (SATA/USB) | 8 | not separately measured; defaulting to NVMe-shape (queue depth helps; not seek-bottlenecked) |
+/// | unknown class / `None` | 8 | conservative-by-perf: io=1 is 3x worse on NVMe (the dominant Windows hardware), so unknowns get NVMe-shape rather than HDD-shape |
+///
+/// Trade-offs documented in workdirs/design/profile-data.md addenda
+/// 3 + 4 (2026-06-02). The env-var-gate (PARKED commit 89e9bb6)
+/// stays for users who want to manually pick io=1.
 ///
 /// Detection routes through the existing leaderboard hardware probe
 /// (`detect_with_root_hint`) when the `telemetry` feature is on; when
-/// off, falls through to the legacy `cpu_threads × 3`. The cap kicks
-/// in only when the workdir probe returns a `disk_class` string
-/// containing `"HDD"` (matches `"HDD"` and `"USB-HDD"`); everything
-/// else — `"NVMe-Gen*"`, `"SATA-SSD"`, `"USB-SSD"`, `"network"`,
-/// `"mixed"`, missing — stays on the legacy default.
+/// off, falls through to `IO_THREADS_UNKNOWN_DEFAULT` (8).
 ///
-/// Emits a `tracing::info!` line at `-v` when the cap kicks in so the
-/// user sees the auto-tune in the log without needing `-vv`.
-fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize {
+/// Misclassification gotcha (per design 09:33 PDT note): a USB-HDD
+/// through an older SAT pass-through bridge can classify as USB-SSD
+/// and get io=8 instead of io=1. The actual perf impact is ~zero
+/// because the HDD is seek-bottlenecked at the device level
+/// regardless of thread count (1.4% wall span per sdd-testwin); the
+/// "wrong" thread count only costs per-thread CPU efficiency, not
+/// wall.
+pub(crate) fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize {
+    // PRIMARY mechanism (β): startup throughput probe on the first
+    // scan root. Per Mick GO 2026-06-02 09:42 PDT, transparent to
+    // disk_class misclassification (notably v0.3.5 SAT pass-through
+    // limit USB-HDD-as-USB-SSD case) + per-instance accurate.
+    //
+    // Skip the probe when:
+    // - SUPERDEDUPER_IOTHREADS_PARKED env set (manual override)
+    // - explicit --io-threads is already handled upstream in
+    //   ScanConfig::from_args (this function is only called when no
+    //   explicit value was passed)
+    //
+    // Fall back to (α) per-disk-class table when:
+    // - probe errors (no eligible files, IO failure, panic)
+    // - first_root is None (no workdir to probe against)
+    if std::env::var("SUPERDEDUPER_IOTHREADS_PARKED").is_ok() {
+        tracing::info!("io-threads probe skipped: SUPERDEDUPER_IOTHREADS_PARKED env set");
+        return 1;
+    }
+    if let Some(root) = first_root {
+        match crate::pipeline::io_threads_probe::probe_optimal_io_threads(root) {
+            Ok(n) => return n,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "io-threads probe failed; falling back to (a) per-disk-class table"
+            ),
+        }
+    }
+
+    // (α) FALLBACK: per-disk-class table (per testdesign 09:33 PDT).
+    // Engages when probe failed OR no first_root available. Repurposed
+    // from the prior 716d479 PARKED commit per design 09:52 PDT lean.
     #[cfg(feature = "telemetry")]
     let disk_class = Some(
         crate::leaderboard::hardware::detect_with_root_hint(first_root.map(|p| p.as_path()))
@@ -263,34 +330,53 @@ fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize
     compute_default_io_threads(cpu_threads, disk_class.as_deref())
 }
 
-/// Pure / testable inner of [`default_io_threads`]. Given a CPU-thread
-/// count and the optionally-detected `disk_class` string, return the
-/// default `--io-threads` value to use. HDD-class storage caps at
-/// [`HDD_IO_THREADS_CAP`]; everything else (None, NVMe/SSD-class,
-/// network, mixed) keeps the legacy `cpu_threads × 3`.
-///
-/// Splitting this from [`default_io_threads`] lets tests target the
-/// decision logic without a per-machine probe — the probe itself is
-/// machine-state and not the unit under test.
+/// True when running under WSL. Reads `/proc/version` for the
+/// `microsoft` marker; cached via OnceLock at first call. False on
+/// non-Linux targets.
+#[cfg(target_os = "linux")]
+fn is_wsl_runtime() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        std::fs::read_to_string("/proc/version")
+            .map(|s| s.to_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn is_wsl_runtime() -> bool {
+    false
+}
+
+/// Outer testable layer: pulls the WSL flag from runtime + delegates
+/// to the pure decision-logic inner. Splitting lets tests target the
+/// decision logic without depending on whether the test host happens
+/// to be WSL or not.
 fn compute_default_io_threads(cpu_threads: usize, disk_class: Option<&str>) -> usize {
-    let legacy_default = cpu_threads.saturating_mul(3).max(1);
-    if let Some(class) = disk_class {
-        if class.contains("HDD") {
-            let capped = legacy_default.min(HDD_IO_THREADS_CAP);
-            if capped < legacy_default {
-                tracing::info!(
-                    disk_class = %class,
-                    legacy_default,
-                    capped,
-                    cap = HDD_IO_THREADS_CAP,
-                    "io-threads default auto-capped for HDD-class storage \
-                     (pass --io-threads explicitly to override)"
-                );
-            }
-            return capped;
-        }
+    compute_default_io_threads_inner(cpu_threads, disk_class, is_wsl_runtime())
+}
+
+/// Pure / testable inner of [`compute_default_io_threads`]. Tests
+/// pass `is_wsl` explicitly + thereby cover both branches independent
+/// of the actual host.
+fn compute_default_io_threads_inner(
+    cpu_threads: usize,
+    disk_class: Option<&str>,
+    is_wsl: bool,
+) -> usize {
+    let _ = cpu_threads; // kept in signature for forward compat
+    if std::env::var("SUPERDEDUPER_IOTHREADS_PARKED").is_ok() {
+        return 1;
     }
-    legacy_default
+    if is_wsl {
+        return IO_THREADS_WSL;
+    }
+    match disk_class {
+        Some(c) if c.contains("HDD") => IO_THREADS_HDD,
+        Some(c) if c.contains("NVMe") => IO_THREADS_NVME,
+        Some(c) if c.contains("SSD") => IO_THREADS_SSD,
+        _ => IO_THREADS_UNKNOWN_DEFAULT,
+    }
 }
 
 #[cfg(test)]
@@ -321,8 +407,10 @@ mod tests {
             follow_links: false,
             allow_system_paths: false,
             force_mft: false,
+            parallel_roots: false,
             placeholders_only: false,
             force_hash: false,
+            cold_enforced: false,
             allow_recall_on_read: false,
             hash_algo: HashAlgoArg::River5,
             mode: crate::cli::ScanMode::Exact,
@@ -386,58 +474,118 @@ mod tests {
         assert_eq!(cfg.tier1_bytes, 4096, "default --tier1-bytes is 4K");
     }
 
+    // Option (c) 2026-06-02: tests below match the new per-disk-class
+    // table. Data source: sdd-testwin iothreads-windows-probe-1 + 2.
+    // See workdirs/design/profile-data.md addenda 3 + 4.
+
     #[test]
-    fn io_threads_default_is_3x_on_nvme_class() {
-        // Pure decision-logic check; the per-machine probe is mocked
-        // out by passing the disk_class string directly.
+    fn io_threads_default_is_8_on_nvme_class() {
+        // sdd-testwin probe-1 (Windows NVMe cold+warm): knee at io=4..16;
+        // testdesign picked io=8 as the midpoint. Fixed value, not a
+        // function of cpu_threads -- queue depth is per-device.
         assert_eq!(
-            compute_default_io_threads(8, Some("NVMe-Gen4")),
-            24,
-            "NVMe-class keeps the legacy threads*3 default"
+            compute_default_io_threads_inner(8, Some("NVMe-Gen4"), false),
+            IO_THREADS_NVME,
         );
         assert_eq!(
-            compute_default_io_threads(8, Some("SATA-SSD")),
-            24,
-            "SATA-SSD keeps the legacy threads*3 default"
-        );
-        assert_eq!(
-            compute_default_io_threads(8, Some("network")),
-            24,
-            "network class keeps the legacy default — no measured perf data either way"
-        );
-        assert_eq!(
-            compute_default_io_threads(8, None),
-            24,
-            "no probe (None) keeps the legacy default — fail-open, not fail-cap"
+            compute_default_io_threads_inner(32, Some("NVMe-Gen5"), false),
+            IO_THREADS_NVME,
+            "high cpu count still gets the per-device knee (not cpu*3)"
         );
     }
 
     #[test]
-    fn io_threads_default_auto_caps_on_hdd_class() {
-        // 2026-05-31 perf-98 cross-storage finding: hash io_pool plateau
-        // at 8..16 on USB-HDD; 16 stays inside the plateau without
-        // regressing the parallelism-helps-from-1 left of the knee.
+    fn io_threads_default_is_8_on_ssd_classes() {
+        // SATA-SSD / USB-SSD not separately measured; default to
+        // NVMe-shape (queue depth helps; not seek-bottlenecked).
+        // Bracketed by testdesign 09:33 PDT.
         assert_eq!(
-            compute_default_io_threads(8, Some("HDD")),
-            HDD_IO_THREADS_CAP,
-            "HDD must cap at 16 (legacy 24 -> capped 16)"
+            compute_default_io_threads_inner(8, Some("SATA-SSD"), false),
+            IO_THREADS_SSD,
         );
         assert_eq!(
-            compute_default_io_threads(32, Some("USB-HDD")),
-            HDD_IO_THREADS_CAP,
-            "USB-HDD must cap at 16 (legacy 96 -> capped 16)"
+            compute_default_io_threads_inner(8, Some("USB-SSD"), false),
+            IO_THREADS_SSD,
         );
     }
 
     #[test]
-    fn io_threads_hdd_cap_does_not_inflate_below_legacy() {
-        // Edge case: a low-thread machine where threads*3 < cap should
-        // NOT be lifted to the cap. The cap is a ceiling, not a target.
+    fn io_threads_default_is_8_on_unknown_class() {
+        // Conservative-by-perf: io=1 is 3x worse on the dominant
+        // Windows hardware (NVMe). Unknown defaults to NVMe-shape.
         assert_eq!(
-            compute_default_io_threads(2, Some("HDD")),
-            6,
-            "threads*3=6 < cap=16; HDD branch must NOT lift to 16"
+            compute_default_io_threads_inner(8, None, false),
+            IO_THREADS_UNKNOWN_DEFAULT,
+            "no probe (None) -> NVMe-shape default (8), not legacy threads*3"
         );
+        assert_eq!(
+            compute_default_io_threads_inner(8, Some("network"), false),
+            IO_THREADS_UNKNOWN_DEFAULT,
+            "unrecognized class -> NVMe-shape default"
+        );
+        assert_eq!(
+            compute_default_io_threads_inner(8, Some("mixed"), false),
+            IO_THREADS_UNKNOWN_DEFAULT,
+        );
+    }
+
+    #[test]
+    fn io_threads_default_is_1_on_hdd_class() {
+        // sdd-testwin probe-2 (Windows USB-HDD cold via v0.3.30
+        // --cold-enforced): 1.4% wall span across io=1/4/16/64.
+        // io=1 marginally fastest + zero pool overhead.
+        assert_eq!(
+            compute_default_io_threads_inner(8, Some("HDD"), false),
+            IO_THREADS_HDD,
+        );
+        assert_eq!(
+            compute_default_io_threads_inner(32, Some("USB-HDD"), false),
+            IO_THREADS_HDD,
+            "USB-HDD treated as HDD; cpu_threads ignored",
+        );
+    }
+
+    #[test]
+    fn io_threads_default_is_1_on_wsl() {
+        // WSL override engages regardless of disk_class -- WSL warm
+        // regime is the more dominant signal than the underlying
+        // virtual disk shape (which misdetects as HDD anyway per
+        // yesterday's 71857b2 fix; "WSL2" string now bypasses the
+        // HDD branch BUT we also want the explicit is_wsl override
+        // so that any future disk_class detection change can't
+        // accidentally re-engage HDD-shape thread counts here).
+        assert_eq!(
+            compute_default_io_threads_inner(8, Some("WSL2"), true),
+            IO_THREADS_WSL,
+        );
+        assert_eq!(
+            compute_default_io_threads_inner(8, Some("NVMe-Gen4"), true),
+            IO_THREADS_WSL,
+            "WSL flag overrides even if disk_class detects NVMe (defensive)"
+        );
+        assert_eq!(
+            compute_default_io_threads_inner(8, None, true),
+            IO_THREADS_WSL,
+        );
+    }
+
+    #[test]
+    fn io_threads_default_is_fixed_regardless_of_cpu_count() {
+        // The whole point of the new table: per-DEVICE knee, not a
+        // function of cpu_threads. Low-thread and high-thread machines
+        // get the same per-class default.
+        for cpu in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(
+                compute_default_io_threads_inner(cpu, Some("NVMe-Gen4"), false),
+                IO_THREADS_NVME,
+                "NVMe default is cpu-independent (cpu={cpu})"
+            );
+            assert_eq!(
+                compute_default_io_threads_inner(cpu, Some("HDD"), false),
+                IO_THREADS_HDD,
+                "HDD default is cpu-independent (cpu={cpu})"
+            );
+        }
     }
 
     #[test]

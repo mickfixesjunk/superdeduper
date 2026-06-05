@@ -1312,14 +1312,24 @@ fn run(
             // Drive-scope dot positioning. On SSDs we use a stable
             // path-hash for Y (scattered "TV snow"); on HDDs we
             // use the cumulative-bytes climb (clean diagonal).
-            let lcn_bytes = if progress_drive_is_hdd {
-                total_bytes
-            } else {
-                hash_path_to_lcn(path)
-            };
-
+            //
+            // 2026-06-02 perf cleanup (design iterate-freely 17:15
+            // PDT; pre-empting hypothesis 2/3/5 investigation):
+            // hash_path_to_lcn(path) is a BLAKE3 hash on the path
+            // string -- ~1-2us per call. Pre-fix it was computed on
+            // EVERY callback (per-file-per-tier) but only USED inside
+            // the modulus-gated try_send (every 10th call on SSD;
+            // every 50th on HDD). 90-98% of the BLAKE3 work was
+            // discarded. Moved inside the modulus-gated branch.
+            // Per-file cost change for the dominant SSD case on a
+            // 312K-file scan: ~280K wasted BLAKE3 calls -> 0.
             let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
             if n.is_multiple_of(read_modulus) {
+                let lcn_bytes = if progress_drive_is_hdd {
+                    total_bytes
+                } else {
+                    hash_path_to_lcn(path)
+                };
                 let _ = progress_tx.try_send(EngineEvent::Read(ReadSample {
                     drive: progress_drive,
                     lcn_bytes,
@@ -1775,7 +1785,7 @@ fn run(
         use crate::leaderboard::hardware;
         use crate::leaderboard::hmac_signer;
         use crate::leaderboard::submission::{
-            self, ResultSummary, RunShape, SubmissionInputs, FEATURE_BIT_ALLOW_RECALL_ON_READ,
+            self, FEATURE_BIT_ALLOW_RECALL_ON_READ,
             FEATURE_BIT_ALLOW_SYSTEM_PATHS, FEATURE_BIT_CACHE, FEATURE_BIT_EXCLUDE_GLOB,
             FEATURE_BIT_FOLLOW_LINKS, FEATURE_BIT_FORMAT_AWARE, FEATURE_BIT_INCLUDE_GLOB,
             FEATURE_BIT_REFERENCE_ROOTS,
@@ -1852,21 +1862,24 @@ fn run(
         let (zero_byte_group_max, max_hardlink_count_in_scan, name_collision_count) =
             run_shape_esoterics_accum.finalize();
 
-        let inputs = SubmissionInputs {
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            run_uuid: uuid::Uuid::new_v4().to_string(),
-            scan_id: Some(scan_id_for_this_run.clone()),
-            // #88 Phase 1 — pass the first scan root so filesystem
-            // detection has a real path to probe instead of falling
-            // back to the platform default. Unlocks pathfinder-refs
-            // + network-pioneer signal classes.
-            hardware: hardware::detect_with_root_hint(roots.first().map(|r| r.path.as_path())),
-            run_shape: RunShape {
+        // Codex-review item 2 (v0.3.25): the field-name boilerplate
+        // is consolidated in payload_meta::build_scan_submission_inputs.
+        // The GUI passes the streaming-accumulator outputs + the
+        // count_distinct_share_roots reading via root_paths; constant
+        // fields (walker_variant, dry_run, bench, lane, etc.) come from
+        // the helper.
+        let inputs = crate::leaderboard::payload_meta::build_scan_submission_inputs(
+            crate::leaderboard::payload_meta::ScanSubmissionArgs {
+                scan_id: scan_id_for_this_run.clone(),
+                // #88 Phase 1 — pass the first scan root so filesystem
+                // detection has a real path to probe instead of falling
+                // back to the platform default. Unlocks pathfinder-refs
+                // + network-pioneer signal classes.
+                hardware: hardware::detect_with_root_hint(roots.first().map(|r| r.path.as_path())),
                 wall_clock_seconds,
                 bytes_scanned: total_bytes_read,
                 files_scanned: total_files,
                 hash_algorithm,
-                walker_variant: "hybrid".to_string(),
                 scope,
                 features_used_bitmap: features_bits,
                 corpus_kind,
@@ -1896,37 +1909,15 @@ fn run(
                         None
                     }
                 },
-                // #89 — kept `None` per design's catalog-semantic
-                // flag (rollback from initial `Some(true)`). The
-                // `safety-first` achievement (catalog:932) describes
-                // "Used --dry-run 25+ times before commit" and sits
-                // on the skill/curation axis — it rewards deliberate
-                // dry-run *intent*, not every-submission protocol
-                // shape. Setting Some(true) per scan-finish would
-                // collapse the metric into "scanned 25+ times" and
-                // strip the curation semantic. Reactivate the field
-                // when a real dry-run UX ships: a future GUI
-                // "Preview without action" toggle, or CLI
-                // `superdeduper scan --dry-run`.
-                dry_run: None,
-                // #89 — group-reviews happen AFTER scan-finish, so
-                // the count is always 0 at initial submission time.
-                // Plumbed as `None` (omitted from payload) until a
-                // PATCH path updates it. See submission.rs comment
-                // on the field for the deferred future-work note.
-                groups_reviewed_count: None,
-            },
-            result_summary: ResultSummary {
-                duplicate_groups: total_dups,
                 // Use inode-aware reclaim (collapses hardlink
                 // aliases) for the leaderboard payload. Clamp to
                 // bytes_scanned just in case some weird edge case
                 // still produces reclaim > scanned (e.g. a file
                 // counted as both alias and unique somehow); backend
                 // sanity-rejects on that.
+                duplicate_groups: total_dups,
                 duplicate_bytes_reclaimable: reclaimable_inode.min(total_bytes_read),
                 largest_single_group_bytes: largest_group_bytes.min(total_bytes_read),
-                actions_taken_summary: std::collections::BTreeMap::new(),
                 // #142 follow-up — populate placeholder_skip_count
                 // from the running counters so the GUI submission
                 // matches the CLI's. Pre-fix the field always
@@ -1943,12 +1934,8 @@ fn run(
                         None
                     }
                 },
-                placeholder_skip_bytes: None,
-                client_found_dupsets: None,
             },
-            bench: None,
-            lane: None,
-        };
+        );
         // Diagnostic-only payload preview. install_id is empty string
         // here because the engine doesn't load the install state at
         // scan-end — the real submission flow re-loads it just-in-time
@@ -1966,19 +1953,6 @@ fn run(
         // can't load (unregistered, missing file), we leave the
         // History row without a payload — Resubmit stays disabled
         // + the user has a clear "register first" surface.
-        if let Ok(Some(install_state)) = crate::leaderboard::install::load() {
-            let full_payload = submission::build_payload(&inputs, &install_state.install_id);
-            submission_payload_for_history = Some((full_payload, install_state.install_id));
-        }
-
-        // #41 — build the FULL submittable payload (with the real
-        // install_id from the active install state) + stash it for
-        // the scan_history record-write site below. Resubmit replays
-        // this verbatim so the signature stays valid against the
-        // install_id captured at build time. If the install state
-        // can't load (unregistered, missing file), we just leave
-        // the History row without a payload — Resubmit stays
-        // disabled, the user has a clear "register first" surface.
         if let Ok(Some(install_state)) = crate::leaderboard::install::load() {
             let full_payload = submission::build_payload(&inputs, &install_state.install_id);
             submission_payload_for_history = Some((full_payload, install_state.install_id));
@@ -2674,14 +2648,50 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
                 .unwrap_or(1)
         }),
         io_threads: {
-            // Explicit setting wins; otherwise oversubscribe to
-            // CPU × 3 like the CLI default.
+            // 2026-06-02 P1 fix (design URGENT 22:05Z, Mick C:\sdd-tests
+            // 60x GUI-vs-CLI gap): explicit setting wins; otherwise
+            // delegate to crate::config::default_io_threads which runs
+            // the v0.3.31 startup probe + (α) per-disk-class fallback.
+            //
+            // Pre-fix the GUI hardcoded cpu × 3 here (= 96 threads on a
+            // 9950X3D2) which bypassed the workload-aware default
+            // entirely. On a real NVMe with 312K-file corpus that
+            // produced 60x slower wall-time than the CLI (CLI's
+            // ScanConfig::from_args hits the probe; GUI didn't).
+            //
+            // 2026-06-02 v0.3.34 diagnostic (design 23:38Z): v0.3.33
+            // ship reduced the gap from 5min to 3min, not all the way
+            // to CLI's ~5s. Emit a tracing::info! that pins which path
+            // ran -- user override vs default-via-probe vs default-via-
+            // (α)-fallback. Mick can read this from the engine log to
+            // confirm the new code path is engaging.
             let cpu = settings.threads.unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
             });
-            settings.io_threads.unwrap_or(cpu.saturating_mul(3).max(1))
+            let (chosen, source) = match settings.io_threads {
+                Some(n) => (n, "user-explicit"),
+                None => {
+                    let first_root = roots.first().map(|r| &r.path);
+                    let n = crate::config::default_io_threads(cpu, first_root);
+                    (n, "default-via-default_io_threads")
+                }
+            };
+            // 2026-06-02: GUI binary does NOT install a tracing
+            // subscriber (per src/bin/superdeduper_gui.rs); tracing::info!
+            // would be a no-op + never reach Mick's engine log file. Use
+            // the superdeduper-log macro instead -- writes to both stderr
+            // AND the persistent engine log at
+            // <data_dir>/log/superdeduper.<unix>.<pid>.log per
+            // [[feedback_persist_engine_log]] (Mick directive 2026-05-29).
+            crate::log_info!(
+                "GUI scan: io-threads selected io_threads={} source={} cpu_threads={}",
+                chosen,
+                source,
+                cpu,
+            );
+            chosen
         },
         output: None,
         follow_links: settings.follow_links,
@@ -2689,11 +2699,15 @@ fn build_config(roots: &[RootEntry], settings: &ScanSettings) -> crate::Result<S
         // GUI never sets force_mft; it's an A/B knob exposed via
         // the CLI for the v0.3.14 inventory matrix only.
         force_mft: false,
+        parallel_roots: false,
         // GUI settings don't surface the placeholder-policy knob yet;
         // tier guard defaults to conservative (refuse cloud recalls).
         // Phase 7 GUI counter exposes the bucket; a future iteration
         // can add the toggle if user feedback shows it's wanted.
         allow_recall_on_read: false,
+        // 2026-06-02 R2 engine-ask: cold-enforced is a CLI-only
+        // measurement flag; GUI scans use the OS page cache as normal.
+        cold_enforced: false,
         hash_algo: settings.hash_algo,
         // #81 — Compile the user's ExclusionConfig (master toggle +
         // active preset packs + custom rules) into the runtime

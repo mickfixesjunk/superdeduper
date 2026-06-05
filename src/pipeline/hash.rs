@@ -116,6 +116,17 @@ pub struct HashCounters {
     /// changing wire format.
     pub placeholders_blocked_recall: AtomicU64,
     pub placeholders_blocked_other_reparse: AtomicU64,
+    /// 2026-06-02 Option C (Mick GO: "C"): "files tier 2 cull'd that
+    /// would have gone to tier 3". Drives the v0.3.33+ decision on
+    /// whether tier 2 is load-bearing (KEEP) or over-engineered (DROP
+    /// to match cz's 2-pass shape).
+    ///
+    /// Mechanically: files that ENTER tier 2 (i.e. survived tier 1
+    /// with a 2+ collision group) MINUS files that LEAVE tier 2 (i.e.
+    /// still in a 2+ collision group after tier 2 hashing). The
+    /// difference is what tier 2 culled.
+    pub tier2_input_files: AtomicU64,
+    pub tier2_survivors: AtomicU64,
 }
 
 /// Outcome reported by the per-file [`FileProgress`] callback.
@@ -267,6 +278,8 @@ fn run_with_counters_inner(
             tier_micros: snap_arr(&arc.tier_micros),
             tier_bytes: snap_arr(&arc.tier_bytes),
             tier_count: snap_arr(&arc.tier_count),
+            tier2_input_files: AtomicU64::new(arc.tier2_input_files.load(Ordering::Relaxed)),
+            tier2_survivors: AtomicU64::new(arc.tier2_survivors.load(Ordering::Relaxed)),
             placeholders_blocked_recall: AtomicU64::new(
                 arc.placeholders_blocked_recall.load(Ordering::Relaxed),
             ),
@@ -525,7 +538,7 @@ fn run_group(
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Ok(out);
         }
-        let hash_bytes = match tier3_hash_cancellable(rep, size, algo, cancel) {
+        let hash_bytes = match tier3_hash_cancellable(rep, size, algo, cancel, cfg.cold_enforced) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -598,7 +611,7 @@ fn run_group(
     }
     survivors = split_by(&survivors, |f| {
         tiered(f, Tier::One, algo, cache, counters, on_file, || {
-            tier1_hash(f, size, algo, cfg.tier1_bytes)
+            tier1_hash(f, size, algo, cfg.tier1_bytes, cfg.cold_enforced)
         })
     })?;
     if survivors.len() < 2 {
@@ -609,11 +622,23 @@ fn run_group(
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Ok(out);
         }
+        // 2026-06-02 Option C: instrument tier 2 cull. INPUT = files
+        // entering tier 2 (survivors from tier 1). OUTPUT = files
+        // leaving tier 2 (survivors going to tier 3). The diff is
+        // what tier 2 culled; drives v0.3.33+ decision on whether to
+        // keep or drop tier 2.
+        let tier2_input = survivors.len() as u64;
+        counters
+            .tier2_input_files
+            .fetch_add(tier2_input, Ordering::Relaxed);
         survivors = split_by(&survivors, |f| {
             tiered(f, Tier::Two, algo, cache, counters, on_file, || {
-                tier2_hash(f, size, algo)
+                tier2_hash(f, size, algo, cfg.cold_enforced)
             })
         })?;
+        counters
+            .tier2_survivors
+            .fetch_add(survivors.len() as u64, Ordering::Relaxed);
         if survivors.len() < 2 {
             return Ok(out);
         }
@@ -624,7 +649,7 @@ fn run_group(
     }
     let groups = into_subgroups(&survivors, |f| {
         tiered(f, Tier::Three, algo, cache, counters, on_file, || {
-            tier3_hash_cancellable(f, size, algo, cancel)
+            tier3_hash_cancellable(f, size, algo, cancel, cfg.cold_enforced)
         })
     })?;
     for (hash, files) in groups {
@@ -1023,15 +1048,63 @@ fn tier1_hash(
     size: u64,
     algo: HashAlgo,
     tier1_bytes: u64,
+    cold_enforced: bool,
 ) -> std::io::Result<Vec<u8>> {
     let to_read = size.min(tier1_bytes) as usize;
+    // 2026-06-02 R2 engine-ask (--cold-enforced): when set, read the
+    // WHOLE file via bench-real's read_uncached (FILE_FLAG_NO_BUFFERING
+    // / O_DIRECT / F_NOCACHE) and slice the first tier1_bytes off the
+    // front. Trade-off: wastes IO compared to a true partial head
+    // read, but produces clean cold-cache measurement (no per-file
+    // sector-alignment math for arbitrary tier1_bytes values). The
+    // user opted into MEASUREMENT mode -- measurement clarity wins
+    // over per-file throughput here.
+    if cold_enforced {
+        let (full, _cold) = superdeduper_bench_real::read_uncached(&f.entry.path)?;
+        let head = &full[..to_read.min(full.len())];
+        return Ok(algo::hash_oneshot(algo, head));
+    }
     let mut buf = vec![0u8; to_read];
     let mut file = File::open(&f.entry.path)?;
     read_exact_or_eof(&mut file, &mut buf)?;
     Ok(algo::hash_oneshot(algo, &buf))
 }
 
-fn tier2_hash(f: &LaidOutFile, size: u64, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
+fn tier2_hash(
+    f: &LaidOutFile,
+    size: u64,
+    algo: HashAlgo,
+    cold_enforced: bool,
+) -> std::io::Result<Vec<u8>> {
+    // 2026-06-02 R2 engine-ask: same MVP-shortcut as tier 1 -- read
+    // the whole file uncached and slice the three regions. Avoids
+    // sector-alignment fiddling for non-aligned mid_off / tail_off
+    // values that would otherwise need per-platform alignment logic.
+    if cold_enforced {
+        let (full, _cold) = superdeduper_bench_real::read_uncached(&f.entry.path)?;
+        let region = TIER2_REGION as usize;
+        let mut combined = vec![0u8; 3 * region];
+        let head_end = region.min(full.len());
+        combined[..head_end].copy_from_slice(&full[..head_end]);
+        let mid_off = (size.saturating_sub(TIER2_REGION) / 2) as usize;
+        let mid_end = (mid_off + region).min(full.len());
+        let mid_take = mid_end.saturating_sub(mid_off);
+        if mid_take > 0 {
+            combined[region..region + mid_take].copy_from_slice(&full[mid_off..mid_end]);
+        }
+        let tail_off = size.saturating_sub(TIER2_REGION) as usize;
+        let tail_end = (tail_off + region).min(full.len());
+        let tail_take = tail_end.saturating_sub(tail_off);
+        if tail_take > 0 {
+            combined[2 * region..2 * region + tail_take]
+                .copy_from_slice(&full[tail_off..tail_end]);
+        }
+        return Ok(algo::hash_oneshot(algo, &combined));
+    }
+    tier2_hash_buffered(f, size, algo)
+}
+
+fn tier2_hash_buffered(f: &LaidOutFile, size: u64, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
     // Read the three regions into a single contiguous buffer and
     // dispatch one `hash_oneshot` call. The previous
     // new/update×3/finalize pattern crossed the C FFI four times per
@@ -1073,12 +1146,23 @@ fn tier3_hash_cancellable(
     size: u64,
     algo: HashAlgo,
     cancel: Option<&Arc<AtomicBool>>,
+    cold_enforced: bool,
 ) -> std::io::Result<Vec<u8>> {
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
             "cancelled",
         ));
+    }
+    // 2026-06-02 R2 engine-ask: cold-enforced takes the slurp path
+    // (read_uncached returns the whole file). Loses the streaming-
+    // ping-pong large-file optimization but produces clean cold-cache
+    // measurement. Cancel point: read_uncached is not cancellable
+    // mid-read, so a large cold-enforced tier 3 cannot be interrupted
+    // until the read completes. Acceptable for MEASUREMENT mode.
+    if cold_enforced {
+        let (full, _cold) = superdeduper_bench_real::read_uncached(&f.entry.path)?;
+        return Ok(algo::hash_oneshot(algo, &full));
     }
     if size <= TIER3_ONESHOT_THRESHOLD {
         // Small-file path: a single read_to_end is sequential by
@@ -1302,7 +1386,9 @@ mod tests {
             follow_links: false,
             allow_system_paths: false,
             force_mft: false,
+            parallel_roots: false,
             allow_recall_on_read: false,
+            cold_enforced: false,
             io_threads: 4,
             hash_algo: HashAlgo::Blake3,
             exclusion_policy: crate::exclusions::ExclusionPolicy::disabled(),

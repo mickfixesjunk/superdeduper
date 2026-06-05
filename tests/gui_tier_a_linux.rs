@@ -68,9 +68,17 @@ fn make_dup_corpus(tag: &str) -> (PathBuf, [PathBuf; 4]) {
     (dir, [keeper, loser_a, loser_b, distinct])
 }
 
-/// Isolate XDG_* + HOME to a fresh tempdir so app::new() sees no checkpoint
-/// (no Resume modal), a hermetic cache, and a clean scan-history. Returns the
-/// root so the caller can inspect/clean it.
+/// Isolate XDG_* + HOME + SUPERDEDUPER_TEST_DATA_DIR to a fresh tempdir so
+/// app::new() sees no checkpoint (no Resume modal), a hermetic cache, and a
+/// clean scan-history. Returns the root so the caller can inspect/clean it.
+///
+/// XDG_* covers Linux; SUPERDEDUPER_TEST_DATA_DIR covers cross-platform via
+/// install.rs::data_dir + cache.rs::default_cache_path + scan_history.rs::data_dir
+/// (gui/checkpoint.rs::default_checkpoint_path inherits transitively). Without
+/// the env-var, sdd-testwin's Windows runs hit real %LOCALAPPDATA%\\superdeduper
+/// state from prior real runs (stale settings shadow test roots, dismissed
+/// alpha modal hides the Continue button, leftover checkpoint races with the
+/// boot path) — that's the 8/9-cells-fail-on-Windows finding's likely root.
 fn isolated_env(tag: &str) -> PathBuf {
     let mut root = std::env::temp_dir();
     root.push(format!(
@@ -88,6 +96,9 @@ fn isolated_env(tag: &str) -> PathBuf {
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
     std::env::set_var("HOME", &root);
+    // Cross-platform engine-side hermetic redirect; the engine's
+    // install/cache/scan_history/checkpoint resolvers all honor this first.
+    std::env::set_var("SUPERDEDUPER_TEST_DATA_DIR", root.join("data"));
     root
 }
 
@@ -504,6 +515,7 @@ fn tier_a_g_reference_protection_preserves_reference_file() {
 /// confirm with "HARDLINK", and assert the dupes are replaced with hardlinks to
 /// the keeper: all member paths still exist (no path touched) + they collapse to
 /// a SINGLE shared inode (the real on-disk effect), content byte-identical.
+#[cfg(unix)]
 #[test]
 fn tier_a_g_hardlink_collapses_dupes_to_one_inode() {
     let _env = env_lock();
@@ -757,6 +769,7 @@ fn tier_a_action_patches_scan_history_actually_reclaimed_bytes() {
 /// EXACTLY ONE plain copy survives (the keeper) ⟺ the guard refused the alias as
 /// a LOSER (anti-vacuous: if the alias were merely the keeper, both plains would
 /// be actioned -> 0 plains survive -> this FAILS, catching the vacuous case).
+#[cfg(unix)]
 #[test]
 fn tier_a_g_system_path_alias_refused_preserves_target() {
     let _env = env_lock();
@@ -840,4 +853,213 @@ fn tier_a_g_system_path_alias_refused_preserves_target() {
 fn crate_is_system_like(p: &std::path::Path) -> bool {
     let s = p.to_string_lossy();
     s.starts_with("/etc/") || s.starts_with("/usr/") || s.starts_with("/bin/") || s.starts_with("/var/lib/")
+}
+
+// =============================================================================
+// scan-perf ratio cell -- ship gate for v0.3.36+ GUI perf fixes
+// Spec: workdirs/testdesign/specs/egui-kittest-scan-perf-assertion.md
+// Author: sdd-testwin 2026-06-04 19:10 PDT post v0.3.37 verify
+// =============================================================================
+
+/// Generate the deterministic 1040-file perf corpus per spec §2:
+///   500 unique-size files (1KB - 1MB random)
+///   250 size-twin pairs = 500 files (4KB - 256KB; tier 1 head matches, tier 3 differs)
+///    20 dup pairs       =  40 files (4KB - 1MB; exact duplicates)
+/// Total ~1040 files, ~250 MiB, deterministic via fixed seed=0xC0FFEE.
+fn generate_perf_test_corpus(tempdir_root: &std::path::Path) -> std::path::PathBuf {
+    use std::io::Write;
+    let dir = tempdir_root.join("perf-corpus-1040");
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Cheap deterministic PRNG (xorshift64; seed=0xC0FFEE) -- avoid pulling in rand crate.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            for chunk in buf.chunks_mut(8) {
+                let v = self.next().to_le_bytes();
+                let n = chunk.len();
+                chunk.copy_from_slice(&v[..n]);
+            }
+        }
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next() as usize) % (hi - lo)
+        }
+    }
+    let mut rng = Rng(0x00C0FFEE);
+
+    // 500 unique-size files; sizes spread 1KB-1MB
+    for i in 0..500 {
+        let size = rng.range(1024, 1024 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let f = std::fs::File::create(dir.join(format!("uniq_{:04}.bin", i))).unwrap();
+        std::io::BufWriter::new(f).write_all(&buf).unwrap();
+    }
+
+    // 250 size-twin pairs: each pair shares size but has DIFFERENT random content
+    for i in 0..250 {
+        let size = rng.range(4096, 256 * 1024);
+        let mut a = vec![0u8; size];
+        let mut b = vec![0u8; size];
+        rng.fill(&mut a);
+        rng.fill(&mut b);
+        let fa = std::fs::File::create(dir.join(format!("twin_{:04}_a.bin", i))).unwrap();
+        std::io::BufWriter::new(fa).write_all(&a).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("twin_{:04}_b.bin", i))).unwrap();
+        std::io::BufWriter::new(fb).write_all(&b).unwrap();
+    }
+
+    // 20 dup pairs: each pair byte-identical (same random content written twice)
+    for i in 0..20 {
+        let size = rng.range(4096, 1024 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let fa = std::fs::File::create(dir.join(format!("dup_{:04}_a.bin", i))).unwrap();
+        std::io::BufWriter::new(fa).write_all(&buf).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("dup_{:04}_b.bin", i))).unwrap();
+        std::io::BufWriter::new(fb).write_all(&buf).unwrap();
+    }
+
+    dir
+}
+
+/// Ship-gate cell: assert GUI scan wall <= N x CLI scan wall on the same hardware + corpus.
+/// N default 3.0x; configurable via SUPERDEDUPER_TEST_PERF_RATIO env. v0.3.36+ ship gate while
+/// engine iterates on GUI perf fixes. See spec for full rationale + tightening plan.
+#[test]
+fn tier_a_gui_scan_perf_within_cli_ratio() {
+    let _env = env_lock();
+    let _home = isolated_env("perfratio");
+    let corpus_root_tmp = std::env::temp_dir();
+    let corpus = generate_perf_test_corpus(&corpus_root_tmp);
+
+    // ---------- Step 1: CLI baseline (with warmup pass) ----------
+    // Warmup pass (NOT timed) per testdesign 2026-06-04 19:54 PDT: hot the OS page cache
+    // for the corpus + binary's runtime init so the timed run measures steady-state CLI
+    // cost, not first-MFT-walk + cold-disk-read overhead. Cold-vs-warm CLI noise was 6x
+    // (0.58s cold first run vs 0.09s warm subsequent) which made the ratio gate flaky.
+    let cli_exe = env!("CARGO_BIN_EXE_superdeduper");
+    let _warmup = std::process::Command::new(cli_exe)
+        .args(["scan", &corpus.to_string_lossy(), "--no-cache"])
+        .output()
+        .expect("CLI warmup scan failed to spawn");
+    let t_cli_start = std::time::Instant::now();
+    let cli_out = std::process::Command::new(cli_exe)
+        .args(["scan", &corpus.to_string_lossy(), "--no-cache"])
+        .output()
+        .expect("CLI sd scan failed to spawn");
+    let t_cli = t_cli_start.elapsed();
+    assert!(
+        cli_out.status.success(),
+        "CLI scan exited non-zero: {} stderr-tail: {}",
+        cli_out.status,
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+
+    // ---------- Step 2: GUI via egui_kittest in-process ----------
+    let corpus_for_closure = corpus.clone();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1400.0_f32, 900.0])
+        .build_eframe(move |cc| {
+            let mut app = SuperdeduperApp::new(cc);
+            app.add_root(corpus_for_closure.clone(), false);
+            app
+        });
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(&harness, "Continue"); // dismiss alpha modal
+    for _ in 0..3 {
+        harness.step();
+    }
+    let t_gui_start = std::time::Instant::now();
+    click_all(&harness, "Start scan");
+    let mut populated = false;
+    let timeout_ratio = 6.0_f64;
+    let timeout = t_cli.mul_f64(timeout_ratio).max(std::time::Duration::from_secs(30));
+    let poll_deadline = std::time::Instant::now() + timeout;
+    // Candidate-4 calibration telemetry per testdesign 19:38 PDT + 19:54 PDT (commit-permanent):
+    // time each harness.step() to measure egui_kittest frame-pump cost vs engine scan work.
+    // Finding 19:50 PDT: 65.6% of GUI walltime is poll-sleep yield (291 polls * 10ms), NOT
+    // engine work. true engine work = total_step_time -- that's what O3 ratchet uses below.
+    let mut step_count: u64 = 0;
+    let mut total_step_time = std::time::Duration::ZERO;
+    let mut max_step_time = std::time::Duration::ZERO;
+    let mut sleep_count: u64 = 0;
+    while std::time::Instant::now() < poll_deadline {
+        let t_step = std::time::Instant::now();
+        harness.step();
+        let step_dur = t_step.elapsed();
+        step_count += 1;
+        total_step_time += step_dur;
+        if step_dur > max_step_time { max_step_time = step_dur; }
+        click_all(&harness, "scan \u{2192}"); // advance preflight proceed (the "scan →" button)
+        if harness.query_all_by_label_contains("Go (").next().is_some() {
+            populated = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        sleep_count += 1;
+    }
+    let t_gui = t_gui_start.elapsed();
+    let avg_step_ms = if step_count > 0 { total_step_time.as_secs_f64() * 1000.0 / step_count as f64 } else { 0.0 };
+    let step_work_frac = if t_gui.as_secs_f64() > 0.0 { total_step_time.as_secs_f64() / t_gui.as_secs_f64() } else { 0.0 };
+    let sleep_work_frac = (sleep_count as f64 * 0.010) / t_gui.as_secs_f64().max(1e-9);
+    eprintln!(
+        "scan-perf-CAL: steps={} total_step_time={:.3}s avg_step={:.2}ms max_step={:.2}ms step_frac={:.3} sleep_frac={:.3}",
+        step_count, total_step_time.as_secs_f64(), avg_step_ms, max_step_time.as_secs_f64() * 1000.0, step_work_frac, sleep_work_frac
+    );
+
+    if !populated {
+        panic!(
+            "GUI scan did not populate groups table within {:.1}x t_cli ({:.2}s); see harness diagnostic above",
+            timeout_ratio,
+            timeout.as_secs_f64()
+        );
+    }
+
+    // ---------- Step 3: Assert ratio bound (O3 per testdesign 2026-06-04 19:54 PDT) ----------
+    // Ratchet on total_step_time (the engine-work-equivalent inside harness.step()) NOT t_gui
+    // wall, because harness poll-sleep yields inflate t_gui by 65.6% without measuring engine
+    // work. Calibration finding 19:50 PDT: harness yield = ~2.91s out of 4.42s; engine work
+    // ~1.3s -> true engine-vs-CLI signal not the wall-derived 50x.
+    let ratio_bound: f64 = std::env::var("SUPERDEDUPER_TEST_PERF_RATIO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3.0);
+    let observed_ratio = total_step_time.as_secs_f64() / t_cli.as_secs_f64();
+
+    eprintln!(
+        "scan-perf-ratio: CLI={:.3}s GUI_wall={:.3}s GUI_engine_work={:.3}s ratio={:.2}x bound={:.1}x corpus={}",
+        t_cli.as_secs_f64(),
+        t_gui.as_secs_f64(),
+        total_step_time.as_secs_f64(),
+        observed_ratio,
+        ratio_bound,
+        corpus.display()
+    );
+
+    std::fs::remove_dir_all(&corpus).ok();
+
+    if observed_ratio > ratio_bound {
+        panic!(
+            "GUI engine work {:.3}s > CLI {:.3}s * {:.1}x bound (observed ratio {:.2}x; harness wall was {:.3}s)",
+            total_step_time.as_secs_f64(),
+            t_cli.as_secs_f64(),
+            ratio_bound,
+            observed_ratio,
+            t_gui.as_secs_f64()
+        );
+    }
 }

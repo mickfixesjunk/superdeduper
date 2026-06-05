@@ -10,6 +10,7 @@ pub mod audio_hash;
 pub mod grouping;
 pub mod hash;
 pub mod image_hash;
+pub mod io_threads_probe;
 pub mod iocp;
 pub mod layout;
 

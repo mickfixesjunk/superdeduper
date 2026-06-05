@@ -212,6 +212,101 @@ pub fn run_shape_esoterics(
     acc.finalize()
 }
 
+/// Codex-review item 2 (v0.3.25 2026-06-02): shared
+/// `SubmissionInputs` builder for non-bench scan submissions. Centralizes
+/// the constant fields (`client_version` / `run_uuid` / `walker_variant`
+/// / `dry_run` / `groups_reviewed_count` / `actions_taken_summary` /
+/// `placeholder_skip_bytes` / `client_found_dupsets` / `bench` / `lane`)
+/// so a wire-shape evolution touches ONE function instead of two.
+///
+/// Callers populate `ScanSubmissionArgs` (struct-init syntax keeps
+/// argument labelling clear despite the parameter count) + invoke
+/// `build_scan_submission_inputs`. Used by:
+/// * `src/main.rs::run_scan` -- CLI scan-finish path
+/// * `src/gui/live.rs::engine_thread` -- GUI streaming-accumulator path
+///
+/// Pre-refactor the two call sites had byte-identical field-name
+/// layouts but differed in variant-value sourcing (e.g. CLI's
+/// `reclaimable_bytes` vs GUI's `reclaimable_inode`); the helper
+/// preserves that pattern while pulling the constants into one place.
+pub struct ScanSubmissionArgs {
+    pub scan_id: String,
+    pub hardware: superdeduper_bench_iface::HardwareFingerprint,
+    pub wall_clock_seconds: f64,
+    pub bytes_scanned: u64,
+    pub files_scanned: u64,
+    pub hash_algorithm: String,
+    pub scope: String,
+    pub features_used_bitmap: u64,
+    pub corpus_kind: String,
+    pub cache_hit_ratio: Option<f64>,
+    pub easter_egg_hits: Vec<String>,
+    pub zero_byte_group_max: Option<u64>,
+    pub max_hardlink_count_in_scan: Option<u64>,
+    pub name_collision_count: Option<u64>,
+    pub share_count_in_scope: Option<u64>,
+    pub duplicate_groups: u64,
+    pub duplicate_bytes_reclaimable: u64,
+    pub largest_single_group_bytes: u64,
+    pub placeholder_skip_count: Option<u64>,
+}
+
+pub fn build_scan_submission_inputs(
+    args: ScanSubmissionArgs,
+) -> crate::leaderboard::submission::SubmissionInputs {
+    use crate::leaderboard::submission::{ResultSummary, RunShape, SubmissionInputs};
+    SubmissionInputs {
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        run_uuid: uuid::Uuid::new_v4().to_string(),
+        scan_id: Some(args.scan_id),
+        hardware: args.hardware,
+        run_shape: RunShape {
+            wall_clock_seconds: args.wall_clock_seconds,
+            bytes_scanned: args.bytes_scanned,
+            files_scanned: args.files_scanned,
+            hash_algorithm: args.hash_algorithm,
+            walker_variant: "hybrid".to_string(),
+            scope: args.scope,
+            features_used_bitmap: args.features_used_bitmap,
+            corpus_kind: args.corpus_kind,
+            cache_hit_ratio: args.cache_hit_ratio,
+            easter_egg_hits: args.easter_egg_hits,
+            zero_byte_group_max: args.zero_byte_group_max,
+            max_hardlink_count_in_scan: args.max_hardlink_count_in_scan,
+            name_collision_count: args.name_collision_count,
+            share_count_in_scope: args.share_count_in_scope,
+            // #89: kept None per design's catalog-semantic flag (see
+            // submission.rs comment on the field). Reactivate when a
+            // real dry-run UX ships.
+            dry_run: None,
+            // #89: group-reviews happen post-scan-finish; the count
+            // is always 0 at initial submission time.
+            groups_reviewed_count: None,
+        },
+        result_summary: ResultSummary {
+            duplicate_groups: args.duplicate_groups,
+            duplicate_bytes_reclaimable: args.duplicate_bytes_reclaimable,
+            largest_single_group_bytes: args.largest_single_group_bytes,
+            // Always empty at scan-end -- actions happen post-scan;
+            // PATCH /actions populates this later.
+            actions_taken_summary: std::collections::BTreeMap::new(),
+            placeholder_skip_count: args.placeholder_skip_count,
+            // Always None at scan-end -- the tier guard hasn't been
+            // threaded to track per-placeholder byte totals yet
+            // (separate follow-up).
+            placeholder_skip_bytes: None,
+            // T-BENCH-ME field; always None for non-bench scans.
+            client_found_dupsets: None,
+        },
+        // T-BENCH-ME canonical-bench fields; always None on the
+        // non-bench scan-submission path.
+        bench: None,
+        // Mick bench-lane UX; always None for non-bench submissions
+        // (server falls back to has_account_linkage gating).
+        lane: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
