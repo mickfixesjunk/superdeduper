@@ -307,6 +307,23 @@ strip = "symbols"
 opt-level = 3
 lto = "thin"
 
+# 2026-06-05: release-debug profile for Windows flamegraph (Cand 4
+# investigation). Identical to release except KEEPS debug symbols so
+# ETW + WPA / xperf / VS profiler / cargo-flamegraph can resolve stack
+# frames. On Windows the .pdb file is generated alongside the .exe;
+# on Linux the symbols stay in the ELF.
+#
+# Build: `cargo build --release --profile release-debug --features "gui telemetry"`
+# Resulting binary is ~30-50% larger but functionally identical.
+#
+# NOT for shipped releases; CI tag-driven workflow still uses [profile.release]
+# (strip = "symbols") for smaller artifacts. This profile exists purely for
+# perf-investigation iteration where flamegraph quality matters.
+[profile.release-debug]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+
 # ---------------------------------------------------------------------------
 # Phase 0 trait extraction (2026-05-31): root Cargo.toml is both [package]
 # AND [workspace] root. The root engine crate lives here; leaf crates that

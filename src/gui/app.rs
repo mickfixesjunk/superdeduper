@@ -4149,9 +4149,29 @@ fn skip_accesskit_during_scan_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN").is_some())
 }
 
+/// PERF INSTRUMENTATION GATE -- SUPERDEDUPER_PERF_INSTRUMENT_UPDATE
+/// (Cand 4 investigation 2026-06-05 07:00 PDT post-Cand-1-refuted).
+///
+/// When the env var is SET, update() emits a single-line per-frame
+/// `perf-update: drain=Xms modal=Yms body=Zms total=Tms` line to stderr
+/// while a scan is in flight. sdd-testwin pipes stderr to a file +
+/// analyzes offline to identify which phase dominates per-step cost on
+/// Windows.
+///
+/// Diagnostic-only. Default (env var unset) is unchanged. Cached via
+/// OnceLock; the env::var_os call fires ONCE per process.
+fn perf_instrument_update_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_UPDATE").is_some())
+}
+
 impl eframe::App for SuperdeduperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let t_update_start = std::time::Instant::now();
+        let t_drain_start = t_update_start;
         self.drain_events();
+        let drain_dur = t_drain_start.elapsed();
         if self.is_scanning {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
 
@@ -4164,9 +4184,17 @@ impl eframe::App for SuperdeduperApp {
             // animated widget that would bump the tree.
             if skip_accesskit_during_scan_enabled() {
                 egui::CentralPanel::default().show(ctx, |_ui| {});
+                if perf_instrument_update_enabled() {
+                    eprintln!(
+                        "perf-update: drain={:.3}ms modal=0.000ms body=0.000ms total={:.3}ms skip-mode=1",
+                        drain_dur.as_secs_f64() * 1000.0,
+                        t_update_start.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
                 return;
             }
         }
+        let t_modal_start = std::time::Instant::now();
 
         // Accessibility-action dispatch (#189, 2026-05-31). Keyboard
         // shortcuts route to the same internal handlers as the
@@ -4242,6 +4270,8 @@ impl eframe::App for SuperdeduperApp {
         let _ = self.render_bench_modal(ctx);
         let _ = self.render_channel_banner(ctx);
         let _ = self.render_exclusions_safe_defaults_banner(ctx);
+        let modal_dur = t_modal_start.elapsed();
+        let t_body_start = std::time::Instant::now();
 
         // File menubar — owns project lifecycle (New / Open / Save /
         // Save As / Open Archive Manifest). Rendered as a thin strip
@@ -4354,6 +4384,24 @@ impl eframe::App for SuperdeduperApp {
             .show(ctx, |ui| {
                 self.sparkles.paint(ui, fill);
             });
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE -- per-phase timing emit
+        // (Cand 4 investigation per design 07:00 PDT). Only fires while
+        // a scan is in flight to keep stderr noise bounded to the
+        // measurement window. sdd-testwin pipes stderr to a file +
+        // analyzes offline (awk + sort + mean/max). For early-return
+        // paths (alpha modal / resume modal) the emit is skipped --
+        // those aren't on the per-frame hot path during a scan.
+        if perf_instrument_update_enabled() && self.is_scanning {
+            let body_dur = t_body_start.elapsed();
+            let total = t_update_start.elapsed();
+            eprintln!(
+                "perf-update: drain={:.3}ms modal={:.3}ms body={:.3}ms total={:.3}ms skip-mode=0",
+                drain_dur.as_secs_f64() * 1000.0,
+                modal_dur.as_secs_f64() * 1000.0,
+                body_dur.as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            );
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
