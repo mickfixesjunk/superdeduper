@@ -944,8 +944,16 @@ fn tier_a_gui_scan_perf_within_cli_ratio() {
     let corpus_root_tmp = std::env::temp_dir();
     let corpus = generate_perf_test_corpus(&corpus_root_tmp);
 
-    // ---------- Step 1: CLI baseline ----------
+    // ---------- Step 1: CLI baseline (with warmup pass) ----------
+    // Warmup pass (NOT timed) per testdesign 2026-06-04 19:54 PDT: hot the OS page cache
+    // for the corpus + binary's runtime init so the timed run measures steady-state CLI
+    // cost, not first-MFT-walk + cold-disk-read overhead. Cold-vs-warm CLI noise was 6x
+    // (0.58s cold first run vs 0.09s warm subsequent) which made the ratio gate flaky.
     let cli_exe = env!("CARGO_BIN_EXE_superdeduper");
+    let _warmup = std::process::Command::new(cli_exe)
+        .args(["scan", &corpus.to_string_lossy(), "--no-cache"])
+        .output()
+        .expect("CLI warmup scan failed to spawn");
     let t_cli_start = std::time::Instant::now();
     let cli_out = std::process::Command::new(cli_exe)
         .args(["scan", &corpus.to_string_lossy(), "--no-cache"])
@@ -981,16 +989,37 @@ fn tier_a_gui_scan_perf_within_cli_ratio() {
     let timeout_ratio = 6.0_f64;
     let timeout = t_cli.mul_f64(timeout_ratio).max(std::time::Duration::from_secs(30));
     let poll_deadline = std::time::Instant::now() + timeout;
+    // Candidate-4 calibration telemetry per testdesign 19:38 PDT + 19:54 PDT (commit-permanent):
+    // time each harness.step() to measure egui_kittest frame-pump cost vs engine scan work.
+    // Finding 19:50 PDT: 65.6% of GUI walltime is poll-sleep yield (291 polls * 10ms), NOT
+    // engine work. true engine work = total_step_time -- that's what O3 ratchet uses below.
+    let mut step_count: u64 = 0;
+    let mut total_step_time = std::time::Duration::ZERO;
+    let mut max_step_time = std::time::Duration::ZERO;
+    let mut sleep_count: u64 = 0;
     while std::time::Instant::now() < poll_deadline {
+        let t_step = std::time::Instant::now();
         harness.step();
+        let step_dur = t_step.elapsed();
+        step_count += 1;
+        total_step_time += step_dur;
+        if step_dur > max_step_time { max_step_time = step_dur; }
         click_all(&harness, "scan \u{2192}"); // advance preflight proceed (the "scan →" button)
         if harness.query_all_by_label_contains("Go (").next().is_some() {
             populated = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+        sleep_count += 1;
     }
     let t_gui = t_gui_start.elapsed();
+    let avg_step_ms = if step_count > 0 { total_step_time.as_secs_f64() * 1000.0 / step_count as f64 } else { 0.0 };
+    let step_work_frac = if t_gui.as_secs_f64() > 0.0 { total_step_time.as_secs_f64() / t_gui.as_secs_f64() } else { 0.0 };
+    let sleep_work_frac = (sleep_count as f64 * 0.010) / t_gui.as_secs_f64().max(1e-9);
+    eprintln!(
+        "scan-perf-CAL: steps={} total_step_time={:.3}s avg_step={:.2}ms max_step={:.2}ms step_frac={:.3} sleep_frac={:.3}",
+        step_count, total_step_time.as_secs_f64(), avg_step_ms, max_step_time.as_secs_f64() * 1000.0, step_work_frac, sleep_work_frac
+    );
 
     if !populated {
         panic!(
@@ -1000,17 +1029,22 @@ fn tier_a_gui_scan_perf_within_cli_ratio() {
         );
     }
 
-    // ---------- Step 3: Assert ratio bound ----------
+    // ---------- Step 3: Assert ratio bound (O3 per testdesign 2026-06-04 19:54 PDT) ----------
+    // Ratchet on total_step_time (the engine-work-equivalent inside harness.step()) NOT t_gui
+    // wall, because harness poll-sleep yields inflate t_gui by 65.6% without measuring engine
+    // work. Calibration finding 19:50 PDT: harness yield = ~2.91s out of 4.42s; engine work
+    // ~1.3s -> true engine-vs-CLI signal not the wall-derived 50x.
     let ratio_bound: f64 = std::env::var("SUPERDEDUPER_TEST_PERF_RATIO")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3.0);
-    let observed_ratio = t_gui.as_secs_f64() / t_cli.as_secs_f64();
+    let observed_ratio = total_step_time.as_secs_f64() / t_cli.as_secs_f64();
 
     eprintln!(
-        "scan-perf-ratio: CLI={:.2}s GUI={:.2}s ratio={:.2}x bound={:.1}x corpus={}",
+        "scan-perf-ratio: CLI={:.3}s GUI_wall={:.3}s GUI_engine_work={:.3}s ratio={:.2}x bound={:.1}x corpus={}",
         t_cli.as_secs_f64(),
         t_gui.as_secs_f64(),
+        total_step_time.as_secs_f64(),
         observed_ratio,
         ratio_bound,
         corpus.display()
@@ -1020,11 +1054,12 @@ fn tier_a_gui_scan_perf_within_cli_ratio() {
 
     if observed_ratio > ratio_bound {
         panic!(
-            "GUI scan {:.2}s > CLI {:.2}s * {:.1}x bound (observed ratio {:.2}x)",
-            t_gui.as_secs_f64(),
+            "GUI engine work {:.3}s > CLI {:.3}s * {:.1}x bound (observed ratio {:.2}x; harness wall was {:.3}s)",
+            total_step_time.as_secs_f64(),
             t_cli.as_secs_f64(),
             ratio_bound,
-            observed_ratio
+            observed_ratio,
+            t_gui.as_secs_f64()
         );
     }
 }
