@@ -3895,6 +3895,32 @@ impl SuperdeduperApp {
     /// wall at the bottom. Wrapped in a ScrollArea so #115's
     /// low-res-screen "badges below the fold" case is reachable.
     fn render_sidebar_panel(&mut self, ctx: &egui::Context) {
+        // PATH 1 experimental gate (Cand 4 sidebar isolation; design 08:20 PDT).
+        // Short-circuits to empty SidePanel when env var set + a scan is in
+        // flight. Empirically validates: does the sidebar's 2.14ms/frame on
+        // NEO Windows account for the ~83% remaining body cost post-Cand-2?
+        if self.is_scanning && skip_sidebar_during_scan_enabled() {
+            SidePanel::left("sidebar")
+                .resizable(true)
+                .default_width(300.0)
+                .min_width(240.0)
+                .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
+                .show(ctx, |_ui| {});
+            return;
+        }
+
+        // Sub-widget instrumentation inside sidebar (Option B drill-down per
+        // design 08:20 PDT; emits a single perf-update-sidebar line when env
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE is set + a scan is in flight).
+        // Identifies which inner widget (cache_banner / scan_mode_picker /
+        // roots_panel / funnel / badge_wall) dominates the 2.14ms.
+        let sb_inst = perf_instrument_update_enabled() && self.is_scanning;
+        let mut sb_cache_banner = std::time::Duration::ZERO;
+        let mut sb_scan_mode = std::time::Duration::ZERO;
+        let mut sb_roots = std::time::Duration::ZERO;
+        let mut sb_funnel = std::time::Duration::ZERO;
+        let mut sb_badge_wall = std::time::Duration::ZERO;
+
         SidePanel::left("sidebar")
             .resizable(true)
             .default_width(300.0)
@@ -3919,35 +3945,43 @@ impl SuperdeduperApp {
                         // banner is a no-op when no cache exists
                         // for the current roots OR when the user
                         // has settings.always_use_cache enabled.
+                        let t0 = std::time::Instant::now();
                         crate::gui::widgets::cache_banner::show(
                             ui,
                             &mut self.state,
                             self.persisted.settings.always_use_cache,
                         );
+                        if sb_inst { sb_cache_banner = t0.elapsed(); }
                         // #25 v2.5: scan-mode dropdown above the
                         // Roots panel per spec §3.8 ("top of
                         // scan-config panel"). Selection lives on
                         // `self.scan_mode` — session-sticky, NOT
                         // persisted across launches per spec.
+                        let t0 = std::time::Instant::now();
                         crate::gui::widgets::scan_mode_picker::show(
                             ui,
                             &mut self.scan_mode,
                             self.is_scanning,
                         );
+                        if sb_inst { sb_scan_mode = t0.elapsed(); }
                         ui.add_space(6.0);
+                        let t0 = std::time::Instant::now();
                         let roots_action = roots_panel::show(
                             ui,
                             &self.persisted.roots,
                             self.is_scanning,
                             self.can_resume,
                         );
+                        if sb_inst { sb_roots = t0.elapsed(); }
                         if let Some(a) = roots_action {
                             self.dispatch_root_action(a);
                         }
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(6.0);
+                        let t0 = std::time::Instant::now();
                         funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
+                        if sb_inst { sb_funnel = t0.elapsed(); }
 
                         // §10.4 badge-wall: bottom-left always-
                         // visible achievements grid. Auto-degrades
@@ -3959,18 +3993,31 @@ impl SuperdeduperApp {
                             ui.add_space(12.0);
                             ui.separator();
                             ui.add_space(6.0);
+                            let t0 = std::time::Instant::now();
                             let state = crate::leaderboard::catalog::peek_state();
                             let action = if ui.available_width() < 280.0 {
                                 crate::gui::widgets::badge_wall::show_mini(ui, &state)
                             } else {
                                 crate::gui::widgets::badge_wall::show(ui, &state)
                             };
+                            if sb_inst { sb_badge_wall = t0.elapsed(); }
                             if let Some(a) = action {
                                 self.dispatch_badge_wall_action(a);
                             }
                         }
                     });
             });
+
+        if sb_inst {
+            eprintln!(
+                "perf-update-sidebar: cache_banner={:.3}ms scan_mode={:.3}ms roots={:.3}ms funnel={:.3}ms badge_wall={:.3}ms",
+                sb_cache_banner.as_secs_f64() * 1000.0,
+                sb_scan_mode.as_secs_f64() * 1000.0,
+                sb_roots.as_secs_f64() * 1000.0,
+                sb_funnel.as_secs_f64() * 1000.0,
+                sb_badge_wall.as_secs_f64() * 1000.0,
+            );
+        }
     }
 
     /// Central panel — drive scope at the top (clickable per-
@@ -4164,6 +4211,22 @@ fn perf_instrument_update_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_UPDATE").is_some())
+}
+
+/// EXPERIMENTAL GATE -- SUPERDEDUPER_PERF_SKIP_SIDEBAR_DURING_SCAN
+/// (Cand 4 post-2969f74 widget breakdown: sdd-testwin 08:17 PDT data
+/// shows sidebar = 76.9% of body / 2.14ms per frame on NEO Windows).
+///
+/// When the env var is SET AND a scan is in flight, render_sidebar_panel
+/// short-circuits to an empty SidePanel. Empirically tests: does the
+/// 2.14ms/frame sidebar render account for the ~83% body-cost still
+/// remaining after Cand 2?
+///
+/// Diagnostic-only. Default unchanged. NOT v0.3.38 ship.
+fn skip_sidebar_during_scan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_SKIP_SIDEBAR_DURING_SCAN").is_some())
 }
 
 impl eframe::App for SuperdeduperApp {
