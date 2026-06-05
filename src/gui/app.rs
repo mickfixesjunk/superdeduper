@@ -4283,15 +4283,38 @@ impl eframe::App for SuperdeduperApp {
         // return them so the resume-effect state machine and
         // post-render dispatch (settings-open + menu-action) can
         // both run in the same frame, in their original sequence.
+        // Per-widget instrumentation (Option B widget-level spans, Cand 4
+        // post-Path-B-blocked per design 08:10 PDT). Each render fn timed
+        // when SUPERDEDUPER_PERF_INSTRUMENT_UPDATE is SET + a scan is in
+        // flight; emit a perf-update-body line at the bottom of update().
+        // Cost when env var unset: 12x Instant::now() + elapsed() per frame
+        // = ~0.5us; negligible relative to the timed phases.
+        let body_inst = perf_instrument_update_enabled() && self.is_scanning;
+        let mut span_brand = std::time::Duration::ZERO;
+        let mut span_menubar = std::time::Duration::ZERO;
+        let mut span_header = std::time::Duration::ZERO;
+        let mut span_sparkles_tick = std::time::Duration::ZERO;
+        let mut span_progress = std::time::Duration::ZERO;
+        let mut span_sidebar = std::time::Duration::ZERO;
+        let mut span_central = std::time::Duration::ZERO;
+        let mut span_overlays = std::time::Duration::ZERO;
+
+        let t0 = std::time::Instant::now();
         self.render_brand_panel(ctx);
+        if body_inst { span_brand = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         let menu_action = self.render_menubar_panel(ctx);
+        if body_inst { span_menubar = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         let want_settings = self.render_header_panel(ctx);
+        if body_inst { span_header = t0.elapsed(); }
                             // Cache-fast-forward effect: STRICTLY resume-only. Only fires
                             // while resume_effect_active is true, the engine is in
                             // Hashing, and the rate exceeds the fast-forward threshold.
                             // After catch-up (Sparkles emits `left_fast_forward`) we
                             // clear resume_effect_active so the effect ends and the bar
                             // returns to its normal render for the rest of the scan.
+        let t_sparkles_tick = std::time::Instant::now();
         if self.resume_effect_active
             && matches!(
                 self.state.overall.stage,
@@ -4328,6 +4351,7 @@ impl eframe::App for SuperdeduperApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
+        if body_inst { span_sparkles_tick = t_sparkles_tick.elapsed(); }
         if want_settings {
             self.settings_open = true;
         }
@@ -4338,10 +4362,17 @@ impl eframe::App for SuperdeduperApp {
         // #140 phase-3 -- A-update-layout-panel-extraction.
         // Bottom 3 layout panels: progress strip + sidebar +
         // central. Pure renders; no event returns.
+        let t0 = std::time::Instant::now();
         self.render_overall_progress_panel(ctx);
+        if body_inst { span_progress = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         self.render_sidebar_panel(ctx);
+        if body_inst { span_sidebar = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         self.render_central_panel(ctx);
+        if body_inst { span_central = t0.elapsed(); }
 
+        let t_overlays = std::time::Instant::now();
         // Action-progress modal renders LAST so it overlays
         // everything else (CentralPanel, SidePanel, TopBottomPanels).
         // egui Window-with-anchor handles the z-order; we just have
@@ -4384,6 +4415,7 @@ impl eframe::App for SuperdeduperApp {
             .show(ctx, |ui| {
                 self.sparkles.paint(ui, fill);
             });
+        if body_inst { span_overlays = t_overlays.elapsed(); }
         // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE -- per-phase timing emit
         // (Cand 4 investigation per design 07:00 PDT). Only fires while
         // a scan is in flight to keep stderr noise bounded to the
@@ -4400,6 +4432,21 @@ impl eframe::App for SuperdeduperApp {
                 modal_dur.as_secs_f64() * 1000.0,
                 body_dur.as_secs_f64() * 1000.0,
                 total.as_secs_f64() * 1000.0,
+            );
+            // Option B widget-level spans (Cand 4 post-Path-B-blocked,
+            // design 08:10 PDT). Same activation gate; reports each
+            // major render fn's wall-clock so sdd-testwin sees which
+            // widget dominates within body on Windows.
+            eprintln!(
+                "perf-update-body: brand={:.3}ms menubar={:.3}ms header={:.3}ms sparkles_tick={:.3}ms progress={:.3}ms sidebar={:.3}ms central={:.3}ms overlays={:.3}ms",
+                span_brand.as_secs_f64() * 1000.0,
+                span_menubar.as_secs_f64() * 1000.0,
+                span_header.as_secs_f64() * 1000.0,
+                span_sparkles_tick.as_secs_f64() * 1000.0,
+                span_progress.as_secs_f64() * 1000.0,
+                span_sidebar.as_secs_f64() * 1000.0,
+                span_central.as_secs_f64() * 1000.0,
+                span_overlays.as_secs_f64() * 1000.0,
             );
         }
     }
