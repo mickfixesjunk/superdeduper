@@ -868,7 +868,22 @@ fn crate_is_system_like(p: &std::path::Path) -> bool {
 /// Total ~1040 files, ~250 MiB, deterministic via fixed seed=0xC0FFEE.
 fn generate_perf_test_corpus(tempdir_root: &std::path::Path) -> std::path::PathBuf {
     use std::io::Write;
-    let dir = tempdir_root.join("perf-corpus-1040");
+    // SUPERDEDUPER_TEST_PERF_CORPUS_SCALE (Cand 5 corpus-mismatch investigation
+    // 2026-06-05 10:50 PDT post-v0.3.38 failure): multiplier for the 1040-file
+    // baseline. scale=10 => 10400 files; scale=50 => 52000; scale=300 => 312000
+    // (approx Mick C:sdd-tests scale per testdesign 13:48 PDT). Default 1 keeps
+    // the existing 1040-file cell behavior. Env-var-gated so the ratchet cell
+    // semantics don't drift.
+    let scale: usize = std::env::var("SUPERDEDUPER_TEST_PERF_CORPUS_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let dir_name = if scale == 1 {
+        "perf-corpus-1040".to_string()
+    } else {
+        format!("perf-corpus-1040x{}", scale)
+    };
+    let dir = tempdir_root.join(dir_name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -898,36 +913,39 @@ fn generate_perf_test_corpus(tempdir_root: &std::path::Path) -> std::path::PathB
     }
     let mut rng = Rng(0x00C0FFEE);
 
-    // 500 unique-size files; sizes spread 1KB-1MB
-    for i in 0..500 {
+    // 500 unique-size files; sizes spread 1KB-1MB (multiplied by scale)
+    let n_uniq = 500 * scale;
+    for i in 0..n_uniq {
         let size = rng.range(1024, 1024 * 1024);
         let mut buf = vec![0u8; size];
         rng.fill(&mut buf);
-        let f = std::fs::File::create(dir.join(format!("uniq_{:04}.bin", i))).unwrap();
+        let f = std::fs::File::create(dir.join(format!("uniq_{:07}.bin", i))).unwrap();
         std::io::BufWriter::new(f).write_all(&buf).unwrap();
     }
 
-    // 250 size-twin pairs: each pair shares size but has DIFFERENT random content
-    for i in 0..250 {
+    // 250 size-twin pairs (multiplied): each pair shares size but DIFFERENT content
+    let n_twin = 250 * scale;
+    for i in 0..n_twin {
         let size = rng.range(4096, 256 * 1024);
         let mut a = vec![0u8; size];
         let mut b = vec![0u8; size];
         rng.fill(&mut a);
         rng.fill(&mut b);
-        let fa = std::fs::File::create(dir.join(format!("twin_{:04}_a.bin", i))).unwrap();
+        let fa = std::fs::File::create(dir.join(format!("twin_{:07}_a.bin", i))).unwrap();
         std::io::BufWriter::new(fa).write_all(&a).unwrap();
-        let fb = std::fs::File::create(dir.join(format!("twin_{:04}_b.bin", i))).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("twin_{:07}_b.bin", i))).unwrap();
         std::io::BufWriter::new(fb).write_all(&b).unwrap();
     }
 
-    // 20 dup pairs: each pair byte-identical (same random content written twice)
-    for i in 0..20 {
+    // 20 dup pairs (multiplied): each pair byte-identical
+    let n_dup = 20 * scale;
+    for i in 0..n_dup {
         let size = rng.range(4096, 1024 * 1024);
         let mut buf = vec![0u8; size];
         rng.fill(&mut buf);
-        let fa = std::fs::File::create(dir.join(format!("dup_{:04}_a.bin", i))).unwrap();
+        let fa = std::fs::File::create(dir.join(format!("dup_{:07}_a.bin", i))).unwrap();
         std::io::BufWriter::new(fa).write_all(&buf).unwrap();
-        let fb = std::fs::File::create(dir.join(format!("dup_{:04}_b.bin", i))).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("dup_{:07}_b.bin", i))).unwrap();
         std::io::BufWriter::new(fb).write_all(&buf).unwrap();
     }
 

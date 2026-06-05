@@ -147,6 +147,32 @@ impl BulkAction {
     }
 }
 
+/// Cached sorted view of state.duplicates indices. Invalidated by ANY
+/// change to (duplicates.len(), drive_root, reference_roots_len). Sort
+/// keys (inode-aware savings) and the filter (drive scope + reference
+/// roots) are stable between mutations, so caching saves O(N log N) sort
+/// + O(N) filter on every frame during scan.
+///
+/// 2026-06-05 Cand 5 (corpus-mismatch v0.3.38 failure): the previous
+/// per-frame sort at line 225 of show_filtered was the suspected
+/// dominant cost at Mick C:\sdd-tests scale (312K files; ~30K visible
+/// dup groups; 30K * log2(30K) * 50ns * 30 fps * 300sec = ~50sec of
+/// pure sort compute). This cache eliminates that.
+#[derive(Default)]
+struct SortCache {
+    /// Snapshot of state.duplicates.len() at last sort. Append-only
+    /// during scan -> cache invalidates monotonically.
+    last_len: usize,
+    /// Snapshot of drive_root for the cached view. None vs Some(path)
+    /// transitions invalidate; switching between drives invalidates.
+    last_drive_root: Option<PathBuf>,
+    /// Snapshot of reference_roots.len() at last sort.
+    last_ref_roots_len: usize,
+    /// Indices into state.duplicates in sorted order (descending by
+    /// inode-aware savings).
+    sorted: Vec<usize>,
+}
+
 #[derive(Default)]
 pub struct GroupsTableState {
     expanded: hashbrown::HashSet<usize>,
@@ -163,6 +189,8 @@ pub struct GroupsTableState {
     /// per-row "0 B reclaimable" rows still exist in the data model;
     /// only their rendering is hidden.
     pub hide_unreclaimable: bool,
+    /// Cached sorted view (see SortCache for cache-key semantics).
+    sort_cache: SortCache,
 }
 
 /// Render the unfiltered table. Kept for callers that don't need a
@@ -222,22 +250,55 @@ pub fn show_filtered(
     // Apply the drive filter: keep a group if any member lives under
     // drive_root OR under any reference root. (Empty filter ⇒ keep
     // every group, original behaviour.)
-    let mut sorted: Vec<(usize, &DuplicateGroupSummary)> = state
-        .duplicates
+    //
+    // 2026-06-05 Cand 5 perf fix: cache the sorted view across frames.
+    // The cache key is (state.duplicates.len(), drive_root, reference_
+    // roots.len()) -- duplicates is append-only during scan so len-bump
+    // is a sufficient mutation signal; the filter changes when the user
+    // clicks a drive scope. Cache MISS does the original O(N) filter +
+    // O(N log N) sort; HIT skips both. At Mick scale (~30K groups +
+    // 9000 frames over 5min scan) this saves ~9000 * (30K iter + 30K *
+    // log2(30K) cmps) = ~6B operations per scan -- the suspected
+    // dominant cost of the v0.3.38 corpus-mismatch failure.
+    let cache_key_len = state.duplicates.len();
+    let cache_key_drive = drive_root.map(|p| p.to_path_buf());
+    let cache_key_ref_len = reference_roots.len();
+    let cache_hit = table_state.sort_cache.last_len == cache_key_len
+        && table_state.sort_cache.last_drive_root == cache_key_drive
+        && table_state.sort_cache.last_ref_roots_len == cache_key_ref_len
+        && !table_state.sort_cache.sorted.is_empty();
+    if !cache_hit {
+        let mut tmp: Vec<usize> = state
+            .duplicates
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| group_passes_filter(g, drive_root, reference_roots))
+            .map(|(idx, _)| idx)
+            .collect();
+        // Sort by inode-aware reclaim (biggest actual freeable space
+        // first). Path-aware would float hardlink-equivalent groups to
+        // the top on hardlink-heavy corpora even though they have 0 B
+        // to reclaim -- bad UX (the most-clickable row is the least
+        // useful one).
+        tmp.sort_by(|&ai, &bi| {
+            let sa = crate::gui::state::inode_aware_savings(&state.duplicates[ai]);
+            let sb = crate::gui::state::inode_aware_savings(&state.duplicates[bi]);
+            sb.cmp(&sa)
+        });
+        table_state.sort_cache.last_len = cache_key_len;
+        table_state.sort_cache.last_drive_root = cache_key_drive;
+        table_state.sort_cache.last_ref_roots_len = cache_key_ref_len;
+        table_state.sort_cache.sorted = tmp;
+    }
+    // Reconstruct the (idx, &group) pairs from the cached indices so
+    // downstream code reads the same shape it always did. The mapping
+    // is a borrow per row (no clone of DuplicateGroupSummary).
+    let sorted: Vec<(usize, &DuplicateGroupSummary)> = table_state
+        .sort_cache
+        .sorted
         .iter()
-        .enumerate()
-        .filter(|(_, g)| group_passes_filter(g, drive_root, reference_roots))
+        .filter_map(|&idx| state.duplicates.get(idx).map(|g| (idx, g)))
         .collect();
-    // Sort by inode-aware reclaim (biggest actual freeable space
-    // first). Path-aware would float hardlink-equivalent groups to
-    // the top on hardlink-heavy corpora even though they have 0 B
-    // to reclaim — bad UX (the most-clickable row is the least
-    // useful one).
-    sorted.sort_by(|a, b| {
-        let sa = crate::gui::state::inode_aware_savings(a.1);
-        let sb = crate::gui::state::inode_aware_savings(b.1);
-        sb.cmp(&sa)
-    });
 
     if sorted.is_empty() {
         ui.label(
