@@ -952,6 +952,154 @@ fn generate_perf_test_corpus(tempdir_root: &std::path::Path) -> std::path::PathB
     dir
 }
 
+/// Mick-shape corpus generator per testdesign spec
+/// workdirs/testdesign/specs/egui-kittest-scan-perf-mick-shape.md (2026-06-05 14:00 PDT;
+/// ratified design 13:55 PDT). Produces production-realistic file shape that the 1040-file
+/// synthetic cell can't reproduce.
+///
+/// Shape (default; configurable via SUPERDEDUPER_TEST_PERF_MICK_SHAPE_SCALE env var multiplier):
+///   - Small  (35K-70K files; 4KB-64KB; many size-twins for tier 1+2 cull)
+///   - Medium (12.5K-25K files; 64KB-10MB)
+///   - Large  (2.5K-5K files; 10MB+)
+/// Total ~50-100K files; ~10-50 GiB on disk at scale=1.0.
+///
+/// Deterministic PRNG seed: 0xCAFEBABE (per spec hint).
+///
+/// CACHING: re-uses corpus at <tempdir_root>/mick-shape-corpus-v{N}-<scale> if manifest matches
+/// the requested (scale, version, seed). Regenerates only on version bump OR scale change.
+/// Manifest path: <corpus>/corpus-version.json. Stage time ~1-5min one-time per machine; cached
+/// for all subsequent runs.
+///
+/// SCALE: env var SUPERDEDUPER_TEST_PERF_MICK_SHAPE_SCALE accepts floats (default 1.0; 0.1 for
+/// quick local diagnostic on resource-constrained machines; 0.05 = ~5K-files smoke test).
+#[allow(dead_code)] // Used by Mick-shape cell which sdd-testwin authors separately.
+fn generate_mick_shape_corpus(tempdir_root: &std::path::Path) -> std::path::PathBuf {
+    use std::io::Write;
+    const MICK_SHAPE_VERSION: u32 = 1;
+    const MICK_SHAPE_SEED: u64 = 0xCAFEBABE;
+
+    let scale: f64 = std::env::var("SUPERDEDUPER_TEST_PERF_MICK_SHAPE_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+
+    // File counts at scale=1.0 (midpoint of spec ranges).
+    let n_small = (50_000.0 * scale) as usize;
+    let n_medium = (18_000.0 * scale) as usize;
+    let n_large = (3_500.0 * scale) as usize;
+    let total = n_small + n_medium + n_large;
+
+    let dir_name = format!("mick-shape-corpus-v{}-s{:.3}", MICK_SHAPE_VERSION, scale);
+    let dir = tempdir_root.join(&dir_name);
+    let manifest_path = dir.join("corpus-version.json");
+
+    // Cache-hit check: manifest exists + matches version + scale.
+    if let Ok(s) = std::fs::read_to_string(&manifest_path) {
+        let v_ok = s.contains(&format!("\"version\":{}", MICK_SHAPE_VERSION));
+        let s_ok = s.contains(&format!("\"scale\":{:.3}", scale));
+        if v_ok && s_ok {
+            eprintln!("mick-shape: cache HIT at {} (manifest matches v{} scale {:.3})",
+                dir.display(), MICK_SHAPE_VERSION, scale);
+            return dir;
+        }
+    }
+
+    eprintln!("mick-shape: cache MISS; generating {} files (scale {:.3}) at {}",
+        total, scale, dir.display());
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            for chunk in buf.chunks_mut(8) {
+                let v = self.next().to_le_bytes();
+                let n = chunk.len();
+                chunk.copy_from_slice(&v[..n]);
+            }
+        }
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next() as usize) % (hi - lo)
+        }
+    }
+    let mut rng = Rng(MICK_SHAPE_SEED);
+
+    let t_start = std::time::Instant::now();
+
+    // Small files: 4KB-64KB. Half are size-twin pairs (forces tier 1+2 hash cull).
+    let n_small_twins = n_small / 2;
+    let n_small_uniq = n_small - n_small_twins;
+    for i in 0..n_small_uniq {
+        let size = rng.range(4096, 64 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let f = std::fs::File::create(dir.join(format!("s_uniq_{:07}.bin", i))).unwrap();
+        std::io::BufWriter::new(f).write_all(&buf).unwrap();
+    }
+    // Twin pairs share size + differ in content (tier 1 head match; tier 2/3 differentiates).
+    for i in 0..(n_small_twins / 2) {
+        let size = rng.range(4096, 64 * 1024);
+        let mut a = vec![0u8; size];
+        let mut b = vec![0u8; size];
+        rng.fill(&mut a);
+        rng.fill(&mut b);
+        let fa = std::fs::File::create(dir.join(format!("s_twin_{:07}_a.bin", i))).unwrap();
+        std::io::BufWriter::new(fa).write_all(&a).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("s_twin_{:07}_b.bin", i))).unwrap();
+        std::io::BufWriter::new(fb).write_all(&b).unwrap();
+    }
+
+    // Medium files: 64KB-10MB. Most unique; a few dup pairs (visible groups in UI).
+    let n_med_dups = n_medium / 20; // 5% are dup pairs
+    let n_med_uniq = n_medium - n_med_dups;
+    for i in 0..n_med_uniq {
+        let size = rng.range(64 * 1024, 10 * 1024 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let f = std::fs::File::create(dir.join(format!("m_uniq_{:07}.bin", i))).unwrap();
+        std::io::BufWriter::new(f).write_all(&buf).unwrap();
+    }
+    for i in 0..(n_med_dups / 2) {
+        let size = rng.range(64 * 1024, 10 * 1024 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let fa = std::fs::File::create(dir.join(format!("m_dup_{:07}_a.bin", i))).unwrap();
+        std::io::BufWriter::new(fa).write_all(&buf).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("m_dup_{:07}_b.bin", i))).unwrap();
+        std::io::BufWriter::new(fb).write_all(&buf).unwrap();
+    }
+
+    // Large files: 10MB+. All unique (tier 3 hash work dominates).
+    for i in 0..n_large {
+        let size = rng.range(10 * 1024 * 1024, 50 * 1024 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let f = std::fs::File::create(dir.join(format!("l_uniq_{:07}.bin", i))).unwrap();
+        std::io::BufWriter::new(f).write_all(&buf).unwrap();
+    }
+
+    let elapsed = t_start.elapsed();
+    let manifest = format!(
+        "{{\"version\":{},\"seed\":\"{:#x}\",\"scale\":{:.3},\"total_files\":{},\"n_small\":{},\"n_medium\":{},\"n_large\":{},\"gen_secs\":{:.1}}}\n",
+        MICK_SHAPE_VERSION, MICK_SHAPE_SEED, scale, total, n_small, n_medium, n_large, elapsed.as_secs_f64()
+    );
+    std::fs::write(&manifest_path, manifest).expect("write mick-shape manifest");
+
+    eprintln!("mick-shape: generated {} files in {:.1}s at {}",
+        total, elapsed.as_secs_f64(), dir.display());
+    dir
+}
+
 /// Ship-gate cell: assert GUI scan wall <= N x CLI scan wall on the same hardware + corpus.
 /// N default 3.0x; configurable via SUPERDEDUPER_TEST_PERF_RATIO env. v0.3.36+ ship gate while
 /// engine iterates on GUI perf fixes. See spec for full rationale + tightening plan.
