@@ -4125,11 +4125,47 @@ impl SuperdeduperApp {
     }
 }
 
+/// EXPERIMENTAL GATE -- SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN (Mick GO
+/// Option C 2026-06-04 20:00 PDT). Verifies Candidate 2 hypothesis: per-
+/// frame accesskit_windows tree update cost is the dominant per-step cost
+/// in the scan-perf cell on Windows (4.71ms per step on NEO vs 0.95ms on
+/// WSL accesskit_unix).
+///
+/// When the env var is set (any value, matches the SUPERDEDUPER_IOTHREADS_PARKED
+/// pattern) AND a scan is in flight, the GUI update() short-circuits: it
+/// drains events + schedules the next repaint as normal, but renders an
+/// EMPTY central panel instead of the full widget tree. egui still
+/// produces a frame, but accesskit sees the same near-empty tree every
+/// frame; accesskit_windows has nothing to diff + push.
+///
+/// Diagnostic-only. Default behavior (env var unset) is UNCHANGED. The
+/// experimental commit is NOT a user-visible behavior change and is NOT
+/// reserved for v0.3.38 (which ships when the actual perf gate PASSES).
+///
+/// Cached via OnceLock so we pay env::var_os ONCE per process.
+fn skip_accesskit_during_scan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN").is_some())
+}
+
 impl eframe::App for SuperdeduperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         if self.is_scanning {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
+            // SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN experimental gate
+            // (see fn-level comment above). Short-circuit the rest of
+            // update() with an empty central panel. egui produces a
+            // valid frame; accesskit tree stays near-static; per-step
+            // accesskit-update cost drops to ~zero. Returns BEFORE any
+            // other panel renders so we don't accidentally include any
+            // animated widget that would bump the tree.
+            if skip_accesskit_during_scan_enabled() {
+                egui::CentralPanel::default().show(ctx, |_ui| {});
+                return;
+            }
         }
 
         // Accessibility-action dispatch (#189, 2026-05-31). Keyboard
