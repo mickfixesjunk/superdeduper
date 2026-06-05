@@ -307,6 +307,18 @@ strip = "symbols"
 opt-level = 3
 lto = "thin"
 
+# 2026-06-05 Q2 methodology lock per design 08:50 PDT: explicit inherits
+# from release for [profile.test] so `cargo test --release --test ...`
+# measurements match production-binary optimization level. The verbose
+# `cargo test --release -v` output on Linux already shows the test
+# binary getting opt-level=3 lto=fat codegen-units=1 (matches release)
+# via cargo's default `--release` flag handling, so this entry is
+# belt+suspenders that makes the relationship EXPLICIT in the manifest
+# and protects against any future cargo behavior change. No expected
+# runtime difference.
+[profile.test]
+inherits = "release"
+
 # 2026-06-05: release-debug profile for Windows flamegraph (Cand 4
 # investigation). Identical to release except KEEPS debug symbols so
 # ETW + WPA / xperf / VS profiler / cargo-flamegraph can resolve stack
