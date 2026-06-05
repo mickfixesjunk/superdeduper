@@ -854,3 +854,177 @@ fn crate_is_system_like(p: &std::path::Path) -> bool {
     let s = p.to_string_lossy();
     s.starts_with("/etc/") || s.starts_with("/usr/") || s.starts_with("/bin/") || s.starts_with("/var/lib/")
 }
+
+// =============================================================================
+// scan-perf ratio cell -- ship gate for v0.3.36+ GUI perf fixes
+// Spec: workdirs/testdesign/specs/egui-kittest-scan-perf-assertion.md
+// Author: sdd-testwin 2026-06-04 19:10 PDT post v0.3.37 verify
+// =============================================================================
+
+/// Generate the deterministic 1040-file perf corpus per spec §2:
+///   500 unique-size files (1KB - 1MB random)
+///   250 size-twin pairs = 500 files (4KB - 256KB; tier 1 head matches, tier 3 differs)
+///    20 dup pairs       =  40 files (4KB - 1MB; exact duplicates)
+/// Total ~1040 files, ~250 MiB, deterministic via fixed seed=0xC0FFEE.
+fn generate_perf_test_corpus(tempdir_root: &std::path::Path) -> std::path::PathBuf {
+    use std::io::Write;
+    let dir = tempdir_root.join("perf-corpus-1040");
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Cheap deterministic PRNG (xorshift64; seed=0xC0FFEE) -- avoid pulling in rand crate.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            for chunk in buf.chunks_mut(8) {
+                let v = self.next().to_le_bytes();
+                let n = chunk.len();
+                chunk.copy_from_slice(&v[..n]);
+            }
+        }
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next() as usize) % (hi - lo)
+        }
+    }
+    let mut rng = Rng(0x00C0FFEE);
+
+    // 500 unique-size files; sizes spread 1KB-1MB
+    for i in 0..500 {
+        let size = rng.range(1024, 1024 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let f = std::fs::File::create(dir.join(format!("uniq_{:04}.bin", i))).unwrap();
+        std::io::BufWriter::new(f).write_all(&buf).unwrap();
+    }
+
+    // 250 size-twin pairs: each pair shares size but has DIFFERENT random content
+    for i in 0..250 {
+        let size = rng.range(4096, 256 * 1024);
+        let mut a = vec![0u8; size];
+        let mut b = vec![0u8; size];
+        rng.fill(&mut a);
+        rng.fill(&mut b);
+        let fa = std::fs::File::create(dir.join(format!("twin_{:04}_a.bin", i))).unwrap();
+        std::io::BufWriter::new(fa).write_all(&a).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("twin_{:04}_b.bin", i))).unwrap();
+        std::io::BufWriter::new(fb).write_all(&b).unwrap();
+    }
+
+    // 20 dup pairs: each pair byte-identical (same random content written twice)
+    for i in 0..20 {
+        let size = rng.range(4096, 1024 * 1024);
+        let mut buf = vec![0u8; size];
+        rng.fill(&mut buf);
+        let fa = std::fs::File::create(dir.join(format!("dup_{:04}_a.bin", i))).unwrap();
+        std::io::BufWriter::new(fa).write_all(&buf).unwrap();
+        let fb = std::fs::File::create(dir.join(format!("dup_{:04}_b.bin", i))).unwrap();
+        std::io::BufWriter::new(fb).write_all(&buf).unwrap();
+    }
+
+    dir
+}
+
+/// Ship-gate cell: assert GUI scan wall <= N x CLI scan wall on the same hardware + corpus.
+/// N default 3.0x; configurable via SUPERDEDUPER_TEST_PERF_RATIO env. v0.3.36+ ship gate while
+/// engine iterates on GUI perf fixes. See spec for full rationale + tightening plan.
+#[test]
+fn tier_a_gui_scan_perf_within_cli_ratio() {
+    let _env = env_lock();
+    let _home = isolated_env("perfratio");
+    let corpus_root_tmp = std::env::temp_dir();
+    let corpus = generate_perf_test_corpus(&corpus_root_tmp);
+
+    // ---------- Step 1: CLI baseline ----------
+    let cli_exe = env!("CARGO_BIN_EXE_superdeduper");
+    let t_cli_start = std::time::Instant::now();
+    let cli_out = std::process::Command::new(cli_exe)
+        .args(["scan", &corpus.to_string_lossy(), "--no-cache"])
+        .output()
+        .expect("CLI sd scan failed to spawn");
+    let t_cli = t_cli_start.elapsed();
+    assert!(
+        cli_out.status.success(),
+        "CLI scan exited non-zero: {} stderr-tail: {}",
+        cli_out.status,
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+
+    // ---------- Step 2: GUI via egui_kittest in-process ----------
+    let corpus_for_closure = corpus.clone();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1400.0_f32, 900.0])
+        .build_eframe(move |cc| {
+            let mut app = SuperdeduperApp::new(cc);
+            app.add_root(corpus_for_closure.clone(), false);
+            app
+        });
+    for _ in 0..3 {
+        harness.step();
+    }
+    click_all(&harness, "Continue"); // dismiss alpha modal
+    for _ in 0..3 {
+        harness.step();
+    }
+    let t_gui_start = std::time::Instant::now();
+    click_all(&harness, "Start scan");
+    let mut populated = false;
+    let timeout_ratio = 6.0_f64;
+    let timeout = t_cli.mul_f64(timeout_ratio).max(std::time::Duration::from_secs(30));
+    let poll_deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < poll_deadline {
+        harness.step();
+        click_all(&harness, "scan \u{2192}"); // advance preflight proceed (the "scan →" button)
+        if harness.query_all_by_label_contains("Go (").next().is_some() {
+            populated = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let t_gui = t_gui_start.elapsed();
+
+    if !populated {
+        panic!(
+            "GUI scan did not populate groups table within {:.1}x t_cli ({:.2}s); see harness diagnostic above",
+            timeout_ratio,
+            timeout.as_secs_f64()
+        );
+    }
+
+    // ---------- Step 3: Assert ratio bound ----------
+    let ratio_bound: f64 = std::env::var("SUPERDEDUPER_TEST_PERF_RATIO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3.0);
+    let observed_ratio = t_gui.as_secs_f64() / t_cli.as_secs_f64();
+
+    eprintln!(
+        "scan-perf-ratio: CLI={:.2}s GUI={:.2}s ratio={:.2}x bound={:.1}x corpus={}",
+        t_cli.as_secs_f64(),
+        t_gui.as_secs_f64(),
+        observed_ratio,
+        ratio_bound,
+        corpus.display()
+    );
+
+    std::fs::remove_dir_all(&corpus).ok();
+
+    if observed_ratio > ratio_bound {
+        panic!(
+            "GUI scan {:.2}s > CLI {:.2}s * {:.1}x bound (observed ratio {:.2}x)",
+            t_gui.as_secs_f64(),
+            t_cli.as_secs_f64(),
+            ratio_bound,
+            observed_ratio
+        );
+    }
+}
