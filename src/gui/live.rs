@@ -1062,7 +1062,7 @@ fn run(
     // optimal point + map the per-chunk-overhead curve. Default
     // unchanged (50) so unset behavior is identical.
     let chunk_max = chunk_size_max();
-    crate::log_info!("GUI scan: chunk_groups max_chunk_size={chunk_max} (default=50; SUPERDEDUPER_CHUNK_SIZE override)");
+    crate::log_info!("GUI scan: chunk_groups max_chunk_size={chunk_max} (default=500; SUPERDEDUPER_CHUNK_SIZE override)");
     let chunks = chunk_groups(laid, 32, chunk_max);
     let total_chunks = chunks.len();
 
@@ -2687,11 +2687,15 @@ fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {
 /// updates) and reasonably small chunks (for cancellation
 /// responsiveness). Target ≥ `min_chunks` chunks where possible, but
 /// never put more than `max_chunk_size` groups in a single chunk.
-/// A-perf-chunks-h_new Path B: SUPERDEDUPER_CHUNK_SIZE override for
-/// the chunk_groups max_chunk_size argument. Default 50 (unchanged
-/// pre-this-flag behavior). sdd-testwin sweeps 50/100/250/500/1000
-/// to map per-chunk-overhead curve against engine-in-GUI 217s wall
-/// gap. Cached via OnceLock; env::var fires once per process. Min 1.
+/// A-perf-chunks-h_new ship default: chunk_groups max_chunk_size.
+/// Default 500 per sdd-testwin sweep matrix knee-point (2026-06-06
+/// 01:05 PDT): chunked-par-iter overhead at ~258 ms per chunk emit
+/// dominates 217s engine-in-GUI slowdown; cs=500 lands at 78.64s on
+/// Mick-corpus C:\sdd-tests (vs cs=50 278.21s = -72% wall), cs=1000
+/// shows slight regression (84.62s) so 500 is the right knee.
+/// SUPERDEDUPER_CHUNK_SIZE env-var override stays so future sweeps
+/// can re-characterize after the v0.3.40+ per-chunk-emit fix lands.
+/// Cached via OnceLock; env::var fires once per process. Min 1.
 fn chunk_size_max() -> usize {
     use std::sync::OnceLock;
     static CHUNK_SIZE: OnceLock<usize> = OnceLock::new();
@@ -2700,7 +2704,7 @@ fn chunk_size_max() -> usize {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.max(1))
-            .unwrap_or(50)
+            .unwrap_or(500)
     })
 }
 
