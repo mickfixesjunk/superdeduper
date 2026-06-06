@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
+
 use globset::{Glob, GlobSetBuilder};
 use parking_lot::Mutex;
 
@@ -1638,61 +1640,90 @@ fn run(
                     .load(Ordering::Relaxed),
             );
 
-        for g in dups {
-            if already_reported.contains(&g.content_hash) {
-                continue; // carried over from a prior checkpoint
-            }
-            let visible_files = filter_reference_only(g.files, &reference_set);
-            if visible_files.len() < 2 {
-                continue;
-            }
+        // v0.3.40 A-perf-pc-decouple Phase 4 (Mick GO 2026-06-06 ship-
+        // today): parallelize the per-group processing across rayon's
+        // global pool. sdd-testwin's v0.3.40 reduced-scope (aa140a8)
+        // matrix showed chunk_emit_ms_total ~24s on Mick-corpus = the
+        // bottleneck is the SERIAL for-g-in-dups loop, where each
+        // iteration's order_keeper_first calls file_mtime() (stat
+        // syscall per file). ~30K groups x ~800us serial = 24s wall.
+        //
+        // Splitting via par_iter lets the stat-bound work run across
+        // the global rayon pool (CPU-sized); the cheap serial fold
+        // afterwards updates aggregates (atomics + BTreeMap entry +
+        // checkpoint::record + sum_tx send) in a few ms total. With
+        // 8 logical cores parallelizing the stat work, projected wall
+        // for the per-chunk emit block drops from ~24s to ~3-5s on
+        // Mick-corpus = engine wall approaches CLI parity per design's
+        // <=1.10x criteria (lock-in 2026-06-06 12:28 PDT).
+        struct ProcessedGroup {
+            summary: DuplicateGroupSummary,
+            savings: u64,
+            group_reclaim: u64,
+        }
+        let keep_strategy = settings.keep_strategy;
+        let reference_set_ref = &reference_set;
+        let already_reported_ref = &already_reported;
+        let processed: Vec<ProcessedGroup> = dups
+            .into_par_iter()
+            .filter_map(|g| {
+                if already_reported_ref.contains(&g.content_hash) {
+                    return None;
+                }
+                let visible_files = filter_reference_only(g.files, reference_set_ref);
+                if visible_files.len() < 2 {
+                    return None;
+                }
+                let savings = g
+                    .size
+                    .saturating_mul(visible_files.len().saturating_sub(1) as u64);
+                let unique_inodes = if g.unique_inodes == 0 {
+                    visible_files.len() as u64
+                } else {
+                    g.unique_inodes
+                };
+                let group_reclaim = if !g.link_equivalent && unique_inodes > 1 {
+                    g.size.saturating_mul(unique_inodes.saturating_sub(1))
+                } else {
+                    0
+                };
+                let ordered_files =
+                    order_keeper_first(visible_files, keep_strategy, reference_set_ref);
+                Some(ProcessedGroup {
+                    summary: DuplicateGroupSummary {
+                        size: g.size,
+                        content_hash: g.content_hash,
+                        files: ordered_files,
+                        link_equivalent: g.link_equivalent,
+                        unique_inodes: g.unique_inodes,
+                        similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
+                    },
+                    savings,
+                    group_reclaim,
+                })
+            })
+            .collect();
+
+        for out in processed {
+            let g_size = out.summary.size;
+            let g_link_equivalent = out.summary.link_equivalent;
             confirmed += 1;
-            let savings = g
-                .size
-                .saturating_mul(visible_files.len().saturating_sub(1) as u64);
-            reclaimable = reclaimable.saturating_add(savings);
-            // Inode-aware reclaim — for hardlinked corpora
-            // (C:\Windows / WinSxS dominated), the path-aware
-            // count above inflates because each WinSxS alias counts
-            // as a "dup" even though all aliases share an inode.
-            // Inode-aware is the TRUE freeable bytes; ships in the
-            // leaderboard payload + clamped against bytes_scanned to
-            // satisfy the backend's result_self_consistency check.
-            // Hardlink-equivalent groups have nothing to reclaim
-            // (already collapsed on disk) — skip them.
-            let unique_inodes = if g.unique_inodes == 0 {
-                visible_files.len() as u64
-            } else {
-                g.unique_inodes
-            };
-            let group_reclaim = if !g.link_equivalent && unique_inodes > 1 {
-                g.size.saturating_mul(unique_inodes.saturating_sub(1))
-            } else {
-                0
-            };
-            reclaimable_inode = reclaimable_inode.saturating_add(group_reclaim);
+            reclaimable = reclaimable.saturating_add(out.savings);
+            reclaimable_inode = reclaimable_inode.saturating_add(out.group_reclaim);
             // `largest_single_group_bytes` per backend's sanity
             // check is the largest group's RECLAIM, not its total
             // bytes-on-disk. Backend rule: largest <= reclaim total.
-            // Using inode-aware per-group reclaim guarantees that
-            // because each per-group reclaim is a summand of the
-            // total (and there are no negative summands).
-            if group_reclaim > largest_group_bytes {
-                largest_group_bytes = group_reclaim;
+            if out.group_reclaim > largest_group_bytes {
+                largest_group_bytes = out.group_reclaim;
             }
             // #162 -- A-run-shape-esoterics-streaming: feed the group
             // through the shared accumulator. Same algorithm the CLI
-            // uses via `payload_meta::run_shape_esoterics` -- by
-            // construction the two paths produce identical RunShape
-            // values. `visible_files` (post `filter_reference_only`)
-            // is what the GUI displays + counts toward reclaimable; we
-            // pass the same slice to the accumulator so the
-            // reference-only members aren't double-counted.
+            // uses via `payload_meta::run_shape_esoterics`.
             run_shape_esoterics_accum.add_group(
-                g.size,
-                &g.content_hash,
-                g.link_equivalent,
-                visible_files.iter(),
+                g_size,
+                &out.summary.content_hash,
+                g_link_equivalent,
+                out.summary.files.iter(),
             );
             total_dups += 1;
             *groups_by_similarity_kind
@@ -1707,29 +1738,13 @@ fn run(
             diag_counters
                 .reclaimable_bytes
                 .store(reclaimable, Ordering::Relaxed);
-            // Reorder so the smart-heuristic keeper lands at
-            // index 0. The GUI's safe-rename / recycle / hardlink
-            // flows all treat `files[0]` as the canonical keeper
-            // — putting the best-scored file there is how we
-            // make `KeepStrategy::Smart` the GUI default without
-            // each downstream action having to know about it.
-            let visible_files =
-                order_keeper_first(visible_files, settings.keep_strategy, &reference_set);
-            let summary = DuplicateGroupSummary {
-                size: g.size,
-                content_hash: g.content_hash,
-                files: visible_files,
-                link_equivalent: g.link_equivalent,
-                unique_inodes: g.unique_inodes,
-                similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
-            };
-            checkpoint_state.record(&summary);
+            checkpoint_state.record(&out.summary);
             // A-perf-pc-decouple (v0.3.40): runner thread batches +
             // emits DuplicatesFoundBatch instead of per-group blocking
             // send. Send to sum_tx is cheap (unbounded channel push;
             // no GUI lock + no UI re-render until batched flush).
             if let Some(sender) = sum_tx_opt.as_ref() {
-                let _ = sender.send(summary);
+                let _ = sender.send(out.summary);
             }
         }
 
