@@ -26,7 +26,10 @@ $BINARY_SHA = '_REPLACE_ME_'          # e.g. '01cbf40' or '804750c' or 'phase4-s
 $LABEL      = '_REPLACE_ME_'          # used in output dir name, e.g. 'phase4-firstsha'
 # -----------------------------------------------------------------------
 
-$OUT       = "C:\sdd-tests\cold-vs-cold-mick-corpus-$LABEL"
+# Cat 1 #3 fix: output dir is OUTSIDE the scanned corpus (was C:\sdd-tests\... ;
+# now C:\sdd-tests-matrix-output\...). Previously cells scanned harness output
+# from prior cells, contaminating timing + results.
+$OUT       = "C:\sdd-tests-matrix-output\cold-vs-cold-mick-corpus-$LABEL"
 $HERMETIC  = Join-Path $OUT 'hermetic-data'
 $INSTALL   = Join-Path $HERMETIC 'install'
 $CORPUS    = 'C:\sdd-tests'
@@ -156,8 +159,32 @@ function Invoke-CliScan([string]$label) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     & $CLI scan --no-cache --format json -o $jsonPath $CORPUS 2> $stderrPath
     $sw.Stop()
-    Write-Host ("$label WALL: {0:N3}s ({1:N2} min)" -f $sw.Elapsed.TotalSeconds, $sw.Elapsed.TotalMinutes)
+    $cliExit = $LASTEXITCODE
+    Write-Host ("$label WALL: {0:N3}s ({1:N2} min)  exit={2}" -f $sw.Elapsed.TotalSeconds, $sw.Elapsed.TotalMinutes, $cliExit)
     Get-Content $stderrPath | Where-Object { $_ -match '^(stage|total|tier|  Tier|  \(per)' } | ForEach-Object { Write-Host $_ }
+    # Cat 1 #1 fix: CLI cell must exit cleanly AND produce a valid scan-history
+    # JSON. Either failure returns -1 (sentinel) so the gate reports ERROR not
+    # GREEN. Positive walls are not enough -- they could be a fast crash.
+    if ($cliExit -ne 0) {
+        Write-Host "$label FAIL: CLI non-zero exit ($cliExit)"
+        return -1
+    }
+    if (-not (Test-Path $jsonPath)) {
+        Write-Host "$label FAIL: scan output JSON missing at $jsonPath"
+        return -1
+    }
+    try {
+        $j = Get-Content $jsonPath -Raw | ConvertFrom-Json
+        if ($null -eq $j) { throw 'empty json' }
+        if (-not ($j.PSObject.Properties.Name -contains 'total_files') -and
+            -not ($j.PSObject.Properties.Name -contains 'files_inventory')) {
+            Write-Host "$label FAIL: scan JSON missing total_files / files_inventory"
+            return -1
+        }
+    } catch {
+        Write-Host "$label FAIL: scan JSON parse error: $_"
+        return -1
+    }
     return $sw.Elapsed.TotalSeconds
 }
 
@@ -208,77 +235,113 @@ function Invoke-GuiLive-FileWatch([string]$label) {
     }
     Write-Host ("$label WALL: {0:N3}s ({1:N2} min)" -f $sw.Elapsed.TotalSeconds, $sw.Elapsed.TotalMinutes)
     if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+
+    # Cat 1 #1 fix: small-positive elapsed from a fast GUI crash would otherwise
+    # pass the F1 wall>0 check and produce false-GREEN. Validate that the
+    # scan-history JSON actually contains a completed scan record before
+    # accepting the wall as a real measurement.
+    if (-not $jsonFile) {
+        Write-Host "$label FAIL: no scan-history file (GUI did not complete a scan)"
+        return -1
+    }
+    try {
+        $rec = Get-Content $jsonFile.FullName -Raw | ConvertFrom-Json
+        if ($null -eq $rec) { throw 'empty record' }
+        $hasScanId = ($rec.PSObject.Properties.Name -contains 'scan_id') -and ($rec.scan_id)
+        $hasStart  = ($rec.PSObject.Properties.Name -contains 'started_at_unix')
+        $hasEnd    = ($rec.PSObject.Properties.Name -contains 'completed_at_unix')
+        if (-not ($hasScanId -and $hasStart -and $hasEnd)) {
+            Write-Host "$label FAIL: scan-history missing scan_id / started_at_unix / completed_at_unix"
+            return -1
+        }
+        if ($rec.completed_at_unix -lt $rec.started_at_unix) {
+            Write-Host "$label FAIL: completed_at_unix < started_at_unix"
+            return -1
+        }
+    } catch {
+        Write-Host "$label FAIL: scan-history JSON parse error: $_"
+        return -1
+    }
     return $sw.Elapsed.TotalSeconds
 }
 
 # ---- 5-CELL MATRIX -----------------------------------------------------
+# Cat 1 #2 fix: try/finally ensures Defender + state file restore even on
+# ErrorActionPreference=Stop exceptions or Ctrl-C. Without this, a crash
+# mid-matrix would leave Defender DISABLED + app.ron patched (roots:[]).
 $results = [ordered]@{}
+try {
+    Write-Host ''
+    Write-Host '========== Cell 1: cold-CLI Defender-OFF =========='
+    Set-Defender $false
+    Invoke-StandbyPurge
+    $results['cell1-cold-cli-defoff'] = Invoke-CliScan 'cell1-cold-cli-defoff'
 
-Write-Host ''
-Write-Host '========== Cell 1: cold-CLI Defender-OFF =========='
-Set-Defender $false
-Invoke-StandbyPurge
-$results['cell1-cold-cli-defoff'] = Invoke-CliScan 'cell1-cold-cli-defoff'
+    Write-Host ''
+    Write-Host '========== Cell 2: cold-GUI Defender-OFF =========='
+    Reset-HermeticData
+    Invoke-StandbyPurge
+    $results['cell2-cold-gui-defoff'] = Invoke-GuiLive-FileWatch 'cell2-cold-gui-defoff'
 
-Write-Host ''
-Write-Host '========== Cell 2: cold-GUI Defender-OFF =========='
-Reset-HermeticData
-Invoke-StandbyPurge
-$results['cell2-cold-gui-defoff'] = Invoke-GuiLive-FileWatch 'cell2-cold-gui-defoff'
+    Write-Host ''
+    Write-Host '========== Cell 3: cold-CLI Defender-ON =========='
+    Set-Defender $true
+    Invoke-StandbyPurge
+    $results['cell3-cold-cli-defon'] = Invoke-CliScan 'cell3-cold-cli-defon'
 
-Write-Host ''
-Write-Host '========== Cell 3: cold-CLI Defender-ON =========='
-Set-Defender $true
-Invoke-StandbyPurge
-$results['cell3-cold-cli-defon'] = Invoke-CliScan 'cell3-cold-cli-defon'
+    Write-Host ''
+    Write-Host '========== Cell 4: cold-GUI Defender-ON =========='
+    Reset-HermeticData
+    Invoke-StandbyPurge
+    $results['cell4-cold-gui-defon'] = Invoke-GuiLive-FileWatch 'cell4-cold-gui-defon'
 
-Write-Host ''
-Write-Host '========== Cell 4: cold-GUI Defender-ON =========='
-Reset-HermeticData
-Invoke-StandbyPurge
-$results['cell4-cold-gui-defon'] = Invoke-GuiLive-FileWatch 'cell4-cold-gui-defon'
+    Write-Host ''
+    Write-Host '========== Cell 5: warm-GUI Defender-OFF (anchor) =========='
+    Set-Defender $false
+    Reset-HermeticData
+    $results['cell5-warm-gui-defoff'] = Invoke-GuiLive-FileWatch 'cell5-warm-gui-defoff'
 
-Write-Host ''
-Write-Host '========== Cell 5: warm-GUI Defender-OFF (anchor) =========='
-Set-Defender $false
-Reset-HermeticData
-$results['cell5-warm-gui-defoff'] = Invoke-GuiLive-FileWatch 'cell5-warm-gui-defoff'
-
-# ---- Defender final state restore (F3 fix: restore to pre-matrix state) -
-Set-Defender (-not $defenderWasDisabled)
-Write-Host "Defender restored to pre-matrix state (DisableRealtimeMonitoring=$defenderWasDisabled)"
-
-# ---- Harvest perf-chunks + perf-streaming from each .stderr ----------
-Write-Host ''
-Write-Host '========== INSTRUMENTATION HARVEST =========='
-$harvestPath = Join-Path $OUT 'instrumentation-harvest.txt'
-'' | Set-Content -Path $harvestPath
-foreach ($lbl in @($results.Keys)) {
-    $stderrFile = Join-Path $OUT "$lbl.stderr"
-    if (-not (Test-Path $stderrFile)) { continue }
-    Add-Content -Path $harvestPath -Value ""
-    Add-Content -Path $harvestPath -Value "===== $lbl.stderr ====="
-    foreach ($line in (Get-Content $stderrFile -ErrorAction SilentlyContinue)) {
-        if ($line -match 'perf-chunks|perf-streaming|perf-startup|GUI scan:|SCAN-COMPLETE') {
-            Add-Content -Path $harvestPath -Value $line
-            Write-Host ("  [{0}] {1}" -f $lbl, $line)
+    # ---- Harvest perf-chunks + perf-streaming + perf-startup -----------
+    Write-Host ''
+    Write-Host '========== INSTRUMENTATION HARVEST =========='
+    $harvestPath = Join-Path $OUT 'instrumentation-harvest.txt'
+    '' | Set-Content -Path $harvestPath
+    foreach ($lbl in @($results.Keys)) {
+        $stderrFile = Join-Path $OUT "$lbl.stderr"
+        if (-not (Test-Path $stderrFile)) { continue }
+        Add-Content -Path $harvestPath -Value ""
+        Add-Content -Path $harvestPath -Value "===== $lbl.stderr ====="
+        foreach ($line in (Get-Content $stderrFile -ErrorAction SilentlyContinue)) {
+            if ($line -match 'perf-chunks|perf-streaming|perf-startup|GUI scan:|SCAN-COMPLETE') {
+                Add-Content -Path $harvestPath -Value $line
+                Write-Host ("  [{0}] {1}" -f $lbl, $line)
+            }
         }
     }
-}
-
-# ---- GUI state restore from backups created at start ------------------
-# (uses Copy-then-delete instead of Rename, so we can detect stale backups
-# next run -- see backup step at runner start)
-Write-Host ''
-Write-Host '========== STATE RESTORE =========='
-foreach ($f in $stateFiles) {
-    $bk = "$f$BACKBAK"
-    if (Test-Path $bk) {
-        if (Test-Path $f) { Remove-Item -Path $f -Force }
-        Move-Item -Path $bk -Destination $f -Force
-        Write-Host "RESTORED: $f"
-    } else {
-        Write-Host "(no backup to restore: $f -- runner-created file may remain)"
+} finally {
+    # ALWAYS-RUN CLEANUP. Cat 1 #2 fix: runs even on script exception / Ctrl-C
+    # so Defender + state files never leak past the runner.
+    Write-Host ''
+    Write-Host '========== CLEANUP (always-run) =========='
+    try {
+        Set-Defender (-not $defenderWasDisabled)
+        Write-Host "Defender restored to pre-matrix state (DisableRealtimeMonitoring=$defenderWasDisabled)"
+    } catch {
+        Write-Host "CLEANUP WARNING: Defender restore failed: $_"
+    }
+    foreach ($f in $stateFiles) {
+        $bk = "$f$BACKBAK"
+        if (Test-Path $bk) {
+            try {
+                if (Test-Path $f) { Remove-Item -Path $f -Force }
+                Move-Item -Path $bk -Destination $f -Force
+                Write-Host "RESTORED: $f"
+            } catch {
+                Write-Host "CLEANUP WARNING: failed to restore ${f}: $_"
+            }
+        } else {
+            Write-Host "(no backup to restore: $f -- runner-created file may remain)"
+        }
     }
 }
 
