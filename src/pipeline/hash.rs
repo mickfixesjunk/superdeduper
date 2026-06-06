@@ -75,8 +75,28 @@ const TIER3_BUF: usize = 1 << 20;
 /// one stage line + one per-worker line (wall_ms / groups / bytes /
 /// first_entry_ms / last_exit_ms / throughput_mb_s / active_pct). Lets
 /// us identify whether the chunk_hash_ms 2.39x GUI-vs-CLI slowdown is
-/// rayon contention (low active_pct), per-worker throughput drop
-/// (low throughput_mb_s), or worker starvation (groups_orphan > 0).
+/// rayon contention (low active_pct + uniform), per-worker throughput
+/// drop (low throughput_mb_s + high active_pct), or work-distribution
+/// skew (high active_pct variance across workers).
+///
+/// `groups_orphan` reads (quality N3 2026-06-06 23:55 PDT): a non-zero
+/// count is EXPECTED here, not "starvation". rayon's `install` lets
+/// the caller thread participate via work-stealing; that thread's
+/// `current_thread_index()` returns None and we bucket it as orphan.
+/// The load-bearing check is the sum-conservation invariant
+/// `orphan + sum(per_worker_groups) == groups_in`. A break in that
+/// equation = real pool plumbing regression; a non-zero orphan with
+/// the equation holding = normal install() participation.
+///
+/// `throughput_mb_s` reads (quality N4): uses input group size, not
+/// bytes actually read. Cache hits, T1/T2 partial-region reads, and
+/// short-circuited Tier 0/1/2 paths all over-state. Treat as
+/// "candidate bytes per second" -- comparing across workers is valid;
+/// comparing against disk throughput is not.
+///
+/// Per-worker idle-gap derivation (quality N5):
+///   idle_gap_ms = (last_exit_ms - first_entry_ms) - wall_ms
+/// Strong contention signal; surface in Phase 5 attribution.
 ///
 /// Diagnostic-only. Default (unset) is unchanged. Cached via OnceLock
 /// so env::var_os fires ONCE per process.
@@ -351,8 +371,10 @@ fn run_with_counters_inner(
     // A-perf-rayon-contention (v0.3.40 Phase 5 profile-first):
     // per-worker accumulators gated by SUPERDEDUPER_PERF_INSTRUMENT_RAYON.
     // Identifies whether chunk_hash_ms 2.39x GUI-vs-CLI slowdown is rayon
-    // contention (low active_pct), throughput drop (low MB/s per worker),
-    // or worker starvation (groups_orphan > 0 / num_workers < expected).
+    // contention (low active_pct + uniform) or throughput drop (low MB/s
+    // + high active_pct). See `perf_instrument_rayon_enabled` for the
+    // groups_orphan reading (NOT starvation -- install-caller participates
+    // via work-stealing; sum-conservation is the load-bearing check).
     let perf_rayon = perf_instrument_rayon_enabled();
     let num_workers = io_pool.current_num_threads().max(1);
     let per_worker_wall_ns: Vec<AtomicU64> = (0..num_workers).map(|_| AtomicU64::new(0)).collect();
