@@ -163,6 +163,17 @@ pub enum ProgressOutcome {
 /// surface unreadable files in the Log tab.
 pub type FileProgress = Arc<dyn Fn(&std::path::Path, u8, ProgressOutcome) + Send + Sync>;
 
+/// Streaming dup-group emit callback (v0.3.40 A-perf-pc-decouple).
+/// Fires from rayon worker threads as each [`DuplicateGroup`] is
+/// finalized inside [`run_group`]. Lets the GUI tap the producer side
+/// of the hash pipeline without the chunked-invocation pattern: the
+/// caller plumbs each group through a lock-free channel to a separate
+/// runner thread that batches + emits to the GUI at ~100ms cadence,
+/// while the engine runs the full corpus as ONE par_iter (so engine
+/// throughput approaches CLI parity). Called concurrently from N
+/// worker threads — must be cheap + thread-safe.
+pub type GroupComplete = Arc<dyn Fn(&DuplicateGroup) + Send + Sync>;
+
 /// Top-level entry point. Takes size-grouped, layout-annotated files
 /// and returns confirmed duplicate groups by full content hash.
 pub fn run(groups: Vec<LaidOutGroup>, cfg: &ScanConfig) -> Result<Vec<DuplicateGroup>> {
@@ -179,7 +190,7 @@ pub fn run_with_counters(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, None, None, None)
+    run_with_counters_inner(groups, cfg, cache, None, None, None, None)
 }
 
 /// Same as [`run_with_counters`] but with a per-file progress
@@ -192,7 +203,7 @@ pub fn run_with_progress(
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: FileProgress,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, Some(on_file), None, None)
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), None, None, None)
 }
 
 /// Like [`run_with_progress`] but also takes a cancellation flag. The
@@ -207,7 +218,7 @@ pub fn run_cancellable(
     on_file: FileProgress,
     cancel: Arc<AtomicBool>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, Some(on_file), Some(cancel), None)
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), None, Some(cancel), None)
 }
 
 /// Variant of [`run_cancellable`] that reuses a caller-built `io_pool`.
@@ -231,6 +242,39 @@ pub fn run_cancellable_with_pool(
         cfg,
         cache,
         Some(on_file),
+        None,
+        Some(cancel),
+        Some(io_pool),
+    )
+}
+
+/// Streaming entry point (v0.3.40 A-perf-pc-decouple). Same shape as
+/// [`run_cancellable_with_pool`] but takes a [`GroupComplete`] callback
+/// that fires as each dup-group is finalized inside [`run_group`]. The
+/// returned `Vec<DuplicateGroup>` is the full set (same as the chunked
+/// path); streaming callers typically ignore it and consume groups via
+/// the callback into a lock-free worker -> runner channel, then a
+/// runner thread batches + emits to the GUI at ~100ms cadence.
+///
+/// Closes the engine-inside-GUI throughput penalty: the GUI now invokes
+/// the hash pipeline ONCE across the whole corpus (no chunking) and
+/// the par_iter runs at CLI parity (~1.6 GiB/s on Mick's C:\sdd-tests
+/// per sdd-testwin's 2026-06-06 baseline).
+pub fn run_streaming(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+    on_file: FileProgress,
+    on_group: GroupComplete,
+    cancel: Arc<AtomicBool>,
+    io_pool: &rayon::ThreadPool,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    run_with_counters_inner(
+        groups,
+        cfg,
+        cache,
+        Some(on_file),
+        Some(on_group),
         Some(cancel),
         Some(io_pool),
     )
@@ -252,11 +296,13 @@ fn run_with_counters_inner(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: Option<FileProgress>,
+    on_group: Option<GroupComplete>,
     cancel: Option<Arc<AtomicBool>>,
     shared_pool: Option<&rayon::ThreadPool>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
     let counters = Arc::new(HashCounters::default());
     let on_file_ref = on_file.as_ref();
+    let on_group_ref = on_group.as_ref();
     let cancel_ref = cancel.as_ref();
     // Dedicated pool sized to cfg.io_threads. The hashing par_iter
     // spends most of its time blocked on CreateFileW / ReadFile /
@@ -287,7 +333,17 @@ fn run_with_counters_inner(
         .install(|| {
             groups
                 .into_par_iter()
-                .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref, cancel_ref))
+                .map(|g| {
+                    run_group(
+                        g,
+                        cfg,
+                        cache.as_ref(),
+                        &counters,
+                        on_file_ref,
+                        on_group_ref,
+                        cancel_ref,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()
         })?
         .into_iter()
@@ -502,6 +558,7 @@ fn run_group(
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
     on_file: Option<&FileProgress>,
+    on_group: Option<&GroupComplete>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<DuplicateGroup>> {
     let size = group.size;
@@ -549,6 +606,9 @@ fn run_group(
             file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
+        if let Some(cb) = on_group {
+            cb(&g);
+        }
         return Ok(vec![g]);
     }
 
@@ -622,6 +682,9 @@ fn run_group(
             file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
+        if let Some(cb) = on_group {
+            cb(&g);
+        }
         out.push(g);
         if let Some(cb) = on_file {
             cb(&rep.entry.path, 3, ProgressOutcome::Hashed { bytes: size });
@@ -722,6 +785,9 @@ fn run_group(
             file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
+        if let Some(cb) = on_group {
+            cb(&g);
+        }
         out.push(g);
     }
     Ok(out)
