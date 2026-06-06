@@ -4212,7 +4212,7 @@ fn skip_accesskit_during_scan_enabled() -> bool {
 ///
 /// Diagnostic-only. Default (env var unset) is unchanged. Cached via
 /// OnceLock; the env::var_os call fires ONCE per process.
-fn perf_instrument_update_enabled() -> bool {
+pub(crate) fn perf_instrument_update_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_UPDATE").is_some())

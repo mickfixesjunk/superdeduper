@@ -1208,7 +1208,21 @@ fn run(
     let already_reported: hashbrown::HashSet<String> =
         checkpoint_state.completed_hashes.iter().cloned().collect();
 
+    // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):
+    // accumulate per-chunk wall + setup/hash/emit phases so the
+    // scan-finish emit decomposes the 217s GUI-vs-CLI throughput
+    // gap into chunk-loop-overhead vs hash-work vs emit. CLI runs ONE
+    // chunk all-at-once; GUI runs ~1000 chunks; if chunk_setup +
+    // chunk_emit aggregate is large, per-chunk fixed cost is load-
+    // bearing. p50/p99 give the per-chunk distribution shape.
+    let chunk_loop_started = std::time::Instant::now();
+    let mut chunk_walls_ns: Vec<u128> = Vec::with_capacity(total_chunks);
+    let mut chunk_setup_ns_total: u128 = 0;
+    let mut chunk_hash_ns_total: u128 = 0;
+    let mut chunk_emit_ns_total: u128 = 0;
+
     for (i, chunk) in chunks.into_iter().enumerate() {
+        let chunk_t_start = std::time::Instant::now();
         if cancel.load(Ordering::Relaxed) {
             if let Some(p) = &checkpoint_path {
                 checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
@@ -1419,6 +1433,7 @@ fn run(
             }
         });
 
+        let chunk_t_pre_hash = std::time::Instant::now();
         let chunk_result = if let Some(pool) = shared_io_pool.as_ref() {
             pipeline::hash::run_cancellable_with_pool(
                 chunk,
@@ -1437,6 +1452,7 @@ fn run(
                 Arc::clone(&cancel),
             )
         };
+        let chunk_t_post_hash = std::time::Instant::now();
         let (dups, counters) = match chunk_result {
             Ok(v) => v,
             Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -1690,6 +1706,44 @@ fn run(
                 ),
             });
         }
+
+        // A-perf-chunks-h_new: accumulate per-chunk phase durations.
+        // Mid-chunk cancel paths return early via `return Ok(());`
+        // above and never reach this; partial accumulators just
+        // never emit -- acceptable since cancellation during a 4-min
+        // scan is rare and partial data isn't decision-useful.
+        let chunk_t_end = std::time::Instant::now();
+        chunk_walls_ns.push(chunk_t_end.duration_since(chunk_t_start).as_nanos());
+        chunk_setup_ns_total = chunk_setup_ns_total
+            .saturating_add(chunk_t_pre_hash.duration_since(chunk_t_start).as_nanos());
+        chunk_hash_ns_total = chunk_hash_ns_total
+            .saturating_add(chunk_t_post_hash.duration_since(chunk_t_pre_hash).as_nanos());
+        chunk_emit_ns_total = chunk_emit_ns_total
+            .saturating_add(chunk_t_end.duration_since(chunk_t_post_hash).as_nanos());
+    }
+
+    // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):
+    // emit the per-chunk phase decomposition for the just-completed
+    // chunk loop. Gated by SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1 so
+    // sdd-testwin's hermetic harness picks it up automatically. One
+    // line at scan-finish (not per-frame) -- grep target for the
+    // Mick-corpus 217s engine-in-GUI slowdown root-cause analysis.
+    if crate::gui::app::perf_instrument_update_enabled() && !chunk_walls_ns.is_empty() {
+        let chunk_loop_total_ms = chunk_loop_started.elapsed().as_secs_f64() * 1000.0;
+        chunk_walls_ns.sort_unstable();
+        let n = chunk_walls_ns.len();
+        let p50 = chunk_walls_ns[n / 2];
+        let p99 = chunk_walls_ns[(n.saturating_sub(1) * 99) / 100];
+        crate::log_info!(
+            "perf-chunks: chunks_total={} chunk_setup_ms_total={:.3} chunk_wall_p50_ms={:.3} chunk_wall_p99_ms={:.3} chunk_hash_ms_total={:.3} chunk_emit_ms_total={:.3} chunk_loop_total_ms={:.3}",
+            n,
+            chunk_setup_ns_total as f64 / 1_000_000.0,
+            p50 as f64 / 1_000_000.0,
+            p99 as f64 / 1_000_000.0,
+            chunk_hash_ns_total as f64 / 1_000_000.0,
+            chunk_emit_ns_total as f64 / 1_000_000.0,
+            chunk_loop_total_ms,
+        );
     }
 
     // Scan finished cleanly — the checkpoint has served its purpose.
