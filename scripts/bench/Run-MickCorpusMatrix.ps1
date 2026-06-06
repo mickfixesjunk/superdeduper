@@ -54,6 +54,43 @@ Set-Location $OUT
 $env:SUPERDEDUPER_TEST_DATA_DIR          = $HERMETIC
 $env:SUPERDEDUPER_PERF_INSTRUMENT_UPDATE = '1'
 
+# ---- Backup GUI state files BEFORE patching them (F2 fix) -------------
+# Runner is now self-sufficient: backs up real user state, patches for
+# hermetic run, restores at end. Caller no longer responsible for backup.
+$stateFiles = @(
+    'C:\Users\NeoMatrix\AppData\Roaming\superdeduper\data\app.ron',
+    'C:\Users\NeoMatrix\AppData\Local\superdeduper\recent-projects.json',
+    'C:\Users\NeoMatrix\AppData\Local\superdeduper\results-state.json',
+    'C:\Users\NeoMatrix\AppData\Local\superdeduper\scan-checkpoint.json'
+)
+foreach ($f in $stateFiles) {
+    $bk = "$f$BACKBAK"
+    if (Test-Path $f) {
+        if (Test-Path $bk) {
+            throw "Stale backup at $bk -- refusing to overwrite. Investigate + remove manually before re-running."
+        }
+        Copy-Item -Path $f -Destination $bk -Force
+        Write-Host "BACKED UP: $f -> $bk"
+    } else {
+        Write-Host "(no real file to back up: $f)"
+    }
+}
+
+# ---- Capture pre-matrix Defender state (F3 fix) ------------------------
+$defenderWasDisabled = (Get-MpPreference).DisableRealtimeMonitoring
+Write-Host "Pre-matrix Defender DisableRealtimeMonitoring = $defenderWasDisabled (will restore at end)"
+
+# ---- Patch app.ron in place for hermetic run --------------------------
+$appRon = 'C:\Users\NeoMatrix\AppData\Roaming\superdeduper\data\app.ron'
+if (Test-Path $appRon) {
+    $rc = Get-Content $appRon -Raw
+    $rc = [regex]::Replace($rc, 'skip_preflight:false', 'skip_preflight:true')
+    $rc = [regex]::Replace($rc, 'dismissed_alpha_warning:false', 'dismissed_alpha_warning:true')
+    $rc = [regex]::Replace($rc, 'roots:\[[^\]]*\]', 'roots:[]')
+    Set-Content -Path $appRon -Value $rc -NoNewline
+    Write-Host 'PATCHED: app.ron (skip_preflight + dismissed_alpha_warning + roots:[])'
+}
+
 # ---- Pre-seed install.prod.json (share_default=auto_opt_in) ----------
 $installJson = @{
     schema_version = 1
@@ -71,13 +108,12 @@ $installJson = @{
 $installJson | Set-Content -Path (Join-Path $INSTALL 'install.prod.json')
 Write-Host 'PRE-SEEDED: install.prod.json (share_default=auto_opt_in)'
 
-# ---- Verify pre-seeded app.ron (caller must patch BEFORE running) ----
-$appRon = 'C:\Users\NeoMatrix\AppData\Roaming\superdeduper\data\app.ron'
+# ---- Verify app.ron patch is in place (defense in depth) --------------
 $ronContent = Get-Content $appRon -Raw
-if ($ronContent -notmatch 'skip_preflight:true') { throw 'app.ron NOT pre-seeded (skip_preflight)' }
-if ($ronContent -notmatch 'dismissed_alpha_warning:true') { throw 'app.ron NOT pre-seeded (dismissed_alpha_warning)' }
-if ($ronContent -notmatch 'roots:\[\]') { throw 'app.ron NOT pre-seeded (roots not empty)' }
-Write-Host 'PRE-SEEDED: app.ron verified'
+if ($ronContent -notmatch 'skip_preflight:true') { throw 'app.ron patch failed (skip_preflight)' }
+if ($ronContent -notmatch 'dismissed_alpha_warning:true') { throw 'app.ron patch failed (dismissed_alpha_warning)' }
+if ($ronContent -notmatch 'roots:\[\]') { throw 'app.ron patch failed (roots not empty)' }
+Write-Host 'VERIFIED: app.ron patches in place'
 
 # ---- Defender control helpers -----------------------------------------
 function Set-Defender([bool]$enabled) {
@@ -208,8 +244,9 @@ Set-Defender $false
 Reset-HermeticData
 $results['cell5-warm-gui-defoff'] = Invoke-GuiLive-FileWatch 'cell5-warm-gui-defoff'
 
-# ---- Defender final state restore (always end disabled per session norms) -
-Set-Defender $false
+# ---- Defender final state restore (F3 fix: restore to pre-matrix state) -
+Set-Defender (-not $defenderWasDisabled)
+Write-Host "Defender restored to pre-matrix state (DisableRealtimeMonitoring=$defenderWasDisabled)"
 
 # ---- Harvest perf-chunks + perf-streaming from each .stderr ----------
 Write-Host ''
@@ -229,21 +266,19 @@ foreach ($lbl in @($results.Keys)) {
     }
 }
 
-# ---- GUI state restore -------------------------------------------------
+# ---- GUI state restore from backups created at start ------------------
+# (uses Copy-then-delete instead of Rename, so we can detect stale backups
+# next run -- see backup step at runner start)
 Write-Host ''
 Write-Host '========== STATE RESTORE =========='
-$stateFiles = @(
-    'C:\Users\NeoMatrix\AppData\Roaming\superdeduper\data\app.ron',
-    'C:\Users\NeoMatrix\AppData\Local\superdeduper\recent-projects.json',
-    'C:\Users\NeoMatrix\AppData\Local\superdeduper\results-state.json',
-    'C:\Users\NeoMatrix\AppData\Local\superdeduper\scan-checkpoint.json'
-)
 foreach ($f in $stateFiles) {
     $bk = "$f$BACKBAK"
     if (Test-Path $bk) {
         if (Test-Path $f) { Remove-Item -Path $f -Force }
-        Rename-Item -Path $bk -NewName (Split-Path -Leaf $f)
+        Move-Item -Path $bk -Destination $f -Force
         Write-Host "RESTORED: $f"
+    } else {
+        Write-Host "(no backup to restore: $f -- runner-created file may remain)"
     }
 }
 
@@ -254,8 +289,26 @@ $c3 = $results['cell3-cold-cli-defon']
 $c4 = $results['cell4-cold-gui-defon']
 $c5 = $results['cell5-warm-gui-defoff']
 
-$ratio_defoff = if ($c1 -gt 0) { $c2 / $c1 } else { 0 }
-$ratio_defon  = if ($c3 -gt 0) { $c4 / $c3 } else { 0 }
+# F1 fix: refuse to compute ratios if any cold cell wall is non-positive
+# (process failure / GUI exited before scan-history wrote / timeout).
+# Reporting a ratio with a 0 denominator would yield false-GREEN.
+$defoff_ok = ($c1 -gt 0) -and ($c2 -gt 0)
+$defon_ok  = ($c3 -gt 0) -and ($c4 -gt 0)
+$ratio_defoff = if ($defoff_ok) { $c2 / $c1 } else { [double]::NaN }
+$ratio_defon  = if ($defon_ok)  { $c4 / $c3 } else { [double]::NaN }
+
+$status_defoff =
+    if (-not $defoff_ok) { 'ERROR -- cell1 or cell2 wall <= 0 (process failure / timeout); criteria undefined' }
+    elseif ($ratio_defoff -le 1.10) { 'GREEN -- meets <=1.10x criteria' }
+    elseif ($ratio_defoff -le 1.20) { 'EDGE -- 1.10x to 1.20x band' }
+    else { 'RED -- exceeds 1.10x criteria' }
+
+$status_defon =
+    if (-not $defon_ok) { 'ERROR -- cell3 or cell4 wall <= 0 (process failure / timeout)' }
+    else { '(informational; Mick real-world simulation)' }
+
+$ratio_defoff_disp = if ($defoff_ok) { ('{0:N3}x' -f $ratio_defoff) } else { 'N/A (cell failure)' }
+$ratio_defon_disp  = if ($defon_ok)  { ('{0:N3}x' -f $ratio_defon)  } else { 'N/A (cell failure)' }
 
 $summary = @"
 
@@ -264,22 +317,20 @@ Binary:  $BINARY_SHA
 Label:   $LABEL
 
   cell1 cold-CLI def-OFF:   {0,8:N2} s
-  cell2 cold-GUI def-OFF:   {1,8:N2} s          paired ratio vs cell1: {6:N3}x
+  cell2 cold-GUI def-OFF:   {1,8:N2} s          paired ratio vs cell1: {6}
   cell3 cold-CLI def-ON :   {2,8:N2} s
-  cell4 cold-GUI def-ON :   {3,8:N2} s          paired ratio vs cell3: {7:N3}x
+  cell4 cold-GUI def-ON :   {3,8:N2} s          paired ratio vs cell3: {7}
   cell5 warm-GUI def-OFF:   {4,8:N2} s
 
 PAIRED RATIOS:
-  cold-GUI/cold-CLI Defender-off: {6:N3}x   (criteria gate: <= 1.10x)
-  cold-GUI/cold-CLI Defender-on:  {7:N3}x   (Mick real-world simulation)
+  cold-GUI/cold-CLI Defender-off: {6}   (criteria gate: <= 1.10x)
+  cold-GUI/cold-CLI Defender-on:  {7}   (Mick real-world simulation)
 
 CRITERIA-GATE STATUS (Defender-off paired):
   {8}
-"@ -f $c1, $c2, $c3, $c4, $c5, 0, $ratio_defoff, $ratio_defon, $(
-    if ($ratio_defoff -le 1.10) { 'GREEN -- meets <=1.10x criteria' }
-    elseif ($ratio_defoff -le 1.20) { 'EDGE -- 1.10x to 1.20x band' }
-    else { 'RED -- exceeds 1.10x criteria' }
-)
+DEFENDER-ON STATUS:
+  {9}
+"@ -f $c1, $c2, $c3, $c4, $c5, 0, $ratio_defoff_disp, $ratio_defon_disp, $status_defoff, $status_defon
 
 Write-Host $summary
 $summary | Set-Content -Path (Join-Path $OUT 'summary.txt')
