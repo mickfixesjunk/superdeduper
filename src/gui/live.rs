@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobSetBuilder};
 use parking_lot::Mutex;
@@ -1220,6 +1220,78 @@ fn run(
     let already_reported: hashbrown::HashSet<String> =
         checkpoint_state.completed_hashes.iter().cloned().collect();
 
+    // A-perf-pc-decouple (v0.3.40, reduced-scope per design 08:35 PDT
+    // ratify): spawn a single runner thread that aggregates dup-group
+    // summaries from the chunk loop and emits batched
+    // EngineEvent::DuplicatesFoundBatch at ~100ms cadence. Closes the
+    // 258ms/chunk emit cost sdd-testwin measured: each per-group
+    // tx.send(EngineEvent::DuplicateFound(summary)) inside the loop
+    // hit the GUI state lock + UI render + accesskit tree update
+    // synchronously; on Mick C:\sdd-tests with ~30K dup groups across
+    // ~600 chunks that summed to ~154s of post-chunk emit work. The
+    // runner pops summaries from an unbounded crossbeam channel into
+    // a Vec<DuplicateGroupSummary> batch and ships ONE event per
+    // 100ms-or-200-groups trigger; the GUI's UiState::apply arm for
+    // DuplicatesFoundBatch (added in 2344711) does the equivalent
+    // dedup + push under a single lock acquire.
+    //
+    // Runner intentionally does NOT poll cancel; it consumes everything
+    // until the chunk loop drops its sum_tx Sender and the channel
+    // disconnects, so partial-scan progress is preserved for the
+    // checkpoint semantics on cancel paths (per testdesign 08:13 PDT
+    // note 2 in the Phase 3 plan LGTM).
+    let (sum_tx, sum_rx) =
+        crossbeam_channel::unbounded::<crate::gui::events::DuplicateGroupSummary>();
+    let mut sum_tx_opt: Option<crossbeam_channel::Sender<crate::gui::events::DuplicateGroupSummary>> =
+        Some(sum_tx);
+    let runner_tx = tx.clone();
+    let mut runner_handle: Option<thread::JoinHandle<()>> = Some(thread::spawn(move || {
+        let mut batch: Vec<crate::gui::events::DuplicateGroupSummary> = Vec::with_capacity(256);
+        let mut last_emit = Instant::now();
+        let mut batches_emitted: u64 = 0;
+        let mut groups_emitted: u64 = 0;
+        let runner_started = Instant::now();
+        loop {
+            let recv = sum_rx.recv_timeout(Duration::from_millis(100));
+            let disconnected = matches!(
+                recv,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            );
+            if let Ok(summary) = recv {
+                batch.push(summary);
+            }
+            let now = Instant::now();
+            let should_flush = !batch.is_empty()
+                && (disconnected
+                    || batch.len() >= 200
+                    || now.duration_since(last_emit) >= Duration::from_millis(100));
+            if should_flush {
+                let drained = std::mem::take(&mut batch);
+                groups_emitted = groups_emitted.saturating_add(drained.len() as u64);
+                batches_emitted = batches_emitted.saturating_add(1);
+                let _ = runner_tx.send(EngineEvent::DuplicatesFoundBatch(drained));
+                batch = Vec::with_capacity(256);
+                last_emit = now;
+            }
+            if disconnected {
+                break;
+            }
+        }
+        // perf-streaming emit (testdesign 08:13 PDT plan note 1): single
+        // line scan-finish target so sdd-testwin's hermetic matrix can
+        // verify engine throughput in GUI mode approaches CLI engine
+        // wall post-fix. Same SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1
+        // gate as perf-chunks / perf-channel for consistency.
+        if crate::gui::app::perf_instrument_update_enabled() && groups_emitted > 0 {
+            crate::log_info!(
+                "perf-streaming: runner_wall_ms={:.3} batches={} groups_emitted={}",
+                runner_started.elapsed().as_secs_f64() * 1000.0,
+                batches_emitted,
+                groups_emitted,
+            );
+        }
+    }));
+
     // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):
     // accumulate per-chunk wall + setup/hash/emit phases so the
     // scan-finish emit decomposes the 217s GUI-vs-CLI throughput
@@ -1268,6 +1340,13 @@ fn run(
                     i + 1,
                     total_chunks
                 ));
+            }
+            // A-perf-pc-decouple: cancel-from-top runner shutdown so
+            // any in-flight batch ships + the thread exits cleanly
+            // before run() returns.
+            drop(sum_tx_opt.take());
+            if let Some(handle) = runner_handle.take() {
+                let _ = handle.join();
             }
             emit_paused(&tx);
             return Ok(());
@@ -1510,10 +1589,23 @@ fn run(
                         total_chunks
                     ));
                 }
+                // A-perf-pc-decouple: mid-chunk cancel runner shutdown
+                // mirrors the top-of-loop path; ensures any final batch
+                // ships + the thread exits before run() returns.
+                drop(sum_tx_opt.take());
+                if let Some(handle) = runner_handle.take() {
+                    let _ = handle.join();
+                }
                 emit_paused(&tx);
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                drop(sum_tx_opt.take());
+                if let Some(handle) = runner_handle.take() {
+                    let _ = handle.join();
+                }
+                return Err(e);
+            }
         };
         let chunk_bytes = counters.bytes_read.load(Ordering::Relaxed);
         total_bytes_read = total_bytes_read.saturating_add(chunk_bytes);
@@ -1632,7 +1724,13 @@ fn run(
                 similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
             };
             checkpoint_state.record(&summary);
-            let _ = tx.send(EngineEvent::DuplicateFound(summary));
+            // A-perf-pc-decouple (v0.3.40): runner thread batches +
+            // emits DuplicatesFoundBatch instead of per-group blocking
+            // send. Send to sum_tx is cheap (unbounded channel push;
+            // no GUI lock + no UI re-render until batched flush).
+            if let Some(sender) = sum_tx_opt.as_ref() {
+                let _ = sender.send(summary);
+            }
         }
 
         // Periodic checkpoint flush so an unexpected crash doesn't
@@ -1732,6 +1830,22 @@ fn run(
             .saturating_add(chunk_t_post_hash.duration_since(chunk_t_pre_hash).as_nanos());
         chunk_emit_ns_total = chunk_emit_ns_total
             .saturating_add(chunk_t_end.duration_since(chunk_t_post_hash).as_nanos());
+    }
+
+    // A-perf-pc-decouple (v0.3.40): chunk loop done -- drop sum_tx so
+    // the runner thread's recv_timeout sees Disconnected on its next
+    // tick, flushes its final batch (if any) via DuplicatesFoundBatch,
+    // emits the perf-streaming summary line, and exits. Join is
+    // best-effort: a runner panic shouldn't break scan-finish, but the
+    // join must complete before ScanFinished so the GUI's terminal
+    // event lands after any final batch. Early-return paths upstream
+    // (cancellation / Interrupted) shut down the runner via the same
+    // take()-and-drop pattern before returning.
+    drop(sum_tx_opt.take());
+    if let Some(handle) = runner_handle.take() {
+        if let Err(e) = handle.join() {
+            crate::log_warn!("dup-runner panicked: {e:?}");
+        }
     }
 
     // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):
