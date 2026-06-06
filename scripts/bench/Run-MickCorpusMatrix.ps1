@@ -56,6 +56,10 @@ Set-Location $OUT
 
 $env:SUPERDEDUPER_TEST_DATA_DIR          = $HERMETIC
 $env:SUPERDEDUPER_PERF_INSTRUMENT_UPDATE = '1'
+# PR #170 rayon-contention instrumentation gate. Harmless on binaries without
+# the perf-rayon-hash / perf-rayon-hash-worker emit; required for any binary
+# that ships PR #170 or later. Set unconditionally for forward-compat.
+$env:SUPERDEDUPER_PERF_INSTRUMENT_RAYON  = '1'
 
 # ---- Backup GUI state files BEFORE patching them (F2 fix) -------------
 # Runner is now self-sufficient: backs up real user state, patches for
@@ -315,7 +319,7 @@ try {
         Add-Content -Path $harvestPath -Value ""
         Add-Content -Path $harvestPath -Value "===== $lbl.stderr ====="
         foreach ($line in (Get-Content $stderrFile -ErrorAction SilentlyContinue)) {
-            if ($line -match 'perf-chunks|perf-streaming|perf-startup|GUI scan:|SCAN-COMPLETE') {
+            if ($line -match 'perf-chunks|perf-streaming|perf-startup|perf-rayon|GUI scan:|SCAN-COMPLETE') {
                 Add-Content -Path $harvestPath -Value $line
                 Write-Host ("  [{0}] {1}" -f $lbl, $line)
             }
