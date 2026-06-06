@@ -486,6 +486,25 @@ impl UiState {
                     self.totals.reclaimable_bytes.saturating_add(savings);
                 self.duplicates.push(g);
             }
+            EngineEvent::DuplicatesFoundBatch(batch) => {
+                // v0.3.40 A-perf-pc-decouple: per-batch dedup + extend
+                // collapses the 258ms per-chunk emit cost of v0.3.39's
+                // chunked-invocation pattern. Same content_hash dedup
+                // (resume re-emit safety) + savings accumulation as the
+                // singleton path; pre-allocate batch.len() capacity to
+                // avoid Vec growth churn on large batches.
+                self.duplicates.reserve(batch.len());
+                for g in batch {
+                    if !self.duplicate_hashes.insert(g.content_hash.clone()) {
+                        continue;
+                    }
+                    self.totals.duplicates = self.totals.duplicates.saturating_add(1);
+                    let savings = inode_aware_savings(&g);
+                    self.totals.reclaimable_bytes =
+                        self.totals.reclaimable_bytes.saturating_add(savings);
+                    self.duplicates.push(g);
+                }
+            }
             EngineEvent::ScanFinished {
                 at,
                 total_files,

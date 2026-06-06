@@ -19,6 +19,7 @@ pub mod drive_overrides;
 pub mod events;
 pub mod live;
 pub mod particles;
+pub mod perf_channel;
 pub mod preflight;
 pub mod preview;
 pub mod project;

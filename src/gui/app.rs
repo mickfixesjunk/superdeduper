@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use egui::{CentralPanel, Frame, SidePanel, TopBottomPanel};
 
 use crate::cli::DedupeAction;
@@ -73,7 +73,7 @@ struct PersistedAppState {
 pub struct SuperdeduperApp {
     state: UiState,
     rx: Receiver<EngineEvent>,
-    tx: Sender<EngineEvent>,
+    tx: crate::gui::perf_channel::PerfTx,
     is_scanning: bool,
     settings_open: bool,
     /// Sticky tab selection for the Settings modal. Persists across
@@ -276,17 +276,31 @@ enum MenuAction {
 
 impl SuperdeduperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // A-perf-startup-instrumentation (testdesign 21:05 PDT
+        // Option-A ratify): per-phase Instant timing for the 10s
+        // startup tail decomposition. Gated by
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1 -- same env var as
+        // perf-update / perf-channel / perf-chunks / perf-streaming so
+        // sdd-testwin's hermetic matrix picks it up automatically. Single
+        // perf-startup line emitted at end of new() with all phase
+        // deltas; lets the matrix pin where the 10s lives so Phase 5
+        // can target the actual cost surface rather than guess.
+        let t_new_start = std::time::Instant::now();
         theme::install(&cc.egui_ctx);
+        let t_after_theme = std::time::Instant::now();
         // egui_extras' image loaders enable `egui::include_image!`
         // — used by the OAuth provider chooser + the linked-state
         // affordances to embed the 48x48 PNG provider logos. One-
         // time install at app boot.
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        let t_after_loaders = std::time::Instant::now();
         let persisted: PersistedAppState = cc
             .storage
             .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdeduper.app.v1"))
             .unwrap_or_default();
+        let t_after_persisted = std::time::Instant::now();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
+        let tx = crate::gui::perf_channel::PerfTx::new(tx);
 
         // Probe the scan-checkpoint file BEFORE any state restore so
         // we can show the launch-time Resume / Start Fresh modal.
@@ -311,6 +325,7 @@ impl SuperdeduperApp {
             },
             Err(_) => None,
         };
+        let t_after_checkpoint_summary = std::time::Instant::now();
 
         // #99 PR2 — Classify the resume tier from the lightweight
         // summary so the launch-time modal can render tier-specific
@@ -330,6 +345,7 @@ impl SuperdeduperApp {
             };
             crate::gui::resume_tier::classify_resume_tier_from_summary(summary, &ctx)
         });
+        let t_after_resume_tier = std::time::Instant::now();
 
         let app = Self {
             state: UiState::default(),
@@ -376,9 +392,11 @@ impl SuperdeduperApp {
             scan_complete_data: None,
         };
         let mut app = app;
+        let t_after_struct = std::time::Instant::now();
         // Populate cache-banner state on first launch — roots may
         // have been seeded from persistence or a CLI argument.
         app.refresh_cache_banner();
+        let t_after_cache_banner = std::time::Instant::now();
 
         // Spawn the badge-wall data fetch in the background. Catalog
         // is public + cached on a CDN; profile fetch only fires if the
@@ -394,6 +412,7 @@ impl SuperdeduperApp {
             };
             catalog::spawn_initial_fetch(server_url, install_id);
         }
+        let t_after_catalog_spawn = std::time::Instant::now();
 
         // Intentionally NO auto-load of prior scan results on launch.
         // Projects are now explicit — File → Open Project loads one;
@@ -422,6 +441,7 @@ impl SuperdeduperApp {
                 Err(e) => tracing::warn!(error = %e, "scan_history: prune failed"),
             }
         }
+        let t_after_history_prune = std::time::Instant::now();
 
         // 2. Crash-detect modal. Anything still in `Pending` whose
         //    most recent activity is more than 5 minutes old is a
@@ -440,6 +460,30 @@ impl SuperdeduperApp {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "scan_history: pending sweep failed"),
             }
+        }
+
+        // A-perf-startup-instrumentation: single perf-startup emit at
+        // end of new() with all phase deltas in ms (gated by
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1). Lets sdd-testwin's
+        // matrix decompose the 10s startup tail empirically -- find
+        // out which phase actually dominates so Phase 5 lazy-init
+        // targets the real cost surface rather than guessing.
+        if perf_instrument_update_enabled() {
+            let t_new_end = std::time::Instant::now();
+            crate::log_info!(
+                "perf-startup: theme_ms={:.3} loaders_ms={:.3} persisted_ms={:.3} checkpoint_summary_ms={:.3} resume_tier_ms={:.3} struct_ms={:.3} cache_banner_ms={:.3} catalog_spawn_ms={:.3} history_prune_ms={:.3} pending_sweep_ms={:.3} new_total_ms={:.3}",
+                t_after_theme.duration_since(t_new_start).as_secs_f64() * 1000.0,
+                t_after_loaders.duration_since(t_after_theme).as_secs_f64() * 1000.0,
+                t_after_persisted.duration_since(t_after_loaders).as_secs_f64() * 1000.0,
+                t_after_checkpoint_summary.duration_since(t_after_persisted).as_secs_f64() * 1000.0,
+                t_after_resume_tier.duration_since(t_after_checkpoint_summary).as_secs_f64() * 1000.0,
+                t_after_struct.duration_since(t_after_resume_tier).as_secs_f64() * 1000.0,
+                t_after_cache_banner.duration_since(t_after_struct).as_secs_f64() * 1000.0,
+                t_after_catalog_spawn.duration_since(t_after_cache_banner).as_secs_f64() * 1000.0,
+                t_after_history_prune.duration_since(t_after_catalog_spawn).as_secs_f64() * 1000.0,
+                t_new_end.duration_since(t_after_history_prune).as_secs_f64() * 1000.0,
+                t_new_end.duration_since(t_new_start).as_secs_f64() * 1000.0,
+            );
         }
 
         app
@@ -714,7 +758,7 @@ impl SuperdeduperApp {
         );
     }
 
-    pub fn sender(&self) -> Sender<EngineEvent> {
+    pub fn sender(&self) -> crate::gui::perf_channel::PerfTx {
         self.tx.clone()
     }
 
@@ -1975,9 +2019,13 @@ impl SuperdeduperApp {
 
     fn drain_events(&mut self) {
         let mut scan_just_finished = false;
+        // ASK 3 (A-perf-channel-h2): sample queue depth at start of
+        // drain so the perf-channel emit can report rx_len_mean/max.
+        crate::gui::perf_channel::note_queue_depth(self.rx.len());
         for _ in 0..512 {
             match self.rx.try_recv() {
                 Ok(ev) => {
+                    crate::gui::perf_channel::note_recv();
                     match &ev {
                         EngineEvent::ScanStarted { .. } => self.is_scanning = true,
                         EngineEvent::ScanFinished {
@@ -3895,6 +3943,32 @@ impl SuperdeduperApp {
     /// wall at the bottom. Wrapped in a ScrollArea so #115's
     /// low-res-screen "badges below the fold" case is reachable.
     fn render_sidebar_panel(&mut self, ctx: &egui::Context) {
+        // PATH 1 experimental gate (Cand 4 sidebar isolation; design 08:20 PDT).
+        // Short-circuits to empty SidePanel when env var set + a scan is in
+        // flight. Empirically validates: does the sidebar's 2.14ms/frame on
+        // NEO Windows account for the ~83% remaining body cost post-Cand-2?
+        if self.is_scanning && skip_sidebar_during_scan_enabled() {
+            SidePanel::left("sidebar")
+                .resizable(true)
+                .default_width(300.0)
+                .min_width(240.0)
+                .frame(Frame::default().fill(theme::PANEL).inner_margin(10.0))
+                .show(ctx, |_ui| {});
+            return;
+        }
+
+        // Sub-widget instrumentation inside sidebar (Option B drill-down per
+        // design 08:20 PDT; emits a single perf-update-sidebar line when env
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE is set + a scan is in flight).
+        // Identifies which inner widget (cache_banner / scan_mode_picker /
+        // roots_panel / funnel / badge_wall) dominates the 2.14ms.
+        let sb_inst = perf_instrument_update_enabled() && self.is_scanning;
+        let mut sb_cache_banner = std::time::Duration::ZERO;
+        let mut sb_scan_mode = std::time::Duration::ZERO;
+        let mut sb_roots = std::time::Duration::ZERO;
+        let mut sb_funnel = std::time::Duration::ZERO;
+        let mut sb_badge_wall = std::time::Duration::ZERO;
+
         SidePanel::left("sidebar")
             .resizable(true)
             .default_width(300.0)
@@ -3919,35 +3993,43 @@ impl SuperdeduperApp {
                         // banner is a no-op when no cache exists
                         // for the current roots OR when the user
                         // has settings.always_use_cache enabled.
+                        let t0 = std::time::Instant::now();
                         crate::gui::widgets::cache_banner::show(
                             ui,
                             &mut self.state,
                             self.persisted.settings.always_use_cache,
                         );
+                        if sb_inst { sb_cache_banner = t0.elapsed(); }
                         // #25 v2.5: scan-mode dropdown above the
                         // Roots panel per spec §3.8 ("top of
                         // scan-config panel"). Selection lives on
                         // `self.scan_mode` — session-sticky, NOT
                         // persisted across launches per spec.
+                        let t0 = std::time::Instant::now();
                         crate::gui::widgets::scan_mode_picker::show(
                             ui,
                             &mut self.scan_mode,
                             self.is_scanning,
                         );
+                        if sb_inst { sb_scan_mode = t0.elapsed(); }
                         ui.add_space(6.0);
+                        let t0 = std::time::Instant::now();
                         let roots_action = roots_panel::show(
                             ui,
                             &self.persisted.roots,
                             self.is_scanning,
                             self.can_resume,
                         );
+                        if sb_inst { sb_roots = t0.elapsed(); }
                         if let Some(a) = roots_action {
                             self.dispatch_root_action(a);
                         }
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(6.0);
+                        let t0 = std::time::Instant::now();
                         funnel::show(ui, &self.state, self.persisted.settings.hash_algo);
+                        if sb_inst { sb_funnel = t0.elapsed(); }
 
                         // §10.4 badge-wall: bottom-left always-
                         // visible achievements grid. Auto-degrades
@@ -3959,18 +4041,31 @@ impl SuperdeduperApp {
                             ui.add_space(12.0);
                             ui.separator();
                             ui.add_space(6.0);
+                            let t0 = std::time::Instant::now();
                             let state = crate::leaderboard::catalog::peek_state();
                             let action = if ui.available_width() < 280.0 {
                                 crate::gui::widgets::badge_wall::show_mini(ui, &state)
                             } else {
                                 crate::gui::widgets::badge_wall::show(ui, &state)
                             };
+                            if sb_inst { sb_badge_wall = t0.elapsed(); }
                             if let Some(a) = action {
                                 self.dispatch_badge_wall_action(a);
                             }
                         }
                     });
             });
+
+        if sb_inst {
+            crate::log_info!(
+                "perf-update-sidebar: cache_banner={:.3}ms scan_mode={:.3}ms roots={:.3}ms funnel={:.3}ms badge_wall={:.3}ms",
+                sb_cache_banner.as_secs_f64() * 1000.0,
+                sb_scan_mode.as_secs_f64() * 1000.0,
+                sb_roots.as_secs_f64() * 1000.0,
+                sb_funnel.as_secs_f64() * 1000.0,
+                sb_badge_wall.as_secs_f64() * 1000.0,
+            );
+        }
     }
 
     /// Central panel — drive scope at the top (clickable per-
@@ -4125,12 +4220,92 @@ impl SuperdeduperApp {
     }
 }
 
+/// EXPERIMENTAL GATE -- SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN (Mick GO
+/// Option C 2026-06-04 20:00 PDT). Verifies Candidate 2 hypothesis: per-
+/// frame accesskit_windows tree update cost is the dominant per-step cost
+/// in the scan-perf cell on Windows (4.71ms per step on NEO vs 0.95ms on
+/// WSL accesskit_unix).
+///
+/// When the env var is set (any value, matches the SUPERDEDUPER_IOTHREADS_PARKED
+/// pattern) AND a scan is in flight, the GUI update() short-circuits: it
+/// drains events + schedules the next repaint as normal, but renders an
+/// EMPTY central panel instead of the full widget tree. egui still
+/// produces a frame, but accesskit sees the same near-empty tree every
+/// frame; accesskit_windows has nothing to diff + push.
+///
+/// Diagnostic-only. Default behavior (env var unset) is UNCHANGED. The
+/// experimental commit is NOT a user-visible behavior change and is NOT
+/// reserved for v0.3.38 (which ships when the actual perf gate PASSES).
+///
+/// Cached via OnceLock so we pay env::var_os ONCE per process.
+fn skip_accesskit_during_scan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN").is_some())
+}
+
+/// PERF INSTRUMENTATION GATE -- SUPERDEDUPER_PERF_INSTRUMENT_UPDATE
+/// (Cand 4 investigation 2026-06-05 07:00 PDT post-Cand-1-refuted).
+///
+/// When the env var is SET, update() emits a single-line per-frame
+/// `perf-update: drain=Xms modal=Yms body=Zms total=Tms` line to stderr
+/// while a scan is in flight. sdd-testwin pipes stderr to a file +
+/// analyzes offline to identify which phase dominates per-step cost on
+/// Windows.
+///
+/// Diagnostic-only. Default (env var unset) is unchanged. Cached via
+/// OnceLock; the env::var_os call fires ONCE per process.
+pub(crate) fn perf_instrument_update_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_UPDATE").is_some())
+}
+
+/// EXPERIMENTAL GATE -- SUPERDEDUPER_PERF_SKIP_SIDEBAR_DURING_SCAN
+/// (Cand 4 post-2969f74 widget breakdown: sdd-testwin 08:17 PDT data
+/// shows sidebar = 76.9% of body / 2.14ms per frame on NEO Windows).
+///
+/// When the env var is SET AND a scan is in flight, render_sidebar_panel
+/// short-circuits to an empty SidePanel. Empirically tests: does the
+/// 2.14ms/frame sidebar render account for the ~83% body-cost still
+/// remaining after Cand 2?
+///
+/// Diagnostic-only. Default unchanged. NOT v0.3.38 ship.
+fn skip_sidebar_during_scan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_SKIP_SIDEBAR_DURING_SCAN").is_some())
+}
+
 impl eframe::App for SuperdeduperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let t_update_start = std::time::Instant::now();
+        let t_drain_start = t_update_start;
         self.drain_events();
+        let drain_dur = t_drain_start.elapsed();
         if self.is_scanning {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
+            // SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN experimental gate
+            // (see fn-level comment above). Short-circuit the rest of
+            // update() with an empty central panel. egui produces a
+            // valid frame; accesskit tree stays near-static; per-step
+            // accesskit-update cost drops to ~zero. Returns BEFORE any
+            // other panel renders so we don't accidentally include any
+            // animated widget that would bump the tree.
+            if skip_accesskit_during_scan_enabled() {
+                egui::CentralPanel::default().show(ctx, |_ui| {});
+                if perf_instrument_update_enabled() {
+                    crate::log_info!(
+                        "perf-update: drain={:.3}ms modal=0.000ms body=0.000ms total={:.3}ms skip-mode=1",
+                        drain_dur.as_secs_f64() * 1000.0,
+                        t_update_start.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                return;
+            }
         }
+        let t_modal_start = std::time::Instant::now();
 
         // Accessibility-action dispatch (#189, 2026-05-31). Keyboard
         // shortcuts route to the same internal handlers as the
@@ -4206,6 +4381,8 @@ impl eframe::App for SuperdeduperApp {
         let _ = self.render_bench_modal(ctx);
         let _ = self.render_channel_banner(ctx);
         let _ = self.render_exclusions_safe_defaults_banner(ctx);
+        let modal_dur = t_modal_start.elapsed();
+        let t_body_start = std::time::Instant::now();
 
         // File menubar — owns project lifecycle (New / Open / Save /
         // Save As / Open Archive Manifest). Rendered as a thin strip
@@ -4217,15 +4394,38 @@ impl eframe::App for SuperdeduperApp {
         // return them so the resume-effect state machine and
         // post-render dispatch (settings-open + menu-action) can
         // both run in the same frame, in their original sequence.
+        // Per-widget instrumentation (Option B widget-level spans, Cand 4
+        // post-Path-B-blocked per design 08:10 PDT). Each render fn timed
+        // when SUPERDEDUPER_PERF_INSTRUMENT_UPDATE is SET + a scan is in
+        // flight; emit a perf-update-body line at the bottom of update().
+        // Cost when env var unset: 12x Instant::now() + elapsed() per frame
+        // = ~0.5us; negligible relative to the timed phases.
+        let body_inst = perf_instrument_update_enabled() && self.is_scanning;
+        let mut span_brand = std::time::Duration::ZERO;
+        let mut span_menubar = std::time::Duration::ZERO;
+        let mut span_header = std::time::Duration::ZERO;
+        let mut span_sparkles_tick = std::time::Duration::ZERO;
+        let mut span_progress = std::time::Duration::ZERO;
+        let mut span_sidebar = std::time::Duration::ZERO;
+        let mut span_central = std::time::Duration::ZERO;
+        let mut span_overlays = std::time::Duration::ZERO;
+
+        let t0 = std::time::Instant::now();
         self.render_brand_panel(ctx);
+        if body_inst { span_brand = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         let menu_action = self.render_menubar_panel(ctx);
+        if body_inst { span_menubar = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         let want_settings = self.render_header_panel(ctx);
+        if body_inst { span_header = t0.elapsed(); }
                             // Cache-fast-forward effect: STRICTLY resume-only. Only fires
                             // while resume_effect_active is true, the engine is in
                             // Hashing, and the rate exceeds the fast-forward threshold.
                             // After catch-up (Sparkles emits `left_fast_forward`) we
                             // clear resume_effect_active so the effect ends and the bar
                             // returns to its normal render for the rest of the scan.
+        let t_sparkles_tick = std::time::Instant::now();
         if self.resume_effect_active
             && matches!(
                 self.state.overall.stage,
@@ -4262,6 +4462,7 @@ impl eframe::App for SuperdeduperApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
+        if body_inst { span_sparkles_tick = t_sparkles_tick.elapsed(); }
         if want_settings {
             self.settings_open = true;
         }
@@ -4272,10 +4473,17 @@ impl eframe::App for SuperdeduperApp {
         // #140 phase-3 -- A-update-layout-panel-extraction.
         // Bottom 3 layout panels: progress strip + sidebar +
         // central. Pure renders; no event returns.
+        let t0 = std::time::Instant::now();
         self.render_overall_progress_panel(ctx);
+        if body_inst { span_progress = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         self.render_sidebar_panel(ctx);
+        if body_inst { span_sidebar = t0.elapsed(); }
+        let t0 = std::time::Instant::now();
         self.render_central_panel(ctx);
+        if body_inst { span_central = t0.elapsed(); }
 
+        let t_overlays = std::time::Instant::now();
         // Action-progress modal renders LAST so it overlays
         // everything else (CentralPanel, SidePanel, TopBottomPanels).
         // egui Window-with-anchor handles the z-order; we just have
@@ -4318,6 +4526,50 @@ impl eframe::App for SuperdeduperApp {
             .show(ctx, |ui| {
                 self.sparkles.paint(ui, fill);
             });
+        if body_inst { span_overlays = t_overlays.elapsed(); }
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE -- per-phase timing emit
+        // (Cand 4 investigation per design 07:00 PDT). Only fires while
+        // a scan is in flight to keep stderr noise bounded to the
+        // measurement window. sdd-testwin pipes stderr to a file +
+        // analyzes offline (awk + sort + mean/max). For early-return
+        // paths (alpha modal / resume modal) the emit is skipped --
+        // those aren't on the per-frame hot path during a scan.
+        if perf_instrument_update_enabled() && self.is_scanning {
+            let body_dur = t_body_start.elapsed();
+            let total = t_update_start.elapsed();
+            crate::log_info!(
+                "perf-update: drain={:.3}ms modal={:.3}ms body={:.3}ms total={:.3}ms skip-mode=0",
+                drain_dur.as_secs_f64() * 1000.0,
+                modal_dur.as_secs_f64() * 1000.0,
+                body_dur.as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            );
+            // Option B widget-level spans (Cand 4 post-Path-B-blocked,
+            // design 08:10 PDT). Same activation gate; reports each
+            // major render fn's wall-clock so sdd-testwin sees which
+            // widget dominates within body on Windows.
+            crate::log_info!(
+                "perf-update-body: brand={:.3}ms menubar={:.3}ms header={:.3}ms sparkles_tick={:.3}ms progress={:.3}ms sidebar={:.3}ms central={:.3}ms overlays={:.3}ms",
+                span_brand.as_secs_f64() * 1000.0,
+                span_menubar.as_secs_f64() * 1000.0,
+                span_header.as_secs_f64() * 1000.0,
+                span_sparkles_tick.as_secs_f64() * 1000.0,
+                span_progress.as_secs_f64() * 1000.0,
+                span_sidebar.as_secs_f64() * 1000.0,
+                span_central.as_secs_f64() * 1000.0,
+                span_overlays.as_secs_f64() * 1000.0,
+            );
+            // ASK 3 (A-perf-channel-h2, testdesign 23:24 PDT): emit
+            // scan-worker -> GUI channel decomposition alongside the
+            // per-frame perf-update emits. Snapshot+reset window =
+            // since-prior-emit. None pre-scan or in zero-activity
+            // windows. Skip-mode (accesskit-skip path) doesn't reach
+            // here so the channel emit naturally lines up with the
+            // normal-path perf-update emit.
+            if let Some(line) = crate::gui::perf_channel::drain_and_format() {
+                crate::log_info!("{line}");
+            }
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

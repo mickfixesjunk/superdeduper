@@ -14,9 +14,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use rayon::prelude::*;
+
 use globset::{Glob, GlobSetBuilder};
 use parking_lot::Mutex;
 
@@ -34,7 +35,7 @@ use crate::pipeline;
 
 /// Legacy single-root scan with default settings. Used by the
 /// `--live` CLI flag where the user explicitly passed paths.
-pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle<()> {
+pub fn spawn(tx: crate::gui::perf_channel::PerfTx, roots: Vec<PathBuf>) -> thread::JoinHandle<()> {
     let entries = roots
         .into_iter()
         .map(|p| RootEntry {
@@ -57,7 +58,7 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_settings(
-    tx: Sender<EngineEvent>,
+    tx: crate::gui::perf_channel::PerfTx,
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
@@ -93,7 +94,7 @@ pub fn spawn_with_settings(
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    tx: Sender<EngineEvent>,
+    tx: crate::gui::perf_channel::PerfTx,
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
@@ -1052,8 +1053,39 @@ fn run(
     // Smaller chunks → more frequent updates between chunks. We also
     // wire a per-file progress callback into the hasher so the UI
     // animates *within* a chunk, not just between them.
-    let chunks = chunk_groups(laid, 32, 50);
+    //
+    // A-perf-chunks-h_new Path B (testdesign + design 2026-06-06 00:18
+    // PDT): SUPERDEDUPER_CHUNK_SIZE env-var override. sdd-testwin's
+    // 90805d1 perf-channel matrix EMPIRICALLY RULED OUT channel
+    // back-pressure as the 217s engine-in-GUI slowdown; new prime
+    // suspect is chunked-par-iter scheduling overhead (~1000 chunks
+    // x ~217 ms per-chunk fixed cost). Lets sdd-testwin sweep
+    // chunk_size 50/100/250/500/1000 in a single matrix to find the
+    // optimal point + map the per-chunk-overhead curve. Default
+    // unchanged (50) so unset behavior is identical.
+    let chunk_max = chunk_size_max();
+    crate::log_info!("GUI scan: chunk_groups max_chunk_size={chunk_max} (default=500; SUPERDEDUPER_CHUNK_SIZE override)");
+    let chunks = chunk_groups(laid, 32, chunk_max);
     let total_chunks = chunks.len();
+
+    // #195 perf — build the stage-4 io thread pool ONCE here and
+    // share it across every chunk via run_cancellable_with_pool.
+    // Pre-fix, each chunk built its own pool (CreateThread x
+    // cfg.io_threads + join on scope-exit). On Windows that's tens
+    // of ms per chunk; with ~1000 chunks on Mick's C:\sdd-tests
+    // corpus the per-chunk pool churn was eating a chunk of the
+    // GUI-vs-CLI gap (CLI builds the pool once for the whole run).
+    // Fall back to fresh-per-chunk if build fails so a broken pool
+    // setup doesn't strand the scan.
+    let shared_io_pool = match pipeline::hash::build_io_pool(&cfg) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            crate::log_warn!(
+                "GUI scan: shared io_pool build failed ({e}); falling back to per-chunk pools"
+            );
+            None
+        }
+    };
     let total_to_hash = laid_count;
     let hashing_started = Instant::now();
     let _ = tx.send(EngineEvent::Status(format!(
@@ -1190,7 +1222,93 @@ fn run(
     let already_reported: hashbrown::HashSet<String> =
         checkpoint_state.completed_hashes.iter().cloned().collect();
 
+    // A-perf-pc-decouple (v0.3.40, reduced-scope per design 08:35 PDT
+    // ratify): spawn a single runner thread that aggregates dup-group
+    // summaries from the chunk loop and emits batched
+    // EngineEvent::DuplicatesFoundBatch at ~100ms cadence. Closes the
+    // 258ms/chunk emit cost sdd-testwin measured: each per-group
+    // tx.send(EngineEvent::DuplicateFound(summary)) inside the loop
+    // hit the GUI state lock + UI render + accesskit tree update
+    // synchronously; on Mick C:\sdd-tests with ~30K dup groups across
+    // ~600 chunks that summed to ~154s of post-chunk emit work. The
+    // runner pops summaries from an unbounded crossbeam channel into
+    // a Vec<DuplicateGroupSummary> batch and ships ONE event per
+    // 100ms-or-200-groups trigger; the GUI's UiState::apply arm for
+    // DuplicatesFoundBatch (added in 2344711) does the equivalent
+    // dedup + push under a single lock acquire.
+    //
+    // Runner intentionally does NOT poll cancel; it consumes everything
+    // until the chunk loop drops its sum_tx Sender and the channel
+    // disconnects, so partial-scan progress is preserved for the
+    // checkpoint semantics on cancel paths (per testdesign 08:13 PDT
+    // note 2 in the Phase 3 plan LGTM).
+    let (sum_tx, sum_rx) =
+        crossbeam_channel::unbounded::<crate::gui::events::DuplicateGroupSummary>();
+    let mut sum_tx_opt: Option<crossbeam_channel::Sender<crate::gui::events::DuplicateGroupSummary>> =
+        Some(sum_tx);
+    let runner_tx = tx.clone();
+    let mut runner_handle: Option<thread::JoinHandle<()>> = Some(thread::spawn(move || {
+        let mut batch: Vec<crate::gui::events::DuplicateGroupSummary> = Vec::with_capacity(256);
+        let mut last_emit = Instant::now();
+        let mut batches_emitted: u64 = 0;
+        let mut groups_emitted: u64 = 0;
+        let runner_started = Instant::now();
+        loop {
+            let recv = sum_rx.recv_timeout(Duration::from_millis(100));
+            let disconnected = matches!(
+                recv,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            );
+            if let Ok(summary) = recv {
+                batch.push(summary);
+            }
+            let now = Instant::now();
+            let should_flush = !batch.is_empty()
+                && (disconnected
+                    || batch.len() >= 200
+                    || now.duration_since(last_emit) >= Duration::from_millis(100));
+            if should_flush {
+                let drained = std::mem::take(&mut batch);
+                groups_emitted = groups_emitted.saturating_add(drained.len() as u64);
+                batches_emitted = batches_emitted.saturating_add(1);
+                let _ = runner_tx.send(EngineEvent::DuplicatesFoundBatch(drained));
+                batch = Vec::with_capacity(256);
+                last_emit = now;
+            }
+            if disconnected {
+                break;
+            }
+        }
+        // perf-streaming emit (testdesign 08:13 PDT plan note 1): single
+        // line scan-finish target so sdd-testwin's hermetic matrix can
+        // verify engine throughput in GUI mode approaches CLI engine
+        // wall post-fix. Same SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1
+        // gate as perf-chunks / perf-channel for consistency.
+        if crate::gui::app::perf_instrument_update_enabled() && groups_emitted > 0 {
+            crate::log_info!(
+                "perf-streaming: runner_wall_ms={:.3} batches={} groups_emitted={}",
+                runner_started.elapsed().as_secs_f64() * 1000.0,
+                batches_emitted,
+                groups_emitted,
+            );
+        }
+    }));
+
+    // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):
+    // accumulate per-chunk wall + setup/hash/emit phases so the
+    // scan-finish emit decomposes the 217s GUI-vs-CLI throughput
+    // gap into chunk-loop-overhead vs hash-work vs emit. CLI runs ONE
+    // chunk all-at-once; GUI runs ~1000 chunks; if chunk_setup +
+    // chunk_emit aggregate is large, per-chunk fixed cost is load-
+    // bearing. p50/p99 give the per-chunk distribution shape.
+    let chunk_loop_started = std::time::Instant::now();
+    let mut chunk_walls_ns: Vec<u128> = Vec::with_capacity(total_chunks);
+    let mut chunk_setup_ns_total: u128 = 0;
+    let mut chunk_hash_ns_total: u128 = 0;
+    let mut chunk_emit_ns_total: u128 = 0;
+
     for (i, chunk) in chunks.into_iter().enumerate() {
+        let chunk_t_start = std::time::Instant::now();
         if cancel.load(Ordering::Relaxed) {
             if let Some(p) = &checkpoint_path {
                 checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
@@ -1224,6 +1342,13 @@ fn run(
                     i + 1,
                     total_chunks
                 ));
+            }
+            // A-perf-pc-decouple: cancel-from-top runner shutdown so
+            // any in-flight batch ships + the thread exits cleanly
+            // before run() returns.
+            drop(sum_tx_opt.take());
+            if let Some(handle) = runner_handle.take() {
+                let _ = handle.join();
             }
             emit_paused(&tx);
             return Ok(());
@@ -1323,7 +1448,10 @@ fn run(
             // discarded. Moved inside the modulus-gated branch.
             // Per-file cost change for the dominant SSD case on a
             // 312K-file scan: ~280K wasted BLAKE3 calls -> 0.
-            let read_modulus = if progress_drive_is_hdd { 50 } else { 10 };
+            // SUPERDEDUPER_THROTTLE_STATE_EMIT_DURING_SCAN (Cand 1
+            // experiment, see state_emit_throttle_mult fn): multiplies
+            // modulus 10x when env var is set so events drop 10x.
+            let read_modulus = (if progress_drive_is_hdd { 50 } else { 10 }) * state_emit_throttle_mult();
             if n.is_multiple_of(read_modulus) {
                 let lcn_bytes = if progress_drive_is_hdd {
                     total_bytes
@@ -1341,7 +1469,8 @@ fn run(
             // Per-tier funnel tick — uses the tier-local counter
             // and the matching Stage enum so the funnel rows
             // narrow as you'd expect: T0 ≥ T1 ≥ T2 ≥ T3.
-            if n_tier.is_multiple_of(100) {
+            let stage_modulus = 100 * state_emit_throttle_mult();
+            if n_tier.is_multiple_of(stage_modulus) {
                 let stage = match tier {
                     0 => Stage::Tier0Format,
                     1 => Stage::Tier1Head,
@@ -1350,13 +1479,14 @@ fn run(
                 };
                 let _ = progress_tx.try_send(EngineEvent::StageTick {
                     stage,
-                    delta: 100,
+                    delta: stage_modulus,
                     total: n_tier,
                 });
             }
 
             // Headline OverallProgress + ETA: only Tier 1 advances.
-            if counts_for_progress && n.is_multiple_of(100) {
+            let progress_modulus = 100 * state_emit_throttle_mult();
+            if counts_for_progress && n.is_multiple_of(progress_modulus) {
                 let elapsed = hashing_started_inner.elapsed().as_secs_f32();
                 // #99 PR6+PR8 — bar math:
                 //   done = restored_skipped + n
@@ -1396,13 +1526,27 @@ fn run(
             }
         });
 
-        let (dups, counters) = match pipeline::hash::run_cancellable(
-            chunk,
-            &cfg,
-            cache.clone(),
-            on_file,
-            Arc::clone(&cancel),
-        ) {
+        let chunk_t_pre_hash = std::time::Instant::now();
+        let chunk_result = if let Some(pool) = shared_io_pool.as_ref() {
+            pipeline::hash::run_cancellable_with_pool(
+                chunk,
+                &cfg,
+                cache.clone(),
+                on_file,
+                Arc::clone(&cancel),
+                pool,
+            )
+        } else {
+            pipeline::hash::run_cancellable(
+                chunk,
+                &cfg,
+                cache.clone(),
+                on_file,
+                Arc::clone(&cancel),
+            )
+        };
+        let chunk_t_post_hash = std::time::Instant::now();
+        let (dups, counters) = match chunk_result {
             Ok(v) => v,
             Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
                 // Cancellation came from the per-file Tier 3 streaming
@@ -1447,10 +1591,23 @@ fn run(
                         total_chunks
                     ));
                 }
+                // A-perf-pc-decouple: mid-chunk cancel runner shutdown
+                // mirrors the top-of-loop path; ensures any final batch
+                // ships + the thread exits before run() returns.
+                drop(sum_tx_opt.take());
+                if let Some(handle) = runner_handle.take() {
+                    let _ = handle.join();
+                }
                 emit_paused(&tx);
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                drop(sum_tx_opt.take());
+                if let Some(handle) = runner_handle.take() {
+                    let _ = handle.join();
+                }
+                return Err(e);
+            }
         };
         let chunk_bytes = counters.bytes_read.load(Ordering::Relaxed);
         total_bytes_read = total_bytes_read.saturating_add(chunk_bytes);
@@ -1483,61 +1640,90 @@ fn run(
                     .load(Ordering::Relaxed),
             );
 
-        for g in dups {
-            if already_reported.contains(&g.content_hash) {
-                continue; // carried over from a prior checkpoint
-            }
-            let visible_files = filter_reference_only(g.files, &reference_set);
-            if visible_files.len() < 2 {
-                continue;
-            }
+        // v0.3.40 A-perf-pc-decouple Phase 4 (Mick GO 2026-06-06 ship-
+        // today): parallelize the per-group processing across rayon's
+        // global pool. sdd-testwin's v0.3.40 reduced-scope (aa140a8)
+        // matrix showed chunk_emit_ms_total ~24s on Mick-corpus = the
+        // bottleneck is the SERIAL for-g-in-dups loop, where each
+        // iteration's order_keeper_first calls file_mtime() (stat
+        // syscall per file). ~30K groups x ~800us serial = 24s wall.
+        //
+        // Splitting via par_iter lets the stat-bound work run across
+        // the global rayon pool (CPU-sized); the cheap serial fold
+        // afterwards updates aggregates (atomics + BTreeMap entry +
+        // checkpoint::record + sum_tx send) in a few ms total. With
+        // 8 logical cores parallelizing the stat work, projected wall
+        // for the per-chunk emit block drops from ~24s to ~3-5s on
+        // Mick-corpus = engine wall approaches CLI parity per design's
+        // <=1.10x criteria (lock-in 2026-06-06 12:28 PDT).
+        struct ProcessedGroup {
+            summary: DuplicateGroupSummary,
+            savings: u64,
+            group_reclaim: u64,
+        }
+        let keep_strategy = settings.keep_strategy;
+        let reference_set_ref = &reference_set;
+        let already_reported_ref = &already_reported;
+        let processed: Vec<ProcessedGroup> = dups
+            .into_par_iter()
+            .filter_map(|g| {
+                if already_reported_ref.contains(&g.content_hash) {
+                    return None;
+                }
+                let visible_files = filter_reference_only(g.files, reference_set_ref);
+                if visible_files.len() < 2 {
+                    return None;
+                }
+                let savings = g
+                    .size
+                    .saturating_mul(visible_files.len().saturating_sub(1) as u64);
+                let unique_inodes = if g.unique_inodes == 0 {
+                    visible_files.len() as u64
+                } else {
+                    g.unique_inodes
+                };
+                let group_reclaim = if !g.link_equivalent && unique_inodes > 1 {
+                    g.size.saturating_mul(unique_inodes.saturating_sub(1))
+                } else {
+                    0
+                };
+                let ordered_files =
+                    order_keeper_first(visible_files, keep_strategy, reference_set_ref);
+                Some(ProcessedGroup {
+                    summary: DuplicateGroupSummary {
+                        size: g.size,
+                        content_hash: g.content_hash,
+                        files: ordered_files,
+                        link_equivalent: g.link_equivalent,
+                        unique_inodes: g.unique_inodes,
+                        similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
+                    },
+                    savings,
+                    group_reclaim,
+                })
+            })
+            .collect();
+
+        for out in processed {
+            let g_size = out.summary.size;
+            let g_link_equivalent = out.summary.link_equivalent;
             confirmed += 1;
-            let savings = g
-                .size
-                .saturating_mul(visible_files.len().saturating_sub(1) as u64);
-            reclaimable = reclaimable.saturating_add(savings);
-            // Inode-aware reclaim — for hardlinked corpora
-            // (C:\Windows / WinSxS dominated), the path-aware
-            // count above inflates because each WinSxS alias counts
-            // as a "dup" even though all aliases share an inode.
-            // Inode-aware is the TRUE freeable bytes; ships in the
-            // leaderboard payload + clamped against bytes_scanned to
-            // satisfy the backend's result_self_consistency check.
-            // Hardlink-equivalent groups have nothing to reclaim
-            // (already collapsed on disk) — skip them.
-            let unique_inodes = if g.unique_inodes == 0 {
-                visible_files.len() as u64
-            } else {
-                g.unique_inodes
-            };
-            let group_reclaim = if !g.link_equivalent && unique_inodes > 1 {
-                g.size.saturating_mul(unique_inodes.saturating_sub(1))
-            } else {
-                0
-            };
-            reclaimable_inode = reclaimable_inode.saturating_add(group_reclaim);
+            reclaimable = reclaimable.saturating_add(out.savings);
+            reclaimable_inode = reclaimable_inode.saturating_add(out.group_reclaim);
             // `largest_single_group_bytes` per backend's sanity
             // check is the largest group's RECLAIM, not its total
             // bytes-on-disk. Backend rule: largest <= reclaim total.
-            // Using inode-aware per-group reclaim guarantees that
-            // because each per-group reclaim is a summand of the
-            // total (and there are no negative summands).
-            if group_reclaim > largest_group_bytes {
-                largest_group_bytes = group_reclaim;
+            if out.group_reclaim > largest_group_bytes {
+                largest_group_bytes = out.group_reclaim;
             }
             // #162 -- A-run-shape-esoterics-streaming: feed the group
             // through the shared accumulator. Same algorithm the CLI
-            // uses via `payload_meta::run_shape_esoterics` -- by
-            // construction the two paths produce identical RunShape
-            // values. `visible_files` (post `filter_reference_only`)
-            // is what the GUI displays + counts toward reclaimable; we
-            // pass the same slice to the accumulator so the
-            // reference-only members aren't double-counted.
+            // uses via `payload_meta::run_shape_esoterics`.
             run_shape_esoterics_accum.add_group(
-                g.size,
-                &g.content_hash,
-                g.link_equivalent,
-                visible_files.iter(),
+                g_size,
+                &out.summary.content_hash,
+                g_link_equivalent,
+                out.summary.files.iter(),
             );
             total_dups += 1;
             *groups_by_similarity_kind
@@ -1552,24 +1738,14 @@ fn run(
             diag_counters
                 .reclaimable_bytes
                 .store(reclaimable, Ordering::Relaxed);
-            // Reorder so the smart-heuristic keeper lands at
-            // index 0. The GUI's safe-rename / recycle / hardlink
-            // flows all treat `files[0]` as the canonical keeper
-            // — putting the best-scored file there is how we
-            // make `KeepStrategy::Smart` the GUI default without
-            // each downstream action having to know about it.
-            let visible_files =
-                order_keeper_first(visible_files, settings.keep_strategy, &reference_set);
-            let summary = DuplicateGroupSummary {
-                size: g.size,
-                content_hash: g.content_hash,
-                files: visible_files,
-                link_equivalent: g.link_equivalent,
-                unique_inodes: g.unique_inodes,
-                similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
-            };
-            checkpoint_state.record(&summary);
-            let _ = tx.send(EngineEvent::DuplicateFound(summary));
+            checkpoint_state.record(&out.summary);
+            // A-perf-pc-decouple (v0.3.40): runner thread batches +
+            // emits DuplicatesFoundBatch instead of per-group blocking
+            // send. Send to sum_tx is cheap (unbounded channel push;
+            // no GUI lock + no UI re-render until batched flush).
+            if let Some(sender) = sum_tx_opt.as_ref() {
+                let _ = sender.send(out.summary);
+            }
         }
 
         // Periodic checkpoint flush so an unexpected crash doesn't
@@ -1655,6 +1831,60 @@ fn run(
                 ),
             });
         }
+
+        // A-perf-chunks-h_new: accumulate per-chunk phase durations.
+        // Mid-chunk cancel paths return early via `return Ok(());`
+        // above and never reach this; partial accumulators just
+        // never emit -- acceptable since cancellation during a 4-min
+        // scan is rare and partial data isn't decision-useful.
+        let chunk_t_end = std::time::Instant::now();
+        chunk_walls_ns.push(chunk_t_end.duration_since(chunk_t_start).as_nanos());
+        chunk_setup_ns_total = chunk_setup_ns_total
+            .saturating_add(chunk_t_pre_hash.duration_since(chunk_t_start).as_nanos());
+        chunk_hash_ns_total = chunk_hash_ns_total
+            .saturating_add(chunk_t_post_hash.duration_since(chunk_t_pre_hash).as_nanos());
+        chunk_emit_ns_total = chunk_emit_ns_total
+            .saturating_add(chunk_t_end.duration_since(chunk_t_post_hash).as_nanos());
+    }
+
+    // A-perf-pc-decouple (v0.3.40): chunk loop done -- drop sum_tx so
+    // the runner thread's recv_timeout sees Disconnected on its next
+    // tick, flushes its final batch (if any) via DuplicatesFoundBatch,
+    // emits the perf-streaming summary line, and exits. Join is
+    // best-effort: a runner panic shouldn't break scan-finish, but the
+    // join must complete before ScanFinished so the GUI's terminal
+    // event lands after any final batch. Early-return paths upstream
+    // (cancellation / Interrupted) shut down the runner via the same
+    // take()-and-drop pattern before returning.
+    drop(sum_tx_opt.take());
+    if let Some(handle) = runner_handle.take() {
+        if let Err(e) = handle.join() {
+            crate::log_warn!("dup-runner panicked: {e:?}");
+        }
+    }
+
+    // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):
+    // emit the per-chunk phase decomposition for the just-completed
+    // chunk loop. Gated by SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1 so
+    // sdd-testwin's hermetic harness picks it up automatically. One
+    // line at scan-finish (not per-frame) -- grep target for the
+    // Mick-corpus 217s engine-in-GUI slowdown root-cause analysis.
+    if crate::gui::app::perf_instrument_update_enabled() && !chunk_walls_ns.is_empty() {
+        let chunk_loop_total_ms = chunk_loop_started.elapsed().as_secs_f64() * 1000.0;
+        chunk_walls_ns.sort_unstable();
+        let n = chunk_walls_ns.len();
+        let p50 = chunk_walls_ns[n / 2];
+        let p99 = chunk_walls_ns[(n.saturating_sub(1) * 99) / 100];
+        crate::log_info!(
+            "perf-chunks: chunks_total={} chunk_setup_ms_total={:.3} chunk_wall_p50_ms={:.3} chunk_wall_p99_ms={:.3} chunk_hash_ms_total={:.3} chunk_emit_ms_total={:.3} chunk_loop_total_ms={:.3}",
+            n,
+            chunk_setup_ns_total as f64 / 1_000_000.0,
+            p50 as f64 / 1_000_000.0,
+            p99 as f64 / 1_000_000.0,
+            chunk_hash_ns_total as f64 / 1_000_000.0,
+            chunk_emit_ns_total as f64 / 1_000_000.0,
+            chunk_loop_total_ms,
+        );
     }
 
     // Scan finished cleanly — the checkpoint has served its purpose.
@@ -2457,6 +2687,33 @@ fn parse_diskutil_solid_state(text: &str) -> Option<bool> {
 /// Uses BLAKE3 truncated to 8 bytes — fast, no allocation beyond a
 /// short slice, and stable across runs so the same file lands in the
 /// same place on repeated scans.
+/// EXPERIMENTAL GATE -- SUPERDEDUPER_THROTTLE_STATE_EMIT_DURING_SCAN
+/// (Mick GO state-emit-throttling experiment via design 2026-06-05 00:00 PDT).
+/// Tests Cand 1 hypothesis: per-file scan-progress event volume drives GUI
+/// per-step cost (drain_events processing + downstream state mutation +
+/// render churn).
+///
+/// When the env var is SET (any value, matches the SUPERDEDUPER_IOTHREADS_PARKED
+/// + SUPERDEDUPER_SKIP_ACCESSKIT_DURING_SCAN pattern), the on_file callback's
+/// existing modulus gates are MULTIPLIED 10x:
+///   - Read events:           every 10/50 -> every 100/500
+///   - StageTick funnel:      every 100   -> every 1000
+///   - OverallProgress + ETA: every 100   -> every 1000
+///
+/// Diagnostic-only. Default behavior (env var unset) is UNCHANGED. Cached
+/// via OnceLock so env::var_os fires ONCE per process.
+fn state_emit_throttle_mult() -> u64 {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<u64> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        if std::env::var_os("SUPERDEDUPER_THROTTLE_STATE_EMIT_DURING_SCAN").is_some() {
+            10
+        } else {
+            1
+        }
+    })
+}
+
 fn hash_path_to_lcn(path: &std::path::Path) -> u64 {
     let bytes = path.as_os_str().to_string_lossy();
     let h = blake3::hash(bytes.as_bytes());
@@ -2469,7 +2726,7 @@ fn hash_path_to_lcn(path: &std::path::Path) -> u64 {
     v % (4 * 1024 * 1024 * 1024 * 1024u64) // 4 TiB-ish
 }
 
-fn emit_paused(tx: &Sender<EngineEvent>) {
+fn emit_paused(tx: &crate::gui::perf_channel::PerfTx) {
     let _ = tx.send(EngineEvent::ScanPaused {
         at: Instant::now(),
         checkpoint_id: "ad-hoc".into(),
@@ -2559,6 +2816,27 @@ fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {
 /// updates) and reasonably small chunks (for cancellation
 /// responsiveness). Target ≥ `min_chunks` chunks where possible, but
 /// never put more than `max_chunk_size` groups in a single chunk.
+/// A-perf-chunks-h_new ship default: chunk_groups max_chunk_size.
+/// Default 500 per sdd-testwin sweep matrix knee-point (2026-06-06
+/// 01:05 PDT): chunked-par-iter overhead at ~258 ms per chunk emit
+/// dominates 217s engine-in-GUI slowdown; cs=500 lands at 78.64s on
+/// Mick-corpus C:\sdd-tests (vs cs=50 278.21s = -72% wall), cs=1000
+/// shows slight regression (84.62s) so 500 is the right knee.
+/// SUPERDEDUPER_CHUNK_SIZE env-var override stays so future sweeps
+/// can re-characterize after the v0.3.40+ per-chunk-emit fix lands.
+/// Cached via OnceLock; env::var fires once per process. Min 1.
+fn chunk_size_max() -> usize {
+    use std::sync::OnceLock;
+    static CHUNK_SIZE: OnceLock<usize> = OnceLock::new();
+    *CHUNK_SIZE.get_or_init(|| {
+        std::env::var("SUPERDEDUPER_CHUNK_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(500)
+    })
+}
+
 fn chunk_groups(
     laid: Vec<pipeline::layout::LaidOutGroup>,
     min_chunks: usize,

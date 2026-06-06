@@ -163,6 +163,17 @@ pub enum ProgressOutcome {
 /// surface unreadable files in the Log tab.
 pub type FileProgress = Arc<dyn Fn(&std::path::Path, u8, ProgressOutcome) + Send + Sync>;
 
+/// Streaming dup-group emit callback (v0.3.40 A-perf-pc-decouple).
+/// Fires from rayon worker threads as each [`DuplicateGroup`] is
+/// finalized inside [`run_group`]. Lets the GUI tap the producer side
+/// of the hash pipeline without the chunked-invocation pattern: the
+/// caller plumbs each group through a lock-free channel to a separate
+/// runner thread that batches + emits to the GUI at ~100ms cadence,
+/// while the engine runs the full corpus as ONE par_iter (so engine
+/// throughput approaches CLI parity). Called concurrently from N
+/// worker threads — must be cheap + thread-safe.
+pub type GroupComplete = Arc<dyn Fn(&DuplicateGroup) + Send + Sync>;
+
 /// Top-level entry point. Takes size-grouped, layout-annotated files
 /// and returns confirmed duplicate groups by full content hash.
 pub fn run(groups: Vec<LaidOutGroup>, cfg: &ScanConfig) -> Result<Vec<DuplicateGroup>> {
@@ -179,7 +190,7 @@ pub fn run_with_counters(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, None, None)
+    run_with_counters_inner(groups, cfg, cache, None, None, None, None)
 }
 
 /// Same as [`run_with_counters`] but with a per-file progress
@@ -192,7 +203,7 @@ pub fn run_with_progress(
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: FileProgress,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, Some(on_file), None)
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), None, None, None)
 }
 
 /// Like [`run_with_progress`] but also takes a cancellation flag. The
@@ -207,7 +218,77 @@ pub fn run_cancellable(
     on_file: FileProgress,
     cancel: Arc<AtomicBool>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
-    run_with_counters_inner(groups, cfg, cache, Some(on_file), Some(cancel))
+    run_with_counters_inner(groups, cfg, cache, Some(on_file), None, Some(cancel), None)
+}
+
+/// Variant of [`run_cancellable`] that reuses a caller-built `io_pool`.
+///
+/// The GUI invokes the hash pipeline once per chunk (so confirmed dup
+/// groups surface mid-scan). Pre-#195 each chunk rebuilt the rayon
+/// io-pool — 8 thread creates + 8 joins per chunk, ~1000 chunks per
+/// real scan on Mick's C:\sdd-tests corpus — which dwarfed the actual
+/// IO work on small chunks. Letting the caller pre-build a single pool
+/// and pass it through hoists that cost out of the inner loop entirely.
+pub fn run_cancellable_with_pool(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+    on_file: FileProgress,
+    cancel: Arc<AtomicBool>,
+    io_pool: &rayon::ThreadPool,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    run_with_counters_inner(
+        groups,
+        cfg,
+        cache,
+        Some(on_file),
+        None,
+        Some(cancel),
+        Some(io_pool),
+    )
+}
+
+/// Streaming entry point (v0.3.40 A-perf-pc-decouple). Same shape as
+/// [`run_cancellable_with_pool`] but takes a [`GroupComplete`] callback
+/// that fires as each dup-group is finalized inside [`run_group`]. The
+/// returned `Vec<DuplicateGroup>` is the full set (same as the chunked
+/// path); streaming callers typically ignore it and consume groups via
+/// the callback into a lock-free worker -> runner channel, then a
+/// runner thread batches + emits to the GUI at ~100ms cadence.
+///
+/// Closes the engine-inside-GUI throughput penalty: the GUI now invokes
+/// the hash pipeline ONCE across the whole corpus (no chunking) and
+/// the par_iter runs at CLI parity (~1.6 GiB/s on Mick's C:\sdd-tests
+/// per sdd-testwin's 2026-06-06 baseline).
+pub fn run_streaming(
+    groups: Vec<LaidOutGroup>,
+    cfg: &ScanConfig,
+    cache: Option<Arc<Mutex<Cache>>>,
+    on_file: FileProgress,
+    on_group: GroupComplete,
+    cancel: Arc<AtomicBool>,
+    io_pool: &rayon::ThreadPool,
+) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
+    run_with_counters_inner(
+        groups,
+        cfg,
+        cache,
+        Some(on_file),
+        Some(on_group),
+        Some(cancel),
+        Some(io_pool),
+    )
+}
+
+/// Build a rayon thread pool sized to `cfg.io_threads` for stage-4
+/// hashing. Exposed so the GUI can build the pool once and share it
+/// across all hash chunks via [`run_cancellable_with_pool`].
+pub fn build_io_pool(cfg: &ScanConfig) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.io_threads.max(1))
+        .thread_name(|i| format!("superdeduper-io-{i}"))
+        .build()
+        .map_err(|e| Error::other(format!("io thread pool build: {e}")))
 }
 
 fn run_with_counters_inner(
@@ -215,10 +296,13 @@ fn run_with_counters_inner(
     cfg: &ScanConfig,
     cache: Option<Arc<Mutex<Cache>>>,
     on_file: Option<FileProgress>,
+    on_group: Option<GroupComplete>,
     cancel: Option<Arc<AtomicBool>>,
+    shared_pool: Option<&rayon::ThreadPool>,
 ) -> Result<(Vec<DuplicateGroup>, HashCounters)> {
     let counters = Arc::new(HashCounters::default());
     let on_file_ref = on_file.as_ref();
+    let on_group_ref = on_group.as_ref();
     let cancel_ref = cancel.as_ref();
     // Dedicated pool sized to cfg.io_threads. The hashing par_iter
     // spends most of its time blocked on CreateFileW / ReadFile /
@@ -228,11 +312,16 @@ fn run_with_counters_inner(
     // Keeping a separate pool from the global rayon means
     // non-hash rayon usage (layout resolver, perceptual Tier-4)
     // keeps its CPU-sized parallelism.
-    let io_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(cfg.io_threads.max(1))
-        .thread_name(|i| format!("superdeduper-io-{i}"))
-        .build()
-        .map_err(|e| Error::other(format!("io thread pool build: {e}")))?;
+    //
+    // When the GUI runs chunked it pre-builds the pool ONCE and
+    // passes it via `shared_pool` so we don't rebuild 8 threads
+    // (~1000 chunks × CreateThread + join on Windows = real time).
+    let owned_pool: Option<rayon::ThreadPool> = if shared_pool.is_some() {
+        None
+    } else {
+        Some(build_io_pool(cfg)?)
+    };
+    let io_pool: &rayon::ThreadPool = shared_pool.unwrap_or_else(|| owned_pool.as_ref().unwrap());
     // A-perf-stage-timing — isolate the parallel-IO scope from the pool
     // construction + post-scope counter unwrap that share main.rs's
     // t_hash bracket. This is the figure HDD-bench needs to decide on
@@ -244,7 +333,17 @@ fn run_with_counters_inner(
         .install(|| {
             groups
                 .into_par_iter()
-                .map(|g| run_group(g, cfg, cache.as_ref(), &counters, on_file_ref, cancel_ref))
+                .map(|g| {
+                    run_group(
+                        g,
+                        cfg,
+                        cache.as_ref(),
+                        &counters,
+                        on_file_ref,
+                        on_group_ref,
+                        cancel_ref,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()
         })?
         .into_iter()
@@ -459,6 +558,7 @@ fn run_group(
     cache: Option<&Arc<Mutex<Cache>>>,
     counters: &Arc<HashCounters>,
     on_file: Option<&FileProgress>,
+    on_group: Option<&GroupComplete>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<DuplicateGroup>> {
     let size = group.size;
@@ -506,6 +606,9 @@ fn run_group(
             file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
+        if let Some(cb) = on_group {
+            cb(&g);
+        }
         return Ok(vec![g]);
     }
 
@@ -579,6 +682,9 @@ fn run_group(
             file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
+        if let Some(cb) = on_group {
+            cb(&g);
+        }
         out.push(g);
         if let Some(cb) = on_file {
             cb(&rep.entry.path, 3, ProgressOutcome::Hashed { bytes: size });
@@ -679,6 +785,9 @@ fn run_group(
             file_sizes: Vec::new(),
         };
         super::assert_unique_paths(&g);
+        if let Some(cb) = on_group {
+            cb(&g);
+        }
         out.push(g);
     }
     Ok(out)

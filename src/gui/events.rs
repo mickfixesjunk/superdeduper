@@ -159,6 +159,13 @@ pub enum EngineEvent {
     Read(ReadSample),
     /// A confirmed duplicate group ready for the results panel.
     DuplicateFound(DuplicateGroupSummary),
+    /// Batched confirmed duplicate groups (v0.3.40 A-perf-pc-decouple).
+    /// The runner thread aggregates groups from the rayon hash workers
+    /// over a ~100ms window and ships ONE event per tick so the GUI
+    /// applies them in a single state-update (one lock acquire, one
+    /// sort, one re-render) instead of per-group push. Closes the
+    /// 258ms/chunk emit cost that chunk_size=500 (v0.3.39) masked.
+    DuplicatesFoundBatch(Vec<DuplicateGroupSummary>),
     /// Final wall-clock totals; scan is done.
     ScanFinished {
         at: Instant,
