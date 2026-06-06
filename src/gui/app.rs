@@ -4009,7 +4009,7 @@ impl SuperdeduperApp {
             });
 
         if sb_inst {
-            eprintln!(
+            crate::log_info!(
                 "perf-update-sidebar: cache_banner={:.3}ms scan_mode={:.3}ms roots={:.3}ms funnel={:.3}ms badge_wall={:.3}ms",
                 sb_cache_banner.as_secs_f64() * 1000.0,
                 sb_scan_mode.as_secs_f64() * 1000.0,
@@ -4248,7 +4248,7 @@ impl eframe::App for SuperdeduperApp {
             if skip_accesskit_during_scan_enabled() {
                 egui::CentralPanel::default().show(ctx, |_ui| {});
                 if perf_instrument_update_enabled() {
-                    eprintln!(
+                    crate::log_info!(
                         "perf-update: drain={:.3}ms modal=0.000ms body=0.000ms total={:.3}ms skip-mode=1",
                         drain_dur.as_secs_f64() * 1000.0,
                         t_update_start.elapsed().as_secs_f64() * 1000.0,
@@ -4489,7 +4489,7 @@ impl eframe::App for SuperdeduperApp {
         if perf_instrument_update_enabled() && self.is_scanning {
             let body_dur = t_body_start.elapsed();
             let total = t_update_start.elapsed();
-            eprintln!(
+            crate::log_info!(
                 "perf-update: drain={:.3}ms modal={:.3}ms body={:.3}ms total={:.3}ms skip-mode=0",
                 drain_dur.as_secs_f64() * 1000.0,
                 modal_dur.as_secs_f64() * 1000.0,
@@ -4500,7 +4500,7 @@ impl eframe::App for SuperdeduperApp {
             // design 08:10 PDT). Same activation gate; reports each
             // major render fn's wall-clock so sdd-testwin sees which
             // widget dominates within body on Windows.
-            eprintln!(
+            crate::log_info!(
                 "perf-update-body: brand={:.3}ms menubar={:.3}ms header={:.3}ms sparkles_tick={:.3}ms progress={:.3}ms sidebar={:.3}ms central={:.3}ms overlays={:.3}ms",
                 span_brand.as_secs_f64() * 1000.0,
                 span_menubar.as_secs_f64() * 1000.0,
