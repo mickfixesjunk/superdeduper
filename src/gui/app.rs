@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use egui::{CentralPanel, Frame, SidePanel, TopBottomPanel};
 
 use crate::cli::DedupeAction;
@@ -73,7 +73,7 @@ struct PersistedAppState {
 pub struct SuperdeduperApp {
     state: UiState,
     rx: Receiver<EngineEvent>,
-    tx: Sender<EngineEvent>,
+    tx: crate::gui::perf_channel::PerfTx,
     is_scanning: bool,
     settings_open: bool,
     /// Sticky tab selection for the Settings modal. Persists across
@@ -287,6 +287,7 @@ impl SuperdeduperApp {
             .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdeduper.app.v1"))
             .unwrap_or_default();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
+        let tx = crate::gui::perf_channel::PerfTx::new(tx);
 
         // Probe the scan-checkpoint file BEFORE any state restore so
         // we can show the launch-time Resume / Start Fresh modal.
@@ -714,7 +715,7 @@ impl SuperdeduperApp {
         );
     }
 
-    pub fn sender(&self) -> Sender<EngineEvent> {
+    pub fn sender(&self) -> crate::gui::perf_channel::PerfTx {
         self.tx.clone()
     }
 
@@ -1975,9 +1976,13 @@ impl SuperdeduperApp {
 
     fn drain_events(&mut self) {
         let mut scan_just_finished = false;
+        // ASK 3 (A-perf-channel-h2): sample queue depth at start of
+        // drain so the perf-channel emit can report rx_len_mean/max.
+        crate::gui::perf_channel::note_queue_depth(self.rx.len());
         for _ in 0..512 {
             match self.rx.try_recv() {
                 Ok(ev) => {
+                    crate::gui::perf_channel::note_recv();
                     match &ev {
                         EngineEvent::ScanStarted { .. } => self.is_scanning = true,
                         EngineEvent::ScanFinished {
@@ -4511,6 +4516,16 @@ impl eframe::App for SuperdeduperApp {
                 span_central.as_secs_f64() * 1000.0,
                 span_overlays.as_secs_f64() * 1000.0,
             );
+            // ASK 3 (A-perf-channel-h2, testdesign 23:24 PDT): emit
+            // scan-worker -> GUI channel decomposition alongside the
+            // per-frame perf-update emits. Snapshot+reset window =
+            // since-prior-emit. None pre-scan or in zero-activity
+            // windows. Skip-mode (accesskit-skip path) doesn't reach
+            // here so the channel emit naturally lines up with the
+            // normal-path perf-update emit.
+            if let Some(line) = crate::gui::perf_channel::drain_and_format() {
+                crate::log_info!("{line}");
+            }
         }
     }
 

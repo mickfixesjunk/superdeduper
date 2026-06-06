@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use crossbeam_channel::Sender;
 use globset::{Glob, GlobSetBuilder};
 use parking_lot::Mutex;
 
@@ -34,7 +33,7 @@ use crate::pipeline;
 
 /// Legacy single-root scan with default settings. Used by the
 /// `--live` CLI flag where the user explicitly passed paths.
-pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle<()> {
+pub fn spawn(tx: crate::gui::perf_channel::PerfTx, roots: Vec<PathBuf>) -> thread::JoinHandle<()> {
     let entries = roots
         .into_iter()
         .map(|p| RootEntry {
@@ -57,7 +56,7 @@ pub fn spawn(tx: Sender<EngineEvent>, roots: Vec<PathBuf>) -> thread::JoinHandle
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_settings(
-    tx: Sender<EngineEvent>,
+    tx: crate::gui::perf_channel::PerfTx,
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
@@ -93,7 +92,7 @@ pub fn spawn_with_settings(
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    tx: Sender<EngineEvent>,
+    tx: crate::gui::perf_channel::PerfTx,
     roots: Vec<RootEntry>,
     settings: ScanSettings,
     cancel: Arc<AtomicBool>,
@@ -2532,7 +2531,7 @@ fn hash_path_to_lcn(path: &std::path::Path) -> u64 {
     v % (4 * 1024 * 1024 * 1024 * 1024u64) // 4 TiB-ish
 }
 
-fn emit_paused(tx: &Sender<EngineEvent>) {
+fn emit_paused(tx: &crate::gui::perf_channel::PerfTx) {
     let _ = tx.send(EngineEvent::ScanPaused {
         at: Instant::now(),
         checkpoint_id: "ad-hoc".into(),
