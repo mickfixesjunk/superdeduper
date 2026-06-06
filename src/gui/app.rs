@@ -276,16 +276,29 @@ enum MenuAction {
 
 impl SuperdeduperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // A-perf-startup-instrumentation (testdesign 21:05 PDT
+        // Option-A ratify): per-phase Instant timing for the 10s
+        // startup tail decomposition. Gated by
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1 -- same env var as
+        // perf-update / perf-channel / perf-chunks / perf-streaming so
+        // sdd-testwin's hermetic matrix picks it up automatically. Single
+        // perf-startup line emitted at end of new() with all phase
+        // deltas; lets the matrix pin where the 10s lives so Phase 5
+        // can target the actual cost surface rather than guess.
+        let t_new_start = std::time::Instant::now();
         theme::install(&cc.egui_ctx);
+        let t_after_theme = std::time::Instant::now();
         // egui_extras' image loaders enable `egui::include_image!`
         // — used by the OAuth provider chooser + the linked-state
         // affordances to embed the 48x48 PNG provider logos. One-
         // time install at app boot.
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        let t_after_loaders = std::time::Instant::now();
         let persisted: PersistedAppState = cc
             .storage
             .and_then(|s| eframe::get_value::<PersistedAppState>(s, "superdeduper.app.v1"))
             .unwrap_or_default();
+        let t_after_persisted = std::time::Instant::now();
         let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(4096);
         let tx = crate::gui::perf_channel::PerfTx::new(tx);
 
@@ -312,6 +325,7 @@ impl SuperdeduperApp {
             },
             Err(_) => None,
         };
+        let t_after_checkpoint_summary = std::time::Instant::now();
 
         // #99 PR2 — Classify the resume tier from the lightweight
         // summary so the launch-time modal can render tier-specific
@@ -331,6 +345,7 @@ impl SuperdeduperApp {
             };
             crate::gui::resume_tier::classify_resume_tier_from_summary(summary, &ctx)
         });
+        let t_after_resume_tier = std::time::Instant::now();
 
         let app = Self {
             state: UiState::default(),
@@ -377,9 +392,11 @@ impl SuperdeduperApp {
             scan_complete_data: None,
         };
         let mut app = app;
+        let t_after_struct = std::time::Instant::now();
         // Populate cache-banner state on first launch — roots may
         // have been seeded from persistence or a CLI argument.
         app.refresh_cache_banner();
+        let t_after_cache_banner = std::time::Instant::now();
 
         // Spawn the badge-wall data fetch in the background. Catalog
         // is public + cached on a CDN; profile fetch only fires if the
@@ -441,6 +458,28 @@ impl SuperdeduperApp {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "scan_history: pending sweep failed"),
             }
+        }
+
+        // A-perf-startup-instrumentation: single perf-startup emit at
+        // end of new() with all phase deltas in ms (gated by
+        // SUPERDEDUPER_PERF_INSTRUMENT_UPDATE=1). Lets sdd-testwin's
+        // matrix decompose the 10s startup tail empirically -- find
+        // out which phase actually dominates so Phase 5 lazy-init
+        // targets the real cost surface rather than guessing.
+        if perf_instrument_update_enabled() {
+            let t_new_end = std::time::Instant::now();
+            crate::log_info!(
+                "perf-startup: theme_ms={:.3} loaders_ms={:.3} persisted_ms={:.3} checkpoint_summary_ms={:.3} resume_tier_ms={:.3} struct_ms={:.3} cache_banner_ms={:.3} telemetry_tail_ms={:.3} new_total_ms={:.3}",
+                t_after_theme.duration_since(t_new_start).as_secs_f64() * 1000.0,
+                t_after_loaders.duration_since(t_after_theme).as_secs_f64() * 1000.0,
+                t_after_persisted.duration_since(t_after_loaders).as_secs_f64() * 1000.0,
+                t_after_checkpoint_summary.duration_since(t_after_persisted).as_secs_f64() * 1000.0,
+                t_after_resume_tier.duration_since(t_after_checkpoint_summary).as_secs_f64() * 1000.0,
+                t_after_struct.duration_since(t_after_resume_tier).as_secs_f64() * 1000.0,
+                t_after_cache_banner.duration_since(t_after_struct).as_secs_f64() * 1000.0,
+                t_new_end.duration_since(t_after_cache_banner).as_secs_f64() * 1000.0,
+                t_new_end.duration_since(t_new_start).as_secs_f64() * 1000.0,
+            );
         }
 
         app
