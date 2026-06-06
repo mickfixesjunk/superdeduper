@@ -1051,7 +1051,19 @@ fn run(
     // Smaller chunks → more frequent updates between chunks. We also
     // wire a per-file progress callback into the hasher so the UI
     // animates *within* a chunk, not just between them.
-    let chunks = chunk_groups(laid, 32, 50);
+    //
+    // A-perf-chunks-h_new Path B (testdesign + design 2026-06-06 00:18
+    // PDT): SUPERDEDUPER_CHUNK_SIZE env-var override. sdd-testwin's
+    // 90805d1 perf-channel matrix EMPIRICALLY RULED OUT channel
+    // back-pressure as the 217s engine-in-GUI slowdown; new prime
+    // suspect is chunked-par-iter scheduling overhead (~1000 chunks
+    // x ~217 ms per-chunk fixed cost). Lets sdd-testwin sweep
+    // chunk_size 50/100/250/500/1000 in a single matrix to find the
+    // optimal point + map the per-chunk-overhead curve. Default
+    // unchanged (50) so unset behavior is identical.
+    let chunk_max = chunk_size_max();
+    crate::log_info!("GUI scan: chunk_groups max_chunk_size={chunk_max} (default=50; SUPERDEDUPER_CHUNK_SIZE override)");
+    let chunks = chunk_groups(laid, 32, chunk_max);
     let total_chunks = chunks.len();
 
     // #195 perf — build the stage-4 io thread pool ONCE here and
@@ -2675,6 +2687,23 @@ fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {
 /// updates) and reasonably small chunks (for cancellation
 /// responsiveness). Target ≥ `min_chunks` chunks where possible, but
 /// never put more than `max_chunk_size` groups in a single chunk.
+/// A-perf-chunks-h_new Path B: SUPERDEDUPER_CHUNK_SIZE override for
+/// the chunk_groups max_chunk_size argument. Default 50 (unchanged
+/// pre-this-flag behavior). sdd-testwin sweeps 50/100/250/500/1000
+/// to map per-chunk-overhead curve against engine-in-GUI 217s wall
+/// gap. Cached via OnceLock; env::var fires once per process. Min 1.
+fn chunk_size_max() -> usize {
+    use std::sync::OnceLock;
+    static CHUNK_SIZE: OnceLock<usize> = OnceLock::new();
+    *CHUNK_SIZE.get_or_init(|| {
+        std::env::var("SUPERDEDUPER_CHUNK_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(50)
+    })
+}
+
 fn chunk_groups(
     laid: Vec<pipeline::layout::LaidOutGroup>,
     min_chunks: usize,
