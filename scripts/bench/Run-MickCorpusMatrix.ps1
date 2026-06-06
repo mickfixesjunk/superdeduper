@@ -176,9 +176,12 @@ function Invoke-CliScan([string]$label) {
     try {
         $j = Get-Content $jsonPath -Raw | ConvertFrom-Json
         if ($null -eq $j) { throw 'empty json' }
-        if (-not ($j.PSObject.Properties.Name -contains 'total_files') -and
-            -not ($j.PSObject.Properties.Name -contains 'files_inventory')) {
-            Write-Host "$label FAIL: scan JSON missing total_files / files_inventory"
+        # CLI scan emits superdeduper.scan.v2 schema with top-level 'schema' + 'groups'.
+        # Earlier check used 'total_files / files_inventory' (engine internal field names)
+        # which never appear at top-level -- triggered false-ERROR on a66f813 ship-gate matrix.
+        if (-not ($j.PSObject.Properties.Name -contains 'schema') -and
+            -not ($j.PSObject.Properties.Name -contains 'groups')) {
+            Write-Host "$label FAIL: scan JSON missing schema / groups (not superdeduper.scan.v2)"
             return -1
         }
     } catch {
