@@ -259,7 +259,7 @@ foreach ($lbl in @($results.Keys)) {
     Add-Content -Path $harvestPath -Value ""
     Add-Content -Path $harvestPath -Value "===== $lbl.stderr ====="
     foreach ($line in (Get-Content $stderrFile -ErrorAction SilentlyContinue)) {
-        if ($line -match 'perf-chunks|perf-streaming|GUI scan:|SCAN-COMPLETE') {
+        if ($line -match 'perf-chunks|perf-streaming|perf-startup|GUI scan:|SCAN-COMPLETE') {
             Add-Content -Path $harvestPath -Value $line
             Write-Host ("  [{0}] {1}" -f $lbl, $line)
         }
