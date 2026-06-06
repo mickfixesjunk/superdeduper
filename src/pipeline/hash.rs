@@ -68,6 +68,24 @@ const TIER2_MIN_FILE: u64 = 256 * 1024;
 /// Read buffer for Tier 3 streaming.
 const TIER3_BUF: usize = 1 << 20;
 
+/// PERF INSTRUMENTATION GATE -- SUPERDEDUPER_PERF_INSTRUMENT_RAYON
+/// (v0.3.40 Phase 5 profile-first; testdesign 2026-06-06 16:10 PDT).
+///
+/// When SET, the hash io_pool par_iter emits per-worker timing data:
+/// one stage line + one per-worker line (wall_ms / groups / bytes /
+/// first_entry_ms / last_exit_ms / throughput_mb_s / active_pct). Lets
+/// us identify whether the chunk_hash_ms 2.39x GUI-vs-CLI slowdown is
+/// rayon contention (low active_pct), per-worker throughput drop
+/// (low throughput_mb_s), or worker starvation (groups_orphan > 0).
+///
+/// Diagnostic-only. Default (unset) is unchanged. Cached via OnceLock
+/// so env::var_os fires ONCE per process.
+fn perf_instrument_rayon_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_RAYON").is_some())
+}
+
 /// Per-scan instrumentation. The engine atomically updates these
 /// counters so callers (CLI summary, GUI scope) can read them without
 /// locking. Returned alongside the duplicates from [`run`].
@@ -329,12 +347,36 @@ fn run_with_counters_inner(
     // is the lever; if walk_ms is, parallel-walk is.
     let hash_io_started = Instant::now();
     let groups_in = groups.len();
+
+    // A-perf-rayon-contention (v0.3.40 Phase 5 profile-first):
+    // per-worker accumulators gated by SUPERDEDUPER_PERF_INSTRUMENT_RAYON.
+    // Identifies whether chunk_hash_ms 2.39x GUI-vs-CLI slowdown is rayon
+    // contention (low active_pct), throughput drop (low MB/s per worker),
+    // or worker starvation (groups_orphan > 0 / num_workers < expected).
+    let perf_rayon = perf_instrument_rayon_enabled();
+    let num_workers = io_pool.current_num_threads().max(1);
+    let per_worker_wall_ns: Vec<AtomicU64> = (0..num_workers).map(|_| AtomicU64::new(0)).collect();
+    let per_worker_groups: Vec<AtomicU64> = (0..num_workers).map(|_| AtomicU64::new(0)).collect();
+    let per_worker_bytes: Vec<AtomicU64> = (0..num_workers).map(|_| AtomicU64::new(0)).collect();
+    let per_worker_first_entry_ns: Vec<AtomicU64> =
+        (0..num_workers).map(|_| AtomicU64::new(u64::MAX)).collect();
+    let per_worker_last_exit_ns: Vec<AtomicU64> =
+        (0..num_workers).map(|_| AtomicU64::new(0)).collect();
+    let groups_orphan = AtomicU64::new(0);
+
     let mut confirmed: Vec<DuplicateGroup> = io_pool
         .install(|| {
             groups
                 .into_par_iter()
                 .map(|g| {
-                    run_group(
+                    let entry_time = if perf_rayon { Some(Instant::now()) } else { None };
+                    let widx = if perf_rayon {
+                        rayon::current_thread_index()
+                    } else {
+                        None
+                    };
+                    let group_bytes = g.size;
+                    let result = run_group(
                         g,
                         cfg,
                         cache.as_ref(),
@@ -342,7 +384,34 @@ fn run_with_counters_inner(
                         on_file_ref,
                         on_group_ref,
                         cancel_ref,
-                    )
+                    );
+                    if perf_rayon {
+                        let entry = entry_time.unwrap();
+                        let exit_time = Instant::now();
+                        let wall_ns = exit_time.duration_since(entry).as_nanos() as u64;
+                        match widx {
+                            Some(idx) if idx < num_workers => {
+                                per_worker_wall_ns[idx].fetch_add(wall_ns, Ordering::Relaxed);
+                                per_worker_groups[idx].fetch_add(1, Ordering::Relaxed);
+                                per_worker_bytes[idx]
+                                    .fetch_add(group_bytes, Ordering::Relaxed);
+                                let entry_off = entry
+                                    .duration_since(hash_io_started)
+                                    .as_nanos() as u64;
+                                per_worker_first_entry_ns[idx]
+                                    .fetch_min(entry_off, Ordering::Relaxed);
+                                let exit_off = exit_time
+                                    .duration_since(hash_io_started)
+                                    .as_nanos() as u64;
+                                per_worker_last_exit_ns[idx]
+                                    .fetch_max(exit_off, Ordering::Relaxed);
+                            }
+                            _ => {
+                                groups_orphan.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    result
                 })
                 .collect::<Result<Vec<_>>>()
         })?
@@ -350,6 +419,52 @@ fn run_with_counters_inner(
         .flatten()
         .collect();
     let hash_io_ms = hash_io_started.elapsed().as_millis() as u64;
+
+    if perf_rayon {
+        let stage_total_ms = hash_io_started.elapsed().as_secs_f64() * 1000.0;
+        crate::log_info!(
+            "perf-rayon-hash: stage_total_ms={:.3} num_workers={} groups_in={} groups_orphan={}",
+            stage_total_ms,
+            num_workers,
+            groups_in,
+            groups_orphan.load(Ordering::Relaxed)
+        );
+        for idx in 0..num_workers {
+            let wall_ms =
+                per_worker_wall_ns[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            let groups_n = per_worker_groups[idx].load(Ordering::Relaxed);
+            let bytes_n = per_worker_bytes[idx].load(Ordering::Relaxed);
+            let first = per_worker_first_entry_ns[idx].load(Ordering::Relaxed);
+            let last = per_worker_last_exit_ns[idx].load(Ordering::Relaxed);
+            let first_ms = if first == u64::MAX {
+                -1.0
+            } else {
+                first as f64 / 1_000_000.0
+            };
+            let last_ms = last as f64 / 1_000_000.0;
+            let throughput_mb_s = if wall_ms > 0.0 {
+                (bytes_n as f64 / (1024.0 * 1024.0)) / (wall_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let active_pct = if stage_total_ms > 0.0 {
+                (wall_ms / stage_total_ms) * 100.0
+            } else {
+                0.0
+            };
+            crate::log_info!(
+                "perf-rayon-hash-worker: worker_id={} wall_ms={:.3} groups={} bytes={} first_entry_ms={:.3} last_exit_ms={:.3} throughput_mb_s={:.2} active_pct={:.1}",
+                idx,
+                wall_ms,
+                groups_n,
+                bytes_n,
+                first_ms,
+                last_ms,
+                throughput_mb_s,
+                active_pct
+            );
+        }
+    }
     tracing::info!(
         hash_io_ms,
         io_threads = cfg.io_threads.max(1),
