@@ -412,6 +412,7 @@ impl SuperdeduperApp {
             };
             catalog::spawn_initial_fetch(server_url, install_id);
         }
+        let t_after_catalog_spawn = std::time::Instant::now();
 
         // Intentionally NO auto-load of prior scan results on launch.
         // Projects are now explicit — File → Open Project loads one;
@@ -440,6 +441,7 @@ impl SuperdeduperApp {
                 Err(e) => tracing::warn!(error = %e, "scan_history: prune failed"),
             }
         }
+        let t_after_history_prune = std::time::Instant::now();
 
         // 2. Crash-detect modal. Anything still in `Pending` whose
         //    most recent activity is more than 5 minutes old is a
@@ -469,7 +471,7 @@ impl SuperdeduperApp {
         if perf_instrument_update_enabled() {
             let t_new_end = std::time::Instant::now();
             crate::log_info!(
-                "perf-startup: theme_ms={:.3} loaders_ms={:.3} persisted_ms={:.3} checkpoint_summary_ms={:.3} resume_tier_ms={:.3} struct_ms={:.3} cache_banner_ms={:.3} telemetry_tail_ms={:.3} new_total_ms={:.3}",
+                "perf-startup: theme_ms={:.3} loaders_ms={:.3} persisted_ms={:.3} checkpoint_summary_ms={:.3} resume_tier_ms={:.3} struct_ms={:.3} cache_banner_ms={:.3} catalog_spawn_ms={:.3} history_prune_ms={:.3} pending_sweep_ms={:.3} new_total_ms={:.3}",
                 t_after_theme.duration_since(t_new_start).as_secs_f64() * 1000.0,
                 t_after_loaders.duration_since(t_after_theme).as_secs_f64() * 1000.0,
                 t_after_persisted.duration_since(t_after_loaders).as_secs_f64() * 1000.0,
@@ -477,7 +479,9 @@ impl SuperdeduperApp {
                 t_after_resume_tier.duration_since(t_after_checkpoint_summary).as_secs_f64() * 1000.0,
                 t_after_struct.duration_since(t_after_resume_tier).as_secs_f64() * 1000.0,
                 t_after_cache_banner.duration_since(t_after_struct).as_secs_f64() * 1000.0,
-                t_new_end.duration_since(t_after_cache_banner).as_secs_f64() * 1000.0,
+                t_after_catalog_spawn.duration_since(t_after_cache_banner).as_secs_f64() * 1000.0,
+                t_after_history_prune.duration_since(t_after_catalog_spawn).as_secs_f64() * 1000.0,
+                t_new_end.duration_since(t_after_history_prune).as_secs_f64() * 1000.0,
                 t_new_end.duration_since(t_new_start).as_secs_f64() * 1000.0,
             );
         }
