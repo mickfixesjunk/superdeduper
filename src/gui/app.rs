@@ -4261,6 +4261,31 @@ pub(crate) fn perf_instrument_update_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_UPDATE").is_some())
 }
 
+/// SUPERDEDUPER_PERF_INSTRUMENT_CHUNK_EMIT -- v0.3.41 chunk_emit
+/// decomposition (Mick directive 2026-06-06 20:30 PDT do-it-all-tonight
+/// + design 2026-06-06 20:15 PDT spec §3.1).
+///
+/// When SET, the chunk-loop in `src/gui/live.rs::run` emits one
+/// `perf-chunk-emit:` line per chunk via `crate::log_info!` decomposing
+/// the chunk-emit budget (chunk_t_post_hash -> chunk_t_end window) into
+/// 6 named buckets:
+///
+///   perf-chunk-emit: chunk_idx checkpoint_save_us checkpoint_record_us
+///                    tx_send_dup_us tx_try_send_us tx_send_log_us
+///                    cache_stats_us group_count
+///
+/// Buckets are accumulated in microseconds within the chunk; aggregation
+/// across chunks happens in the sdd-testwin matrix harvest per spec §3.2
+/// sum-conservation invariant (`residual_ms < 5% of chunk_emit_ms`).
+///
+/// Diagnostic-only. Default (env var unset) is unchanged. Cached via
+/// OnceLock; the env::var_os call fires ONCE per process.
+pub(crate) fn perf_instrument_chunk_emit_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_CHUNK_EMIT").is_some())
+}
+
 /// EXPERIMENTAL GATE -- SUPERDEDUPER_PERF_SKIP_SIDEBAR_DURING_SCAN
 /// (Cand 4 post-2969f74 widget breakdown: sdd-testwin 08:17 PDT data
 /// shows sidebar = 76.9% of body / 2.14ms per frame on NEO Windows).
