@@ -30,6 +30,9 @@ struct Args {
 }
 
 fn main() -> eframe::Result<()> {
+    // v0.3.42 Phase 11 (PERF_METRICS.md §4): capture process-start
+    // baseline FIRST, before any eframe/winit init. TTWS anchors here.
+    superdeduper::perf_scan_lifecycle::record_process_start();
     let args = Args::parse();
 
     // Channel resolution: ENV var > [network] channel in persisted

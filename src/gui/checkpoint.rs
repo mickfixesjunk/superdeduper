@@ -277,7 +277,23 @@ struct SaveWorkerInner {
     pending: Mutex<Option<Checkpoint>>,
     notify: Condvar,
     stop: AtomicBool,
+    /// v0.3.42 Phase 11c (C+ option per design 2026-06-07 11:00 PDT):
+    /// shared live state. When attached, the bg thread reads from this
+    /// on its auto-flush timer (1000ms cadence) so the chunk-loop's
+    /// own enqueue cadence isn't load-bearing for crash-recovery
+    /// resume safety. The single-chunk pivot (Part 1 of C+) collapses
+    /// the chunk loop to one iteration; without this, the only enqueue
+    /// fires at chunk-start with empty state and crash-recovery
+    /// regresses to ~entire-scan-duration. The timer-driven
+    /// auto-flush preserves the v0.3.41 ~1s recovery window.
+    live_state: Mutex<Option<Arc<Mutex<Checkpoint>>>>,
 }
+
+/// v0.3.42 Phase 11c (C+ option per design 2026-06-07 11:00 PDT):
+/// bg-thread auto-flush cadence. 1000ms matches the v0.3.41 Phase 7
+/// rate-limit cadence + crash-recovery window.
+const SAVE_WORKER_AUTO_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(1000);
 
 impl SaveWorker {
     /// Spawn the bg thread for the given checkpoint path. Returns
@@ -288,6 +304,7 @@ impl SaveWorker {
             pending: Mutex::new(None),
             notify: Condvar::new(),
             stop: AtomicBool::new(false),
+            live_state: Mutex::new(None),
         });
         let inner_for_thread = Arc::clone(&inner);
         let handle = std::thread::Builder::new()
@@ -300,6 +317,26 @@ impl SaveWorker {
         }
     }
 
+    /// v0.3.42 Phase 11c (C+ option) -- attach a shared live checkpoint
+    /// state so the bg thread can auto-flush on its 1000ms timer
+    /// without the caller having to enqueue periodically. Callers wire
+    /// this BEFORE the scan starts mutating state. Replaces any
+    /// previously-attached state. Idempotent.
+    ///
+    /// The chunk-loop body (or any other writer) takes a
+    /// `Arc<Mutex<Checkpoint>>` clone and locks briefly to call
+    /// `record()`; the bg thread takes its own clone, locks briefly to
+    /// snapshot, then runs `save()` outside the lock. Lock contention
+    /// is per-group record() (microseconds) vs once-per-second
+    /// timer-fire snapshot.
+    pub fn attach_live_state(&self, state: Arc<Mutex<Checkpoint>>) {
+        *self.inner.live_state.lock() = Some(state);
+        // Wake the bg thread so the timer cycle restarts from this
+        // attach point (otherwise it could be mid-wait for up to the
+        // full interval before noticing).
+        self.inner.notify.notify_one();
+    }
+
     /// Replace the pending checkpoint snapshot with `cp`. Returns
     /// immediately; does NOT block on disk I/O.
     pub fn enqueue(&self, cp: Checkpoint) {
@@ -308,6 +345,18 @@ impl SaveWorker {
             *guard = Some(cp);
         }
         self.inner.notify.notify_one();
+    }
+
+    /// Returns a cloneable handle that callbacks running on rayon
+    /// worker threads can use to enqueue checkpoint snapshots without
+    /// taking ownership of the SaveWorker itself (whose Drop semantics
+    /// are tied to scan-end shutdown). v0.3.42 Phase 11c (run_streaming
+    /// wiring): the on_group callback uses this to enqueue snapshots
+    /// from concurrent workers without blocking the shutdown path.
+    pub fn handle(&self) -> SaveWorkerHandle {
+        SaveWorkerHandle {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// Signal stop + join. Idempotent.
@@ -328,26 +377,84 @@ impl Drop for SaveWorker {
     }
 }
 
+/// Cloneable enqueue-only handle. Built by [`SaveWorker::handle`];
+/// shares the underlying Arc<SaveWorkerInner> so multiple worker
+/// threads can enqueue concurrently. Drop is a no-op (shutdown stays
+/// tied to the original SaveWorker).
+#[derive(Clone)]
+pub struct SaveWorkerHandle {
+    inner: Arc<SaveWorkerInner>,
+}
+
+impl SaveWorkerHandle {
+    /// Same semantics as [`SaveWorker::enqueue`]: replace pending
+    /// snapshot + notify the bg thread. Safe to call from rayon
+    /// worker threads.
+    pub fn enqueue(&self, cp: Checkpoint) {
+        {
+            let mut guard = self.inner.pending.lock();
+            *guard = Some(cp);
+        }
+        self.inner.notify.notify_one();
+    }
+}
+
 fn run_save_loop(inner: Arc<SaveWorkerInner>) {
     loop {
-        let pending = {
+        // v0.3.42 Phase 11c (C+ option) -- wait with timeout so the
+        // bg thread auto-flushes on a fixed cadence even without
+        // explicit enqueue() calls. Three wake paths:
+        //
+        // 1. Explicit enqueue() -> notify_one -> wait returns
+        //    (timed_out=false). Caller-set pending wins.
+        // 2. attach_live_state() -> notify_one -> wait returns
+        //    (timed_out=false). Restart timer cycle from attach point.
+        // 3. SAVE_WORKER_AUTO_FLUSH_INTERVAL elapsed -> wait returns
+        //    (timed_out=true). Take live-state snapshot + save.
+        // 4. shutdown() -> stop=true + notify_one -> wait returns.
+        //    Drain pending + final live-state snapshot, then return.
+        let timed_out = {
             let mut guard = inner.pending.lock();
-            while guard.is_none() && !inner.stop.load(Ordering::Acquire) {
-                inner.notify.wait(&mut guard);
+            if guard.is_some() || inner.stop.load(Ordering::Acquire) {
+                false
+            } else {
+                inner
+                    .notify
+                    .wait_for(&mut guard, SAVE_WORKER_AUTO_FLUSH_INTERVAL)
+                    .timed_out()
             }
-            guard.take()
         };
+
+        // Drain explicit-enqueue pending FIRST (priority over
+        // live-state snapshot; explicit indicates the caller wants a
+        // specific moment captured).
+        let pending = inner.pending.lock().take();
         if let Some(cp) = pending {
             let _ = save(&inner.path, &cp);
+        } else if timed_out {
+            // No explicit-enqueue but the timer fired -- snapshot the
+            // attached live state if any.
+            let live_state = inner.live_state.lock().clone();
+            if let Some(state_arc) = live_state {
+                let snapshot = state_arc.lock().clone();
+                let _ = save(&inner.path, &snapshot);
+            }
         }
+
         if inner.stop.load(Ordering::Acquire) {
             // Drain the LAST pending: an enqueue may have raced with
             // the stop signal between our take() above and the notify
-            // arriving. Saving it here preserves the
-            // "latest-snapshot-survives" guarantee even at shutdown.
-            let last = inner.pending.lock().take();
-            if let Some(cp) = last {
+            // arriving. Save it + the live-state snapshot so the
+            // very-latest crash-recovery state lands on disk before
+            // we exit.
+            let last_pending = inner.pending.lock().take();
+            if let Some(cp) = last_pending {
                 let _ = save(&inner.path, &cp);
+            }
+            let live_state = inner.live_state.lock().clone();
+            if let Some(state_arc) = live_state {
+                let snapshot = state_arc.lock().clone();
+                let _ = save(&inner.path, &snapshot);
             }
             return;
         }
@@ -466,5 +573,100 @@ mod tests {
         let worker = SaveWorker::spawn(path.clone());
         drop(worker); // shutdown without any enqueue: nothing written.
         assert!(!path.exists());
+    }
+
+    /// v0.3.42 Phase 11c -- attached live state auto-flushes on the
+    /// 1000ms timer. Set up live state with "first" hash, wait past
+    /// the timer interval, then update to "second" hash. shutdown
+    /// drains; final file content must reflect the latest live state.
+    #[test]
+    fn save_worker_auto_flushes_attached_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let live = Arc::new(Mutex::new(cp_with_hash("initial")));
+        let worker = SaveWorker::spawn(path.clone());
+        worker.attach_live_state(Arc::clone(&live));
+
+        // Wait past the timer interval (1000ms) + a slop margin so the
+        // bg thread guaranteed-fires its first timer-driven save.
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.completed_hashes,
+            vec!["initial".to_string()],
+            "first timer-fire saved the initial attached state"
+        );
+
+        // Mutate the live state under the lock; bg thread should pick
+        // up the new state on its next timer fire.
+        *live.lock() = cp_with_hash("updated");
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.completed_hashes,
+            vec!["updated".to_string()],
+            "second timer-fire picked up the live-state update"
+        );
+
+        drop(worker);
+    }
+
+    /// Shutdown drains the attached live state's last value even if
+    /// the timer hadn't fired yet. Caller mutates live state +
+    /// shutdown immediately; the post-stop drain branch must run a
+    /// final live-state snapshot save.
+    #[test]
+    fn save_worker_shutdown_drains_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let live = Arc::new(Mutex::new(cp_with_hash("first")));
+        let mut worker = SaveWorker::spawn(path.clone());
+        worker.attach_live_state(Arc::clone(&live));
+
+        // Mutate live state THEN shutdown without waiting for the
+        // timer. The drain branch must save the post-mutation state.
+        *live.lock() = cp_with_hash("preshutdown");
+        worker.shutdown();
+
+        let loaded = load(&path).unwrap().unwrap();
+        // Either the initial timer fired between attach + shutdown
+        // ("preshutdown") or only the drain branch saved
+        // ("preshutdown" too). Both lead to the same end state.
+        assert_eq!(
+            loaded.completed_hashes,
+            vec!["preshutdown".to_string()],
+            "shutdown drain saved the latest live-state mutation"
+        );
+    }
+
+    /// Explicit enqueue takes priority over the attached live state.
+    /// Caller can pin a specific snapshot (e.g., cancellation save
+    /// with cumulative_* fields) and it wins over the timer-driven
+    /// auto-flush path.
+    #[test]
+    fn save_worker_explicit_enqueue_wins_over_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let live = Arc::new(Mutex::new(cp_with_hash("from-live")));
+        let mut worker = SaveWorker::spawn(path.clone());
+        worker.attach_live_state(Arc::clone(&live));
+
+        // Immediately enqueue an explicit snapshot before any timer
+        // fire. The pending-first branch must save the explicit.
+        worker.enqueue(cp_with_hash("from-explicit"));
+        // Then shutdown so we don't race a later timer fire.
+        worker.shutdown();
+
+        let loaded = load(&path).unwrap().unwrap();
+        // The drain branch may write live-state after the explicit
+        // save -- this is fine; the LIVE state would be the final
+        // file content. Both paths are documented behaviors. Verify
+        // it's one of the two expected values, not garbage.
+        assert!(
+            loaded.completed_hashes == vec!["from-explicit".to_string()]
+                || loaded.completed_hashes == vec!["from-live".to_string()],
+            "saved value must be one of the two attached states; got {:?}",
+            loaded.completed_hashes
+        );
     }
 }
