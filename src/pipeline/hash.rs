@@ -106,6 +106,113 @@ fn perf_instrument_rayon_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("SUPERDEDUPER_PERF_INSTRUMENT_RAYON").is_some())
 }
 
+/// Per-worker accumulators for `SUPERDEDUPER_PERF_INSTRUMENT_RAYON` =
+/// stage-4 hash io_pool attribution. Sized to
+/// `io_pool.current_num_threads().max(1)`; each rayon worker writes to
+/// its own slot via `current_thread_index()`, so writes are
+/// single-writer per slot under `io_pool.install()` semantics.
+///
+/// File-task-level attribution (v0.3.41 PR #170 codex P2 fix). v0.3.40
+/// PR #170 booked walls at the **outer per-group** level, which charged
+/// all nested `flat.par_iter()` hash work inside `run_group` to the
+/// outer group's worker. For multi-file groups (any group with >=2
+/// files) the nested par_iter fans the actual tier work back out across
+/// `io_pool` workers via work-stealing -- so the outer attribution
+/// silently mis-credited per-worker walls + undercounted bytes (only
+/// `g.size` for one file, not the per-tier sum). v0.3.41 moves the
+/// instant + index capture inside the per-helper closures
+/// (split_by / split_by_optional / into_subgroups) so each FILE-task
+/// is booked to the worker that actually executed it.
+///
+/// Field roles:
+/// * `enabled` -- the OnceLock-cached `perf_instrument_rayon_enabled()`
+///   read. Captured here so per-call-site `if perf { ... }` branches
+///   share one source of truth.
+/// * `num_workers` -- bound for `current_thread_index()` checks.
+/// * `stage_start` -- the `hash_io_started` Instant; per-worker
+///   `first_entry_ns` / `last_exit_ns` are stored as nanos-since-start.
+/// * `wall_ns[idx]` -- sum of per-file wall walls for worker `idx`.
+/// * `files[idx]` -- count of per-file tasks routed to worker `idx`.
+/// * `bytes[idx]` -- sum of per-file `f.entry.size` for worker `idx`.
+///   See PR #170 quality N4 caveat (uses input bytes, not bytes
+///   actually read; throughput is "candidate bytes per second", valid
+///   for per-worker comparison, not absolute disk MB/s).
+/// * `first_entry_ns[idx]` -- min entry-offset; `u64::MAX` sentinel
+///   means worker never touched.
+/// * `last_exit_ns[idx]` -- max exit-offset; `0` sentinel means worker
+///   never touched.
+/// * `files_orphan` -- file-tasks where `current_thread_index()`
+///   returned `None`. Per PR #170 quality N3: NOT starvation;
+///   install-caller participates in work-stealing. Sum-conservation
+///   (`files_orphan + sum(files[idx]) == files_total`) is the
+///   load-bearing check.
+///
+/// Allocation cost: even when `enabled = false` the AtomicU64 vecs are
+/// allocated. ~5 * 8B * num_workers per `run_with_counters_inner` call
+/// = a few hundred bytes per chunk; quality N1 (PR #170) noted this is
+/// negligible vs the chunk-level work. The OFF-path per-file branch is
+/// still a single bool check inside the par_iter closure.
+struct RayonPerfSlots {
+    enabled: bool,
+    num_workers: usize,
+    stage_start: Instant,
+    wall_ns: Vec<AtomicU64>,
+    files: Vec<AtomicU64>,
+    bytes: Vec<AtomicU64>,
+    first_entry_ns: Vec<AtomicU64>,
+    last_exit_ns: Vec<AtomicU64>,
+    files_orphan: AtomicU64,
+}
+
+impl RayonPerfSlots {
+    fn new(enabled: bool, num_workers: usize, stage_start: Instant) -> Self {
+        let mk_zero = |n: usize| (0..n).map(|_| AtomicU64::new(0)).collect();
+        let mk_max = |n: usize| (0..n).map(|_| AtomicU64::new(u64::MAX)).collect();
+        Self {
+            enabled,
+            num_workers,
+            stage_start,
+            wall_ns: mk_zero(num_workers),
+            files: mk_zero(num_workers),
+            bytes: mk_zero(num_workers),
+            first_entry_ns: mk_max(num_workers),
+            last_exit_ns: mk_zero(num_workers),
+            files_orphan: AtomicU64::new(0),
+        }
+    }
+
+    /// Book a per-file hash task. Called inside each helper's
+    /// `flat.par_iter()` closure (split_by / split_by_optional /
+    /// into_subgroups). Resolves the rayon worker that actually ran
+    /// the task and updates that worker's slot. Out-of-range or `None`
+    /// thread-index routes to `files_orphan` (work-stealing on the
+    /// install-caller, NOT pool starvation -- see struct docs).
+    ///
+    /// `file_bytes` should be `f.entry.size`. Throughput is bytes-in /
+    /// wall, NOT bytes-read; see quality N4 caveat.
+    fn record_file(&self, file_bytes: u64, started: Instant, ended: Instant) {
+        if !self.enabled {
+            return;
+        }
+        let widx = rayon::current_thread_index();
+        let wall_ns = ended.duration_since(started).as_nanos() as u64;
+        match widx {
+            Some(idx) if idx < self.num_workers => {
+                self.wall_ns[idx].fetch_add(wall_ns, Ordering::Relaxed);
+                self.files[idx].fetch_add(1, Ordering::Relaxed);
+                self.bytes[idx].fetch_add(file_bytes, Ordering::Relaxed);
+                let entry_off = started.duration_since(self.stage_start).as_nanos() as u64;
+                self.first_entry_ns[idx].fetch_min(entry_off, Ordering::Relaxed);
+                let exit_off = ended.duration_since(self.stage_start).as_nanos() as u64;
+                self.last_exit_ns[idx].fetch_max(exit_off, Ordering::Relaxed);
+            }
+            _ => {
+                self.files_orphan.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Per-scan instrumentation. The engine atomically updates these
 /// counters so callers (CLI summary, GUI scope) can read them without
 /// locking. Returned alongside the duplicates from [`run`].
@@ -368,37 +475,33 @@ fn run_with_counters_inner(
     let hash_io_started = Instant::now();
     let groups_in = groups.len();
 
-    // A-perf-rayon-contention (v0.3.40 Phase 5 profile-first):
+    // A-perf-rayon-contention (v0.3.40 Phase 5 profile-first; v0.3.41
+    // codex P2 -- file-task-level attribution):
     // per-worker accumulators gated by SUPERDEDUPER_PERF_INSTRUMENT_RAYON.
     // Identifies whether chunk_hash_ms 2.39x GUI-vs-CLI slowdown is rayon
     // contention (low active_pct + uniform) or throughput drop (low MB/s
     // + high active_pct). See `perf_instrument_rayon_enabled` for the
-    // groups_orphan reading (NOT starvation -- install-caller participates
+    // files_orphan reading (NOT starvation -- install-caller participates
     // via work-stealing; sum-conservation is the load-bearing check).
+    //
+    // v0.3.41 P2 fix: slots are passed through run_group -> split_by /
+    // split_by_optional / into_subgroups so each FILE-task's wall is
+    // booked to the worker that ran it. v0.3.40 PR #170 booked at the
+    // outer per-group level, which charged all nested hash work for
+    // multi-file groups to whichever worker drew the OUTER group --
+    // skewing per-worker walls + undercounting bytes. See RayonPerfSlots
+    // doc-comment for the full attribution story.
     let perf_rayon = perf_instrument_rayon_enabled();
     let num_workers = io_pool.current_num_threads().max(1);
-    let per_worker_wall_ns: Vec<AtomicU64> = (0..num_workers).map(|_| AtomicU64::new(0)).collect();
-    let per_worker_groups: Vec<AtomicU64> = (0..num_workers).map(|_| AtomicU64::new(0)).collect();
-    let per_worker_bytes: Vec<AtomicU64> = (0..num_workers).map(|_| AtomicU64::new(0)).collect();
-    let per_worker_first_entry_ns: Vec<AtomicU64> =
-        (0..num_workers).map(|_| AtomicU64::new(u64::MAX)).collect();
-    let per_worker_last_exit_ns: Vec<AtomicU64> =
-        (0..num_workers).map(|_| AtomicU64::new(0)).collect();
-    let groups_orphan = AtomicU64::new(0);
+    let perf_slots = RayonPerfSlots::new(perf_rayon, num_workers, hash_io_started);
+    let perf_ref: Option<&RayonPerfSlots> = if perf_rayon { Some(&perf_slots) } else { None };
 
     let mut confirmed: Vec<DuplicateGroup> = io_pool
         .install(|| {
             groups
                 .into_par_iter()
                 .map(|g| {
-                    let entry_time = if perf_rayon { Some(Instant::now()) } else { None };
-                    let widx = if perf_rayon {
-                        rayon::current_thread_index()
-                    } else {
-                        None
-                    };
-                    let group_bytes = g.size;
-                    let result = run_group(
+                    run_group(
                         g,
                         cfg,
                         cache.as_ref(),
@@ -406,34 +509,8 @@ fn run_with_counters_inner(
                         on_file_ref,
                         on_group_ref,
                         cancel_ref,
-                    );
-                    if perf_rayon {
-                        let entry = entry_time.unwrap();
-                        let exit_time = Instant::now();
-                        let wall_ns = exit_time.duration_since(entry).as_nanos() as u64;
-                        match widx {
-                            Some(idx) if idx < num_workers => {
-                                per_worker_wall_ns[idx].fetch_add(wall_ns, Ordering::Relaxed);
-                                per_worker_groups[idx].fetch_add(1, Ordering::Relaxed);
-                                per_worker_bytes[idx]
-                                    .fetch_add(group_bytes, Ordering::Relaxed);
-                                let entry_off = entry
-                                    .duration_since(hash_io_started)
-                                    .as_nanos() as u64;
-                                per_worker_first_entry_ns[idx]
-                                    .fetch_min(entry_off, Ordering::Relaxed);
-                                let exit_off = exit_time
-                                    .duration_since(hash_io_started)
-                                    .as_nanos() as u64;
-                                per_worker_last_exit_ns[idx]
-                                    .fetch_max(exit_off, Ordering::Relaxed);
-                            }
-                            _ => {
-                                groups_orphan.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    result
+                        perf_ref,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()
         })?
@@ -445,19 +522,19 @@ fn run_with_counters_inner(
     if perf_rayon {
         let stage_total_ms = hash_io_started.elapsed().as_secs_f64() * 1000.0;
         crate::log_info!(
-            "perf-rayon-hash: stage_total_ms={:.3} num_workers={} groups_in={} groups_orphan={}",
+            "perf-rayon-hash: stage_total_ms={:.3} num_workers={} groups_in={} files_orphan={}",
             stage_total_ms,
             num_workers,
             groups_in,
-            groups_orphan.load(Ordering::Relaxed)
+            perf_slots.files_orphan.load(Ordering::Relaxed)
         );
         for idx in 0..num_workers {
             let wall_ms =
-                per_worker_wall_ns[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
-            let groups_n = per_worker_groups[idx].load(Ordering::Relaxed);
-            let bytes_n = per_worker_bytes[idx].load(Ordering::Relaxed);
-            let first = per_worker_first_entry_ns[idx].load(Ordering::Relaxed);
-            let last = per_worker_last_exit_ns[idx].load(Ordering::Relaxed);
+                perf_slots.wall_ns[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            let files_n = perf_slots.files[idx].load(Ordering::Relaxed);
+            let bytes_n = perf_slots.bytes[idx].load(Ordering::Relaxed);
+            let first = perf_slots.first_entry_ns[idx].load(Ordering::Relaxed);
+            let last = perf_slots.last_exit_ns[idx].load(Ordering::Relaxed);
             let first_ms = if first == u64::MAX {
                 -1.0
             } else {
@@ -475,10 +552,10 @@ fn run_with_counters_inner(
                 0.0
             };
             crate::log_info!(
-                "perf-rayon-hash-worker: worker_id={} wall_ms={:.3} groups={} bytes={} first_entry_ms={:.3} last_exit_ms={:.3} throughput_mb_s={:.2} active_pct={:.1}",
+                "perf-rayon-hash-worker: worker_id={} wall_ms={:.3} files={} bytes={} first_entry_ms={:.3} last_exit_ms={:.3} throughput_mb_s={:.2} active_pct={:.1}",
                 idx,
                 wall_ms,
-                groups_n,
+                files_n,
                 bytes_n,
                 first_ms,
                 last_ms,
@@ -697,6 +774,7 @@ fn run_group(
     on_file: Option<&FileProgress>,
     on_group: Option<&GroupComplete>,
     cancel: Option<&Arc<AtomicBool>>,
+    perf: Option<&RayonPerfSlots>,
 ) -> Result<Vec<DuplicateGroup>> {
     let size = group.size;
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -774,11 +852,21 @@ fn run_group(
     // Stream A — link-equivalent inodes. One tier-3 hash per inode for
     // the content_hash; emit directly. Tier-1/2 are unnecessary (the
     // inode equivalence already confirms identity within each group).
+    //
+    // Stream A runs SERIALLY on whichever io_pool worker drew the outer
+    // group (no nested par_iter -- one tier3 hash per rep). Per-rep
+    // attribution to that worker is correct: this is the file-task that
+    // worker actually executed.
     for (rep, aliases) in &link_equiv {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Ok(out);
         }
-        let hash_bytes = match tier3_hash_cancellable(rep, size, algo, cancel, cfg.cold_enforced) {
+        let perf_started = perf.map(|_| Instant::now());
+        let hash_result = tier3_hash_cancellable(rep, size, algo, cancel, cfg.cold_enforced);
+        if let (Some(p), Some(s)) = (perf, perf_started) {
+            p.record_file(rep.entry.size, s, Instant::now());
+        }
+        let hash_bytes = match hash_result {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -836,7 +924,7 @@ fn run_group(
     }
 
     if cfg.use_format_aware {
-        survivors = split_by_optional(&survivors, |f| {
+        survivors = split_by_optional(&survivors, perf, |f| {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return None;
             }
@@ -852,7 +940,7 @@ fn run_group(
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Ok(out);
     }
-    survivors = split_by(&survivors, |f| {
+    survivors = split_by(&survivors, perf, |f| {
         tiered(f, Tier::One, algo, cache, counters, on_file, || {
             tier1_hash(f, size, algo, cfg.tier1_bytes, cfg.cold_enforced)
         })
@@ -874,7 +962,7 @@ fn run_group(
         counters
             .tier2_input_files
             .fetch_add(tier2_input, Ordering::Relaxed);
-        survivors = split_by(&survivors, |f| {
+        survivors = split_by(&survivors, perf, |f| {
             tiered(f, Tier::Two, algo, cache, counters, on_file, || {
                 tier2_hash(f, size, algo, cfg.cold_enforced)
             })
@@ -890,7 +978,7 @@ fn run_group(
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Ok(out);
     }
-    let groups = into_subgroups(&survivors, |f| {
+    let groups = into_subgroups(&survivors, perf, |f| {
         tiered(f, Tier::Three, algo, cache, counters, on_file, || {
             tier3_hash_cancellable(f, size, algo, cancel, cfg.cold_enforced)
         })
@@ -940,12 +1028,29 @@ fn run_group(
 /// (they fall through to subsequent tiers). Files that produce a
 /// fingerprint must collide with at least one other fingerprinted
 /// file to survive.
-fn split_by_optional<F>(flat: &[LaidOutFile], hasher: F) -> Result<Vec<LaidOutFile>>
+fn split_by_optional<F>(
+    flat: &[LaidOutFile],
+    perf: Option<&RayonPerfSlots>,
+    hasher: F,
+) -> Result<Vec<LaidOutFile>>
 where
     F: Fn(&LaidOutFile) -> Option<Vec<u8>> + Send + Sync,
 {
-    let pairs: Vec<(LaidOutFile, Option<Vec<u8>>)> =
-        flat.par_iter().map(|f| (f.clone(), hasher(f))).collect();
+    let pairs: Vec<(LaidOutFile, Option<Vec<u8>>)> = flat
+        .par_iter()
+        .map(|f| {
+            // Per-file rayon attribution (PR #170 codex P2). The Instant
+            // capture is the hot path inside the nested par_iter that
+            // actually fans across io_pool workers; see RayonPerfSlots
+            // doc-comment.
+            let started = perf.map(|_| Instant::now());
+            let fp = hasher(f);
+            if let (Some(p), Some(s)) = (perf, started) {
+                p.record_file(f.entry.size, s, Instant::now());
+            }
+            (f.clone(), fp)
+        })
+        .collect();
 
     let mut without_fp: Vec<LaidOutFile> = Vec::new();
     let mut by_hash: HashMap<Vec<u8>, Vec<LaidOutFile>> = HashMap::new();
@@ -964,17 +1069,30 @@ where
     Ok(keep)
 }
 
-fn split_by<F>(flat: &[LaidOutFile], hasher: F) -> Result<Vec<LaidOutFile>>
+fn split_by<F>(
+    flat: &[LaidOutFile],
+    perf: Option<&RayonPerfSlots>,
+    hasher: F,
+) -> Result<Vec<LaidOutFile>>
 where
     F: Fn(&LaidOutFile) -> std::io::Result<Vec<u8>> + Send + Sync,
 {
     let pairs: Vec<(LaidOutFile, Vec<u8>)> = flat
         .par_iter()
-        .filter_map(|f| match hasher(f) {
-            Ok(h) => Some((f.clone(), h)),
-            Err(e) => {
-                tracing::warn!(path = %f.entry.path.display(), error = %e, "hash failed; dropping file");
-                None
+        .filter_map(|f| {
+            // Per-file rayon attribution (PR #170 codex P2). See
+            // RayonPerfSlots doc-comment for the wall-booking surface.
+            let started = perf.map(|_| Instant::now());
+            let res = hasher(f);
+            if let (Some(p), Some(s)) = (perf, started) {
+                p.record_file(f.entry.size, s, Instant::now());
+            }
+            match res {
+                Ok(h) => Some((f.clone(), h)),
+                Err(e) => {
+                    tracing::warn!(path = %f.entry.path.display(), error = %e, "hash failed; dropping file");
+                    None
+                }
             }
         })
         .collect();
@@ -996,17 +1114,30 @@ where
 /// Hash each file and return the buckets keyed by hash. Caller decides
 /// what to do with bucket sizes (Tier 3 keeps everything ≥2; earlier
 /// tiers just want the union of ≥2 buckets).
-fn into_subgroups<F>(flat: &[LaidOutFile], hasher: F) -> Result<HashMap<Vec<u8>, Vec<LaidOutFile>>>
+fn into_subgroups<F>(
+    flat: &[LaidOutFile],
+    perf: Option<&RayonPerfSlots>,
+    hasher: F,
+) -> Result<HashMap<Vec<u8>, Vec<LaidOutFile>>>
 where
     F: Fn(&LaidOutFile) -> std::io::Result<Vec<u8>> + Send + Sync,
 {
     let pairs: Vec<(LaidOutFile, Vec<u8>)> = flat
         .par_iter()
-        .filter_map(|f| match hasher(f) {
-            Ok(h) => Some((f.clone(), h)),
-            Err(e) => {
-                tracing::warn!(path = %f.entry.path.display(), error = %e, "hash failed; dropping file");
-                None
+        .filter_map(|f| {
+            // Per-file rayon attribution (PR #170 codex P2). See
+            // RayonPerfSlots doc-comment for the wall-booking surface.
+            let started = perf.map(|_| Instant::now());
+            let res = hasher(f);
+            if let (Some(p), Some(s)) = (perf, started) {
+                p.record_file(f.entry.size, s, Instant::now());
+            }
+            match res {
+                Ok(h) => Some((f.clone(), h)),
+                Err(e) => {
+                    tracing::warn!(path = %f.entry.path.display(), error = %e, "hash failed; dropping file");
+                    None
+                }
             }
         })
         .collect();
