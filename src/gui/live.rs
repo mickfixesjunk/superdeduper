@@ -1332,6 +1332,38 @@ fn run(
         .as_ref()
         .map(|p| checkpoint::SaveWorker::spawn(p.clone()));
 
+    // v0.3.41 Phase 7 (Mick directive 2026-06-07 00:25 PDT post-Phase-5
+    // burst-skew finding): rate-limit the per-chunk SaveWorker::enqueue
+    // so we only pay the checkpoint_state.clone() cost at most once per
+    // CHECKPOINT_ENQUEUE_MIN_INTERVAL. Phase 5 matrix verdict (design
+    // 00:25 PDT) showed:
+    //
+    // * chunk_emit_ms_total 22.4s -> 7.8s (Phase 4 bg-thread fix worked
+    //   at -65%; checkpoint::save genuinely off the chunk loop).
+    // * BUT per-chunk burst skew 1.827 -- some chunks paid ~150ms in
+    //   the checkpoint_save_us bucket vs ~85ms uniform-average. The
+    //   surviving cost was NOT the disk write (gone) but the
+    //   per-chunk Checkpoint clone() needed to hand a snapshot to the
+    //   bg thread. Clone scales with the monotonic growth of
+    //   completed_hashes + previous_duplicates (every confirmed dup
+    //   group records itself), so later chunks have bigger clones.
+    // * Sum total 7.3s of remaining checkpoint_save = 99.91% of
+    //   chunk_emit residual. §2.1 ratio 1.142x EDGE (target <=1.10x).
+    //
+    // Time-based rate-limit (~1000ms) caps the clone cadence at roughly
+    // every 3-5 chunks for Mick-corpus' ~280ms per-chunk wall. Recovery
+    // window: at most ~1s of progress lost on unclean exit between
+    // enqueues. Acceptable per design 00:25 PDT trade-off
+    // (vs ~30s on the pre-fix per-chunk save cadence).
+    //
+    // Implementation note: time-based (not chunk-count-based) per
+    // testdesign's lean -- robust to non-uniform per-chunk walls (e.g.
+    // a slow-disk chunk that takes 2s pulls more recovery window than
+    // a fast chunk; time-based keeps the worst-case bounded by the
+    // interval, not the chunk count).
+    const CHECKPOINT_ENQUEUE_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+    let mut last_checkpoint_enqueue_at: Option<Instant> = None;
+
     for (i, chunk) in chunks.into_iter().enumerate() {
         let chunk_t_start = std::time::Instant::now();
         // v0.3.41 chunk_emit decomp: per-chunk u64 accumulators (us).
@@ -1844,19 +1876,28 @@ fn run(
         // relative to the 255ms JSON-encode + tempfile write that
         // checkpoint::save used to do inline.
         //
+        // v0.3.41 Phase 7: time-based rate-limit on enqueue. Skips the
+        // clone() entirely when we've enqueued within the last
+        // CHECKPOINT_ENQUEUE_MIN_INTERVAL window. See the top-of-loop
+        // doc-comment for the burst-skew rationale.
+        //
         // v0.3.41 chunk_emit decomp: bucket #1 checkpoint_save_us now
-        // measures the enqueue path (clone + mutex briefly + notify),
-        // not the JSON encode + disk write. Spec §3.1 / §2.1
-        // dominant-bucket hypothesis = pre-#162 era assumed
-        // cheap-relative-to-hashing; bg-thread offload restores that
-        // invariant by moving the disk-bound work off the chunk loop.
+        // measures the rate-limit check + (if not skipped) the enqueue
+        // path (clone + mutex briefly + notify). Skipped chunks book a
+        // single Instant::elapsed() compare = nanoseconds.
         let save_started = if perf_chunk_emit {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        if let Some(s) = saver.as_ref() {
-            s.enqueue(checkpoint_state.clone());
+        let should_enqueue = last_checkpoint_enqueue_at
+            .map(|t| t.elapsed() >= CHECKPOINT_ENQUEUE_MIN_INTERVAL)
+            .unwrap_or(true);
+        if should_enqueue {
+            if let Some(s) = saver.as_ref() {
+                s.enqueue(checkpoint_state.clone());
+                last_checkpoint_enqueue_at = Some(Instant::now());
+            }
         }
         if let Some(s) = save_started {
             checkpoint_save_us = s.elapsed().as_micros() as u64;
