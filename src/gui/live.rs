@@ -1314,6 +1314,24 @@ fn run(
     // Instant::now() / elapsed calls are short-circuited via the gated
     // helper closures below.
     let perf_chunk_emit = crate::gui::app::perf_instrument_chunk_emit_enabled();
+
+    // v0.3.41 Phase 4 fix: hand the periodic checkpoint::save off to a
+    // background worker. The 22:55 PDT matrix verdict showed
+    // checkpoint::save dominated chunk_emit at 99.974% (21.9s of
+    // 22.4s); moving it to a bg thread eliminates ~22s from the chunk
+    // loop's critical path on Mick-corpus.
+    //
+    // Single-slot replace semantics (see SaveWorker docs): chunk loop
+    // calls enqueue() with a fresh snapshot; bg thread saves the
+    // latest. Older still-pending snapshots are dropped (we only need
+    // crash-recovery from the most-recent state). The cancellation /
+    // Interrupted paths SHUTDOWN the worker before doing the sync
+    // cumulative-aware save -- that preserves the durability semantic
+    // (pause-time saves are still sync + carry cumulative_*).
+    let mut saver: Option<checkpoint::SaveWorker> = checkpoint_path
+        .as_ref()
+        .map(|p| checkpoint::SaveWorker::spawn(p.clone()));
+
     for (i, chunk) in chunks.into_iter().enumerate() {
         let chunk_t_start = std::time::Instant::now();
         // v0.3.41 chunk_emit decomp: per-chunk u64 accumulators (us).
@@ -1327,6 +1345,14 @@ fn run(
         let mut cache_stats_us: u64 = 0;
         let mut group_count: u64 = 0;
         if cancel.load(Ordering::Relaxed) {
+            // v0.3.41 Phase 4: shutdown bg saver BEFORE the sync save
+            // below so the bg-thread doesn't race the cumulative-aware
+            // sync save on the same path. Drops any stale pending
+            // snapshot; the upcoming sync save carries the latest
+            // (post-cumulative) state.
+            if let Some(mut s) = saver.take() {
+                s.shutdown();
+            }
             if let Some(p) = &checkpoint_path {
                 checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
                 // #108-extended — preserve files + wall_clock
@@ -1574,6 +1600,13 @@ fn run(
                 // outer `?` would propagate the cancel as a scan
                 // failure and the checkpoint would never write — the
                 // exact bug that breaks resume after a mid-hash cancel.
+                //
+                // v0.3.41 Phase 4: same shutdown-before-sync-save
+                // discipline as the top-of-loop cancel above so the bg
+                // thread doesn't race the cumulative-aware save.
+                if let Some(mut s) = saver.take() {
+                    s.shutdown();
+                }
                 if let Some(p) = &checkpoint_path {
                     checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
                     // #108-extended — preserve files + wall_clock
@@ -1622,6 +1655,14 @@ fn run(
                 drop(sum_tx_opt.take());
                 if let Some(handle) = runner_handle.take() {
                     let _ = handle.join();
+                }
+                // v0.3.41 Phase 4: shutdown bg saver on error exit too
+                // so the bg thread doesn't outlive run() (Drop would
+                // catch this too via SaveWorker::drop, but explicit
+                // shutdown here surfaces any panic visible to the
+                // caller).
+                if let Some(mut s) = saver.take() {
+                    s.shutdown();
                 }
                 return Err(e);
             }
@@ -1794,20 +1835,28 @@ fn run(
         }
 
         // Periodic checkpoint flush so an unexpected crash doesn't
-        // lose progress beyond the last chunk. JSON encode + atomic
-        // rename is cheap relative to the hashing work.
+        // lose progress beyond the last chunk.
         //
-        // v0.3.41 chunk_emit decomp: bucket #1 checkpoint_save_us (one
-        // call per chunk). Spec §3.1 / §2.1 dominant-bucket
-        // hypothesis = pre-#162 era assumed cheap-relative-to-hashing,
-        // broken now that hashing is healthy.
+        // v0.3.41 Phase 4: handoff to bg thread. enqueue() replaces
+        // the bg-thread's pending snapshot with the current state
+        // (single-slot semantics; older still-pending snapshots are
+        // dropped since they're superseded). Clone cost is small
+        // relative to the 255ms JSON-encode + tempfile write that
+        // checkpoint::save used to do inline.
+        //
+        // v0.3.41 chunk_emit decomp: bucket #1 checkpoint_save_us now
+        // measures the enqueue path (clone + mutex briefly + notify),
+        // not the JSON encode + disk write. Spec §3.1 / §2.1
+        // dominant-bucket hypothesis = pre-#162 era assumed
+        // cheap-relative-to-hashing; bg-thread offload restores that
+        // invariant by moving the disk-bound work off the chunk loop.
         let save_started = if perf_chunk_emit {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        if let Some(p) = &checkpoint_path {
-            let _ = checkpoint::save(p, &checkpoint_state);
+        if let Some(s) = saver.as_ref() {
+            s.enqueue(checkpoint_state.clone());
         }
         if let Some(s) = save_started {
             checkpoint_save_us = s.elapsed().as_micros() as u64;
@@ -1986,6 +2035,17 @@ fn run(
         if let Err(e) = handle.join() {
             crate::log_warn!("dup-runner panicked: {e:?}");
         }
+    }
+
+    // v0.3.41 Phase 4: drain + join the bg checkpoint-save worker.
+    // The worker may have a final pending snapshot from the last
+    // chunk's enqueue; shutdown() drains it before joining so the
+    // very-latest crash-recovery state lands on disk before
+    // checkpoint::delete() removes it on clean scan-finish below.
+    // (Save-then-delete is harmless; the delete supersedes the save
+    // for the clean-exit path.)
+    if let Some(mut s) = saver.take() {
+        s.shutdown();
     }
 
     // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):
