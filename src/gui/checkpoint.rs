@@ -310,6 +310,18 @@ impl SaveWorker {
         self.inner.notify.notify_one();
     }
 
+    /// Returns a cloneable handle that callbacks running on rayon
+    /// worker threads can use to enqueue checkpoint snapshots without
+    /// taking ownership of the SaveWorker itself (whose Drop semantics
+    /// are tied to scan-end shutdown). v0.3.42 Phase 11c (run_streaming
+    /// wiring): the on_group callback uses this to enqueue snapshots
+    /// from concurrent workers without blocking the shutdown path.
+    pub fn handle(&self) -> SaveWorkerHandle {
+        SaveWorkerHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Signal stop + join. Idempotent.
     pub fn shutdown(&mut self) {
         if let Some(h) = self.handle.take() {
@@ -325,6 +337,28 @@ impl SaveWorker {
 impl Drop for SaveWorker {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Cloneable enqueue-only handle. Built by [`SaveWorker::handle`];
+/// shares the underlying Arc<SaveWorkerInner> so multiple worker
+/// threads can enqueue concurrently. Drop is a no-op (shutdown stays
+/// tied to the original SaveWorker).
+#[derive(Clone)]
+pub struct SaveWorkerHandle {
+    inner: Arc<SaveWorkerInner>,
+}
+
+impl SaveWorkerHandle {
+    /// Same semantics as [`SaveWorker::enqueue`]: replace pending
+    /// snapshot + notify the bg thread. Safe to call from rayon
+    /// worker threads.
+    pub fn enqueue(&self, cp: Checkpoint) {
+        {
+            let mut guard = self.inner.pending.lock();
+            *guard = Some(cp);
+        }
+        self.inner.notify.notify_one();
     }
 }
 
