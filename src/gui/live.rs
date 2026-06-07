@@ -105,6 +105,13 @@ fn run(
     audio_similarity_threshold: f64,
 ) -> crate::Result<()> {
     let _scan_started_at = Instant::now();
+    // v0.3.42 Phase 11 (PERF_METRICS.md): per-scan lifecycle marker
+    // for the GUI side. Process baseline is whatever
+    // record_process_start captured at bin/superdeduper_gui.rs main
+    // entry; ttws_ms covers eframe/winit/egui init + user-click delay
+    // on first scan, 0 on subsequent scans (suppress per spec §9 lean
+    // a).
+    let mut perf_lifecycle = crate::perf_scan_lifecycle::PerfScanLifecycle::new("gui");
     // Wall-clock start, separate from the Instant above (Instant is
     // monotonic + opaque; we need a UNIX timestamp the scan_history
     // persistence layer can sort + display). One reading, threaded
@@ -584,6 +591,7 @@ fn run(
         let inv_tx = tx.clone();
         let mut files_seen: u64 = 0;
         let mut last_emit = Instant::now();
+        perf_lifecycle.walk_started();
         let inv_result = inventory::walk::enumerate_cancellable(&cfg, Some(&*cancel), |evt| {
             use crate::inventory::walk::WalkEvent;
             match evt {
@@ -652,6 +660,7 @@ fn run(
                 }
             }
         });
+        perf_lifecycle.walk_completed();
         files = match inv_result {
             Ok(v) => v,
             Err(e) => {
@@ -662,6 +671,14 @@ fn run(
                 return Err(e);
             }
         };
+    } else {
+        // Resume path: saved_inventory used instead of running the
+        // walker. Record both walk boundaries back-to-back so TTW=~0us
+        // + TTDD captures everything that happens after this point.
+        // Without this, perf_lifecycle.scan_completed() would skip the
+        // emit on resume runs (walk_start would still be None).
+        perf_lifecycle.walk_started();
+        perf_lifecycle.walk_completed();
     }
     // Volume-guid backfill: cache lookups require volume_guid. The
     // walker's Windows fast path (Block N) populates it via
@@ -2577,6 +2594,11 @@ fn run(
     #[cfg(not(feature = "similar-audio"))]
     let _ = audio_similarity_threshold;
 
+    // v0.3.42 Phase 11: emit the perf-scan-lifecycle line at the
+    // GUI's TTDD_END boundary. Spec §9 puts this immediately before
+    // ScanFinished so the log carries the lifecycle metric BEFORE
+    // the terminal scan-complete event lands.
+    perf_lifecycle.scan_completed();
     // Use inode-aware reclaim — this is what overwrites
     // state.totals.reclaimable_bytes at scan-end (per state.rs's
     // ScanFinished handler). The path-aware `reclaimable` is kept

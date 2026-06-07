@@ -13,6 +13,10 @@ use superdeduper::config::ScanConfig;
 use superdeduper::{dedupe, inventory, output, pipeline};
 
 fn main() -> anyhow::Result<()> {
+    // v0.3.42 Phase 11 (PERF_METRICS.md §4): capture process-start
+    // baseline FIRST, before any other work. TTWS is anchored on this
+    // Instant; later boundaries derive from it.
+    superdeduper::perf_scan_lifecycle::record_process_start();
     let cli = Cli::parse();
     init_logging(cli.verbose, cli.quiet);
 
@@ -1989,6 +1993,10 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
     }
 
     let scan_started = std::time::Instant::now();
+    // v0.3.42 Phase 11 (PERF_METRICS.md): per-scan lifecycle marker.
+    // walk_started/walk_completed/scan_completed bracket the three
+    // metrics around shared code paths.
+    let mut perf_lifecycle = superdeduper::perf_scan_lifecycle::PerfScanLifecycle::new("cli");
     // Wall-clock UNIX seconds for the scan_history record — same
     // pattern as `gui::live::run()` so CLI + GUI scans both persist
     // history rows with comparable timestamps.
@@ -2061,8 +2069,10 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
     };
 
     let t_inventory = std::time::Instant::now();
+    perf_lifecycle.walk_started();
     let (inventory, skipped) =
         inventory::enumerate_with_skipped(&cfg, cache.as_ref()).context("inventory failed")?;
+    perf_lifecycle.walk_completed();
     let inventory_ms = t_inventory.elapsed().as_millis();
     // Capture #38 v1 history totals before `inventory` is consumed
     // by `pipeline::grouping::group_by_size(inventory)` further down.
@@ -2559,6 +2569,13 @@ fn run_scan(args: ScanArgs, quiet: bool) -> anyhow::Result<()> {
             tracing::warn!(error = %e, "scan_history: record_completed failed (non-fatal)");
         }
     }
+
+    // v0.3.42 Phase 11: emit the perf-scan-lifecycle line at scan
+    // success-path completion. Consumed by `scan_completed`; partial /
+    // early-return / diagnostic-mode paths (--placeholders-only,
+    // --force-hash) deliberately suppress the emit since TTDD would
+    // be invalid for those flows.
+    perf_lifecycle.scan_completed();
 
     Ok(())
 }
