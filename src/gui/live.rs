@@ -199,7 +199,15 @@ fn run(
         .collect();
     let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
     let checkpoint_path = checkpoint::default_checkpoint_path().ok();
-    let mut checkpoint_state = Checkpoint::new(roots.clone(), settings.clone());
+    // v0.3.42 Phase 11c (C+ option): checkpoint_state is now shared
+    // via Arc<Mutex<>> so the SaveWorker bg-thread can auto-flush
+    // snapshots on its 1000ms timer. The chunk loop's serial fold
+    // calls record() under the lock (per-group; ~30K lock/unlock
+    // pairs on Mick-corpus = ~3-5ms total wall; negligible vs the
+    // hash work). The bg-thread snapshots under the lock + saves
+    // outside it. See SaveWorker::attach_live_state below.
+    let checkpoint_state: Arc<Mutex<Checkpoint>> =
+        Arc::new(Mutex::new(Checkpoint::new(roots.clone(), settings.clone())));
 
     // #64 Phase 1 — diagnostic instrumentation around the resume
     // load path. Every fail mode previously fell through silently
@@ -359,9 +367,12 @@ fn run(
         .as_ref()
         .map(|p| p.cumulative_wall_clock_seconds)
         .unwrap_or(0);
-    checkpoint_state.cumulative_bytes_scanned = prior_cumulative_bytes_scanned;
-    checkpoint_state.cumulative_files_scanned = prior_cumulative_files_scanned;
-    checkpoint_state.cumulative_wall_clock_seconds = prior_cumulative_wall_clock_seconds;
+    {
+        let mut cs = checkpoint_state.lock();
+        cs.cumulative_bytes_scanned = prior_cumulative_bytes_scanned;
+        cs.cumulative_files_scanned = prior_cumulative_files_scanned;
+        cs.cumulative_wall_clock_seconds = prior_cumulative_wall_clock_seconds;
+    }
 
     // Inventory state carried over from a prior pause: lets us skip
     // Stage 1 entirely and jump straight to size-grouping. Empty
@@ -386,7 +397,7 @@ fn run(
             ),
         });
         for g in &prior.previous_duplicates {
-            checkpoint_state.record(g);
+            checkpoint_state.lock().record(g);
             for p in &g.files {
                 restored_dup_paths.insert(p.clone());
             }
@@ -431,7 +442,7 @@ fn run(
             resumed_inventory = Some(mapped);
             // Also propagate into the new checkpoint we're about to
             // build so a subsequent pause doesn't lose the list.
-            checkpoint_state.saved_inventory = Some(saved_files_from_runtime(
+            checkpoint_state.lock().saved_inventory = Some(saved_files_from_runtime(
                 resumed_inventory.as_deref().unwrap_or(&[]),
             ));
         }
@@ -539,7 +550,8 @@ fn run(
     // prior.saved_inventory above. Re-saving here is idempotent
     // — overwrites the same content, doesn't lose anything.
     if let Some(p) = &checkpoint_path {
-        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+        let snapshot = checkpoint_state.lock().clone();
+        if let Err(e) = checkpoint::save(p, &snapshot) {
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Warn,
                 message: format!(
@@ -740,7 +752,7 @@ fn run(
     // doesn't have to re-walk on the next resume. Cheap: just clones
     // path + size + mtime; serialisation happens inside the next
     // checkpoint::save call below in the hashing loop.
-    checkpoint_state.saved_inventory = Some(saved_files_from_runtime(&files));
+    checkpoint_state.lock().saved_inventory = Some(saved_files_from_runtime(&files));
     // G1: compute corpus_signature_hash from the inventory's file
     // sizes — path/content-free per leaderboard-spec §6. Two users
     // scanning the same canonical corpus produce the same hash;
@@ -761,7 +773,8 @@ fn run(
                          // here narrows the loss window to "during the walk itself" —
                          // everything after Stage 1 completes survives a process kill.
     if let Some(p) = &checkpoint_path {
-        if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+        let snapshot = checkpoint_state.lock().clone();
+        if let Err(e) = checkpoint::save(p, &snapshot) {
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Warn,
                 message: format!("post-walk checkpoint save failed: {e}"),
@@ -1080,9 +1093,27 @@ fn run(
     // chunk_size 50/100/250/500/1000 in a single matrix to find the
     // optimal point + map the per-chunk-overhead curve. Default
     // unchanged (50) so unset behavior is identical.
+    // v0.3.42 Phase 11c (C+ per design 2026-06-07 11:00 PDT): collapse
+    // the chunk loop to a single iteration so the whole corpus runs in
+    // ONE rayon par_iter (CLI parity). The chunk_groups
+    // (min=1, max=usize::MAX) call produces 1 chunk containing every
+    // group. Phase 8 matrix verdict identified the per-chunk dispatch
+    // overhead as the source of the +2108ms GUI-CLI TTDD delta; the
+    // single-iteration loop eliminates that overhead while preserving
+    // the existing chunk-loop infrastructure (cancellation paths +
+    // resume filters + UI batching). SUPERDEDUPER_CHUNK_SIZE env var
+    // remains read for backward compatibility but no longer affects
+    // chunking (single chunk by construction).
+    //
+    // Resume safety is preserved via SaveWorker auto-flush timer
+    // (1000ms cadence; see saver.attach_live_state below). The chunk
+    // loop's enqueue cadence is no longer load-bearing for
+    // crash-recovery durability.
     let chunk_max = chunk_size_max();
-    crate::log_info!("GUI scan: chunk_groups max_chunk_size={chunk_max} (default=500; SUPERDEDUPER_CHUNK_SIZE override)");
-    let chunks = chunk_groups(laid, 32, chunk_max);
+    crate::log_info!(
+        "GUI scan: single-chunk pivot active (v0.3.42 Phase 11c); SUPERDEDUPER_CHUNK_SIZE={chunk_max} observed but no longer chunks"
+    );
+    let chunks = chunk_groups(laid, 1, usize::MAX);
     let total_chunks = chunks.len();
 
     // #195 perf — build the stage-4 io thread pool ONCE here and
@@ -1237,7 +1268,7 @@ fn run(
     }
 
     let already_reported: hashbrown::HashSet<String> =
-        checkpoint_state.completed_hashes.iter().cloned().collect();
+        checkpoint_state.lock().completed_hashes.iter().cloned().collect();
 
     // A-perf-pc-decouple (v0.3.40, reduced-scope per design 08:35 PDT
     // ratify): spawn a single runner thread that aggregates dup-group
@@ -1348,6 +1379,16 @@ fn run(
     let mut saver: Option<checkpoint::SaveWorker> = checkpoint_path
         .as_ref()
         .map(|p| checkpoint::SaveWorker::spawn(p.clone()));
+    // v0.3.42 Phase 11c (C+): attach the shared live checkpoint state
+    // so the bg thread can auto-flush snapshots on its 1000ms timer
+    // independently of caller enqueue cadence. This preserves the
+    // ~1s crash-recovery window despite the single-chunk pivot
+    // collapsing the chunk loop's per-iteration enqueue to ONE fire
+    // at end-of-(single)-chunk. Without this attach, a mid-scan crash
+    // would lose every record() made between chunk-start and crash.
+    if let Some(s) = saver.as_ref() {
+        s.attach_live_state(Arc::clone(&checkpoint_state));
+    }
 
     // v0.3.41 Phase 7 (Mick directive 2026-06-07 00:25 PDT post-Phase-5
     // burst-skew finding): rate-limit the per-chunk SaveWorker::enqueue
@@ -1403,16 +1444,20 @@ fn run(
                 s.shutdown();
             }
             if let Some(p) = &checkpoint_path {
-                checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
-                // #108-extended — preserve files + wall_clock
-                // cumulatively across resume chains too, so the
-                // backend's throughput + IOPS sanity checks
-                // (which divide by wall_clock) don't trip when
-                // bytes is cumulative but the others are per-spawn.
-                checkpoint_state.cumulative_files_scanned = total_files;
-                checkpoint_state.cumulative_wall_clock_seconds =
-                    _scan_started_at.elapsed().as_secs() + prior_cumulative_wall_clock_seconds;
-                if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                let snapshot = {
+                    let mut cs = checkpoint_state.lock();
+                    cs.cumulative_bytes_scanned = total_bytes_read;
+                    // #108-extended — preserve files + wall_clock
+                    // cumulatively across resume chains too, so the
+                    // backend's throughput + IOPS sanity checks
+                    // (which divide by wall_clock) don't trip when
+                    // bytes is cumulative but the others are per-spawn.
+                    cs.cumulative_files_scanned = total_files;
+                    cs.cumulative_wall_clock_seconds =
+                        _scan_started_at.elapsed().as_secs() + prior_cumulative_wall_clock_seconds;
+                    cs.clone()
+                };
+                if let Err(e) = checkpoint::save(p, &snapshot) {
                     let _ = tx.send(EngineEvent::Log {
                         level: LogLevel::Warn,
                         message: format!("checkpoint save failed: {e}"),
@@ -1657,16 +1702,20 @@ fn run(
                     s.shutdown();
                 }
                 if let Some(p) = &checkpoint_path {
-                    checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
-                    // #108-extended — preserve files + wall_clock
-                    // cumulatively across resume chains too, so the
-                    // backend's throughput + IOPS sanity checks
-                    // (which divide by wall_clock) don't trip when
-                    // bytes is cumulative but the others are per-spawn.
-                    checkpoint_state.cumulative_files_scanned = total_files;
-                    checkpoint_state.cumulative_wall_clock_seconds =
-                        _scan_started_at.elapsed().as_secs() + prior_cumulative_wall_clock_seconds;
-                    if let Err(e) = checkpoint::save(p, &checkpoint_state) {
+                    let snapshot = {
+                        let mut cs = checkpoint_state.lock();
+                        cs.cumulative_bytes_scanned = total_bytes_read;
+                        // #108-extended — preserve files + wall_clock
+                        // cumulatively across resume chains too, so the
+                        // backend's throughput + IOPS sanity checks
+                        // (which divide by wall_clock) don't trip when
+                        // bytes is cumulative but the others are per-spawn.
+                        cs.cumulative_files_scanned = total_files;
+                        cs.cumulative_wall_clock_seconds =
+                            _scan_started_at.elapsed().as_secs() + prior_cumulative_wall_clock_seconds;
+                        cs.clone()
+                    };
+                    if let Err(e) = checkpoint::save(p, &snapshot) {
                         let _ = tx.send(EngineEvent::Log {
                             level: LogLevel::Warn,
                             message: format!("checkpoint save failed: {e}"),
@@ -1852,7 +1901,7 @@ fn run(
             } else {
                 None
             };
-            checkpoint_state.record(&out.summary);
+            checkpoint_state.lock().record(&out.summary);
             if let Some(s) = rec_started {
                 checkpoint_record_us =
                     checkpoint_record_us.saturating_add(s.elapsed().as_micros() as u64);
@@ -1912,7 +1961,8 @@ fn run(
             .unwrap_or(true);
         if should_enqueue {
             if let Some(s) = saver.as_ref() {
-                s.enqueue(checkpoint_state.clone());
+                let snapshot = checkpoint_state.lock().clone();
+                s.enqueue(snapshot);
                 last_checkpoint_enqueue_at = Some(Instant::now());
             }
         }
