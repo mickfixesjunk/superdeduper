@@ -64,6 +64,12 @@ $env:SUPERDEDUPER_PERF_INSTRUMENT_RAYON  = '1'
 # the perf-chunk-emit emit; required for any binary that ships PR #172 or
 # later. Set unconditionally for forward-compat.
 $env:SUPERDEDUPER_PERF_INSTRUMENT_CHUNK_EMIT = '1'
+# PR #175 io_threads probe stabilization (Phase 9). The default_io_threads probe
+# was non-deterministic across runs; without pinning, CLI and GUI cells in the
+# same matrix can sample different worker counts (16 vs 4 observed on phase8).
+# Env pin forces both binaries to use 16 workers for apples-to-apples comparison.
+# Harmless on pre-PR-175 binaries (env var unread).
+$env:SUPERDEDUPER_FORCE_IO_THREADS = '16'
 
 # ---- Backup GUI state files BEFORE patching them (F2 fix) -------------
 # Runner is now self-sufficient: backs up real user state, patches for
