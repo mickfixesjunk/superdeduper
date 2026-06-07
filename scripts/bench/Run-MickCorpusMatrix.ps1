@@ -60,6 +60,10 @@ $env:SUPERDEDUPER_PERF_INSTRUMENT_UPDATE = '1'
 # the perf-rayon-hash / perf-rayon-hash-worker emit; required for any binary
 # that ships PR #170 or later. Set unconditionally for forward-compat.
 $env:SUPERDEDUPER_PERF_INSTRUMENT_RAYON  = '1'
+# PR #172 chunk_emit 6-bucket decomposition gate. Harmless on binaries without
+# the perf-chunk-emit emit; required for any binary that ships PR #172 or
+# later. Set unconditionally for forward-compat.
+$env:SUPERDEDUPER_PERF_INSTRUMENT_CHUNK_EMIT = '1'
 
 # ---- Backup GUI state files BEFORE patching them (F2 fix) -------------
 # Runner is now self-sufficient: backs up real user state, patches for
