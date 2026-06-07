@@ -1307,9 +1307,84 @@ fn run(
     let mut chunk_hash_ns_total: u128 = 0;
     let mut chunk_emit_ns_total: u128 = 0;
 
+    // v0.3.41 chunk_emit decomp (design 2026-06-06 spec §3.1 6 named
+    // buckets). Cached env-var read; perf_chunk_emit_enabled() is a
+    // OnceLock-cached single bool branch. When OFF, every per-bucket
+    // accumulator stays zero + the emit line is skipped + the
+    // Instant::now() / elapsed calls are short-circuited via the gated
+    // helper closures below.
+    let perf_chunk_emit = crate::gui::app::perf_instrument_chunk_emit_enabled();
+
+    // v0.3.41 Phase 4 fix: hand the periodic checkpoint::save off to a
+    // background worker. The 22:55 PDT matrix verdict showed
+    // checkpoint::save dominated chunk_emit at 99.974% (21.9s of
+    // 22.4s); moving it to a bg thread eliminates ~22s from the chunk
+    // loop's critical path on Mick-corpus.
+    //
+    // Single-slot replace semantics (see SaveWorker docs): chunk loop
+    // calls enqueue() with a fresh snapshot; bg thread saves the
+    // latest. Older still-pending snapshots are dropped (we only need
+    // crash-recovery from the most-recent state). The cancellation /
+    // Interrupted paths SHUTDOWN the worker before doing the sync
+    // cumulative-aware save -- that preserves the durability semantic
+    // (pause-time saves are still sync + carry cumulative_*).
+    let mut saver: Option<checkpoint::SaveWorker> = checkpoint_path
+        .as_ref()
+        .map(|p| checkpoint::SaveWorker::spawn(p.clone()));
+
+    // v0.3.41 Phase 7 (Mick directive 2026-06-07 00:25 PDT post-Phase-5
+    // burst-skew finding): rate-limit the per-chunk SaveWorker::enqueue
+    // so we only pay the checkpoint_state.clone() cost at most once per
+    // CHECKPOINT_ENQUEUE_MIN_INTERVAL. Phase 5 matrix verdict (design
+    // 00:25 PDT) showed:
+    //
+    // * chunk_emit_ms_total 22.4s -> 7.8s (Phase 4 bg-thread fix worked
+    //   at -65%; checkpoint::save genuinely off the chunk loop).
+    // * BUT per-chunk burst skew 1.827 -- some chunks paid ~150ms in
+    //   the checkpoint_save_us bucket vs ~85ms uniform-average. The
+    //   surviving cost was NOT the disk write (gone) but the
+    //   per-chunk Checkpoint clone() needed to hand a snapshot to the
+    //   bg thread. Clone scales with the monotonic growth of
+    //   completed_hashes + previous_duplicates (every confirmed dup
+    //   group records itself), so later chunks have bigger clones.
+    // * Sum total 7.3s of remaining checkpoint_save = 99.91% of
+    //   chunk_emit residual. §2.1 ratio 1.142x EDGE (target <=1.10x).
+    //
+    // Time-based rate-limit (~1000ms) caps the clone cadence at roughly
+    // every 3-5 chunks for Mick-corpus' ~280ms per-chunk wall. Recovery
+    // window: at most ~1s of progress lost on unclean exit between
+    // enqueues. Acceptable per design 00:25 PDT trade-off
+    // (vs ~30s on the pre-fix per-chunk save cadence).
+    //
+    // Implementation note: time-based (not chunk-count-based) per
+    // testdesign's lean -- robust to non-uniform per-chunk walls (e.g.
+    // a slow-disk chunk that takes 2s pulls more recovery window than
+    // a fast chunk; time-based keeps the worst-case bounded by the
+    // interval, not the chunk count).
+    const CHECKPOINT_ENQUEUE_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+    let mut last_checkpoint_enqueue_at: Option<Instant> = None;
+
     for (i, chunk) in chunks.into_iter().enumerate() {
         let chunk_t_start = std::time::Instant::now();
+        // v0.3.41 chunk_emit decomp: per-chunk u64 accumulators (us).
+        // Reset every chunk; emit one line per chunk when
+        // perf_chunk_emit is ON (spec §3.1).
+        let mut checkpoint_save_us: u64 = 0;
+        let mut checkpoint_record_us: u64 = 0;
+        let mut tx_send_dup_us: u64 = 0;
+        let mut tx_try_send_us: u64 = 0;
+        let mut tx_send_log_us: u64 = 0;
+        let mut cache_stats_us: u64 = 0;
+        let mut group_count: u64 = 0;
         if cancel.load(Ordering::Relaxed) {
+            // v0.3.41 Phase 4: shutdown bg saver BEFORE the sync save
+            // below so the bg-thread doesn't race the cumulative-aware
+            // sync save on the same path. Drops any stale pending
+            // snapshot; the upcoming sync save carries the latest
+            // (post-cumulative) state.
+            if let Some(mut s) = saver.take() {
+                s.shutdown();
+            }
             if let Some(p) = &checkpoint_path {
                 checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
                 // #108-extended — preserve files + wall_clock
@@ -1557,6 +1632,13 @@ fn run(
                 // outer `?` would propagate the cancel as a scan
                 // failure and the checkpoint would never write — the
                 // exact bug that breaks resume after a mid-hash cancel.
+                //
+                // v0.3.41 Phase 4: same shutdown-before-sync-save
+                // discipline as the top-of-loop cancel above so the bg
+                // thread doesn't race the cumulative-aware save.
+                if let Some(mut s) = saver.take() {
+                    s.shutdown();
+                }
                 if let Some(p) = &checkpoint_path {
                     checkpoint_state.cumulative_bytes_scanned = total_bytes_read;
                     // #108-extended — preserve files + wall_clock
@@ -1605,6 +1687,14 @@ fn run(
                 drop(sum_tx_opt.take());
                 if let Some(handle) = runner_handle.take() {
                     let _ = handle.join();
+                }
+                // v0.3.41 Phase 4: shutdown bg saver on error exit too
+                // so the bg thread doesn't outlive run() (Drop would
+                // catch this too via SaveWorker::drop, but explicit
+                // shutdown here surfaces any panic visible to the
+                // caller).
+                if let Some(mut s) = saver.take() {
+                    s.shutdown();
                 }
                 return Err(e);
             }
@@ -1738,24 +1828,93 @@ fn run(
             diag_counters
                 .reclaimable_bytes
                 .store(reclaimable, Ordering::Relaxed);
+            // v0.3.41 chunk_emit decomp: bucket #2 checkpoint_record_us
+            // (sum across this chunk's groups). Spec §3.1.
+            let rec_started = if perf_chunk_emit {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             checkpoint_state.record(&out.summary);
+            if let Some(s) = rec_started {
+                checkpoint_record_us =
+                    checkpoint_record_us.saturating_add(s.elapsed().as_micros() as u64);
+            }
             // A-perf-pc-decouple (v0.3.40): runner thread batches +
             // emits DuplicatesFoundBatch instead of per-group blocking
             // send. Send to sum_tx is cheap (unbounded channel push;
             // no GUI lock + no UI re-render until batched flush).
+            //
+            // v0.3.41 chunk_emit decomp: bucket #3 tx_send_dup_us. The
+            // PR #170 spec hypothesis §2.3 was the blocking
+            // tx.send(DuplicateFound) per group; v0.3.40 already moved
+            // to the batched sum_tx_opt unbounded channel, but the
+            // bucket name + measurement window are preserved for
+            // continuity with the spec interpretation tree §4.2.
+            let send_started = if perf_chunk_emit {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             if let Some(sender) = sum_tx_opt.as_ref() {
                 let _ = sender.send(out.summary);
             }
+            if let Some(s) = send_started {
+                tx_send_dup_us =
+                    tx_send_dup_us.saturating_add(s.elapsed().as_micros() as u64);
+            }
+            group_count = group_count.saturating_add(1);
         }
 
         // Periodic checkpoint flush so an unexpected crash doesn't
-        // lose progress beyond the last chunk. JSON encode + atomic
-        // rename is cheap relative to the hashing work.
-        if let Some(p) = &checkpoint_path {
-            let _ = checkpoint::save(p, &checkpoint_state);
+        // lose progress beyond the last chunk.
+        //
+        // v0.3.41 Phase 4: handoff to bg thread. enqueue() replaces
+        // the bg-thread's pending snapshot with the current state
+        // (single-slot semantics; older still-pending snapshots are
+        // dropped since they're superseded). Clone cost is small
+        // relative to the 255ms JSON-encode + tempfile write that
+        // checkpoint::save used to do inline.
+        //
+        // v0.3.41 Phase 7: time-based rate-limit on enqueue. Skips the
+        // clone() entirely when we've enqueued within the last
+        // CHECKPOINT_ENQUEUE_MIN_INTERVAL window. See the top-of-loop
+        // doc-comment for the burst-skew rationale.
+        //
+        // v0.3.41 chunk_emit decomp: bucket #1 checkpoint_save_us now
+        // measures the rate-limit check + (if not skipped) the enqueue
+        // path (clone + mutex briefly + notify). Skipped chunks book a
+        // single Instant::elapsed() compare = nanoseconds.
+        let save_started = if perf_chunk_emit {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let should_enqueue = last_checkpoint_enqueue_at
+            .map(|t| t.elapsed() >= CHECKPOINT_ENQUEUE_MIN_INTERVAL)
+            .unwrap_or(true);
+        if should_enqueue {
+            if let Some(s) = saver.as_ref() {
+                s.enqueue(checkpoint_state.clone());
+                last_checkpoint_enqueue_at = Some(Instant::now());
+            }
+        }
+        if let Some(s) = save_started {
+            checkpoint_save_us = s.elapsed().as_micros() as u64;
         }
 
         tier3_done += 1;
+        // v0.3.41 chunk_emit decomp: bucket #4 tx_try_send_us. Per spec
+        // §3.1 + testdesign gap #1: timing window wraps the FULL
+        // Status-emission lifecycle including the preceding format!()
+        // build (so format-allocation cost is captured in the same
+        // bucket as the try_sends -- avoids invisible residual). Spec
+        // also calls for summing the StageTick try_sends here.
+        let try_send_started = if perf_chunk_emit {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // Cross-chunk ticks: try_send so we never queue behind the
         // per-file progress samples that share this channel.
         let _ = tx.try_send(EngineEvent::StageTick {
@@ -1790,11 +1949,27 @@ fn run(
             total_dups,
             cache_suffix
         )));
+        if let Some(s) = try_send_started {
+            tx_try_send_us = s.elapsed().as_micros() as u64;
+        }
         // #100 — periodic cache-stats emit during Stage 4 so a user
         // watching a resume run can see in real-time whether the
         // cache fast-forward is happening (vs waiting for scan-
         // finish). Fires every 10 chunks; cheap (atomic loads).
+        //
+        // v0.3.41 chunk_emit decomp: bucket #6 cache_stats_us (the
+        // compute: hit-rate + bar-position + format!) + bucket #5
+        // tx_send_log_us (the blocking tx.send for the Log event).
+        // Spec §3.1 + testdesign gap #2 (explicit named bucket;
+        // estimated ~9% of chunk_emit_ms on Mick-corpus; would surface
+        // as residual + trip the 5% sum-conservation threshold if not
+        // separately accounted).
         if (i + 1).is_multiple_of(10) {
+            let cache_started = if perf_chunk_emit {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let total_so_far = total_cache_hits.saturating_add(
                 tier_count_total[0]
                     .saturating_add(tier_count_total[1])
@@ -1821,15 +1996,32 @@ fn run(
             } else {
                 0.0
             };
+            // v0.3.41: do the format!() BEFORE timing the tx.send so
+            // cache_stats_us captures the formatting cost + the
+            // tx_send_log_us bucket captures just the channel send.
+            // (Bumping format!() into cache_stats_us is intentional --
+            // it's part of the cache-stats compute surface.)
+            let log_message = format!(
+                "cache so far: {total_cache_hits} hit(s), {total_cache_drift_misses} drift miss(es), {} fresh hash(es) — {hit_rate_so_far:.1}% hit rate (chunk {}/{}) · bar {bar_pct:.2}% ({adjusted_done_now}/{adjusted_total_now} files, restored_dup_skip={restored_skipped}, predicted_cache_hits={predicted_cache_hits})",
+                total_so_far.saturating_sub(total_cache_hits),
+                i + 1,
+                total_chunks,
+            );
+            if let Some(s) = cache_started {
+                cache_stats_us = s.elapsed().as_micros() as u64;
+            }
+            let log_started = if perf_chunk_emit {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let _ = tx.send(EngineEvent::Log {
                 level: LogLevel::Info,
-                message: format!(
-                    "cache so far: {total_cache_hits} hit(s), {total_cache_drift_misses} drift miss(es), {} fresh hash(es) — {hit_rate_so_far:.1}% hit rate (chunk {}/{}) · bar {bar_pct:.2}% ({adjusted_done_now}/{adjusted_total_now} files, restored_dup_skip={restored_skipped}, predicted_cache_hits={predicted_cache_hits})",
-                    total_so_far.saturating_sub(total_cache_hits),
-                    i + 1,
-                    total_chunks,
-                ),
+                message: log_message,
             });
+            if let Some(s) = log_started {
+                tx_send_log_us = s.elapsed().as_micros() as u64;
+            }
         }
 
         // A-perf-chunks-h_new: accumulate per-chunk phase durations.
@@ -1845,6 +2037,29 @@ fn run(
             .saturating_add(chunk_t_post_hash.duration_since(chunk_t_pre_hash).as_nanos());
         chunk_emit_ns_total = chunk_emit_ns_total
             .saturating_add(chunk_t_end.duration_since(chunk_t_post_hash).as_nanos());
+
+        // v0.3.41 chunk_emit decomp: per-chunk emit line, gated.
+        // Format per spec §3.1:
+        //   perf-chunk-emit: chunk_idx checkpoint_save_us checkpoint_record_us
+        //                    tx_send_dup_us tx_try_send_us tx_send_log_us
+        //                    cache_stats_us group_count
+        //
+        // sdd-testwin matrix harvest aggregates these via the generic
+        // (.*perf-.*:.*) regex; aggregation across chunks happens
+        // offline per spec §3.2 sum-conservation invariant.
+        if perf_chunk_emit {
+            crate::log_info!(
+                "perf-chunk-emit: chunk_idx={} checkpoint_save_us={} checkpoint_record_us={} tx_send_dup_us={} tx_try_send_us={} tx_send_log_us={} cache_stats_us={} group_count={}",
+                i,
+                checkpoint_save_us,
+                checkpoint_record_us,
+                tx_send_dup_us,
+                tx_try_send_us,
+                tx_send_log_us,
+                cache_stats_us,
+                group_count,
+            );
+        }
     }
 
     // A-perf-pc-decouple (v0.3.40): chunk loop done -- drop sum_tx so
@@ -1861,6 +2076,17 @@ fn run(
         if let Err(e) = handle.join() {
             crate::log_warn!("dup-runner panicked: {e:?}");
         }
+    }
+
+    // v0.3.41 Phase 4: drain + join the bg checkpoint-save worker.
+    // The worker may have a final pending snapshot from the last
+    // chunk's enqueue; shutdown() drains it before joining so the
+    // very-latest crash-recovery state lands on disk before
+    // checkpoint::delete() removes it on clean scan-finish below.
+    // (Save-then-delete is harmless; the delete supersedes the save
+    // for the clean-exit path.)
+    if let Some(mut s) = saver.take() {
+        s.shutdown();
     }
 
     // A-perf-chunks-h_new (testdesign ASK 4, 2026-06-06 00:11 PDT):

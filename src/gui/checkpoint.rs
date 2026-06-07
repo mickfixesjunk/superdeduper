@@ -18,7 +18,11 @@
 //! tier is fast because the cache already has every completed file.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::gui::events::DuplicateGroupSummary;
@@ -232,6 +236,124 @@ pub fn delete(path: &Path) -> Result<()> {
     }
 }
 
+/// v0.3.41 Phase 4 -- background-thread checkpoint saver. Moves the
+/// ~255ms-per-chunk checkpoint::save off the chunk-loop critical path
+/// (it was 99.974% of chunk_emit_ms_total per the testdesign 22:55 PDT
+/// matrix verdict; 21.9s of 22.4s).
+///
+/// Pattern: single replace-on-enqueue slot. The chunk loop calls
+/// [`SaveWorker::enqueue`] with a fresh `Checkpoint` snapshot; the bg
+/// thread waits on a Condvar, picks up the latest snapshot, drops the
+/// lock, and runs `checkpoint::save`. If the chunk loop enqueues again
+/// while the bg thread is mid-write, the new snapshot replaces any
+/// still-pending older one (single-slot semantics) -- we only care
+/// about the latest crash-recovery state, never about save-every-chunk
+/// durability.
+///
+/// Shutdown: `shutdown()` (or `Drop`) signals stop + notifies the
+/// Condvar + joins. The bg thread drains any post-stop pending snapshot
+/// before returning so the very-latest enqueue isn't lost.
+///
+/// Race notes:
+/// * The chunk loop NEVER blocks on disk I/O. The mutex is held for
+///   `take()` / `replace()` only (microseconds).
+/// * Cancellation paths in `live::run` shutdown the worker BEFORE the
+///   sync cumulative-aware save, so the bg thread doesn't race the
+///   sync save on the same path. Both use tempfile + atomic rename, so
+///   even if they did race the file would never be torn -- but
+///   serialising via shutdown is the right invariant.
+/// * Errors from `checkpoint::save` are SWALLOWED inside the bg thread
+///   (logging on failure would require plumbing a tx; checkpoint save
+///   failure on the periodic per-chunk save is non-fatal -- the
+///   cancellation-path sync save will surface it via the existing log
+///   if it still fails at pause time).
+pub struct SaveWorker {
+    inner: Arc<SaveWorkerInner>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct SaveWorkerInner {
+    path: PathBuf,
+    pending: Mutex<Option<Checkpoint>>,
+    notify: Condvar,
+    stop: AtomicBool,
+}
+
+impl SaveWorker {
+    /// Spawn the bg thread for the given checkpoint path. Returns
+    /// immediately; the bg thread waits on its first enqueue.
+    pub fn spawn(path: PathBuf) -> Self {
+        let inner = Arc::new(SaveWorkerInner {
+            path,
+            pending: Mutex::new(None),
+            notify: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let inner_for_thread = Arc::clone(&inner);
+        let handle = std::thread::Builder::new()
+            .name("sdd-checkpoint-saver".into())
+            .spawn(move || run_save_loop(inner_for_thread))
+            .expect("checkpoint saver thread spawn");
+        Self {
+            inner,
+            handle: Some(handle),
+        }
+    }
+
+    /// Replace the pending checkpoint snapshot with `cp`. Returns
+    /// immediately; does NOT block on disk I/O.
+    pub fn enqueue(&self, cp: Checkpoint) {
+        {
+            let mut guard = self.inner.pending.lock();
+            *guard = Some(cp);
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Signal stop + join. Idempotent.
+    pub fn shutdown(&mut self) {
+        if let Some(h) = self.handle.take() {
+            self.inner.stop.store(true, Ordering::Release);
+            self.inner.notify.notify_one();
+            // Join is best-effort; a bg-thread panic shouldn't break
+            // the caller (the sync-save path is the durability gate).
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for SaveWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_save_loop(inner: Arc<SaveWorkerInner>) {
+    loop {
+        let pending = {
+            let mut guard = inner.pending.lock();
+            while guard.is_none() && !inner.stop.load(Ordering::Acquire) {
+                inner.notify.wait(&mut guard);
+            }
+            guard.take()
+        };
+        if let Some(cp) = pending {
+            let _ = save(&inner.path, &cp);
+        }
+        if inner.stop.load(Ordering::Acquire) {
+            // Drain the LAST pending: an enqueue may have raced with
+            // the stop signal between our take() above and the notify
+            // arriving. Saving it here preserves the
+            // "latest-snapshot-survives" guarantee even at shutdown.
+            let last = inner.pending.lock().take();
+            if let Some(cp) = last {
+                let _ = save(&inner.path, &cp);
+            }
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +402,69 @@ mod tests {
         delete(&path).unwrap(); // already absent
         save(&path, &Checkpoint::new(vec![], ScanSettings::default())).unwrap();
         delete(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    fn cp_with_hash(hash: &str) -> Checkpoint {
+        let mut cp = Checkpoint::new(vec![], ScanSettings::default());
+        cp.record(&DuplicateGroupSummary {
+            size: 0,
+            content_hash: hash.into(),
+            files: vec![],
+            link_equivalent: false,
+            unique_inodes: 0,
+            similarity_kind: crate::pipeline::SimilarityKind::ByteIdentical,
+        });
+        cp
+    }
+
+    #[test]
+    fn save_worker_persists_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let worker = SaveWorker::spawn(path.clone());
+        worker.enqueue(cp_with_hash("aa"));
+        drop(worker); // shutdown via Drop drains the pending snapshot.
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.completed_hashes, vec!["aa".to_string()]);
+    }
+
+    #[test]
+    fn save_worker_last_enqueue_wins_after_shutdown() {
+        // The bg worker may be mid-save when shutdown lands; the drain
+        // step in run_save_loop guarantees the final enqueue still
+        // ends up on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let mut worker = SaveWorker::spawn(path.clone());
+        // Rapid-fire several enqueues; bg thread may collapse some.
+        for h in ["aa", "bb", "cc", "dd"] {
+            worker.enqueue(cp_with_hash(h));
+        }
+        worker.enqueue(cp_with_hash("final"));
+        worker.shutdown();
+        let loaded = load(&path).unwrap().unwrap();
+        // Exactly which intermediate snapshots got saved is racy
+        // (single-slot replace can drop earlier ones), but the FINAL
+        // enqueue must always survive due to the drain step.
+        assert_eq!(loaded.completed_hashes, vec!["final".to_string()]);
+    }
+
+    #[test]
+    fn save_worker_shutdown_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let mut worker = SaveWorker::spawn(path);
+        worker.shutdown();
+        worker.shutdown(); // no panic; handle already taken.
+    }
+
+    #[test]
+    fn save_worker_no_enqueue_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let worker = SaveWorker::spawn(path.clone());
+        drop(worker); // shutdown without any enqueue: nothing written.
         assert!(!path.exists());
     }
 }

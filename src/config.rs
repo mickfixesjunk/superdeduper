@@ -286,6 +286,55 @@ const IO_THREADS_WSL: usize = 1;
 /// "wrong" thread count only costs per-thread CPU efficiency, not
 /// wall.
 pub(crate) fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf>) -> usize {
+    // v0.3.41 Phase 9 (γ) -- probe-once-cache-per-process. Phase 8
+    // matrix verdict identified io_threads probe lottery (CLI 16 / GUI
+    // 4 workers; 4x disparity drove 3.44x hash wall) as the sprint-long
+    // CLI variance band root cause. Cache the first call's result so
+    // every subsequent invocation in this process returns the same N.
+    //
+    // For CLI: one process = one scan = probe runs once (current
+    // behavior preserved). Cache makes the second-call deterministic
+    // in case of multi-call refactors.
+    //
+    // For GUI: long-lived process can run many scans. Pre-Phase-9,
+    // each scan would re-probe (with noisy results); post-Phase-9 the
+    // first scan probes + every subsequent scan inherits the cached N.
+    // This is the load-bearing stabilization for cross-matrix
+    // comparability.
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| default_io_threads_uncached(cpu_threads, first_root))
+}
+
+/// Inner of [`default_io_threads`]; runs the env-override / probe /
+/// fallback decision tree without the OnceLock cache. Exposed so tests
+/// can exercise each decision branch without process-global cache
+/// state interference.
+pub(crate) fn default_io_threads_uncached(
+    cpu_threads: usize,
+    first_root: Option<&PathBuf>,
+) -> usize {
+    // v0.3.41 Phase 9 (δ) -- env override. Highest priority surface,
+    // ahead of both probe + per-disk-class table.
+    //
+    // Use cases:
+    // * sdd-testwin matrix testing: pin N=16 across CLI + GUI cells
+    //   so apples-to-apples comparison isn't poisoned by probe
+    //   lottery. Phase 8 discovery: CLI 16 / GUI 4 -> §2.1=2.467x
+    //   RED was a measurement artifact, not a real regression.
+    // * Mick / power-user override: scan a specific corpus with a
+    //   forced thread count for tuning experiments.
+    // * Regression testing: compare same-N walls across binaries
+    //   without the probe adding noise.
+    //
+    // Env name parallels existing SUPERDEDUPER_* env conventions
+    // (PERF_INSTRUMENT_*, IOTHREADS_PARKED). Parses as a positive
+    // decimal integer; non-positive / non-integer values log a
+    // warning + fall through to the standard probe path.
+    if let Some(n) = read_force_io_threads_env() {
+        return n;
+    }
+
     // PRIMARY mechanism (β): startup throughput probe on the first
     // scan root. Per Mick GO 2026-06-02 09:42 PDT, transparent to
     // disk_class misclassification (notably v0.3.5 SAT pass-through
@@ -328,6 +377,41 @@ pub(crate) fn default_io_threads(cpu_threads: usize, first_root: Option<&PathBuf
         None
     };
     compute_default_io_threads(cpu_threads, disk_class.as_deref())
+}
+
+/// Read + parse `SUPERDEDUPER_FORCE_IO_THREADS`. Returns `Some(n)` if
+/// the env var is set + parses as a positive decimal integer; `None`
+/// otherwise (unset, empty, non-numeric, or non-positive).
+///
+/// Non-positive / non-integer values log a warning so a typo doesn't
+/// silently get ignored.
+fn read_force_io_threads_env() -> Option<usize> {
+    let raw = std::env::var_os("SUPERDEDUPER_FORCE_IO_THREADS")?;
+    let s = raw.to_str()?.trim();
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                force_n = n,
+                "io-threads: SUPERDEDUPER_FORCE_IO_THREADS override engaged"
+            );
+            Some(n)
+        }
+        Ok(_) => {
+            tracing::warn!(
+                raw = %s,
+                "io-threads: SUPERDEDUPER_FORCE_IO_THREADS=0 is invalid; ignoring + falling through to probe"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                raw = %s,
+                error = %e,
+                "io-threads: SUPERDEDUPER_FORCE_IO_THREADS not a positive integer; ignoring + falling through to probe"
+            );
+            None
+        }
+    }
 }
 
 /// True when running under WSL. Reads `/proc/version` for the
@@ -598,6 +682,89 @@ mod tests {
             cfg.io_threads, 99,
             "--io-threads explicit always wins, even past the HDD cap"
         );
+    }
+
+    /// v0.3.41 Phase 9 (δ) -- env override SUPERDEDUPER_FORCE_IO_THREADS.
+    ///
+    /// Note: std::env::set_var is unsafe in the 2024 edition due to
+    /// the multi-threaded-test-runner race surface. These tests use
+    /// `cargo test --test-threads=1`-compatible serialisation via the
+    /// SERIAL_ENV mutex below so the env-var manipulation doesn't
+    /// race with other parallel tests reading the same name.
+    ///
+    /// We exercise `default_io_threads_uncached` (the inner) so the
+    /// OnceLock cache doesn't latch the FIRST test's result for every
+    /// subsequent test in the same process.
+    fn _serial_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL_ENV: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        SERIAL_ENV
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn force_io_threads_env_override_returns_forced_n() {
+        let _g = _serial_env_guard();
+        // SAFETY: serialised against parallel tests reading the same env via _serial_env_guard.
+        unsafe {
+            std::env::set_var("SUPERDEDUPER_FORCE_IO_THREADS", "16");
+        }
+        let n = default_io_threads_uncached(8, None);
+        unsafe {
+            std::env::remove_var("SUPERDEDUPER_FORCE_IO_THREADS");
+        }
+        assert_eq!(
+            n, 16,
+            "SUPERDEDUPER_FORCE_IO_THREADS=16 must win against probe + per-disk-class fallback"
+        );
+    }
+
+    #[test]
+    fn force_io_threads_env_zero_is_ignored() {
+        let _g = _serial_env_guard();
+        unsafe {
+            std::env::set_var("SUPERDEDUPER_FORCE_IO_THREADS", "0");
+        }
+        // Falls through to probe / fallback. No first_root -> fallback
+        // table path. Just verify it didn't return 0.
+        let n = default_io_threads_uncached(8, None);
+        unsafe {
+            std::env::remove_var("SUPERDEDUPER_FORCE_IO_THREADS");
+        }
+        assert!(
+            n > 0,
+            "SUPERDEDUPER_FORCE_IO_THREADS=0 must be rejected; fallback returns >0"
+        );
+    }
+
+    #[test]
+    fn force_io_threads_env_non_numeric_is_ignored() {
+        let _g = _serial_env_guard();
+        unsafe {
+            std::env::set_var("SUPERDEDUPER_FORCE_IO_THREADS", "abc");
+        }
+        let n = default_io_threads_uncached(8, None);
+        unsafe {
+            std::env::remove_var("SUPERDEDUPER_FORCE_IO_THREADS");
+        }
+        assert!(
+            n > 0,
+            "SUPERDEDUPER_FORCE_IO_THREADS=abc must be rejected; fallback returns >0"
+        );
+    }
+
+    #[test]
+    fn force_io_threads_env_unset_falls_through() {
+        let _g = _serial_env_guard();
+        unsafe {
+            std::env::remove_var("SUPERDEDUPER_FORCE_IO_THREADS");
+        }
+        // No env override; probe/fallback runs. With first_root=None
+        // we land in the (α) fallback path (probe skipped).
+        let n = default_io_threads_uncached(8, None);
+        assert!(n > 0, "Unset env var must fall through to probe/fallback");
     }
 
     #[test]
