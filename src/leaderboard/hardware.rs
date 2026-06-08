@@ -914,10 +914,11 @@ fn open_physical_drive_zero() -> std::io::Result<PhysicalDriveHandle> {
 
 #[cfg(target_os = "macos")]
 fn platform_detect_disk_class() -> Option<String> {
-    // macOS detection deferred — sysctl + IOKit work but isn't on
-    // the burn-queue scope. Returns None so detect_disk_class
-    // falls back to "mixed".
-    None
+    // No workdir hint → use the boot volume as a sensible default.
+    // Reuses the workdir-aware scaffolding (statfs → BSD device →
+    // diskutil -plist → SolidState + Protocol → schema label) the
+    // workdir path established in v0.2.59.
+    workdir_disk_class_platform(std::path::Path::new("/"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
@@ -947,7 +948,13 @@ fn default_filesystem() -> &'static str {
 
 /// #88 Phase 1 — Detect the filesystem hosting `path` and map it to
 /// the backend schema's enum: `"NTFS" | "ReFS" | "exFAT" | "FAT32" |
-/// "network-SMB" | "other"`.
+/// "network-SMB" | "APFS" | "HFS+" | "other"`.
+///
+/// `"APFS"` + `"HFS+"` are macOS-platform-completeness additions
+/// (2026-06-08): pre-fix macOS submissions emitted the
+/// `default_filesystem()` `"other"` placeholder; the web bucket
+/// layer collapsed every Mac into a single `fs_other` bracket. The
+/// engine now emits the literal — web owns the collapse policy.
 ///
 /// Path-prefix-based network detection runs first because it's
 /// cheap and doesn't require an FS syscall: UNC `\\server\share`,
@@ -962,8 +969,9 @@ fn default_filesystem() -> &'static str {
 ///   directly ("NTFS" / "ReFS" / "exFAT" / "FAT32" / etc.).
 /// - Linux: `statfs` exposes a 32-bit `f_type` magic; compare
 ///   against known values (NTFS via ntfs-3g / ntfs3, SMB, NFS, etc).
-/// - macOS + other Unix: deferred — returns `None` so default
-///   ("other") wins.
+/// - macOS: `statfs` exposes `f_fstypename` as a fixed-len C string
+///   like `"apfs"` / `"hfs"` / `"exfat"` / `"msdos"`; map via
+///   [`map_macos_fstype_to_schema`].
 fn detect_filesystem(path: &std::path::Path) -> Option<String> {
     // Network-share path-prefix check (works on every platform).
     if let Some(s) = path.to_str() {
@@ -989,7 +997,11 @@ fn detect_filesystem(path: &std::path::Path) -> Option<String> {
     {
         detect_filesystem_linux(path)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        detect_filesystem_macos(path)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         let _ = path;
         None
@@ -1109,6 +1121,58 @@ fn detect_filesystem_linux(path: &std::path::Path) -> Option<String> {
         _ => "other",
     };
     Some(mapped.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn detect_filesystem_macos(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid null-terminated C string;
+    // buf is a stack-allocated zeroed statfs.
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut buf as *mut libc::statfs) };
+    if rc != 0 {
+        return None;
+    }
+    // f_fstypename is `[c_char; 16]` — fixed-len C string. Take
+    // bytes until the null terminator and decode as UTF-8 (every
+    // filesystem name macOS reports is ASCII).
+    let bytes: Vec<u8> = buf
+        .f_fstypename
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    let raw = std::str::from_utf8(&bytes).ok()?;
+    Some(map_macos_fstype_to_schema(raw).to_string())
+}
+
+/// Pure-function helper so the mapping is testable without macOS
+/// execution. Input is the literal `f_fstypename` string from
+/// statfs (lowercase by convention on macOS); output is the
+/// backend schema enum value.
+///
+/// - `apfs`  → `APFS` (Apple silicon + modern Intel default)
+/// - `hfs`   → `HFS+` (pre-2017 Macs / legacy volumes)
+/// - `exfat` → `exFAT`
+/// - `msdos` → `FAT32` (macOS reports FAT12/16/32 collectively as msdos)
+/// - `ntfs`  → `NTFS` (read-only on macOS without third-party kext,
+///                     but volumes do mount — emit the literal so
+///                     leaderboard buckets are honest)
+/// - `smbfs` / `nfs` / `webdav` → `network-SMB` (one network bucket
+///                                                covers all three)
+/// - anything else → `other`
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn map_macos_fstype_to_schema(raw: &str) -> &'static str {
+    match raw {
+        "apfs" => "APFS",
+        "hfs" => "HFS+",
+        "exfat" => "exFAT",
+        "msdos" => "FAT32",
+        "ntfs" => "NTFS",
+        "smbfs" | "nfs" | "webdav" => "network-SMB",
+        _ => "other",
+    }
 }
 
 // ============================================================
@@ -1832,5 +1896,134 @@ mod tests {
     fn rotation_rate_boundary_0x0400_vs_0x0401() {
         assert_eq!(rotation_rate_to_disk_class_kind(0x0400), None);
         assert_eq!(rotation_rate_to_disk_class_kind(0x0401), Some("HDD"));
+    }
+
+    // ============================================================
+    // macOS hardware-detection bundle (2026-06-08, design routing)
+    // ============================================================
+
+    /// Pure mapping — runs on every CI target. Catches accidental
+    /// rename of a literal (e.g. apfs vs APFS) without needing macOS.
+    #[test]
+    fn map_macos_fstype_to_schema_known_values() {
+        assert_eq!(map_macos_fstype_to_schema("apfs"), "APFS");
+        assert_eq!(map_macos_fstype_to_schema("hfs"), "HFS+");
+        assert_eq!(map_macos_fstype_to_schema("exfat"), "exFAT");
+        assert_eq!(map_macos_fstype_to_schema("msdos"), "FAT32");
+        assert_eq!(map_macos_fstype_to_schema("ntfs"), "NTFS");
+        assert_eq!(map_macos_fstype_to_schema("smbfs"), "network-SMB");
+        assert_eq!(map_macos_fstype_to_schema("nfs"), "network-SMB");
+        assert_eq!(map_macos_fstype_to_schema("webdav"), "network-SMB");
+    }
+
+    #[test]
+    fn map_macos_fstype_to_schema_unknown_returns_other() {
+        // Future macOS fstypes (autofs, devfs, lifs, …) collapse to
+        // the schema's catch-all rather than crashing the bench
+        // submission with an enum-validation failure.
+        assert_eq!(map_macos_fstype_to_schema("autofs"), "other");
+        assert_eq!(map_macos_fstype_to_schema("devfs"), "other");
+        assert_eq!(map_macos_fstype_to_schema(""), "other");
+        assert_eq!(map_macos_fstype_to_schema("APFS"), "other"); // case-sensitive: statfs lowercases
+    }
+
+    /// Synthetic plist fixtures pinned to the exact shape
+    /// `diskutil info -plist <bsdname>` emits on macOS 13+. Until
+    /// task #92 (capture real fixtures from Mick's MacBook Air via
+    /// tailnet) lands, these synthetic shapes exercise the parser
+    /// against every documented Protocol + SolidState combination.
+    /// Real captures will replace these strings without changing
+    /// the assertions.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_apfs_internal_nvme() {
+        // Apple silicon MacBook Pro internal SSD — PCI / SolidState=true.
+        let plist = synthetic_plist("PCI-Express", true);
+        assert_eq!(classify_diskutil(&plist).as_deref(), Some("NVMe-Gen4"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_apple_fabric_silicon() {
+        // M1/M2 Mac internal: "Apple Fabric" protocol on Apple silicon
+        // is the documented value for the internal NVMe controller.
+        let plist = synthetic_plist("Apple Fabric", true);
+        assert_eq!(classify_diskutil(&plist).as_deref(), Some("NVMe-Gen4"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_intel_sata_ssd() {
+        // Intel MacBook Air with SATA SSD (e.g. Mick's i5-5250U).
+        let plist = synthetic_plist("SATA", true);
+        assert_eq!(classify_diskutil(&plist).as_deref(), Some("SATA-SSD"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_intel_sata_hdd() {
+        // Legacy Intel Mac with spinning disk.
+        let plist = synthetic_plist("SATA", false);
+        assert_eq!(classify_diskutil(&plist).as_deref(), Some("HDD"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_external_usb_ssd() {
+        let plist = synthetic_plist("USB", true);
+        assert_eq!(classify_diskutil(&plist).as_deref(), Some("USB-SSD"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_external_usb_hdd() {
+        let plist = synthetic_plist("USB", false);
+        assert_eq!(classify_diskutil(&plist).as_deref(), Some("USB-HDD"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_thunderbolt_treated_as_nvme() {
+        // Most TB enclosures are NVMe; existing convention assumes
+        // NVMe-class even when SolidState is missing.
+        let plist = synthetic_plist("Thunderbolt", true);
+        assert_eq!(classify_diskutil(&plist).as_deref(), Some("NVMe-Gen4"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_disk_image_returns_none() {
+        // Mounted .dmg / network volume — caller should fall back
+        // to the legacy "mixed" sentinel rather than mistagging.
+        let plist = synthetic_plist("Disk Image", true);
+        assert!(classify_diskutil(&plist).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_diskutil_missing_solid_state_defaults_false() {
+        // `SolidState` absent — parser must not panic; mapping
+        // falls through to the "false" branch (HDD for SATA).
+        let plist = r#"<dict><key>Protocol</key><string>SATA</string></dict>"#;
+        assert_eq!(classify_diskutil(plist).as_deref(), Some("HDD"));
+    }
+
+    /// Build the minimal plist fragment the regex-style parser
+    /// (`plist_string_value` + `plist_bool_value`) consumes. Mirrors
+    /// the documented `diskutil info -plist` envelope.
+    #[cfg(target_os = "macos")]
+    fn synthetic_plist(protocol: &str, solid_state: bool) -> String {
+        let ss_tag = if solid_state { "<true/>" } else { "<false/>" };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Protocol</key>
+  <string>{protocol}</string>
+  <key>SolidState</key>
+  {ss_tag}
+</dict>
+</plist>"#
+        )
     }
 }
