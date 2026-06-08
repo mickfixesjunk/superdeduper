@@ -667,8 +667,13 @@ fn macos_bsd_device_for(workdir: &std::path::Path) -> Option<String> {
 }
 
 /// Shell-out to `diskutil info -plist <bsdname>`. Returns the raw plist text;
-/// caller parses for the fields it cares about. Timeout-bound so a hung
-/// diskutil doesn't wedge engine startup.
+/// caller parses for the fields it cares about. NOT timeout-bound: a hung
+/// `diskutil` (failing USB controller, wedged kext) WILL wedge the calling
+/// thread until the child exits. Typical runtime <100ms; this risk has not
+/// been observed in practice but is real. Adding a real timeout requires
+/// process-group management (spawn + wait-with-timeout + kill on overshoot)
+/// or a thread-with-bounded-join wrapper — out of scope until telemetry
+/// shows a wedge event. Flagged on PR #180 quality verdict 2026-06-08.
 #[cfg(target_os = "macos")]
 fn macos_diskutil_info(bsd_name: &str) -> Option<String> {
     use std::process::{Command, Stdio};
