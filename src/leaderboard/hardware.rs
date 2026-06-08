@@ -948,13 +948,21 @@ fn default_filesystem() -> &'static str {
 
 /// #88 Phase 1 — Detect the filesystem hosting `path` and map it to
 /// the backend schema's enum: `"NTFS" | "ReFS" | "exFAT" | "FAT32" |
-/// "network-SMB" | "APFS" | "HFS+" | "other"`.
+/// "network-SMB" | "APFS" | "HFS+" | "ext4" | "btrfs" | "xfs" |
+/// "zfs" | "other"`.
 ///
 /// `"APFS"` + `"HFS+"` are macOS-platform-completeness additions
 /// (2026-06-08): pre-fix macOS submissions emitted the
 /// `default_filesystem()` `"other"` placeholder; the web bucket
 /// layer collapsed every Mac into a single `fs_other` bracket. The
 /// engine now emits the literal — web owns the collapse policy.
+///
+/// `"ext4"` / `"btrfs"` / `"xfs"` / `"zfs"` are Linux-platform-
+/// completeness additions (2026-06-08): pre-fix Linux submissions
+/// only recognised NTFS / FAT / SMB / NFS via their statfs magic
+/// numbers, so every honest ext4 / btrfs / xfs / zfs desktop or
+/// server collapsed to `"other"`. The engine now emits the literal;
+/// web bucket layer widening is the matching follow-up.
 ///
 /// Path-prefix-based network detection runs first because it's
 /// cheap and doesn't require an FS syscall: UNC `\\server\share`,
@@ -1093,18 +1101,6 @@ fn volume_root_from_path(path: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn detect_filesystem_linux(path: &std::path::Path) -> Option<String> {
     use std::os::unix::ffi::OsStrExt;
-    // statfs f_type magic numbers from linux/magic.h. NTFS goes
-    // through FUSE-ntfs3 / kernel-ntfs3; both report distinguishable
-    // magics. ReFS doesn't have a Linux driver in mainline; deferred.
-    // Coverage targets pathfinder's signal classes; rare local FS
-    // types fall back to "other" which is also a valid schema value.
-    const SMB_SUPER_MAGIC: i64 = 0x517B;
-    const SMB2_MAGIC_NUMBER: i64 = 0xFE534D42;
-    const NFS_SUPER_MAGIC: i64 = 0x6969;
-    const NTFS_SB_MAGIC: i64 = 0x5346544E; // "NTFS" little-endian
-    const NTFS3_SUPER_MAGIC: i64 = 0x7366746E;
-    const FAT_FS_MAGIC: i64 = 0x4006;
-    const MSDOS_SUPER_MAGIC: i64 = 0x4D44;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: c_path is a valid null-terminated C string;
@@ -1113,14 +1109,48 @@ fn detect_filesystem_linux(path: &std::path::Path) -> Option<String> {
     if rc != 0 {
         return None;
     }
-    let ty = buf.f_type as i64;
-    let mapped = match ty {
+    Some(map_linux_fs_magic_to_schema(buf.f_type as i64).to_string())
+}
+
+/// Pure-function helper so the f_type → schema mapping is testable
+/// cross-platform. Magic numbers from `linux/magic.h`. Coverage
+/// targets pathfinder's signal classes + the 2026-06-08
+/// platform-completeness widening:
+///
+/// - Network: `smbfs`, `smb2`, `nfs` → `"network-SMB"`
+/// - Windows-on-Linux: `ntfs` (via kernel-ntfs3 / ntfs-3g) →
+///   `"NTFS"`. ReFS has no mainline driver; deferred.
+/// - DOS/FAT: `vfat` + `msdos` → `"FAT32"` (no schema bucket
+///   distinguishes FAT12/16/32).
+/// - Linux-native: `ext4` (shared magic with ext2/ext3 — too rare
+///   on modern distros to distinguish), `btrfs`, `xfs`, `zfs`
+///   (ZFS-on-Linux via spl-zfs). Each emits its literal so the
+///   leaderboard bucket can distinguish.
+/// - Everything else (tmpfs / overlayfs / sysfs / autofs / fuse /
+///   …) → `"other"` so the bench submission still validates.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn map_linux_fs_magic_to_schema(magic: i64) -> &'static str {
+    const SMB_SUPER_MAGIC: i64 = 0x517B;
+    const SMB2_MAGIC_NUMBER: i64 = 0xFE534D42;
+    const NFS_SUPER_MAGIC: i64 = 0x6969;
+    const NTFS_SB_MAGIC: i64 = 0x5346544E; // "NTFS" little-endian
+    const NTFS3_SUPER_MAGIC: i64 = 0x7366746E;
+    const FAT_FS_MAGIC: i64 = 0x4006;
+    const MSDOS_SUPER_MAGIC: i64 = 0x4D44;
+    const EXT4_SUPER_MAGIC: i64 = 0xEF53; // shared with ext2 / ext3
+    const BTRFS_SUPER_MAGIC: i64 = 0x9123683E;
+    const XFS_SUPER_MAGIC: i64 = 0x58465342; // "XFSB" big-endian
+    const ZFS_SUPER_MAGIC: i64 = 0x2FC12FC1; // ZFS-on-Linux ZPL
+    match magic {
         SMB_SUPER_MAGIC | SMB2_MAGIC_NUMBER | NFS_SUPER_MAGIC => "network-SMB",
         NTFS_SB_MAGIC | NTFS3_SUPER_MAGIC => "NTFS",
         FAT_FS_MAGIC | MSDOS_SUPER_MAGIC => "FAT32",
+        EXT4_SUPER_MAGIC => "ext4",
+        BTRFS_SUPER_MAGIC => "btrfs",
+        XFS_SUPER_MAGIC => "xfs",
+        ZFS_SUPER_MAGIC => "zfs",
         _ => "other",
-    };
-    Some(mapped.to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1896,6 +1926,53 @@ mod tests {
     fn rotation_rate_boundary_0x0400_vs_0x0401() {
         assert_eq!(rotation_rate_to_disk_class_kind(0x0400), None);
         assert_eq!(rotation_rate_to_disk_class_kind(0x0401), Some("HDD"));
+    }
+
+    // ============================================================
+    // Linux fs magic-number bundle (2026-06-08, design routing)
+    // ============================================================
+
+    /// Pure mapping — runs on every CI target. Catches accidental
+    /// magic-constant drift (e.g. typo'd hex) without needing Linux.
+    #[test]
+    fn map_linux_fs_magic_to_schema_native_filesystems() {
+        // ext4 (shared with ext2/3, see linux/magic.h EXT4_SUPER_MAGIC)
+        assert_eq!(map_linux_fs_magic_to_schema(0xEF53), "ext4");
+        // btrfs
+        assert_eq!(map_linux_fs_magic_to_schema(0x9123683E), "btrfs");
+        // xfs ("XFSB" big-endian)
+        assert_eq!(map_linux_fs_magic_to_schema(0x58465342), "xfs");
+        // zfs (ZFS-on-Linux ZPL superblock)
+        assert_eq!(map_linux_fs_magic_to_schema(0x2FC12FC1), "zfs");
+    }
+
+    #[test]
+    fn map_linux_fs_magic_to_schema_preserves_existing_arms() {
+        // Network: smbfs / smb2 / nfs
+        assert_eq!(map_linux_fs_magic_to_schema(0x517B), "network-SMB");
+        assert_eq!(map_linux_fs_magic_to_schema(0xFE534D42), "network-SMB");
+        assert_eq!(map_linux_fs_magic_to_schema(0x6969), "network-SMB");
+        // NTFS (kernel-ntfs3 + FUSE ntfs-3g)
+        assert_eq!(map_linux_fs_magic_to_schema(0x5346544E), "NTFS");
+        assert_eq!(map_linux_fs_magic_to_schema(0x7366746E), "NTFS");
+        // FAT/MSDOS
+        assert_eq!(map_linux_fs_magic_to_schema(0x4006), "FAT32");
+        assert_eq!(map_linux_fs_magic_to_schema(0x4D44), "FAT32");
+    }
+
+    #[test]
+    fn map_linux_fs_magic_to_schema_unknown_returns_other() {
+        // tmpfs (TMPFS_MAGIC) — common but irrelevant for bench
+        // brackets; collapses to the schema catch-all rather than
+        // crashing the submission.
+        assert_eq!(map_linux_fs_magic_to_schema(0x01021994), "other");
+        // overlayfs (OVERLAYFS_SUPER_MAGIC)
+        assert_eq!(map_linux_fs_magic_to_schema(0x794C7630), "other");
+        // sysfs (SYSFS_MAGIC)
+        assert_eq!(map_linux_fs_magic_to_schema(0x62656572), "other");
+        // 0 (untranslated f_type, should never see this in
+        // practice — statfs returns -1 on error, not 0)
+        assert_eq!(map_linux_fs_magic_to_schema(0), "other");
     }
 
     // ============================================================
