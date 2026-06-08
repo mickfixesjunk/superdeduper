@@ -953,17 +953,16 @@ fn default_filesystem() -> &'static str {
 
 /// #88 Phase 1 — Detect the filesystem hosting `path` and map it to
 /// the backend schema's enum: `"NTFS" | "ReFS" | "exFAT" | "FAT32" |
-/// "network-SMB" | "other"`.
+/// "network-SMB" | "APFS" | "HFS+" | "ext4" | "btrfs" | "xfs" |
+/// "zfs" | "other"`.
 ///
-/// 2026-06-08 platform-completeness pass: macOS (apfs / hfs) and
-/// Linux (ext4 / btrfs / xfs / zfs) are now DETECTED via statfs but
-/// still collapse to `"other"` because the live submit schema enum
-/// has not yet been extended. Codex PR #180 P1 flagged that emitting
-/// the literals would regress submissions from a coarse-but-valid
-/// `"other"` bucket to a hard schema-validation failure. The mappers
-/// `map_macos_fstype_to_schema` + `map_linux_fs_magic_to_schema`
-/// keep the new arms with `=> "other"` so a one-line flip closes
-/// the gap once web ships the schema bump.
+/// macOS (`APFS`, `HFS+`) and Linux native (`ext4`, `btrfs`, `xfs`,
+/// `zfs`) are 2026-06-08 platform-completeness additions: pre-fix
+/// every honest non-Windows submission collapsed to `"other"`
+/// because the engine's mapper + the live submit schema enum
+/// recognised only NTFS / ReFS / exFAT / FAT32 / network-SMB. Web
+/// shipped the schema bump at `47b4419` (2026-06-08 16:35 PDT); this
+/// commit flips the deferred mapper arms to literal emission.
 ///
 /// Path-prefix-based network detection runs first because it's
 /// cheap and doesn't require an FS syscall: UNC `\\server\share`,
@@ -1123,18 +1122,12 @@ fn detect_filesystem_linux(path: &std::path::Path) -> Option<String> {
 ///   `"NTFS"`. ReFS has no mainline driver; deferred.
 /// - DOS/FAT: `vfat` + `msdos` → `"FAT32"` (no schema bucket
 ///   distinguishes FAT12/16/32).
-/// - Linux-native: `ext4` (shared magic with ext2/ext3), `btrfs`,
-///   `xfs`, `zfs` (ZFS-on-Linux via spl-zfs) → `"other"` ← DEFERRED
-///   (see codex PR #180 P1 verdict; flip once web schema bumps).
+/// - Linux-native: `ext4` (shared magic with ext2/ext3 — too rare
+///   on modern distros to distinguish), `btrfs`, `xfs`, `zfs`
+///   (ZFS-on-Linux via spl-zfs). Each emits its literal so the
+///   leaderboard bucket can distinguish.
 /// - Everything else (tmpfs / overlayfs / sysfs / autofs / fuse /
 ///   …) → `"other"` so the bench submission still validates.
-///
-/// The ext4 / btrfs / xfs / zfs arms remain explicit (with
-/// `=> "other"`) so the future flip-to-literal — after the web
-/// submit schema enum gains those values — is a one-line edit per
-/// arm. Emitting the literals today would regress every honest
-/// Linux desktop / server submission from a coarse-but-valid
-/// `"other"` bucket to a hard backend enum-validation failure.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn map_linux_fs_magic_to_schema(magic: i64) -> &'static str {
     const SMB_SUPER_MAGIC: i64 = 0x517B;
@@ -1152,12 +1145,10 @@ fn map_linux_fs_magic_to_schema(magic: i64) -> &'static str {
         SMB_SUPER_MAGIC | SMB2_MAGIC_NUMBER | NFS_SUPER_MAGIC => "network-SMB",
         NTFS_SB_MAGIC | NTFS3_SUPER_MAGIC => "NTFS",
         FAT_FS_MAGIC | MSDOS_SUPER_MAGIC => "FAT32",
-        // DEFERRED: web submit schema enum lacks ext4 / btrfs / xfs / zfs.
-        // Flip these arms to their literals once schema bumps.
-        EXT4_SUPER_MAGIC => "other",
-        BTRFS_SUPER_MAGIC => "other",
-        XFS_SUPER_MAGIC => "other",
-        ZFS_SUPER_MAGIC => "other",
+        EXT4_SUPER_MAGIC => "ext4",
+        BTRFS_SUPER_MAGIC => "btrfs",
+        XFS_SUPER_MAGIC => "xfs",
+        ZFS_SUPER_MAGIC => "zfs",
         _ => "other",
     }
 }
@@ -1191,33 +1182,24 @@ fn detect_filesystem_macos(path: &std::path::Path) -> Option<String> {
 /// statfs (lowercase by convention on macOS); output is the
 /// backend schema enum value.
 ///
+/// - `apfs`  → `APFS` (Apple silicon + modern Intel default)
+/// - `hfs`   → `HFS+` (pre-2017 Macs / legacy volumes)
 /// - `exfat` → `exFAT`
 /// - `msdos` → `FAT32` (macOS reports FAT12/16/32 collectively as msdos)
 /// - `ntfs`  → `NTFS` (read-only on macOS without third-party kext,
 ///                     but volumes do mount)
 /// - `smbfs` / `nfs` / `webdav` → `network-SMB` (one network bucket
 ///                                                covers all three)
-/// - `apfs`  → `other`  ← DEFERRED: schema-bump-pending follow-up.
-/// - `hfs`   → `other`  ← DEFERRED: schema-bump-pending follow-up.
 /// - anything else → `other`
-///
-/// The `apfs` + `hfs` arms remain explicit (with `=> "other"`) so
-/// the future flip-to-literal — after the web submit schema enum
-/// gains `"APFS"` + `"HFS+"` — is a one-line edit. Codex PR #180
-/// P1 verdict (2026-06-08): emitting the literals today would
-/// regress every macOS submission from a coarse-but-valid `"other"`
-/// bucket to a hard backend enum-validation failure.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn map_macos_fstype_to_schema(raw: &str) -> &'static str {
     match raw {
+        "apfs" => "APFS",
+        "hfs" => "HFS+",
         "exfat" => "exFAT",
         "msdos" => "FAT32",
         "ntfs" => "NTFS",
         "smbfs" | "nfs" | "webdav" => "network-SMB",
-        // DEFERRED: web submit schema enum lacks APFS + HFS+.
-        // Flip these arms back to "APFS" + "HFS+" once schema bumps.
-        "apfs" => "other",
-        "hfs" => "other",
         _ => "other",
     }
 }
@@ -1951,23 +1933,16 @@ mod tests {
 
     /// Pure mapping — runs on every CI target. Catches accidental
     /// magic-constant drift (e.g. typo'd hex) without needing Linux.
-    ///
-    /// Per codex PR #180 P1 (2026-06-08), the new ext4 / btrfs / xfs
-    /// / zfs literals are DEFERRED — they collapse to `"other"`
-    /// until the web submit schema enum bumps. These assertions
-    /// pin the deferred shape so a stray flip-to-literal can't slip
-    /// past review; flip the literals + flip these assertions in
-    /// the same follow-up PR.
     #[test]
-    fn map_linux_fs_magic_to_schema_native_filesystems_deferred_to_other() {
+    fn map_linux_fs_magic_to_schema_native_filesystems() {
         // ext4 (shared with ext2/3, see linux/magic.h EXT4_SUPER_MAGIC)
-        assert_eq!(map_linux_fs_magic_to_schema(0xEF53), "other");
+        assert_eq!(map_linux_fs_magic_to_schema(0xEF53), "ext4");
         // btrfs
-        assert_eq!(map_linux_fs_magic_to_schema(0x9123683E), "other");
+        assert_eq!(map_linux_fs_magic_to_schema(0x9123683E), "btrfs");
         // xfs ("XFSB" big-endian)
-        assert_eq!(map_linux_fs_magic_to_schema(0x58465342), "other");
+        assert_eq!(map_linux_fs_magic_to_schema(0x58465342), "xfs");
         // zfs (ZFS-on-Linux ZPL superblock)
-        assert_eq!(map_linux_fs_magic_to_schema(0x2FC12FC1), "other");
+        assert_eq!(map_linux_fs_magic_to_schema(0x2FC12FC1), "zfs");
     }
 
     #[test]
@@ -2006,25 +1981,15 @@ mod tests {
     /// Pure mapping — runs on every CI target. Catches accidental
     /// rename of a literal (e.g. apfs vs APFS) without needing macOS.
     #[test]
-    fn map_macos_fstype_to_schema_existing_schema_arms() {
+    fn map_macos_fstype_to_schema_known_values() {
+        assert_eq!(map_macos_fstype_to_schema("apfs"), "APFS");
+        assert_eq!(map_macos_fstype_to_schema("hfs"), "HFS+");
         assert_eq!(map_macos_fstype_to_schema("exfat"), "exFAT");
         assert_eq!(map_macos_fstype_to_schema("msdos"), "FAT32");
         assert_eq!(map_macos_fstype_to_schema("ntfs"), "NTFS");
         assert_eq!(map_macos_fstype_to_schema("smbfs"), "network-SMB");
         assert_eq!(map_macos_fstype_to_schema("nfs"), "network-SMB");
         assert_eq!(map_macos_fstype_to_schema("webdav"), "network-SMB");
-    }
-
-    /// Per codex PR #180 P1 (2026-06-08), `apfs` + `hfs` are
-    /// DEFERRED — they collapse to `"other"` until the web submit
-    /// schema enum bumps to accept `"APFS"` + `"HFS+"`. Pin the
-    /// deferred shape so a stray flip-to-literal can't slip past
-    /// review; flip the mapper literals + flip these assertions
-    /// in the same follow-up PR.
-    #[test]
-    fn map_macos_fstype_to_schema_native_filesystems_deferred_to_other() {
-        assert_eq!(map_macos_fstype_to_schema("apfs"), "other");
-        assert_eq!(map_macos_fstype_to_schema("hfs"), "other");
     }
 
     #[test]

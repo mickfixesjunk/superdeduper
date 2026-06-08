@@ -316,8 +316,10 @@ pub struct HardwareFingerprint {
     /// "mixed"`. Defaults to "mixed" when detection fails.
     pub disk_class: String,
     /// Enum: `"NTFS" | "ReFS" | "exFAT" | "FAT32" |
-    /// "network-SMB" | "other"`. Defaults to "NTFS" on Windows,
-    /// "other" elsewhere.
+    /// "network-SMB" | "APFS" | "HFS+" | "ext4" | "btrfs" | "xfs"
+    /// | "zfs" | "other"`. Defaults to "NTFS" on Windows, "other"
+    /// elsewhere. macOS (APFS/HFS+) + Linux-native (ext4/btrfs/xfs/
+    /// zfs) added 2026-06-08 (web schema bump shipped at 47b4419).
     pub filesystem: String,
     /// NTFS cluster size in KB. Defaults to 4 (the NTFS default
     /// for volumes <= 16 TB).

@@ -38,7 +38,7 @@
           "type": "string"
         },
         "filesystem": {
-          "description": "Enum: `\"NTFS\" | \"ReFS\" | \"exFAT\" | \"FAT32\" | \"network-SMB\" | \"other\"`. Defaults to \"NTFS\" on Windows, \"other\" elsewhere.",
+          "description": "Enum: `\"NTFS\" | \"ReFS\" | \"exFAT\" | \"FAT32\" | \"network-SMB\" | \"APFS\" | \"HFS+\" | \"ext4\" | \"btrfs\" | \"xfs\" | \"zfs\" | \"other\"`. Defaults to \"NTFS\" on Windows, \"other\" elsewhere. macOS (APFS/HFS+) and Linux-native (ext4/btrfs/xfs/zfs) added 2026-06-08 to surface platform-completeness in leaderboard brackets; web schema bump shipped at 47b4419.",
           "type": "string"
         },
         "is_dev_drive": {
