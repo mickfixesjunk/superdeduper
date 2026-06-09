@@ -137,10 +137,22 @@ mod tests {
     fn vendored_catalog_parses() {
         let cat = catalog();
         assert_eq!(cat.version, "v1");
-        assert_eq!(cat.classifier_version, 2);
+        assert_eq!(cat.classifier_version, 3);
         assert_eq!(cat.brackets.len(), 5);
         let ids: Vec<&str> = cat.brackets.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["flagship", "high-end", "mid-range", "older", "legacy"]);
+    }
+
+    /// Regression: explicit pin for AMD Ryzen 7 7800X3D — a popular
+    /// benchmark CPU. Catalog v2 had the example mislabeled as
+    /// 'Ryzen 9 7800X3D' and the pattern only matched a non-existent
+    /// 'Ryzen 9 78XX' SKU; web v3 corrects both (example +
+    /// `ryzen\s*[79]\s*78[0-9]{2}` defensive pattern). Pin so any
+    /// future re-vendor that drops the v3 fix fails CI. Surfaced by
+    /// codex on PR #183 (2026-06-08).
+    #[test]
+    fn classify_ryzen_7_7800x3d_lands_in_high_end() {
+        assert_eq!(classify_cpu("AMD Ryzen 7 7800X3D").as_str(), "high-end");
     }
 
     #[test]
