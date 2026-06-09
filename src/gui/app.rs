@@ -492,8 +492,10 @@ impl SuperdeduperApp {
 
         // v0.3.43 lazy-eframe-init: close app_new_ms. Companion to
         // record_app_new_start() at the top of this fn. After return,
-        // eframe drives the first update() -> first paint cycle, which
-        // closes first_frame_ms via emit_if_first_frame() in App::update.
+        // eframe drives the first update() -> tessellate -> paint
+        // cycle; first_update_ms closes when the FirstFrameEmitGuard
+        // at the top of App::update drops (P1 fix on PR #182 codex
+        // verdict).
         crate::perf_gui_startup::record_app_new_end();
 
         app

@@ -58,8 +58,9 @@
 //! ## Always-on
 //!
 //! Default ON; no env gate. Cost: 4 `Instant::now()` captures + 1
-//! `log_info!` emit on the first frame paint. Sub-microsecond total.
-//! Aligns with Mick's "I want to see this on every run" directive
+//! `log_info!` emit on the first `App::update` return. Sub-
+//! microsecond total. Aligns with Mick's "I want to see this on
+//! every run" directive
 //! (2026-06-07 ~08:25 PDT) + matches [`crate::perf_scan_lifecycle`].
 //!
 //! Note: the [research scope spec §4.1] proposed an env gate
@@ -94,7 +95,7 @@ fn app_new_start_slot() -> &'static OnceLock<Instant> {
 
 /// `App::new` exit Instant. Set by [`record_app_new_end`] at the
 /// last statement before `App::new` returns the constructed app
-/// value. Used to close `app_new_ms` and open `first_frame_ms`.
+/// value. Used to close `app_new_ms` and open `first_update_ms`.
 fn app_new_end_slot() -> &'static OnceLock<Instant> {
     static SLOT: OnceLock<Instant> = OnceLock::new();
     &SLOT
