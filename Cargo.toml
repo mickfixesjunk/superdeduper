@@ -56,6 +56,14 @@ sha2 = "0.10"
 # deps so no real blast-radius cost). Tiny surface use; could be
 # feature-gated on `telemetry` if cargo-bloat surfaces a regression.
 url = "2.5"
+# CPU bracket classifier (#217) — pattern-match an emitted CPU brand
+# string against the vendored cpu-brackets-catalog.json. Catalog is
+# authored as YAML in the web repo, served as JSON via
+# /api/v1/cpu-brackets/catalog; engine vendors the JSON form so we
+# can parse with the existing serde_json + add a single small regex
+# dep. Already pulled in transitively by globset/aho-corasick, so
+# adding as a direct dep is zero blast-radius.
+regex = "1"
 
 # GUI deps — optional, gated behind the `gui` feature.
 eframe = { version = "0.32", optional = true, default-features = false, features = [

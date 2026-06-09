@@ -93,6 +93,22 @@ pub struct SystemInfo {
     /// Identifier strings for the hash backends, e.g. `"river5-aesni-v15"`.
     pub river5_impl: String,
     pub blake3_impl: String,
+    /// #217: CPU brand string as the engine emits it on submission
+    /// (post-`normalize_cpu_brand`). Available on builds with the
+    /// `telemetry` feature where the hardware probe exists; absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_model_string: Option<String>,
+    /// #217: bracket id from the vendored cpu-brackets-catalog
+    /// snapshot. Render-side maps to the bracket's `display_name`
+    /// via the bundled catalog. Telemetry-only (same gate as
+    /// `cpu_model_string`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_bracket: Option<String>,
+    /// #217: public reference page describing how brackets are
+    /// defined. Stable URL. Telemetry-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_bracket_reference_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -542,6 +558,23 @@ impl Drop for ScratchGuard {
 }
 
 fn probe_system() -> SystemInfo {
+    // #217: when the telemetry feature is on, surface the same
+    // cpu_model_string the bench submission would emit + the bracket
+    // it classifies into. Telemetry-off builds skip this — the
+    // hardware-fingerprint probe lives behind the same gate.
+    #[cfg(feature = "telemetry")]
+    let (cpu_model_string, cpu_bracket, cpu_bracket_reference_url) = {
+        let brand = crate::leaderboard::hardware::detect().cpu_model_string;
+        let bracket = crate::leaderboard::cpu_brackets::classify_cpu(&brand);
+        (
+            Some(brand),
+            Some(bracket.as_str().to_string()),
+            Some(BRACKET_REFERENCE_URL.to_string()),
+        )
+    };
+    #[cfg(not(feature = "telemetry"))]
+    let (cpu_model_string, cpu_bracket, cpu_bracket_reference_url) = (None, None, None);
+
     SystemInfo {
         cpu_threads: std::thread::available_parallelism()
             .map(|n| n.get())
@@ -549,7 +582,30 @@ fn probe_system() -> SystemInfo {
         os: std::env::consts::OS.to_string(),
         river5_impl: river5::impl_name().to_string(),
         blake3_impl: "blake3 (rust crate)".to_string(),
+        cpu_model_string,
+        cpu_bracket,
+        cpu_bracket_reference_url,
     }
+}
+
+/// #217 public reference page for bracket definitions. Stable URL.
+#[cfg(feature = "telemetry")]
+const BRACKET_REFERENCE_URL: &str = "https://superdeduper.io/brackets";
+
+/// #217 resolver: render-side mapping from bracket id (wire) to its
+/// display name. Falls back to the id verbatim when the bundled
+/// catalog doesn't carry the id (e.g. `"unknown"` — kept as `Unknown`
+/// title-cased rather than the bare id). Telemetry-gated like the
+/// rest of the bracket plumbing.
+#[cfg(feature = "telemetry")]
+fn bracket_display_name_resolved(id: &str) -> String {
+    if let Some(name) = crate::leaderboard::cpu_brackets::bracket_display_name(id) {
+        return name.to_string();
+    }
+    if id == "unknown" {
+        return "Unknown".to_string();
+    }
+    id.to_string()
 }
 
 fn probe_hash_throughput() -> HashProbeResult {
@@ -1037,6 +1093,23 @@ fn write_text_report(out: &mut dyn std::io::Write, r: &DiagnoseReport) -> anyhow
     writeln!(out, "  river5 impl: {}", r.system.river5_impl)?;
     writeln!(out, "  blake3 impl: {}", r.system.blake3_impl)?;
     writeln!(out)?;
+    // #217: surface CPU model + leaderboard bracket. Only when the
+    // telemetry feature is on (the hardware probe + bracket catalog
+    // both live behind the same gate). Bracket id is mapped to its
+    // catalog display_name via the vendored cpu-brackets snapshot.
+    #[cfg(feature = "telemetry")]
+    if let Some(model) = &r.system.cpu_model_string {
+        writeln!(out, "Hardware (leaderboard bracket):")?;
+        writeln!(out, "  CPU model:   {}", model)?;
+        if let Some(bracket_id) = &r.system.cpu_bracket {
+            let display = bracket_display_name_resolved(bracket_id);
+            writeln!(out, "  Bracket:     {}", display)?;
+        }
+        if let Some(url) = &r.system.cpu_bracket_reference_url {
+            writeln!(out, "  Reference:   {}", url)?;
+        }
+        writeln!(out)?;
+    }
     writeln!(out, "Hash compute throughput (in-memory):")?;
     writeln!(
         out,

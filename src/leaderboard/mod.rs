@@ -30,6 +30,7 @@ pub mod action_submission;
 pub mod captcha;
 pub mod pending_actions; // #99 v0.2.39 action-credit queue (skip-submit-then-recycle)
 pub mod catalog;
+pub mod cpu_brackets;
 pub mod hardware;
 pub mod hmac_signer;
 pub mod install;
