@@ -4314,6 +4314,16 @@ fn skip_sidebar_during_scan_enabled() -> bool {
 
 impl eframe::App for SuperdeduperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // v0.3.43 lazy-eframe-init: RAII guard fires the perf-gui-startup
+        // emit on Drop, routing every early-return path through the
+        // finalizer. Per codex PR #182 P1 verdict (2026-06-08): the
+        // alpha-warning + resume modal + --live + skip-accesskit paths
+        // all early-return before reaching the bottom of update(); a
+        // bottom-of-update emit site would either skip the emit or fold
+        // user-modal-dwell time into first_update_ms. atomic-swap
+        // sentinel ensures exactly-once emit; subsequent frames' guard
+        // drops are no-ops.
+        let _emit_guard = crate::perf_gui_startup::FirstFrameEmitGuard;
         let t_update_start = std::time::Instant::now();
         let t_drain_start = t_update_start;
         self.drain_events();
@@ -4605,16 +4615,11 @@ impl eframe::App for SuperdeduperApp {
                 crate::log_info!("{line}");
             }
         }
-
-        // v0.3.43 lazy-eframe-init: emit perf-gui-startup once after the
-        // first frame paint completes. Subsequent calls no-op via the
-        // module's atomic-swap sentinel. Placed at the bottom of update()
-        // so first_frame_ms captures the full layout + paint cost of
-        // the initial UI tree. The skip_accesskit_during_scan early
-        // return above can't pre-empt this on frame 1 (is_scanning is
-        // false at process start); if it ever did, emit fires on the
-        // next normal-path frame.
-        crate::perf_gui_startup::emit_if_first_frame();
+        // v0.3.43 perf-gui-startup emit is handled by the
+        // FirstFrameEmitGuard at the top of update() (RAII Drop on
+        // every return path). Per codex PR #182 P1 verdict, the
+        // earlier bottom-of-update emit site missed early-return
+        // paths (alpha-warning, resume modal, --live + skip-accesskit).
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

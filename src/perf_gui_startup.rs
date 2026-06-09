@@ -13,30 +13,47 @@
 //!
 //! ## Buckets
 //!
-//! * **pre_native_ms**         -- process start -> `eframe::run_native` call.
-//!                                Static init / dyld / arg parse / config
-//!                                load / channel resolution.
-//! * **run_native_to_new_ms**  -- `run_native` call -> `App::new(cc)` entry.
-//!                                eframe internals + winit window create +
-//!                                accesskit_windows IPC + GPU context init.
-//! * **app_new_ms**            -- `App::new(cc)` entry -> return. Theme
-//!                                install + image_loader install + persisted
-//!                                state read + checkpoint summary probe.
-//! * **first_frame_ms**        -- `App::new` return -> first paint complete.
-//!                                Default font atlas + initial UI tree
-//!                                layout + GPU first-frame submit.
-//! * **total_to_visible_ms**   -- process start -> first paint complete.
-//!                                Sum-conservation: should equal sum of the
-//!                                four bucket fields within ms-of-rounding.
+//! * **pre_native_ms**            -- process start -> `eframe::run_native` call.
+//!                                   Static init / dyld / arg parse / config
+//!                                   load / channel resolution.
+//! * **run_native_to_new_ms**     -- `run_native` call -> `App::new(cc)` entry.
+//!                                   eframe internals + winit window create +
+//!                                   accesskit_windows IPC + GPU context init.
+//! * **app_new_ms**               -- `App::new(cc)` entry -> return. Theme
+//!                                   install + image_loader install + persisted
+//!                                   state read + checkpoint summary probe.
+//! * **first_update_ms**          -- `App::new` return -> first `App::update`
+//!                                   return. egui layout + lays-out-but-not-yet-
+//!                                   tessellated UI tree. **LOWER BOUND** for
+//!                                   "time to first visible frame": excludes
+//!                                   eframe's post-`update` tessellation,
+//!                                   texture upload, paint, and swap/present.
+//!                                   See P2 verdict on PR #182.
+//! * **total_to_first_update_ms** -- process start -> first `App::update` return.
+//!                                   Sum-conservation: should equal sum of the
+//!                                   four bucket fields within ms-of-rounding.
 //!
 //! ## Emit format
 //!
 //! ```text
-//! perf-gui-startup: pre_native_ms=120 run_native_to_new_ms=4200 app_new_ms=15 first_frame_ms=2540 total_to_visible_ms=6875
+//! perf-gui-startup: pre_native_ms=120 run_native_to_new_ms=4200 app_new_ms=15 first_update_ms=2540 total_to_first_update_ms=6875
 //! ```
 //!
-//! Per-process; fires exactly once per GUI lifetime. Subsequent paints
-//! suppress the emit via the `EMITTED` AtomicBool.
+//! Per-process; fires exactly once per GUI lifetime. Subsequent
+//! frames' guard drops are no-ops via the atomic-swap sentinel.
+//!
+//! Bucket naming honestly reflects the emit-site semantic
+//! ([`FirstFrameEmitGuard::drop`] fires on `update` return, BEFORE
+//! eframe tessellate/paint/present). The first_update_ms signal is
+//! still load-bearing for the matrix verdict: it captures all of our
+//! app code's first-frame cost plus a lower bound on eframe's pre-
+//! `update` first-frame work. The deferred bit (tessellation, GPU
+//! submit, swap/present) is eframe internals -- not engineering-
+//! fixable in our codebase, would only be addressable via a §3.2
+//! candidate that changes eframe config (smaller viewport, no-vsync
+//! cold start), and even those would surface in run_native_to_new_ms
+//! or via shrinking the first-frame UI tree (which DOES drop
+//! first_update_ms).
 //!
 //! ## Always-on
 //!
@@ -113,10 +130,14 @@ pub fn record_app_new_end() {
     let _ = app_new_end_slot().get_or_init(Instant::now);
 }
 
-/// First-frame paint sentinel. Call from inside the first
-/// `eframe::App::update` invocation, AFTER egui has laid out and
-/// painted the initial UI tree. Emits the `perf-gui-startup:` line
-/// exactly once per process; subsequent calls are no-ops.
+/// First-frame emit sentinel. Prefer constructing a
+/// [`FirstFrameEmitGuard`] at the top of `eframe::App::update`
+/// over calling this directly -- the guard pattern routes every
+/// early-return path through the emit. Calling this manually is
+/// equivalent to dropping a guard immediately.
+///
+/// Emits the `perf-gui-startup:` line exactly once per process via
+/// the atomic-swap sentinel; subsequent calls are no-ops.
 ///
 /// Skips the emit if any prior marker was never recorded (degraded
 /// data is worse than no data -- matrix-runner ignores absent
@@ -139,7 +160,7 @@ pub fn emit_if_first_frame() {
     let Some(app_new_end) = app_new_end_slot().get() else {
         return;
     };
-    let first_frame_done = Instant::now();
+    let first_update_done = Instant::now();
 
     let pre_native_ms = pre_run_native
         .saturating_duration_since(process_start)
@@ -150,22 +171,53 @@ pub fn emit_if_first_frame() {
     let app_new_ms = app_new_end
         .saturating_duration_since(*app_new_start)
         .as_millis() as u64;
-    let first_frame_ms = first_frame_done
+    let first_update_ms = first_update_done
         .saturating_duration_since(*app_new_end)
         .as_millis() as u64;
-    let total_to_visible_ms = pre_native_ms
+    let total_to_first_update_ms = pre_native_ms
         .saturating_add(run_native_to_new_ms)
         .saturating_add(app_new_ms)
-        .saturating_add(first_frame_ms);
+        .saturating_add(first_update_ms);
 
     crate::log_info!(
-        "perf-gui-startup: pre_native_ms={} run_native_to_new_ms={} app_new_ms={} first_frame_ms={} total_to_visible_ms={}",
+        "perf-gui-startup: pre_native_ms={} run_native_to_new_ms={} app_new_ms={} first_update_ms={} total_to_first_update_ms={}",
         pre_native_ms,
         run_native_to_new_ms,
         app_new_ms,
-        first_frame_ms,
-        total_to_visible_ms,
+        first_update_ms,
+        total_to_first_update_ms,
     );
+}
+
+/// RAII guard that calls [`emit_if_first_frame`] on Drop. Hold a
+/// `let _emit_guard = FirstFrameEmitGuard;` at the TOP of every
+/// visible-frame entry point (e.g. `eframe::App::update`) so the
+/// emit fires regardless of which early-return path the frame exits
+/// via.
+///
+/// **Why this exists** (P1 verdict on PR #182): the original PR
+/// placed a single emit call at the bottom of `App::update`. Multiple
+/// early-return paths in update() (default alpha-warning modal,
+/// launch-time resume modal, `--live` + skip-accesskit-during-scan)
+/// pre-empt that emit on the first frame -- the user-facing emit
+/// would either never fire on those paths, or fire on a later frame
+/// with user-modal-dwell time folded into `first_update_ms`. Both
+/// outcomes break the "always-on, once-per-GUI-lifetime, clean
+/// matrix signal" contract.
+///
+/// The first construction-then-drop emits the line; subsequent
+/// drops are no-ops via the atomic-swap sentinel. Safe to construct
+/// on every frame -- only the first one ever actually emits.
+///
+/// Drop runs on panic too; partial-data emit on a frame-1 panic is
+/// useful for crash-diagnosis. emit_if_first_frame() validates all
+/// markers and silently skips emit if any are missing.
+pub struct FirstFrameEmitGuard;
+
+impl Drop for FirstFrameEmitGuard {
+    fn drop(&mut self) {
+        emit_if_first_frame();
+    }
 }
 
 #[cfg(test)]
@@ -206,5 +258,27 @@ mod tests {
         // Force the flag true; subsequent emit must return early.
         emitted_flag().store(true, Ordering::SeqCst);
         emit_if_first_frame(); // returns at the swap check; no panic.
+    }
+
+    /// P1 verdict regression guard: FirstFrameEmitGuard fires on drop,
+    /// including drops from early-return paths. Constructing one and
+    /// dropping it must invoke emit_if_first_frame exactly once (the
+    /// atomic-swap sentinel ensures subsequent drops no-op).
+    #[test]
+    fn first_frame_emit_guard_fires_on_drop() {
+        // Reset the emitted flag so the guard has a chance to emit.
+        emitted_flag().store(false, Ordering::SeqCst);
+        // First guard: emits (or silently skips if markers missing,
+        // but flag still flips per the swap semantic).
+        {
+            let _guard = FirstFrameEmitGuard;
+        }
+        // Second guard: drops + calls emit_if_first_frame, which
+        // returns at the swap check because flag is now true.
+        {
+            let _guard = FirstFrameEmitGuard;
+        }
+        // No panic across two drops; sentinel held.
+        assert!(emitted_flag().load(Ordering::SeqCst));
     }
 }
