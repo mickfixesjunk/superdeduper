@@ -4380,6 +4380,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rayon",
+ "regex",
  "rfd",
  "river5",
  "rodio",
