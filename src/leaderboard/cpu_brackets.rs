@@ -97,6 +97,19 @@ pub fn classify_cpu(brand: &str) -> BracketId {
     classify_cpu_with(brand, catalog())
 }
 
+/// Look up a bracket's `display_name` from the bundled catalog given
+/// its wire id (`"flagship"`, `"high-end"`, etc.). Returns `None` for
+/// `"unknown"` and any id absent from the snapshot. Useful for the
+/// CLI + GUI render paths where the id is what's stored / submitted
+/// but the user sees the prettier name.
+pub fn bracket_display_name(id: &str) -> Option<&'static str> {
+    catalog()
+        .brackets
+        .iter()
+        .find(|b| b.id == id)
+        .map(|b| b.display_name.as_str())
+}
+
 /// Same as [`classify_cpu`] but accepts a caller-supplied catalog. Used
 /// by tests to exercise alternate catalogs (mock data, fixture
 /// catalogs) without touching the vendored snapshot.
