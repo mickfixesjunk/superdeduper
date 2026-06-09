@@ -99,11 +99,21 @@ discover_agents() {
   while IFS= read -r line; do
     idx="${line%%:*}"
     name="${line#*:}"
-    # Strip trailing tmux "active" marker (`*`) or "last" marker (`-`).
-    name="${name%[\*\-]}"
+    # `tmux list-windows -F '#W'` emits the window name without flags —
+    # active/last markers (`*` / `-`) live in `#F`, not `#W`. No strip
+    # needed; stripping would destroy legitimate trailing chars on a
+    # window literally named e.g. "superdeduper-".
     if is_excluded "$name"; then continue; fi
     AGENTS[$idx]="$name"
   done < <(tmux list-windows -t "${SESSION}" -F '#I:#W' 2>/dev/null)
+}
+
+# Verify tmux session is alive. Distinguishes "session dead → no panes to
+# sweep" (every agent unreachable, real wedge) from "all panes excluded"
+# (config wedge). Used to gate the empty-AGENTS-after-discover handling
+# so an empty sweep can't masquerade as "all-clear".
+session_alive() {
+  tmux has-session -t "${SESSION}" 2>/dev/null
 }
 
 QUIET=0
@@ -299,6 +309,29 @@ sweep_once() {
   # Refresh the window→agent map every sweep so layout changes are
   # picked up without an editor round-trip.
   discover_agents
+
+  # Empty-AGENTS guard: an empty map means either the tmux session is
+  # dead OR every pane was excluded by the EXCLUDED_WINDOWS list. Either
+  # is a real wedge — sweeping zero panes and reporting "all-clear" would
+  # be a silent everything-is-fine for a dead swarm. Surface as a single
+  # hard line (action-needed in quiet mode), bump the unhealthy count so
+  # the exit-1 branch fires, and skip the per-pane loop.
+  if [[ "${#AGENTS[@]}" == "0" ]]; then
+    local reason
+    if session_alive; then
+      reason="tmux session '${SESSION}' alive but every window excluded — check EXCLUDED_WINDOWS config"
+    else
+      reason="tmux session '${SESSION}' not found — boss-host tmux is dead or unreachable"
+    fi
+    if [[ "$QUIET" == "1" ]]; then
+      echo "SWARM_HEALTH ${ts} action-needed:"
+      echo "  WEDGED_DISCOVERY ${reason}"
+    else
+      echo "swarm-health-check ${ts} — DISCOVERY FAILED"
+      echo "  ${reason}"
+    fi
+    return 1
+  fi
 
   if [[ "$QUIET" != "1" ]]; then
     echo "swarm-health-check ${ts} — sweeping ${#AGENTS[@]} panes in tmux session '${SESSION}'"

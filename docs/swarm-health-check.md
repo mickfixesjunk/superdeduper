@@ -7,17 +7,20 @@
 Adapted from the trade-boss-swarm reference at `mickfixesjunk/trade-boss` (`scripts/swarm-health-check.sh` + `docs/swarm-health-check.md`). This swarm's superdeduper topology has differences worth knowing:
 
 - **Single-host swarm.** All 17 agent panes (WSL + Windows agents both) live in the same `giga-superdeduper` tmux session on neo-wsl. No SSH needed for pane capture.
-- **V1 scope.** WEDGED detection only. IDLE_BAD detection is deferred to V2 once the repo has a priority-label scheme (`p0-critical` / `p1-high`).
+- **Two active failure classes.** `WEDGED_*` (API error, unreachable, or discovery failed) is exit-1 + Monitor-surfaced. `IDLE` (Claude session JSONL hasn't updated within `SWARM_JSONL_FRESH_S` seconds, default 120s) is informational — surfaced in non-quiet mode for operator eyeball, but doesn't bump the wedged count. `IDLE_BAD` (idle + open p0/p1 issues) is still deferred to V2 until the repo has a priority-label scheme.
 - **Stood-down agents** (`czkawka`, `accountant`) are explicitly skipped via a `STOOD_DOWN` list in the script. Reactivate via Mick directive + remove from the list.
 - **dumbo** runs in a separate Claude Code session (cleanroom isolation per [[feedback_dumbo_cleanroom_isolation]] memory) and is NOT in this tmux session — excluded from the sweep.
-- **Tail window**: tail-12 (vs trade-boss's tail-40). Empirically tuned for this swarm — broadcast posts mentioning "API error" patterns leave scrollback text that triggers false positives at tail-40. Tail-12 reflects current state since recovery output displaces the error within seconds.
+- **Dynamic window discovery.** Window→agent map is rebuilt every sweep from `tmux list-windows`, so layout changes (new agents via `giga add-agent`, reorders, removed agents) are picked up automatically. Replaces an earlier hardcoded map that drifted when window indices shifted.
+- **JSONL mtime as the primary "active" signal.** Claude Code appends to the per-session `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` on every tool call and streamed token. The mtime is the ground truth — pane text patterns ("Crunched", "Cogitated", etc.) persist in the buffer after work stops, so pane-only detection used to false-positive on dead-but-once-active sessions. The legacy pane-text `ACTIVE_PATTERN` is kept only as a fallback for hosts whose JSONL we can't probe (Windows agents whose Claude data lives off-host; non-Claude CLIs like codex-review).
+- **Tail window**: tail-12 (vs trade-boss's tail-40), used for the API-error pattern only. Empirically tuned for this swarm — broadcast posts mentioning "API error" patterns leave scrollback text that triggers false positives at tail-40. Tail-12 reflects current state since recovery output displaces the error within seconds.
 
 ## What this is
 
 A periodic sweep of all active agent panes to detect:
 
-1. **Wedged agents** — stuck in a recoverable failure (rate-limit API error, transient connection error, server overload).
-2. (V2, deferred) Unnecessarily-idle agents — pane shows standby pattern AND open p0/p1 issues without `health-check:ignore-idle` label.
+1. **Wedged agents** — stuck in a recoverable failure (rate-limit API error, transient connection error, server overload, tmux session dead).
+2. **Idle agents** — Claude session JSONL hasn't updated within the freshness threshold (default 120s). Informational — sometimes deliberate (agent on standby waiting for inbound) and sometimes a silent stall. Operator decides whether to nudge.
+3. (V2, deferred) Unnecessarily-idle agents — idle AND open p0/p1 issues without `health-check:ignore-idle` label. Requires repo-side priority-label scheme.
 
 When the sweep finds a wedged pane, the design (swarm boss) agent applies a **judgment-based nudge** via `tmux send-keys`. Critically: nudges are applied **one at a time** with delays between, to avoid creating a request storm at the Anthropic API that would worsen any existing rate-limit.
 
@@ -29,7 +32,11 @@ When the sweep finds a wedged pane, the design (swarm boss) agent applies a **ju
 
 ## How it works
 
-The script uses `tmux capture-pane -p` on the local session for each window's primary pane, takes the last 12 lines, and runs pattern matches in order of priority.
+Each sweep:
+
+1. **Rediscover the window→agent map** via `tmux list-windows -F '#I:#W'`. Picks up reorders / adds / removes automatically.
+2. **Bail if no agents found.** If `tmux has-session` fails or every window matched `EXCLUDED_WINDOWS`, emit `WEDGED_DISCOVERY` and exit 1. An empty sweep that reported "all-clear" would silently miss a dead swarm.
+3. **For each agent pane**: capture last 40 lines (`tmux capture-pane -p`), then classify.
 
 ### Classification priorities
 
@@ -38,18 +45,31 @@ Each pane gets exactly ONE status, picked in this order:
 1. **STOOD_DOWN** — agent is in the `STOOD_DOWN` list (`czkawka`, `accountant`). Skip without flagging.
 2. **UNREACHABLE** — `tmux capture-pane` returned empty (session dead, pane closed). Treated as wedged.
 3. **WEDGED_API_ERROR** — last 12 lines match `API Error`, `Server is temporarily limiting`, `Internal server error`, `connection refused`, `429 Too Many`, `Overloaded`, `503 Service`, `connection error`. **Always wins.**
-4. **OK (active-work-detected)** — last 12 lines match active-work cues: `shipping`, `building`, `writing`, `drafting`, `Smoke testing`, `Editing`, `Crunching`, `Cogitated`, `Sautéed`, `Brewed`, `↓ N tokens`, etc. Prevents flagging a mid-task agent.
-5. **OK (no-issue-detected)** — fallback. Pane is in a neutral state (standby with watcher running, empty prompt, etc.); design agent can eyeball if they want but no action needed.
+4. **OK (active-work-detected jsonl-age=Ns)** — Claude session JSONL mtime is fresher than `SWARM_JSONL_FRESH_S` (default 120s). Ground truth that the agent is actively streaming tokens or making tool calls right now.
+5. **IDLE (jsonl-age=Ns no-recent-claude-activity)** — JSONL exists but mtime is older than the freshness threshold. Agent isn't producing output. Could be deliberate standby (watcher armed, no inbound) or a silent stall. **Not exit-1**; surfaces in non-quiet output for operator review.
+6. **OK (active-work-detected pattern-fallback-no-jsonl)** — no JSONL found for this agent (Windows agent, codex-review CLI, fresh agent), but the last 12 lines match the legacy `ACTIVE_PATTERN` (`shipping`, `building`, `Crunching`, `Cogitated`, etc). Weaker signal — known to false-positive after the agent stops since verb words persist in the buffer — but the best available without JSONL.
+7. **OK (no-issue-detected no-jsonl)** — fallback. No JSONL, no API error, no pattern match. Neutral state.
 
 ### Status codes & exit
 
-| Status | Exit-code bit | Action |
-| --- | :---: | --- |
-| OK / STOOD_DOWN | — | None |
-| WEDGED_API_ERROR | 1 | Wait 60s (rate limit usually clears), then nudge |
-| UNREACHABLE | 1 | Manual investigation (check tmux directly) |
+| Status | Exit-code bit | Quiet-mode surfaced | Action |
+| --- | :---: | :---: | --- |
+| OK / STOOD_DOWN | — | no | None |
+| IDLE | — | no | Operator-judgment — nudge only if work is expected |
+| WEDGED_API_ERROR | 1 | yes | Wait 60s (rate limit usually clears), then nudge |
+| UNREACHABLE | 1 | yes | Manual investigation (check tmux directly) |
+| WEDGED_DISCOVERY | 1 | yes | Either tmux session died, or `EXCLUDED_WINDOWS` excludes everything — check operator-host tmux + script config |
 
-Exit code is 0 for healthy, 1 if any wedged/unreachable found.
+Exit code is 0 for healthy, 1 if any `WEDGED_*` / `UNREACHABLE` found. `IDLE` doesn't count.
+
+### Environment variables
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `SWARM_HEALTH_INTERVAL_S` | `3600` | Sleep between sweeps in `--loop` mode |
+| `SWARM_JSONL_FRESH_S` | `120` | mtime threshold (seconds) for "actively working". Increase if your agents commonly have long single-token gaps (large `cargo build`, slow remote `gh api`); decrease if you want tighter stall detection |
+| `CLAUDE_PROJECTS_ROOT` | `$HOME/.claude/projects` | Where Claude Code stores per-session JSONLs |
+| `SWARM_WORKDIR_ROOT` | `/home/neomatrix/.giga/configs/superdeduper/workdirs` | Used to encode each agent's cwd → JSONL session dir |
 
 ## Nudge procedure (design-agent judgment)
 
@@ -167,3 +187,4 @@ Lean (b) for consistency. Tracking via the existing gigachanges entry.
 ## Update history
 
 - **2026-06-06**: Initial creation. Adapted from trade-boss-swarm reference. Triggered by the v0.3.40 ship-cycle rate-limit storm (testdesign hit WEDGED on API error; manual pane sweep recovered them). Tail window tuned from 40 → 12 after empirical false positives on 4 agents with historical API-error text in scrollback.
+- **2026-06-08**: Dynamic tmux discovery replaces the hardcoded window-index → agent-name map (drifted out of sync when river5 moved 4→5 and web moved 6→8, producing UNREACHABLE false-positives and mis-targeted nudges). Same day: JSONL mtime promoted to primary "actively working" signal after empirically catching dead-but-once-active panes that the verb-rotation `ACTIVE_PATTERN` was classifying OK. New `IDLE` status surfaces stale-mtime panes for operator review; new `WEDGED_DISCOVERY` status surfaces empty-AGENTS sweeps (would otherwise have masqueraded as "all-clear" on a dead swarm). `SWARM_JSONL_FRESH_S` env var added (default 120s).
