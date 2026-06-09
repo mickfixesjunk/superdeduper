@@ -113,6 +113,12 @@ fn main() -> eframe::Result<()> {
         Vec::new()
     };
 
+    // v0.3.43 lazy-eframe-init: capture pre-run_native baseline
+    // BEFORE eframe takes over the thread for winit window creation +
+    // accesskit_windows IPC setup + GPU context init. Marks the
+    // boundary between pre_native_ms (our setup) and
+    // run_native_to_new_ms (eframe internals).
+    superdeduper::perf_gui_startup::record_pre_run_native();
     eframe::run_native(
         "superdeduper",
         native_options,

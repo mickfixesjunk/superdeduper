@@ -276,6 +276,10 @@ enum MenuAction {
 
 impl SuperdeduperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // v0.3.43 lazy-eframe-init: anchor app_new_ms. Companion to
+        // record_pre_run_native() in superdeduper_gui.rs + the
+        // record_app_new_end() marker just before this fn returns.
+        crate::perf_gui_startup::record_app_new_start();
         // A-perf-startup-instrumentation (testdesign 21:05 PDT
         // Option-A ratify): per-phase Instant timing for the 10s
         // startup tail decomposition. Gated by
@@ -485,6 +489,12 @@ impl SuperdeduperApp {
                 t_new_end.duration_since(t_new_start).as_secs_f64() * 1000.0,
             );
         }
+
+        // v0.3.43 lazy-eframe-init: close app_new_ms. Companion to
+        // record_app_new_start() at the top of this fn. After return,
+        // eframe drives the first update() -> first paint cycle, which
+        // closes first_frame_ms via emit_if_first_frame() in App::update.
+        crate::perf_gui_startup::record_app_new_end();
 
         app
     }
@@ -4595,6 +4605,16 @@ impl eframe::App for SuperdeduperApp {
                 crate::log_info!("{line}");
             }
         }
+
+        // v0.3.43 lazy-eframe-init: emit perf-gui-startup once after the
+        // first frame paint completes. Subsequent calls no-op via the
+        // module's atomic-swap sentinel. Placed at the bottom of update()
+        // so first_frame_ms captures the full layout + paint cost of
+        // the initial UI tree. The skip_accesskit_during_scan early
+        // return above can't pre-empt this on frame 1 (is_scanning is
+        // false at process start); if it ever did, emit fires on the
+        // next normal-path frame.
+        crate::perf_gui_startup::emit_if_first_frame();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
