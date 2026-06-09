@@ -89,10 +89,11 @@ pub fn strip_trademark_markers(brand: &str) -> String {
 /// Matching is case-insensitive. Pre-strips `(R)`/`(TM)`/`(C)` markers
 /// via [`strip_trademark_markers`].
 ///
-/// Pattern compilation is cached at the catalog level so repeated
-/// calls don't recompile the same regexes. A pattern that fails to
-/// compile is logged once and skipped (catalog is authored by humans;
-/// a stray regex shouldn't crash the binary).
+/// Patterns are compiled per call (see [`classify_cpu_with`] for the
+/// rationale). A pattern that fails to compile is logged once per
+/// (bracket, pattern) site and skipped — catalog is authored by
+/// humans, so a stray regex shouldn't crash the binary but also
+/// shouldn't silently mis-classify users into the wrong bracket.
 pub fn classify_cpu(brand: &str) -> BracketId {
     classify_cpu_with(brand, catalog())
 }
@@ -113,13 +114,28 @@ pub fn bracket_display_name(id: &str) -> Option<&'static str> {
 /// Same as [`classify_cpu`] but accepts a caller-supplied catalog. Used
 /// by tests to exercise alternate catalogs (mock data, fixture
 /// catalogs) without touching the vendored snapshot.
+///
+/// Patterns are compiled per call rather than cached at the catalog
+/// level. ~20 patterns at a few µs of regex compile each is well
+/// below the cost of `diagnose` (a one-shot CLI path); caching would
+/// shave a negligible slice while complicating `OnceLock` storage of
+/// `Vec<Vec<Regex>>` alongside the deserialized JSON. Revisit only
+/// if a future caller hits this in a hot loop.
+///
+/// A pattern that fails to compile is logged once (catalog authoring
+/// bug — the caller's submission would have classified as the bracket
+/// the broken pattern was supposed to match, so a silent skip can
+/// mask a real bug) and the next pattern is tried.
 pub fn classify_cpu_with(brand: &str, cat: &Catalog) -> BracketId {
     let normalized = strip_trademark_markers(brand);
     for bracket in &cat.brackets {
         for pattern in &bracket.patterns {
             let compiled = match Regex::new(&format!("(?i){pattern}")) {
                 Ok(re) => re,
-                Err(_) => continue,
+                Err(e) => {
+                    log_pattern_error(&bracket.id, pattern, &e);
+                    continue;
+                }
             };
             if compiled.is_match(&normalized) {
                 return BracketId(bracket.id.clone());
@@ -127,6 +143,27 @@ pub fn classify_cpu_with(brand: &str, cat: &Catalog) -> BracketId {
         }
     }
     BracketId::unknown()
+}
+
+/// Log a malformed catalog pattern at most once per (bracket, pattern)
+/// site per process. Catalog authoring bugs (an invalid regex in
+/// web-side YAML) silently dropping at classify time mask real
+/// classification gaps; the dedup keeps a long-running GUI from
+/// spamming the log with the same broken pattern every frame.
+fn log_pattern_error(bracket_id: &str, pattern: &str, err: &regex::Error) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{bracket_id}::{pattern}");
+    let mut seen = SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap();
+    if seen.insert(key) {
+        crate::log_warn!(
+            "cpu_brackets: malformed catalog pattern bracket={} pattern={:?} error={}",
+            bracket_id,
+            pattern,
+            err
+        );
+    }
 }
 
 #[cfg(test)]
