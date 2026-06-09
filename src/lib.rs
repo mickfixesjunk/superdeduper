@@ -87,6 +87,7 @@ pub use superdeduper_log::{log_err, log_info, log_warn};
 
 pub mod output;
 pub mod path_display;
+pub mod perf_gui_startup;
 pub mod perf_scan_lifecycle;
 pub mod pipeline;
 pub mod platform;

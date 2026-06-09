@@ -82,6 +82,16 @@ fn process_start_now() -> Instant {
     *process_start_slot().get_or_init(Instant::now)
 }
 
+/// Read-only accessor for sister-module instrumentation (e.g.
+/// [`crate::perf_gui_startup`]) that needs the process-start anchor
+/// without taking the lazy-init side effect. Returns `None` when
+/// [`record_process_start`] was never called -- callers should skip
+/// their emit in that case rather than fall back to wall-clock
+/// derived from `Instant::now()` (would be garbage).
+pub fn process_start_for_diagnostics() -> Option<Instant> {
+    process_start_slot().get().copied()
+}
+
 /// Per-scan lifecycle marker. Construct at scan start, call
 /// [`walk_started`] and [`walk_completed`] at the walker boundaries,
 /// call [`scan_completed`] at the success-path scan-finish to emit the
