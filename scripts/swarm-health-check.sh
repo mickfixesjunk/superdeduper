@@ -7,10 +7,11 @@
 # Differences from trade-boss reference:
 #   - Single-host swarm (neo-wsl only). No SSH needed.
 #   - Windows agents (sdd-testwin, benchmarker) live in the same tmux session via WSL interop.
-#   - V1 scope: WEDGED detection only. IDLE_BAD detection deferred to V2 when priority
-#     labels (p0-critical / p1-high) are added to the repo.
+#   - V1 scope: WEDGED detection is exit-1; IDLE is reported but informational only.
+#     IDLE_BAD (idle + open p0/p1 issues) deferred to V2 when the repo has a
+#     priority-label scheme.
 #   - 2 stood-down agents (czkawka, accountant) are skipped via STOOD_DOWN list.
-#   - dumbo runs in a separate Claude Code session (not in this tmux) and is excluded.
+#   - dumbo is in the EXCLUDED_WINDOWS list — see the comment on that list for why.
 #
 # Signals (highest priority first):
 #   1. API_ERROR_PATTERN matches the pane tail-12 → WEDGED_API_ERROR.
@@ -34,11 +35,11 @@
 #
 # Exit codes (non-loop mode):
 #   0 — all agents healthy (IDLE doesn't count as wedged)
-#   1 — one or more agents wedged (API error or unreachable)
+#   1 — one or more agents wedged (API error, unreachable, or discovery failed)
 #
 # Output format (one line per relevant agent):
-#   STATUS host:agent [reason]
-# STATUS ∈ {OK, WEDGED_API_ERROR, UNREACHABLE, IDLE, STOOD_DOWN}
+#   STATUS agent (window N) [reason]
+# STATUS ∈ {OK, WEDGED_API_ERROR, WEDGED_DISCOVERY, UNREACHABLE, IDLE, STOOD_DOWN}
 #
 # In --quiet mode (Monitor-friendly), the script emits ONE summary line per sweep
 # when nothing is wrong (so the Monitor stays alive without spamming), and a
@@ -67,10 +68,22 @@ CLAUDE_PROJECTS_ROOT="${CLAUDE_PROJECTS_ROOT:-$HOME/.claude/projects}"
 # `-` to anchor.
 WORKDIR_ROOT="${SWARM_WORKDIR_ROOT:-/home/neomatrix/.giga/configs/superdeduper/workdirs}"
 
-# Windows we intentionally exclude from the health sweep (bridges, system
-# panes, etc.). Anything else in the tmux session is treated as an agent
-# pane and classified.
-EXCLUDED_WINDOWS=("codex-review-bridge" "codex-review-cli" "design")
+# Windows we intentionally exclude from the health sweep. Anything else
+# in the tmux session is treated as an agent pane and classified.
+#   - codex-review-bridge / codex-review-cli — non-Claude infra panes (the
+#     bridge worker + the codex-CLI pane itself; both have their own health
+#     story outside this sweep).
+#   - design — this script runs FROM the design boss host; sweeping design
+#     would loop the boss against itself.
+#   - dumbo — cleanroom red-team agent per [[feedback_dumbo_cleanroom_isolation]].
+#     Sweeping dumbo's pane wouldn't itself leak (the script only READS), but a
+#     WEDGED flag would invite a design-boss nudge — and nudging dumbo injects
+#     design's text into a cleanroom session, exactly the leak the isolation
+#     forbids. Cheaper to skip entirely. (Earlier topology assumed dumbo ran
+#     in a separate Claude Code session outside this tmux; that changed when
+#     dumbo was added to giga-superdeduper at window 16. Earlier docs/header
+#     text saying "not in this tmux" was stale and is now corrected.)
+EXCLUDED_WINDOWS=("codex-review-bridge" "codex-review-cli" "design" "dumbo")
 
 # Agents intentionally stood down (per Mick directives). Skipped without flagging.
 # Reactivate via Mick's explicit request + remove from this list.
@@ -148,7 +161,9 @@ is_stood_down() {
   return 1
 }
 
-# Capture last 40 lines from a window's primary pane.
+# Capture the visible pane (tmux's default). The classifier downstream
+# tails further when it needs narrower context (tail-12 for API-error
+# pattern; tail-15 in --verbose).
 capture_window() {
   local window="$1"
   tmux capture-pane -t "${SESSION}:${window}.0" -p 2>/dev/null
