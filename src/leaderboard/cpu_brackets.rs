@@ -174,7 +174,7 @@ mod tests {
     fn vendored_catalog_parses() {
         let cat = catalog();
         assert_eq!(cat.version, "v1");
-        assert_eq!(cat.classifier_version, 3);
+        assert_eq!(cat.classifier_version, 4);
         assert_eq!(cat.brackets.len(), 5);
         let ids: Vec<&str> = cat.brackets.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["flagship", "high-end", "mid-range", "older", "legacy"]);
@@ -190,6 +190,39 @@ mod tests {
     #[test]
     fn classify_ryzen_7_7800x3d_lands_in_high_end() {
         assert_eq!(classify_cpu("AMD Ryzen 7 7800X3D").as_str(), "high-end");
+    }
+
+    /// Catalog v4 cross-section (web d2d92f4 2026-06-08). Hardens the
+    /// methodology gap codex flagged on PR #183: catalog_examples_
+    /// self_classify is necessary but not sufficient — a curated
+    /// real-world brand list catches example-pattern joint-drift like
+    /// the v2 'Ryzen 9 7800X3D' that self-classified but never matched
+    /// real cpuid strings. Each row is a real shipping CPU brand
+    /// string + the bracket web's marketing-tier semantics expect
+    /// (per design 18:55 + 19:00 PDT 2026-06-08).
+    #[test]
+    fn classify_v4_cross_section_pins() {
+        let cases: &[(&str, &str)] = &[
+            ("AMD Ryzen 7 7800X3D", "high-end"),
+            ("AMD Ryzen 7 9800X3D", "high-end"),
+            ("AMD Ryzen 5 7600X", "high-end"),
+            ("Apple M4 Pro", "high-end"),
+            ("Apple M4", "high-end"),
+            ("Intel(R) Core(TM) i7-14700K", "high-end"),
+            ("Intel(R) Core(TM) i5-14600K", "high-end"),
+            ("Intel(R) Core(TM) Ultra 7 265K", "high-end"),
+            ("Intel(R) Core(TM) i9-10900K", "mid-range"),
+            ("AMD Ryzen Threadripper 3970X", "older"),
+        ];
+        for (brand, want) in cases {
+            let got = classify_cpu(brand);
+            assert_eq!(
+                got.as_str(),
+                *want,
+                "cross-section: brand {brand:?} classified as {:?}, expected {want:?}",
+                got.as_str()
+            );
+        }
     }
 
     #[test]
