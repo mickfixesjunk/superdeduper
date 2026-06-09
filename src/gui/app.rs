@@ -276,6 +276,10 @@ enum MenuAction {
 
 impl SuperdeduperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // v0.3.43 lazy-eframe-init: anchor app_new_ms. Companion to
+        // record_pre_run_native() in superdeduper_gui.rs + the
+        // record_app_new_end() marker just before this fn returns.
+        crate::perf_gui_startup::record_app_new_start();
         // A-perf-startup-instrumentation (testdesign 21:05 PDT
         // Option-A ratify): per-phase Instant timing for the 10s
         // startup tail decomposition. Gated by
@@ -485,6 +489,14 @@ impl SuperdeduperApp {
                 t_new_end.duration_since(t_new_start).as_secs_f64() * 1000.0,
             );
         }
+
+        // v0.3.43 lazy-eframe-init: close app_new_ms. Companion to
+        // record_app_new_start() at the top of this fn. After return,
+        // eframe drives the first update() -> tessellate -> paint
+        // cycle; first_update_ms closes when the FirstFrameEmitGuard
+        // at the top of App::update drops (P1 fix on PR #182 codex
+        // verdict).
+        crate::perf_gui_startup::record_app_new_end();
 
         app
     }
@@ -4304,6 +4316,16 @@ fn skip_sidebar_during_scan_enabled() -> bool {
 
 impl eframe::App for SuperdeduperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // v0.3.43 lazy-eframe-init: RAII guard fires the perf-gui-startup
+        // emit on Drop, routing every early-return path through the
+        // finalizer. Per codex PR #182 P1 verdict (2026-06-08): the
+        // alpha-warning + resume modal + --live + skip-accesskit paths
+        // all early-return before reaching the bottom of update(); a
+        // bottom-of-update emit site would either skip the emit or fold
+        // user-modal-dwell time into first_update_ms. atomic-swap
+        // sentinel ensures exactly-once emit; subsequent frames' guard
+        // drops are no-ops.
+        let _emit_guard = crate::perf_gui_startup::FirstFrameEmitGuard;
         let t_update_start = std::time::Instant::now();
         let t_drain_start = t_update_start;
         self.drain_events();
@@ -4595,6 +4617,11 @@ impl eframe::App for SuperdeduperApp {
                 crate::log_info!("{line}");
             }
         }
+        // v0.3.43 perf-gui-startup emit is handled by the
+        // FirstFrameEmitGuard at the top of update() (RAII Drop on
+        // every return path). Per codex PR #182 P1 verdict, the
+        // earlier bottom-of-update emit site missed early-return
+        // paths (alpha-warning, resume modal, --live + skip-accesskit).
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
