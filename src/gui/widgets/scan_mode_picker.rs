@@ -2,10 +2,18 @@
 //! per spec §3.8.
 //!
 //! V2.5 scope (this widget):
-//!   * Three-way dropdown — Exact (default) / Image / Audio.
+//!   * Dropdown — Exact (default), with Image / Audio surfaced only
+//!     when the `experimental-similarity-in-gui` feature is on.
 //!   * Session-sticky, NOT persisted across runs (per spec).
 //!   * Tooltip on each mode explains current engine status (CLI
 //!     today, GUI integration coming with v3).
+//!
+//! Image + Audio dropdown items are gated behind
+//! `experimental-similarity-in-gui` (default OFF) per Mick directive
+//! 2026-06-20: the underlying engine code stays compiled in and the
+//! CLI continues to expose `superdeduper scan --mode image|audio`,
+//! but the GUI hides the options until production-ready. Re-enable
+//! by turning on the feature — no source edits needed.
 //!
 //! Not yet:
 //!   * Picking Image doesn't actually drive Tier-4 in the GUI's
@@ -42,21 +50,24 @@ pub fn show(ui: &mut Ui, current: &mut ScanMode, is_scanning: bool) {
                         "Byte-identical duplicate detection — the default. \
                          Finds files whose contents are exactly the same.",
                     );
-                ui.selectable_value(current, ScanMode::Image, label_for(ScanMode::Image))
-                    .on_hover_text(
-                        "Perceptual image similarity (T1.2). \
-                         Finds resize / format-conversion / re-encode twins. \
-                         CLI today: `superdeduper scan --mode image`. \
-                         GUI integration coming with v3 — mode picker \
-                         currently records the selection but the engine \
-                         falls through to exact-mode behaviour for GUI scans.",
-                    );
-                ui.selectable_value(current, ScanMode::Audio, label_for(ScanMode::Audio))
-                    .on_hover_text(
-                        "Acoustic audio similarity (T1.3). \
-                         Not yet implemented — placeholder reservation for the \
-                         shared mode dropdown.",
-                    );
+                #[cfg(feature = "experimental-similarity-in-gui")]
+                {
+                    ui.selectable_value(current, ScanMode::Image, label_for(ScanMode::Image))
+                        .on_hover_text(
+                            "Perceptual image similarity (T1.2). \
+                             Finds resize / format-conversion / re-encode twins. \
+                             CLI today: `superdeduper scan --mode image`. \
+                             GUI integration coming with v3 — mode picker \
+                             currently records the selection but the engine \
+                             falls through to exact-mode behaviour for GUI scans.",
+                        );
+                    ui.selectable_value(current, ScanMode::Audio, label_for(ScanMode::Audio))
+                        .on_hover_text(
+                            "Acoustic audio similarity (T1.3). \
+                             Not yet implemented — placeholder reservation for the \
+                             shared mode dropdown.",
+                        );
+                }
             });
     });
 
@@ -64,6 +75,13 @@ pub fn show(ui: &mut Ui, current: &mut ScanMode, is_scanning: bool) {
     // engine integration isn't wired yet. Honest UX — the user shouldn't
     // click Start scan expecting perceptual results and silently get
     // exact-only behaviour.
+    //
+    // Gated on `experimental-similarity-in-gui` because Image / Audio
+    // selection is unreachable from the dropdown when the feature is
+    // off; the status hint would never render but the compiler still
+    // wants the match arms exhaustive. Keeping it under the same gate
+    // as the dropdown items keeps the two surfaces in lockstep.
+    #[cfg(feature = "experimental-similarity-in-gui")]
     if !matches!(current, ScanMode::Exact) {
         ui.add_space(2.0);
         let msg = match current {
@@ -101,6 +119,11 @@ mod tests {
         // These strings appear on the dropdown surface; lock the
         // wording so accidental renames in IDE-driven refactors
         // show up as failing tests rather than silent UI changes.
+        // Image / Audio labels are still pinned even when the
+        // dropdown hides those rows — the labels are reused if the
+        // CLI selection flows through a future surface (status bar,
+        // diagnose JSON), and the feature flip should not need to
+        // touch label_for().
         assert_eq!(label_for(ScanMode::Exact), "Exact match");
         assert_eq!(label_for(ScanMode::Image), "Image similarity");
         assert_eq!(label_for(ScanMode::Audio), "Audio similarity");
