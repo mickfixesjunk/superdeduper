@@ -210,6 +210,14 @@ similar-images = ["dep:image", "dep:image_hasher"]
 # CLI flag (already in place from #25 v1), no pipeline
 # integration yet.
 similar-audio = ["dep:symphonia", "dep:rusty-chromaprint", "dep:rubato"]
+# Surface the in-progress Image / Audio similarity modes in the GUI
+# scan-mode dropdown. Default OFF per Mick directive 2026-06-20: the
+# underlying engine code (similar-images / similar-audio features)
+# compiles in and the CLI still exposes `--mode image|audio`, but the
+# GUI dropdown hides them until production-ready to avoid the broken-
+# surface UX (user picks, gets poor / no / confusing results).
+# Re-enable: flip this feature on; no source edits needed.
+experimental-similarity-in-gui = []
 
 [[bin]]
 name = "superdeduper-gui"
