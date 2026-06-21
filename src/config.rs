@@ -82,8 +82,11 @@ pub struct ScanConfig {
     /// sector-aligned for arbitrary file sizes). MEASUREMENT mode only.
     pub cold_enforced: bool,
     /// Which content-hash algorithm to use for Tier 1/2/3 + format
-    /// fingerprints. BLAKE3 is the default; DDH-128 is the
-    /// in-development alternative (currently an xxhash3-128 stub).
+    /// fingerprints. River5 (16-byte, AES-NI-accelerated, ~3× BLAKE3
+    /// on supported CPUs) is the default; BLAKE3 (32-byte,
+    /// cryptographic) is the alternative. River5 was previously
+    /// named DDH-128 / River128; serde aliases keep old persisted
+    /// settings loading cleanly.
     pub hash_algo: crate::pipeline::hash::HashAlgo,
     /// Settings → Exclusions runtime filter (preset packs + custom
     /// extensions + custom path patterns). Defaults to disabled

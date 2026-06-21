@@ -124,17 +124,41 @@ pub enum Decision {
     /// File is filtered out of the scan; carries the rule class
     /// that triggered the exclusion so the scan summary + Settings
     /// "Excluded last scan" counter can break down by source.
+    ///
+    /// NOTE: see the [`ExclusionReason`] doc for the Day-1/Day-2
+    /// limitation — the [`PresetPackId`] inside the preset variants
+    /// is currently a placeholder and cannot be relied on for
+    /// per-pack breakdowns until the Day-2 per-pack GlobSet refactor
+    /// lands.
     Excluded(ExclusionReason),
 }
 
 /// Why a file was excluded. The carrier distinguishes preset-pack
-/// hits (so the scan summary can attribute "excluded by System
-/// libraries pack") from user-added custom rules.
+/// hits from user-added custom rules so the scan summary + Settings
+/// "Excluded last scan" counter can break down by source.
+///
+/// LIMITATION (Day 1 / Day 2 state): the [`PresetPackId`] payload on
+/// the two preset variants is a PLACEHOLDER pinned to
+/// [`PresetPackId::SystemLibraries`] regardless of which active pack
+/// actually scored the hit. [`ExclusionPolicy`] compiles a single
+/// combined [`GlobSet`] across all active packs (see `combined_paths`
+/// and the Day-2 comment on the struct doc), so on a match
+/// `evaluate` cannot attribute the hit to a specific pack without
+/// re-matching against per-pack sets. Real per-pack attribution
+/// requires the Day-2 refactor to a `Vec<(PresetPackId, GlobSet)>`.
+/// Until that lands, the only fields callers can trust are the
+/// rule class (custom-vs-preset, path-vs-extension); do NOT key any
+/// per-pack scan-summary breakdown off the [`PresetPackId`] here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionReason {
-    /// Path matched a glob pattern from this preset pack.
+    /// Path matched a glob pattern from one of the active preset
+    /// packs. NOTE: the [`PresetPackId`] is a placeholder pinned to
+    /// [`PresetPackId::SystemLibraries`] until per-pack GlobSets
+    /// land — see the enum-level doc above.
     PresetPackPath(PresetPackId),
-    /// Extension matched an entry from this preset pack.
+    /// Extension matched an entry from one of the active preset
+    /// packs. NOTE: same [`PresetPackId`] placeholder caveat as
+    /// [`ExclusionReason::PresetPackPath`] above.
     PresetPackExtension(PresetPackId),
     /// Path matched a user-defined custom glob pattern.
     CustomPattern,
@@ -283,6 +307,17 @@ impl ExclusionPolicy {
             let reason = if self.custom_paths.is_match(match_target) {
                 ExclusionReason::CustomPattern
             } else {
+                // FIXME(per-pack-attribution): `combined_paths` is one merged
+                // GlobSet across every active preset pack (see compile()), so
+                // we cannot tell *which* pack scored the hit without a second
+                // match-pass against per-pack sets. We hard-code
+                // `SystemLibraries` as a placeholder; no current caller reads
+                // the pack id (the walker at src/inventory/walk.rs:1672
+                // discards the reason via `Decision::Excluded(_)` and
+                // ExclusionCounters only tracks aggregate counts). The Day-2
+                // refactor anticipated on the ExclusionPolicy struct doc
+                // (a `Vec<(PresetPackId, GlobSet)>`) is the real fix. See
+                // ExclusionReason doc for the full caveat.
                 ExclusionReason::PresetPackPath(PresetPackId::SystemLibraries)
             };
             return Decision::Excluded(reason);
@@ -292,6 +327,13 @@ impl ExclusionPolicy {
                 let reason = if self.custom_exts.contains(&ext) {
                     ExclusionReason::CustomExtension
                 } else {
+                    // FIXME(per-pack-attribution): same placeholder pattern
+                    // as the path branch above — `combined_exts` is one
+                    // merged HashSet across every active preset pack, so we
+                    // cannot attribute the hit to a specific pack. Hard-code
+                    // `SystemLibraries`; no caller reads it today. Real fix
+                    // is the Day-2 per-pack split (ExclusionPolicy struct
+                    // doc). See ExclusionReason doc for the full caveat.
                     ExclusionReason::PresetPackExtension(PresetPackId::SystemLibraries)
                 };
                 return Decision::Excluded(reason);

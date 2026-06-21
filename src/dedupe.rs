@@ -6,9 +6,13 @@
 //!   picking the keeper and again right before the action runs.
 //! * System-critical paths (`C:\Windows`, `C:\Program Files`, …) are
 //!   refused unless `--allow-system-paths` is passed.
-//! * Before any destructive action, the file's `(size, mtime)` is
-//!   re-checked against the results-file's snapshot. Mismatch ⇒ that
-//!   group is skipped with an error.
+//! * Before any destructive action, the file's `size` is re-checked
+//!   against the results-file's snapshot (per-member `file_sizes[i]`,
+//!   falling back to the group representative `size` for older JSON).
+//!   Mismatch ⇒ that path is skipped and counted in
+//!   `Outcome::skipped_invalidated`. mtime is NOT re-checked — adding
+//!   it would require a snapshot-schema bump (see AGENTS.md §Refactor
+//!   Hints `dedupe.rs:9-11`).
 //! * `--dry-run` short-circuits every action with a planned-action
 //!   log line, never touching the filesystem.
 
