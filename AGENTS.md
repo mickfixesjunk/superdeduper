@@ -26,7 +26,7 @@ Files in scope of THIS audit (root only — not recursing into `src/`, `crates/`
 
 Workspace + package root. Declares the engine package (`superdeduper`
 v0.3.42, Rust 1.87, MIT, edition 2021, `publish = false`), four `[[bin]]`
-entries, the always-on + optional dep set, four cargo features (`gui`,
+entries, the always-on + optional dep set, six cargo features (`gui`,
 `audio`, `telemetry`, `similar-images`, `similar-audio`,
 `experimental-similarity-in-gui`), platform-gated deps (`libc` on
 `cfg(unix)`, `windows` crate on `cfg(windows)` with a deliberately curated

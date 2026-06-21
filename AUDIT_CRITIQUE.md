@@ -1,5 +1,14 @@
 # AUDIT_CRITIQUE.md - Completeness review of superdeduper codebase audit
 
+> **HISTORICAL — pre-follow-up state.** This critique was written immediately
+> after the first-pass 25-agent audit and lists 5 unaudited subtrees as the
+> primary coverage gap. Those subtrees were subsequently audited in a follow-
+> up pass; see [FINDINGS_FOLLOWUP.md](./FINDINGS_FOLLOWUP.md) for the closure
+> (44 additional findings, 0 P1, and the 7 missing `AGENTS.md` files now
+> committed alongside this PR). The original recommendations below are kept
+> intact for the audit trail; the "Add the 5 missing AGENTS.md files"
+> follow-up at the end of this document IS NOW COMPLETE.
+
 Post-audit critique by the completeness critic. Scope: verify that the 25-agent
 audit (FINDINGS.md rollup + per-directory AGENTS.md files) actually covers the
 repository, and flag what was missed.

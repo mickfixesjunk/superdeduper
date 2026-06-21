@@ -7,11 +7,19 @@ This document is the aggregated rollup of a multi-agent codebase audit of the su
 Generated during ultracode audit; date from commit log or session context.
 
 Totals across all 25 agents:
-- **P1 (load-bearing):** 3
+- **P1 (load-bearing):** 4
 - **P2 (meaningful drift):** 41
 - **P3 (cosmetic):** 23
 - **Info (refactor opportunities):** 65
-- **Grand total:** 132 findings
+- **Grand total:** 133 findings
+
+(Count corrected post-codex review on PR #187: the synthesis aggregator
+initially reported `P1=3` but the P1 section below enumerates four issues —
+`src/dedupe.rs` validation doc, `src/config.rs` hash_algo doc,
+`src/exclusions/mod.rs` PresetPackId attribution, and
+`crates/superdeduper-bench-real/src/bench_run.rs` fused docstring. All four
+ship as doc-only fixes in PR #186; underlying code refactors for P1-1
+(dedupe mtime) and P1-3 (exclusions per-pack) queued for v0.3.44.)
 
 ---
 
