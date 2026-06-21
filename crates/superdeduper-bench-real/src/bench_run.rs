@@ -479,22 +479,6 @@ impl<R: std::io::Read> std::io::Read for CancelReader<'_, R> {
     }
 }
 
-/// Read a file fully, BYPASSING the OS page cache, so the bench's timed
-/// dedup reflects cold-from-disk throughput (cold-enforce, #106 pt2 — the
-/// client half of the anti-forge closure: in-memory recovery can't fake the
-/// real read). Returns `(bytes, was_cold)`; `was_cold == false` means this
-/// platform/filesystem couldn't bypass the cache and we fell back to a
-/// normal buffered read (still byte-correct, just not cold-enforced).
-///
-/// * Linux: `O_DIRECT` + sector-aligned chunked reads (falls back when the fs
-///   rejects O_DIRECT, e.g. tmpfs/overlay, or the file isn't sector-aligned).
-/// * Windows: `FILE_FLAG_NO_BUFFERING` (same aligned scheme as `diagnose`).
-/// * macOS: `F_NOCACHE` (no alignment constraint).
-/// * other: buffered fallback (`was_cold == false`).
-/// Whether O_DIRECT actually BYPASSES the page cache in this environment.
-/// O_DIRECT is advisory: WSL2 (ext4-on-vhdx / drvfs) ACCEPTS the flag but
-/// silently serves from the Windows host cache — `open(O_DIRECT)` succeeds with
-/// no buffered fallback, yet the read is WARM. Reporting `cold=true` there is a
 /// Cert-blocker #5 (web 2d247e8): notify server "corpus downloaded, dedup
 /// about to start" so it can stamp `dedup_start_ts` on the `bench_run` row.
 /// The verifier then computes `server_observed_wall_ms = received_at -
@@ -826,6 +810,10 @@ fn evict_file_pages(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether O_DIRECT actually BYPASSES the page cache in this environment.
+/// O_DIRECT is advisory: WSL2 (ext4-on-vhdx / drvfs) ACCEPTS the flag but
+/// silently serves from the Windows host cache — `open(O_DIRECT)` succeeds with
+/// no buffered fallback, yet the read is WARM. Reporting `cold=true` there is a
 /// false positive that would let a warm run land on the competitive cold board
 /// (testrunner's WSL finding — the 125x-leverage forge hole achievements
 /// flagged). Fail closed: detect WSL via /proc/version and treat it as not
@@ -847,6 +835,18 @@ pub fn cold_bypass_reliable() -> bool {
     })
 }
 
+/// Read a file fully, BYPASSING the OS page cache, so the bench's timed
+/// dedup reflects cold-from-disk throughput (cold-enforce, #106 pt2 — the
+/// client half of the anti-forge closure: in-memory recovery can't fake the
+/// real read). Returns `(bytes, was_cold)`; `was_cold == false` means this
+/// platform/filesystem couldn't bypass the cache and we fell back to a
+/// normal buffered read (still byte-correct, just not cold-enforced).
+///
+/// * Linux: `O_DIRECT` + sector-aligned chunked reads (falls back when the fs
+///   rejects O_DIRECT, e.g. tmpfs/overlay, or the file isn't sector-aligned).
+/// * Windows: `FILE_FLAG_NO_BUFFERING` (same aligned scheme as `diagnose`).
+/// * macOS: `F_NOCACHE` (no alignment constraint).
+/// * other: buffered fallback (`was_cold == false`).
 #[cfg(target_os = "linux")]
 pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     use std::io::Read;
@@ -908,6 +908,18 @@ pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((out, bulk > 0))
 }
 
+/// Read a file fully, BYPASSING the OS page cache, so the bench's timed
+/// dedup reflects cold-from-disk throughput (cold-enforce, #106 pt2 — the
+/// client half of the anti-forge closure: in-memory recovery can't fake the
+/// real read). Returns `(bytes, was_cold)`; `was_cold == false` means this
+/// platform/filesystem couldn't bypass the cache and we fell back to a
+/// normal buffered read (still byte-correct, just not cold-enforced).
+///
+/// * Linux: `O_DIRECT` + sector-aligned chunked reads (falls back when the fs
+///   rejects O_DIRECT, e.g. tmpfs/overlay, or the file isn't sector-aligned).
+/// * Windows: `FILE_FLAG_NO_BUFFERING` (same aligned scheme as `diagnose`).
+/// * macOS: `F_NOCACHE` (no alignment constraint).
+/// * other: buffered fallback (`was_cold == false`).
 #[cfg(target_os = "macos")]
 pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     use std::io::Read;
@@ -923,6 +935,18 @@ pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((out, cold))
 }
 
+/// Read a file fully, BYPASSING the OS page cache, so the bench's timed
+/// dedup reflects cold-from-disk throughput (cold-enforce, #106 pt2 — the
+/// client half of the anti-forge closure: in-memory recovery can't fake the
+/// real read). Returns `(bytes, was_cold)`; `was_cold == false` means this
+/// platform/filesystem couldn't bypass the cache and we fell back to a
+/// normal buffered read (still byte-correct, just not cold-enforced).
+///
+/// * Linux: `O_DIRECT` + sector-aligned chunked reads (falls back when the fs
+///   rejects O_DIRECT, e.g. tmpfs/overlay, or the file isn't sector-aligned).
+/// * Windows: `FILE_FLAG_NO_BUFFERING` (same aligned scheme as `diagnose`).
+/// * macOS: `F_NOCACHE` (no alignment constraint).
+/// * other: buffered fallback (`was_cold == false`).
 #[cfg(windows)]
 pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     use std::os::windows::ffi::OsStrExt;
@@ -1010,6 +1034,18 @@ pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((out, bulk > 0))
 }
 
+/// Read a file fully, BYPASSING the OS page cache, so the bench's timed
+/// dedup reflects cold-from-disk throughput (cold-enforce, #106 pt2 — the
+/// client half of the anti-forge closure: in-memory recovery can't fake the
+/// real read). Returns `(bytes, was_cold)`; `was_cold == false` means this
+/// platform/filesystem couldn't bypass the cache and we fell back to a
+/// normal buffered read (still byte-correct, just not cold-enforced).
+///
+/// * Linux: `O_DIRECT` + sector-aligned chunked reads (falls back when the fs
+///   rejects O_DIRECT, e.g. tmpfs/overlay, or the file isn't sector-aligned).
+/// * Windows: `FILE_FLAG_NO_BUFFERING` (same aligned scheme as `diagnose`).
+/// * macOS: `F_NOCACHE` (no alignment constraint).
+/// * other: buffered fallback (`was_cold == false`).
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn read_uncached(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
     // No portable cache-bypass on this platform -> buffered (not cold).
